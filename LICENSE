@@ -1,0 +1,58 @@
+ROTH.C mods — License Notice
+
+This repository contains mods for the ROTH.C engine. Almost everything here is original work
+under the MIT License below. One narrow exception is called out in Part 2.
+
+
+PART 1 — THE MODS
+(all files in this repository, except as noted in Part 2)
+
+The mod source, configuration, build files, and documentation are original work, licensed under
+the MIT License:
+
+  MIT License
+
+  Copyright (c) The ROTH.C contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this
+  software and associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy, modify, merge,
+  publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons
+  to whom the Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or
+  substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+  OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+  DEALINGS IN THE SOFTWARE.
+
+
+PART 2 — THE RECONSTRUCTED ENGINE FUNCTION
+(the reconstructed portion of doc_viewer/doc_viewer.c)
+
+The doc_viewer mod works by replacing one engine function with a modified copy of it. The
+reconstructed function body it carries is, by nature, a derivative representation of the design
+and behavior of the engine of the 1996 game "Realms of the Haunting", produced by studying the
+game's original executable. It is not covered by the MIT grant above.
+
+That reconstructed portion is provided under the same preservation-notice terms as the
+reconstructed engine in the ROTH.C repository — published for the purposes of preservation,
+study, and interoperability, in the spirit of long-standing community practice around the
+preservation of historical software. See the "reconstructed engine" part of the LICENSE file in
+the ROTH.C engine repository for the full terms:
+
+  https://github.com/beyond-the-ire/ROTH.C
+
+The copyright in the underlying game and its program remains with its rights holders; nothing
+here grants, transfers, or diminishes any of their rights. No game assets are included. To play
+the game you must own it. If you are a rights holder of "Realms of the Haunting" and have
+concerns, please open an issue; concerns will be addressed promptly and in good faith.
+
+
+"Realms of the Haunting" and associated marks are the property of their respective owners. This
+project is not affiliated with, endorsed by, or connected to the game's developers, publishers,
+or rights holders.
