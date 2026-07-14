@@ -1,0 +1,45 @@
+# CI: build every mod against the current ROTH.C SDK on every push/PR.
+# This doubles as an ABI canary: the engine's SDK grows append-only, so a red build
+# here means a compatibility regression in the engine repo worth investigating.
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-mods:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out roth-mods
+        uses: actions/checkout@v4
+        with:
+          path: roth-mods
+
+      - name: Check out the ROTH.C engine (for its SDK)
+        uses: actions/checkout@v4
+        with:
+          repository: beyond-the-ire/ROTH.C
+          path: ROTH.C
+
+      - name: Install a 32-bit-capable compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib
+
+      # The Makefiles' default ROTH_SDK path (../../ROTH.C/sdk) resolves correctly with
+      # the two checkouts side by side as above.
+      - name: Build all mods
+        run: |
+          set -e
+          for mod in keybinds item_grabber doc_viewer; do
+            echo "== building $mod =="
+            make -C "roth-mods/$mod"
+          done
+
+      - name: Upload built plugins (workflow artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mods
+          path: roth-mods/*/plugin.so
