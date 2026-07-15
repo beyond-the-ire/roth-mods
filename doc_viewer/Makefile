@@ -10,13 +10,23 @@
 # checkout or an unpacked SDK release, e.g. `make ROTH_SDK=/path/to/ROTH.C/sdk`.
 ROTH_SDK ?= ../../ROTH.C/sdk
 
-CC      := gcc
-CFLAGS  := -m32 -shared -fPIC -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -I$(ROTH_SDK)/include
+# CROSS unset builds the native Linux plugin.so; CROSS=mingw cross-builds a Windows plugin.dll with
+# the MinGW i686 compiler. -fPIC is ELF-only (PE relocates via base relocations), so the mingw branch
+# drops it. Everything else — the strict warning set, the SDK-only include path — is identical.
+ifeq ($(CROSS),mingw)
+  CC     := i686-w64-mingw32-gcc
+  LIB    := plugin.dll
+  CFLAGS := -shared -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -I$(ROTH_SDK)/include
+else
+  CC     := gcc
+  LIB    := plugin.so
+  CFLAGS := -m32 -shared -fPIC -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE -I$(ROTH_SDK)/include
+endif
 
-all: plugin.so
+all: $(LIB)
 
-plugin.so: doc_viewer.c $(ROTH_SDK)/include/roth_sdk.h $(ROTH_SDK)/include/roth_sdk_overrides.h
+$(LIB): doc_viewer.c $(ROTH_SDK)/include/roth_sdk.h $(ROTH_SDK)/include/roth_sdk_overrides.h
 	$(CC) $(CFLAGS) -o $@ doc_viewer.c
 
 clean:
-	rm -f plugin.so
+	rm -f plugin.so plugin.dll

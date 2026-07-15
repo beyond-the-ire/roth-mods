@@ -53,3 +53,55 @@ jobs:
         with:
           files: out/*.zip
           generate_release_notes: true
+
+  # Windows mod zips — one <mod>-<tag>-windows.zip per mod (plugin.dll + config + README). A separate
+  # job because the MinGW cross toolchain differs from the Linux i386 job; action-gh-release is
+  # additive per tag, so these attach to the SAME release as the Linux zips.
+  release-mods-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out roth-mods
+        uses: actions/checkout@v4
+        with:
+          path: roth-mods
+
+      # FLIP BACK AT MERGE: the dllexport that puts roth_plugin_query_v1 in the DLL export table lives
+      # on the engine's windows-port branch until the Windows work merges to its default branch. Pin to
+      # that branch here; drop the `ref:` once the engine's Windows support is on the default branch.
+      - name: Check out the ROTH.C engine (for its SDK)
+        uses: actions/checkout@v4
+        with:
+          repository: beyond-the-ire/ROTH.C
+          ref: windows-port
+          path: ROTH.C
+
+      - name: Install the MinGW i686 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 binutils-mingw-w64-i686 zip
+
+      - name: Build and package each mod (Windows)
+        run: |
+          set -e
+          mkdir -p out
+          for mod in keybinds item_grabber doc_viewer; do
+            echo "== building $mod (Windows) =="
+            make -C "roth-mods/$mod" CROSS=mingw
+            i686-w64-mingw32-objdump -p "roth-mods/$mod/plugin.dll" | grep -qw roth_plugin_query_v1 \
+              || { echo "FAIL: $mod plugin.dll does not export roth_plugin_query_v1"; exit 1; }
+            # package the installable folder: plugin + config + the mod's README
+            stage="stage/$mod"
+            mkdir -p "$stage"
+            cp "roth-mods/$mod/plugin.dll" "$stage/"
+            cp roth-mods/$mod/*.cfg "$stage/" 2>/dev/null || true
+            cp "roth-mods/$mod/README.md" "$stage/"
+            (cd stage && zip -r "../out/$mod-${GITHUB_REF_NAME}-windows.zip" "$mod")
+            rm -rf stage
+          done
+          ls -l out/
+
+      - name: Attach the Windows mod zips to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.zip
+          generate_release_notes: true

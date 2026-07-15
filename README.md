@@ -69,6 +69,25 @@ make ROTH_SDK=/path/to/ROTH.C/sdk
 
 Copy the resulting `plugin.so` (and the `.cfg`, if any) into `<game>/mods/<mod>/` to install it.
 
+### Building for Windows
+
+The same Makefiles cross-build a Windows `plugin.dll` with the MinGW i686 toolchain by adding
+`CROSS=mingw`:
+
+```
+cd keybinds
+make CROSS=mingw   # -> plugin.dll  (needs the i686-w64-mingw32 toolchain)
+```
+
+Install a Windows `plugin.dll` exactly like the Linux `plugin.so`: drop the mod folder into
+`<game>/mods/<mod>/` beside the game executable.
+
+On Windows each `plugin.dll` links its own copy of the MinGW C runtime, so a plugin's heap is
+separate from the game executable's. The rule that already keeps the Linux plugins correct also
+keeps them correct here: a plugin frees only what it allocated inside the plugin, and never frees
+(nor asks the host to free) a pointer that came across the host API table. Engine and game memory
+belong to the host and are reached through the SDK's bounded accessors — never `free()`d by a mod.
+
 ## Writing your own
 
 Start with the SDK's **modding guide**, `sdk/MODDING_GUIDE.md`, in the
