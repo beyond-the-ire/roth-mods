@@ -43,3 +43,47 @@ jobs:
         with:
           name: mods
           path: roth-mods/*/plugin.so
+
+  # Windows cross-build: every mod as a plugin.dll via the MinGW i686 toolchain, asserting each DLL
+  # exports the loader entry point. Mirrors build-mods with CROSS=mingw.
+  build-mods-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out roth-mods
+        uses: actions/checkout@v4
+        with:
+          path: roth-mods
+
+      # FLIP BACK AT MERGE: the dllexport that puts roth_plugin_query_v1 in the DLL export table
+      # lives on the engine's windows-port branch until the Windows work merges to its default branch.
+      # Pin to that branch here so the Windows DLLs export the entry point; drop the `ref:` once the
+      # engine's Windows support is on the default branch.
+      - name: Check out the ROTH.C engine (for its SDK)
+        uses: actions/checkout@v4
+        with:
+          repository: beyond-the-ire/ROTH.C
+          ref: windows-port
+          path: ROTH.C
+
+      - name: Install the MinGW i686 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-i686 binutils-mingw-w64-i686
+
+      # The Makefiles' default ROTH_SDK path (../../ROTH.C/sdk) resolves with the two checkouts
+      # side by side as above.
+      - name: Build all mods (Windows) and assert the plugin export
+        run: |
+          set -e
+          for mod in keybinds item_grabber doc_viewer; do
+            echo "== building $mod (Windows) =="
+            make -C "roth-mods/$mod" CROSS=mingw
+            i686-w64-mingw32-objdump -p "roth-mods/$mod/plugin.dll" | grep -qw roth_plugin_query_v1 \
+              || { echo "FAIL: $mod plugin.dll does not export roth_plugin_query_v1"; exit 1; }
+          done
+
+      - name: Upload built plugins (workflow artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mods-windows
+          path: roth-mods/*/plugin.dll

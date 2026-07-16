@@ -1,2 +1,3 @@
 */plugin.so
 *.o
+*/plugin.dll

@@ -1,6 +1,6 @@
 # Realms of the Haunting (ROTH.C) mods
 
-> **DISCLAIMER:** This project is still heavily under development and is currently only available for Linux, but Windows is coming very soon.
+> **DISCLAIMER:** This project is still heavily under development. Mods are available for both Linux and Windows.
 
 This project contains mods for Realms of the Haunting, when playing with the **[ROTH.C](https://github.com/beyond-the-ire/ROTH.C)** executable.
 
@@ -25,10 +25,11 @@ See each mod's `README.md` for screenshots and more information.
 A mod is a folder that goes next to the game.
 
 0. Prerequisite: Make sure you have **[ROTH.C](https://github.com/beyond-the-ire/ROTH.C)** installed.
-1. Download or build the mod folder (e.g. `keybinds/`) so it contains `plugin.so` and, if the mod
-   ships one, its `.cfg` file.
-2. Copy that folder into the `mods/` directory beside the `roth` executable — the same directory
-   the engine's release bundle drops an empty `mods/` into:
+1. Download or build the mod folder (e.g. `keybinds/`) so it contains `plugin.so` (Linux) or
+   `plugin.dll` (Windows) and, if the mod ships one, its `.cfg` file.
+2. Copy that folder into the `mods/` directory beside the game executable (`roth` on Linux,
+   `rothc.exe` on Windows) — the same directory the engine's release bundle drops an empty
+   `mods/` into:
 
    ```
    <game>/mods/keybinds/plugin.so
@@ -68,6 +69,30 @@ make ROTH_SDK=/path/to/ROTH.C/sdk
 ```
 
 Copy the resulting `plugin.so` (and the `.cfg`, if any) into `<game>/mods/<mod>/` to install it.
+
+### Building for Windows
+
+The same Makefiles cross-build a Windows `plugin.dll` with the MinGW i686 toolchain by adding
+`CROSS=mingw`:
+
+```
+cd keybinds
+make CROSS=mingw   # -> plugin.dll  (needs the i686-w64-mingw32 toolchain)
+```
+
+Install a Windows `plugin.dll` exactly like the Linux `plugin.so`: drop the mod folder into
+`<game>/mods/<mod>/` beside the game executable.
+
+Developing on a Windows PC? Run the same builds inside
+[WSL](https://learn.microsoft.com/windows/wsl/) (a full Linux environment; the instructions
+above apply unchanged, and the built `plugin.dll` runs directly on the same machine). A native
+MSYS2 build may also work since a mod is a single compiler invocation, but it is not validated.
+
+On Windows each `plugin.dll` links its own copy of the MinGW C runtime, so a plugin's heap is
+separate from the game executable's. The rule that already keeps the Linux plugins correct also
+keeps them correct here: a plugin frees only what it allocated inside the plugin, and never frees
+(nor asks the host to free) a pointer that came across the host API table. Engine and game memory
+belong to the host and are reached through the SDK's bounded accessors — never `free()`d by a mod.
 
 ## Writing your own
 
