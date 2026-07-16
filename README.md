@@ -83,6 +83,11 @@ make CROSS=mingw   # -> plugin.dll  (needs the i686-w64-mingw32 toolchain)
 Install a Windows `plugin.dll` exactly like the Linux `plugin.so`: drop the mod folder into
 `<game>/mods/<mod>/` beside the game executable.
 
+Developing on a Windows PC? Run the same builds inside
+[WSL](https://learn.microsoft.com/windows/wsl/) (a full Linux environment; the instructions
+above apply unchanged, and the built `plugin.dll` runs directly on the same machine). A native
+MSYS2 build may also work since a mod is a single compiler invocation, but it is not validated.
+
 On Windows each `plugin.dll` links its own copy of the MinGW C runtime, so a plugin's heap is
 separate from the game executable's. The rule that already keeps the Linux plugins correct also
 keeps them correct here: a plugin frees only what it allocated inside the plugin, and never frees
