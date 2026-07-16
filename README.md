@@ -1,6 +1,6 @@
 # Realms of the Haunting (ROTH.C) mods
 
-> **DISCLAIMER:** This project is still heavily under development and is currently only available for Linux, but Windows is coming very soon.
+> **DISCLAIMER:** This project is still heavily under development. Mods are available for both Linux and Windows.
 
 This project contains mods for Realms of the Haunting, when playing with the **[ROTH.C](https://github.com/beyond-the-ire/ROTH.C)** executable.
 
@@ -25,10 +25,11 @@ See each mod's `README.md` for screenshots and more information.
 A mod is a folder that goes next to the game.
 
 0. Prerequisite: Make sure you have **[ROTH.C](https://github.com/beyond-the-ire/ROTH.C)** installed.
-1. Download or build the mod folder (e.g. `keybinds/`) so it contains `plugin.so` and, if the mod
-   ships one, its `.cfg` file.
-2. Copy that folder into the `mods/` directory beside the `roth` executable — the same directory
-   the engine's release bundle drops an empty `mods/` into:
+1. Download or build the mod folder (e.g. `keybinds/`) so it contains `plugin.so` (Linux) or
+   `plugin.dll` (Windows) and, if the mod ships one, its `.cfg` file.
+2. Copy that folder into the `mods/` directory beside the game executable (`roth` on Linux,
+   `rothc.exe` on Windows) — the same directory the engine's release bundle drops an empty
+   `mods/` into:
 
    ```
    <game>/mods/keybinds/plugin.so
