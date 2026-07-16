@@ -54,15 +54,10 @@ jobs:
         with:
           path: roth-mods
 
-      # FLIP BACK AT MERGE: the dllexport that puts roth_plugin_query_v1 in the DLL export table
-      # lives on the engine's windows-port branch until the Windows work merges to its default branch.
-      # Pin to that branch here so the Windows DLLs export the entry point; drop the `ref:` once the
-      # engine's Windows support is on the default branch.
       - name: Check out the ROTH.C engine (for its SDK)
         uses: actions/checkout@v4
         with:
           repository: beyond-the-ire/ROTH.C
-          ref: windows-port
           path: ROTH.C
 
       - name: Install the MinGW i686 toolchain
