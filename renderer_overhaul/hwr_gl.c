@@ -9,9 +9,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <GL/gl.h>
+#include <GL/glext.h>
 #else
 #include <EGL/egl.h>
 #include <GL/gl.h>
+#include <GL/glext.h>
 #endif
 
 #ifndef GL_BGRA
@@ -51,6 +53,24 @@ typedef void (APIENTRY *hwr_gl_bind_renderbuffer_fn)(GLenum, GLuint);
 typedef void (APIENTRY *hwr_gl_renderbuffer_storage_fn)(GLenum, GLenum, GLsizei, GLsizei);
 typedef void (APIENTRY *hwr_gl_framebuffer_renderbuffer_fn)(GLenum, GLenum, GLenum, GLuint);
 typedef GLenum (APIENTRY *hwr_gl_check_framebuffer_status_fn)(GLenum);
+typedef void (APIENTRY *hwr_gl_gen_textures_fn)(GLsizei, GLuint *);
+typedef void (APIENTRY *hwr_gl_delete_textures_fn)(GLsizei, const GLuint *);
+typedef void (APIENTRY *hwr_gl_bind_texture_fn)(GLenum, GLuint);
+typedef void (APIENTRY *hwr_gl_tex_parameter_i_fn)(GLenum, GLenum, GLint);
+typedef void (APIENTRY *hwr_gl_tex_image_2d_fn)(GLenum, GLint, GLint, GLsizei,
+                                                GLsizei, GLint, GLenum, GLenum,
+                                                const GLvoid *);
+typedef void (APIENTRY *hwr_gl_tex_sub_image_2d_fn)(GLenum, GLint, GLint, GLint,
+                                                    GLsizei, GLsizei, GLenum,
+                                                    GLenum, const GLvoid *);
+typedef void (APIENTRY *hwr_gl_draw_arrays_fn)(GLenum, GLint, GLsizei);
+typedef void (APIENTRY *hwr_gl_capability_fn)(GLenum);
+typedef void (APIENTRY *hwr_gl_depth_func_fn)(GLenum);
+typedef void (APIENTRY *hwr_gl_depth_mask_fn)(GLboolean);
+typedef void (APIENTRY *hwr_gl_copy_tex_sub_image_2d_fn)(GLenum, GLint, GLint,
+                                                         GLint, GLint, GLint,
+                                                         GLsizei, GLsizei);
+typedef void (APIENTRY *hwr_gl_pixel_store_i_fn)(GLenum, GLint);
 
 struct hwr_gl_functions {
     hwr_gl_get_string_fn get_string;
@@ -67,11 +87,73 @@ struct hwr_gl_functions {
     hwr_gl_renderbuffer_storage_fn renderbuffer_storage;
     hwr_gl_framebuffer_renderbuffer_fn framebuffer_renderbuffer;
     hwr_gl_check_framebuffer_status_fn check_framebuffer_status;
+    hwr_gl_gen_textures_fn gen_textures;
+    hwr_gl_delete_textures_fn delete_textures;
+    hwr_gl_bind_texture_fn bind_texture;
+    hwr_gl_tex_parameter_i_fn tex_parameter_i;
+    hwr_gl_tex_image_2d_fn tex_image_2d;
+    hwr_gl_tex_sub_image_2d_fn tex_sub_image_2d;
+    PFNGLACTIVETEXTUREPROC active_texture;
+    PFNGLGENBUFFERSPROC gen_buffers;
+    PFNGLDELETEBUFFERSPROC delete_buffers;
+    PFNGLBINDBUFFERPROC bind_buffer;
+    PFNGLBUFFERDATAPROC buffer_data;
+    PFNGLTEXBUFFERPROC tex_buffer;
+    PFNGLCREATESHADERPROC create_shader;
+    PFNGLSHADERSOURCEPROC shader_source;
+    PFNGLCOMPILESHADERPROC compile_shader;
+    PFNGLGETSHADERIVPROC get_shader_iv;
+    PFNGLGETSHADERINFOLOGPROC get_shader_info_log;
+    PFNGLDELETESHADERPROC delete_shader;
+    PFNGLCREATEPROGRAMPROC create_program;
+    PFNGLATTACHSHADERPROC attach_shader;
+    PFNGLLINKPROGRAMPROC link_program;
+    PFNGLGETPROGRAMIVPROC get_program_iv;
+    PFNGLGETPROGRAMINFOLOGPROC get_program_info_log;
+    PFNGLDELETEPROGRAMPROC delete_program;
+    PFNGLUSEPROGRAMPROC use_program;
+    PFNGLGETUNIFORMLOCATIONPROC get_uniform_location;
+    PFNGLUNIFORM1IPROC uniform_1i;
+    PFNGLUNIFORM2IPROC uniform_2i;
+    PFNGLUNIFORM1FPROC uniform_1f;
+    PFNGLUNIFORM2FPROC uniform_2f;
+    PFNGLGENVERTEXARRAYSPROC gen_vertex_arrays;
+    PFNGLDELETEVERTEXARRAYSPROC delete_vertex_arrays;
+    PFNGLBINDVERTEXARRAYPROC bind_vertex_array;
+    PFNGLENABLEVERTEXATTRIBARRAYPROC enable_vertex_attrib_array;
+    PFNGLVERTEXATTRIBPOINTERPROC vertex_attrib_pointer;
+    PFNGLVERTEXATTRIBIPOINTERPROC vertex_attrib_i_pointer;
+    PFNGLFRAMEBUFFERTEXTURE2DPROC framebuffer_texture_2d;
+    hwr_gl_draw_arrays_fn draw_arrays;
+    hwr_gl_capability_fn enable;
+    hwr_gl_capability_fn disable;
+    hwr_gl_depth_func_fn depth_func;
+    hwr_gl_depth_mask_fn depth_mask;
+    PFNGLCLEARBUFFERUIVPROC clear_buffer_uiv;
+    hwr_gl_copy_tex_sub_image_2d_fn copy_tex_sub_image_2d;
+    hwr_gl_pixel_store_i_fn pixel_store_i;
 };
 
 static struct hwr_gl_functions g_gl;
 static GLuint g_fbo;
 static GLuint g_color_buffer;
+static GLuint g_index_fbo;
+static GLuint g_index_texture;
+static GLuint g_index_copy_texture;
+static GLuint g_depth_buffer;
+static GLuint g_texture_buffer;
+static GLuint g_texture_buffer_texture;
+static GLuint g_colormap_texture;
+static GLuint g_tint_texture;
+static GLuint g_glow_texture;
+static GLuint g_blend_texture;
+static GLuint g_palette_texture;
+static GLuint g_scene_vbo;
+static GLuint g_scene_vao;
+static GLuint g_resolve_vao;
+static GLuint g_geometry_program;
+static GLuint g_resolve_program;
+static int g_scene_uploaded;
 static uint32_t g_fbo_width;
 static uint32_t g_fbo_height;
 static uint32_t *g_pixels;
@@ -396,13 +478,282 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(renderbuffer_storage, hwr_gl_renderbuffer_storage_fn, "glRenderbufferStorage");
     HWR_LOAD_GL(framebuffer_renderbuffer, hwr_gl_framebuffer_renderbuffer_fn, "glFramebufferRenderbuffer");
     HWR_LOAD_GL(check_framebuffer_status, hwr_gl_check_framebuffer_status_fn, "glCheckFramebufferStatus");
+    HWR_LOAD_GL(gen_textures, hwr_gl_gen_textures_fn, "glGenTextures");
+    HWR_LOAD_GL(delete_textures, hwr_gl_delete_textures_fn, "glDeleteTextures");
+    HWR_LOAD_GL(bind_texture, hwr_gl_bind_texture_fn, "glBindTexture");
+    HWR_LOAD_GL(tex_parameter_i, hwr_gl_tex_parameter_i_fn, "glTexParameteri");
+    HWR_LOAD_GL(tex_image_2d, hwr_gl_tex_image_2d_fn, "glTexImage2D");
+    HWR_LOAD_GL(tex_sub_image_2d, hwr_gl_tex_sub_image_2d_fn, "glTexSubImage2D");
+    HWR_LOAD_GL(active_texture, PFNGLACTIVETEXTUREPROC, "glActiveTexture");
+    HWR_LOAD_GL(gen_buffers, PFNGLGENBUFFERSPROC, "glGenBuffers");
+    HWR_LOAD_GL(delete_buffers, PFNGLDELETEBUFFERSPROC, "glDeleteBuffers");
+    HWR_LOAD_GL(bind_buffer, PFNGLBINDBUFFERPROC, "glBindBuffer");
+    HWR_LOAD_GL(buffer_data, PFNGLBUFFERDATAPROC, "glBufferData");
+    HWR_LOAD_GL(tex_buffer, PFNGLTEXBUFFERPROC, "glTexBuffer");
+    HWR_LOAD_GL(create_shader, PFNGLCREATESHADERPROC, "glCreateShader");
+    HWR_LOAD_GL(shader_source, PFNGLSHADERSOURCEPROC, "glShaderSource");
+    HWR_LOAD_GL(compile_shader, PFNGLCOMPILESHADERPROC, "glCompileShader");
+    HWR_LOAD_GL(get_shader_iv, PFNGLGETSHADERIVPROC, "glGetShaderiv");
+    HWR_LOAD_GL(get_shader_info_log, PFNGLGETSHADERINFOLOGPROC, "glGetShaderInfoLog");
+    HWR_LOAD_GL(delete_shader, PFNGLDELETESHADERPROC, "glDeleteShader");
+    HWR_LOAD_GL(create_program, PFNGLCREATEPROGRAMPROC, "glCreateProgram");
+    HWR_LOAD_GL(attach_shader, PFNGLATTACHSHADERPROC, "glAttachShader");
+    HWR_LOAD_GL(link_program, PFNGLLINKPROGRAMPROC, "glLinkProgram");
+    HWR_LOAD_GL(get_program_iv, PFNGLGETPROGRAMIVPROC, "glGetProgramiv");
+    HWR_LOAD_GL(get_program_info_log, PFNGLGETPROGRAMINFOLOGPROC, "glGetProgramInfoLog");
+    HWR_LOAD_GL(delete_program, PFNGLDELETEPROGRAMPROC, "glDeleteProgram");
+    HWR_LOAD_GL(use_program, PFNGLUSEPROGRAMPROC, "glUseProgram");
+    HWR_LOAD_GL(get_uniform_location, PFNGLGETUNIFORMLOCATIONPROC, "glGetUniformLocation");
+    HWR_LOAD_GL(uniform_1i, PFNGLUNIFORM1IPROC, "glUniform1i");
+    HWR_LOAD_GL(uniform_2i, PFNGLUNIFORM2IPROC, "glUniform2i");
+    HWR_LOAD_GL(uniform_1f, PFNGLUNIFORM1FPROC, "glUniform1f");
+    HWR_LOAD_GL(uniform_2f, PFNGLUNIFORM2FPROC, "glUniform2f");
+    HWR_LOAD_GL(gen_vertex_arrays, PFNGLGENVERTEXARRAYSPROC, "glGenVertexArrays");
+    HWR_LOAD_GL(delete_vertex_arrays, PFNGLDELETEVERTEXARRAYSPROC, "glDeleteVertexArrays");
+    HWR_LOAD_GL(bind_vertex_array, PFNGLBINDVERTEXARRAYPROC, "glBindVertexArray");
+    HWR_LOAD_GL(enable_vertex_attrib_array, PFNGLENABLEVERTEXATTRIBARRAYPROC, "glEnableVertexAttribArray");
+    HWR_LOAD_GL(vertex_attrib_pointer, PFNGLVERTEXATTRIBPOINTERPROC, "glVertexAttribPointer");
+    HWR_LOAD_GL(vertex_attrib_i_pointer, PFNGLVERTEXATTRIBIPOINTERPROC, "glVertexAttribIPointer");
+    HWR_LOAD_GL(framebuffer_texture_2d, PFNGLFRAMEBUFFERTEXTURE2DPROC, "glFramebufferTexture2D");
+    HWR_LOAD_GL(draw_arrays, hwr_gl_draw_arrays_fn, "glDrawArrays");
+    HWR_LOAD_GL(enable, hwr_gl_capability_fn, "glEnable");
+    HWR_LOAD_GL(disable, hwr_gl_capability_fn, "glDisable");
+    HWR_LOAD_GL(depth_func, hwr_gl_depth_func_fn, "glDepthFunc");
+    HWR_LOAD_GL(depth_mask, hwr_gl_depth_mask_fn, "glDepthMask");
+    HWR_LOAD_GL(clear_buffer_uiv, PFNGLCLEARBUFFERUIVPROC, "glClearBufferuiv");
+    HWR_LOAD_GL(copy_tex_sub_image_2d, hwr_gl_copy_tex_sub_image_2d_fn, "glCopyTexSubImage2D");
+    HWR_LOAD_GL(pixel_store_i, hwr_gl_pixel_store_i_fn, "glPixelStorei");
     return 1;
 }
 
 #undef HWR_LOAD_GL
 
+static const char g_geometry_vertex_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) in ivec3 a_pos;\n"
+    "layout(location=1) in vec2 a_wall;\n"
+    "layout(location=2) in uint a_offset;\n"
+    "layout(location=3) in uvec2 a_dims;\n"
+    "layout(location=4) in uint a_aux;\n"
+    "layout(location=5) in uvec4 a_pan_scale_flags;\n"
+    "layout(location=6) in uvec4 a_light_material;\n"
+    "uniform ivec2 u_view_offset;\n"
+    "uniform int u_eye_z;\n"
+    "uniform vec2 u_basis;\n"
+    "uniform vec2 u_focal;\n"
+    "uniform vec2 u_center;\n"
+    "uniform vec2 u_viewport;\n"
+    "out vec3 v_world;\n"
+    "out float v_depth_fixed;\n"
+    "out vec2 v_wall;\n"
+    "flat out uint v_offset;\n"
+    "flat out uvec2 v_dims;\n"
+    "flat out uint v_aux;\n"
+    "flat out uvec4 v_pan_scale_flags;\n"
+    "flat out uvec4 v_light_material;\n"
+    "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
+    "void main() {\n"
+    "  int dx=wrap16(a_pos.x+u_view_offset.x);\n"
+    "  int dy=wrap16(a_pos.y+u_view_offset.y);\n"
+    "  float s=u_basis.x, c=u_basis.y;\n"
+    "  float vx=s*float(dx)+c*float(dy);\n"
+    "  float depth=s*float(dy)-c*float(dx);\n"
+    "  float zr=float(a_pos.z-u_eye_z);\n"
+    "  float clip_x=(2.0*u_focal.x/u_viewport.x)*vx+"
+    "(2.0*u_center.x/u_viewport.x-1.0)*depth;\n"
+    "  float clip_y=(2.0*u_focal.y/u_viewport.y)*zr+"
+    "(2.0*u_center.y/u_viewport.y-1.0)*depth;\n"
+    "  const float n=16.0, f=20000.0;\n"
+    "  float clip_z=((f+n)/(f-n))*depth-(2.0*f*n/(f-n));\n"
+    "  gl_Position=vec4(clip_x,clip_y,clip_z,depth);\n"
+    "  v_world=vec3(a_pos); v_depth_fixed=depth; v_wall=a_wall;\n"
+    "  v_offset=a_offset; v_dims=a_dims; v_aux=a_aux;\n"
+    "  v_pan_scale_flags=a_pan_scale_flags; v_light_material=a_light_material;\n"
+    "}\n";
+
+static const char g_geometry_fragment_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) out uint out_index;\n"
+    "uniform usamplerBuffer u_texels;\n"
+    "uniform usampler2D u_colormap;\n"
+    "uniform usampler2D u_tint;\n"
+    "uniform usampler2D u_glow;\n"
+    "uniform usampler2D u_blend;\n"
+    "uniform usampler2D u_dst;\n"
+    "uniform int u_shade_level;\n"
+    "uniform int u_tint_shade_level;\n"
+    "uniform int u_light_bias;\n"
+    "uniform int u_glow_phase;\n"
+    "uniform int u_blend_pass;\n"
+    "in vec3 v_world;\n"
+    "in float v_depth_fixed;\n"
+    "in vec2 v_wall;\n"
+    "flat in uint v_offset;\n"
+    "flat in uvec2 v_dims;\n"
+    "flat in uint v_aux;\n"
+    "flat in uvec4 v_pan_scale_flags;\n"
+    "flat in uvec4 v_light_material;\n"
+    "uint sample_texel() {\n"
+    "  uint flags=v_light_material.y;\n"
+    "  if ((flags & 4u)!=0u) return v_light_material.z;\n"
+    "  if ((flags & 2u)!=0u) return v_light_material.z;\n"
+    "  int w=int(v_dims.x), h=int(v_dims.y); int ix,iy;\n"
+    "  if ((flags & 8u)!=0u) {\n"
+    "    float divisor=float(1u << v_pan_scale_flags.z);\n"
+    "    ix=int(floor(v_world.x/divisor+float(v_aux & 255u)*0.5)) & (w-1);\n"
+    "    iy=int(floor(v_world.y/divisor+float(v_aux >> 8)*0.5)) & (h-1);\n"
+    "    if ((flags & 32u)!=0u) iy=(h-1)-iy;\n"
+    "  } else {\n"
+    "    int base=(int(floor(v_wall.x))+int(v_pan_scale_flags.x)*2) >> 1;\n"
+    "    if ((flags & 32u)!=0u) base=(h-1)-base;\n"
+    "    iy=base & (h-1);\n"
+    "    ix=((int(floor(v_wall.y-v_world.z)) >> 1)+int(v_pan_scale_flags.y)) & (w-1);\n"
+    "  }\n"
+    "  return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
+    "}\n"
+    "int shade_row(int selected_level) {\n"
+    "  int level=clamp(selected_level,0,2); int shr=5+level;\n"
+    "  int authored=int(v_light_material.x); int light=authored;\n"
+    "  if (authored!=0) light=(light+u_light_bias) & 255;\n"
+    "  int axv=authored==0 ? -8 : light-128;\n"
+    "  int bias=authored==0 ? 8 : 8+axv;\n"
+    "  int scale=authored==0 ? 32 : 32-(max(axv+4,0) >> 2);\n"
+    "  int depth_term=int(max(abs(v_depth_fixed),0.0));\n"
+    "  int r=(depth_term >> shr)-bias; r=((r+32768) & 65535)-32768;\n"
+    "  return clamp(r,0,min(scale,31));\n"
+    "}\n"
+    "void main() {\n"
+    "  uint texel=sample_texel(); uint material=v_light_material.y;\n"
+    "  if ((material & 1u)!=0u && texel==0u) discard;\n"
+    "  uint mapped; uint face_flags=v_pan_scale_flags.w;\n"
+    "  if ((material & 4u)!=0u) mapped=texel;\n"
+    "  else if ((face_flags & 64u)!=0u && (u_glow_phase & 73)!=0)"
+    " mapped=texelFetch(u_glow,ivec2(int(texel),1),0).r;\n"
+    "  else { bool tinted=(face_flags & 2u)!=0u;"
+    " int row=shade_row(tinted ? u_tint_shade_level : u_shade_level); mapped=tinted ?"
+    " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
+    " texelFetch(u_colormap,ivec2(int(texel),row),0).r; }\n"
+    "  if (u_blend_pass!=0 && (material & 16u)!=0u && (texel & 128u)!=0u) {\n"
+    "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
+    "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(dst)),0).r;\n"
+    "  }\n"
+    "  out_index=mapped;\n"
+    "}\n";
+
+static const char g_resolve_vertex_shader[] =
+    "#version 330 core\n"
+    "void main() {\n"
+    "  vec2 p=vec2((gl_VertexID << 1) & 2,gl_VertexID & 2);\n"
+    "  gl_Position=vec4(p*2.0-1.0,0.0,1.0);\n"
+    "}\n";
+
+static const char g_resolve_fragment_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) out vec4 out_color;\n"
+    "uniform usampler2D u_index; uniform sampler2D u_palette;\n"
+    "void main() { uint i=texelFetch(u_index,ivec2(gl_FragCoord.xy),0).r;"
+    " out_color=texelFetch(u_palette,ivec2(int(i),0),0); }\n";
+
+static GLuint hwr_compile_shader(GLenum type, const char *source)
+{
+    GLuint shader = g_gl.create_shader(type);
+    GLint status = 0;
+    if (shader == 0)
+        return 0;
+    g_gl.shader_source(shader, 1, &source, NULL);
+    g_gl.compile_shader(shader);
+    g_gl.get_shader_iv(shader, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        GLchar log[512];
+        GLsizei length = 0;
+        g_gl.get_shader_info_log(shader, sizeof log, &length, log);
+        snprintf(g_error, sizeof g_error, "GLSL compile failed: %.*s", (int)length, log);
+        g_gl.delete_shader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+static GLuint hwr_link_program(const char *vertex_source, const char *fragment_source)
+{
+    GLuint vertex = hwr_compile_shader(GL_VERTEX_SHADER, vertex_source);
+    GLuint fragment;
+    GLuint program;
+    GLint status = 0;
+    if (vertex == 0)
+        return 0;
+    fragment = hwr_compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+    if (fragment == 0) {
+        g_gl.delete_shader(vertex);
+        return 0;
+    }
+    program = g_gl.create_program();
+    g_gl.attach_shader(program, vertex);
+    g_gl.attach_shader(program, fragment);
+    g_gl.link_program(program);
+    g_gl.delete_shader(vertex);
+    g_gl.delete_shader(fragment);
+    g_gl.get_program_iv(program, GL_LINK_STATUS, &status);
+    if (!status) {
+        GLchar log[512];
+        GLsizei length = 0;
+        g_gl.get_program_info_log(program, sizeof log, &length, log);
+        snprintf(g_error, sizeof g_error, "GLSL link failed: %.*s", (int)length, log);
+        g_gl.delete_program(program);
+        return 0;
+    }
+    return program;
+}
+
+static void hwr_delete_texture(GLuint *texture)
+{
+    if (*texture != 0) {
+        g_gl.delete_textures(1, texture);
+        *texture = 0;
+    }
+}
+
+static void hwr_destroy_scene_objects(void)
+{
+    if (g_geometry_program != 0)
+        g_gl.delete_program(g_geometry_program);
+    if (g_resolve_program != 0)
+        g_gl.delete_program(g_resolve_program);
+    g_geometry_program = 0;
+    g_resolve_program = 0;
+    if (g_scene_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_scene_vao);
+    if (g_resolve_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_resolve_vao);
+    if (g_scene_vbo != 0)
+        g_gl.delete_buffers(1, &g_scene_vbo);
+    if (g_texture_buffer != 0)
+        g_gl.delete_buffers(1, &g_texture_buffer);
+    g_scene_vao = 0;
+    g_resolve_vao = 0;
+    g_scene_vbo = 0;
+    g_texture_buffer = 0;
+    hwr_delete_texture(&g_texture_buffer_texture);
+    hwr_delete_texture(&g_colormap_texture);
+    hwr_delete_texture(&g_tint_texture);
+    hwr_delete_texture(&g_glow_texture);
+    hwr_delete_texture(&g_blend_texture);
+    hwr_delete_texture(&g_palette_texture);
+    g_scene_uploaded = 0;
+}
+
 static void hwr_destroy_framebuffer(void)
 {
+    hwr_delete_texture(&g_index_texture);
+    hwr_delete_texture(&g_index_copy_texture);
+    if (g_depth_buffer != 0) {
+        g_gl.delete_renderbuffers(1, &g_depth_buffer);
+        g_depth_buffer = 0;
+    }
+    if (g_index_fbo != 0) {
+        g_gl.delete_framebuffers(1, &g_index_fbo);
+        g_index_fbo = 0;
+    }
     if (g_color_buffer != 0) {
         g_gl.delete_renderbuffers(1, &g_color_buffer);
         g_color_buffer = 0;
@@ -438,6 +789,38 @@ static int hwr_create_framebuffer(uint32_t width, uint32_t height)
         hwr_destroy_framebuffer();
         return 0;
     }
+
+    g_gl.gen_framebuffers(1, &g_index_fbo);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.gen_textures(1, &g_index_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R8UI, (GLsizei)width,
+                      (GLsizei)height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
+    g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                GL_TEXTURE_2D, g_index_texture, 0);
+    g_gl.gen_renderbuffers(1, &g_depth_buffer);
+    g_gl.bind_renderbuffer(GL_RENDERBUFFER, g_depth_buffer);
+    g_gl.renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
+                              (GLsizei)width, (GLsizei)height);
+    g_gl.framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                  GL_RENDERBUFFER, g_depth_buffer);
+    if (g_gl.check_framebuffer_status(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        snprintf(g_error, sizeof g_error, "the palette-index framebuffer is incomplete");
+        hwr_destroy_framebuffer();
+        return 0;
+    }
+    g_gl.gen_textures(1, &g_index_copy_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R8UI, (GLsizei)width,
+                      (GLsizei)height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
 
     bytes = (size_t)width * (size_t)height * sizeof(uint32_t);
     if (bytes > g_pixels_bytes) {
@@ -517,6 +900,243 @@ const uint32_t *hwr_gl_render_frame(uint32_t width, uint32_t height,
     return g_pixels;
 }
 
+static void hwr_texture_2d_u8(GLuint *texture, GLsizei width, GLsizei height,
+                              GLenum internal_format, GLenum format,
+                              const void *pixels)
+{
+    g_gl.gen_textures(1, texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, *texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.tex_image_2d(GL_TEXTURE_2D, 0, (GLint)internal_format, width, height,
+                      0, format, GL_UNSIGNED_BYTE, pixels);
+}
+
+static void hwr_set_sampler(GLuint program, const char *name, GLint unit)
+{
+    GLint location = g_gl.get_uniform_location(program, name);
+    if (location >= 0)
+        g_gl.uniform_1i(location, unit);
+}
+
+int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
+                        const uint8_t colormap[0x2000],
+                        const uint8_t tint[0x2000],
+                        const uint8_t glow[0x200],
+                        const uint8_t blend[0x10000])
+{
+    const size_t stride = sizeof(struct hwr_gl_vertex);
+    if (!g_initialized || texture_bytes == NULL || texture_size == 0 ||
+        texture_size > (size_t)PTRDIFF_MAX || !hwr_platform_make_current()) {
+        snprintf(g_error, sizeof g_error, "scene texture upload inputs are invalid");
+        return 0;
+    }
+    hwr_destroy_scene_objects();
+    g_geometry_program = hwr_link_program(g_geometry_vertex_shader,
+                                          g_geometry_fragment_shader);
+    g_resolve_program = hwr_link_program(g_resolve_vertex_shader,
+                                         g_resolve_fragment_shader);
+    if (g_geometry_program == 0 || g_resolve_program == 0) {
+        hwr_destroy_scene_objects();
+        return 0;
+    }
+
+    g_gl.gen_buffers(1, &g_texture_buffer);
+    g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
+    g_gl.buffer_data(GL_TEXTURE_BUFFER, (GLsizeiptr)texture_size,
+                     texture_bytes, GL_STATIC_DRAW);
+    g_gl.gen_textures(1, &g_texture_buffer_texture);
+    g_gl.bind_texture(GL_TEXTURE_BUFFER, g_texture_buffer_texture);
+    g_gl.tex_buffer(GL_TEXTURE_BUFFER, GL_R8UI, g_texture_buffer);
+    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+    hwr_texture_2d_u8(&g_colormap_texture, 256, 32, GL_R8UI,
+                      GL_RED_INTEGER, colormap);
+    hwr_texture_2d_u8(&g_tint_texture, 256, 32, GL_R8UI,
+                      GL_RED_INTEGER, tint);
+    hwr_texture_2d_u8(&g_glow_texture, 256, 2, GL_R8UI,
+                      GL_RED_INTEGER, glow);
+    hwr_texture_2d_u8(&g_blend_texture, 256, 256, GL_R8UI,
+                      GL_RED_INTEGER, blend);
+    hwr_texture_2d_u8(&g_palette_texture, 256, 1, GL_RGBA8, GL_RGBA, NULL);
+
+    g_gl.gen_vertex_arrays(1, &g_scene_vao);
+    g_gl.bind_vertex_array(g_scene_vao);
+    g_gl.gen_buffers(1, &g_scene_vbo);
+    g_gl.bind_buffer(GL_ARRAY_BUFFER, g_scene_vbo);
+    g_gl.enable_vertex_attrib_array(0);
+    g_gl.vertex_attrib_i_pointer(0, 3, GL_SHORT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, x));
+    g_gl.enable_vertex_attrib_array(1);
+    g_gl.vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_s));
+    g_gl.enable_vertex_attrib_array(2);
+    g_gl.vertex_attrib_i_pointer(2, 1, GL_UNSIGNED_INT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, texture_offset));
+    g_gl.enable_vertex_attrib_array(3);
+    g_gl.vertex_attrib_i_pointer(3, 2, GL_UNSIGNED_SHORT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, texture_width));
+    g_gl.enable_vertex_attrib_array(4);
+    g_gl.vertex_attrib_i_pointer(4, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, aux));
+    g_gl.enable_vertex_attrib_array(5);
+    g_gl.vertex_attrib_i_pointer(5, 4, GL_UNSIGNED_BYTE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, pan_u));
+    g_gl.enable_vertex_attrib_array(6);
+    g_gl.vertex_attrib_i_pointer(6, 4, GL_UNSIGNED_BYTE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, light));
+    g_gl.gen_vertex_arrays(1, &g_resolve_vao);
+
+    g_gl.use_program(g_geometry_program);
+    hwr_set_sampler(g_geometry_program, "u_texels", 0);
+    hwr_set_sampler(g_geometry_program, "u_colormap", 1);
+    hwr_set_sampler(g_geometry_program, "u_tint", 2);
+    hwr_set_sampler(g_geometry_program, "u_glow", 3);
+    hwr_set_sampler(g_geometry_program, "u_blend", 4);
+    hwr_set_sampler(g_geometry_program, "u_dst", 5);
+    g_gl.use_program(g_resolve_program);
+    hwr_set_sampler(g_resolve_program, "u_index", 0);
+    hwr_set_sampler(g_resolve_program, "u_palette", 1);
+    g_gl.use_program(0);
+    g_scene_uploaded = 1;
+    return 1;
+}
+
+static void hwr_bind_scene_textures(void)
+{
+    GLuint textures[6] = {
+        g_texture_buffer_texture, g_colormap_texture, g_tint_texture,
+        g_glow_texture, g_blend_texture, g_index_copy_texture
+    };
+    GLenum targets[6] = {
+        GL_TEXTURE_BUFFER, GL_TEXTURE_2D, GL_TEXTURE_2D,
+        GL_TEXTURE_2D, GL_TEXTURE_2D, GL_TEXTURE_2D
+    };
+    unsigned i;
+    for (i = 0; i < 6; i++) {
+        g_gl.active_texture(GL_TEXTURE0 + i);
+        g_gl.bind_texture(targets[i], textures[i]);
+    }
+}
+
+static void hwr_uniform_1i(GLuint program, const char *name, GLint value)
+{
+    GLint location = g_gl.get_uniform_location(program, name);
+    if (location >= 0)
+        g_gl.uniform_1i(location, value);
+}
+
+static void hwr_uniform_2i(GLuint program, const char *name, GLint x, GLint y)
+{
+    GLint location = g_gl.get_uniform_location(program, name);
+    if (location >= 0)
+        g_gl.uniform_2i(location, x, y);
+}
+
+static void hwr_uniform_2f(GLuint program, const char *name, GLfloat x, GLfloat y)
+{
+    GLint location = g_gl.get_uniform_location(program, name);
+    if (location >= 0)
+        g_gl.uniform_2f(location, x, y);
+}
+
+const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
+                                    size_t opaque_vertices,
+                                    size_t translucent_vertices,
+                                    const struct hwr_gl_camera *camera,
+                                    const uint8_t palette_rgba[1024],
+                                    uint32_t width, uint32_t height)
+{
+    size_t total = opaque_vertices + translucent_vertices;
+    const GLuint clear_index[4] = { 0x7fu, 0, 0, 0 };
+    GLint blend_location;
+    if (!g_initialized || !g_scene_uploaded || vertices == NULL || camera == NULL ||
+        palette_rgba == NULL || total > (size_t)INT32_MAX ||
+        total > (size_t)PTRDIFF_MAX / sizeof *vertices ||
+        !hwr_platform_make_current()) {
+        snprintf(g_error, sizeof g_error, "scene render inputs are invalid");
+        return NULL;
+    }
+    if ((g_fbo_width != width || g_fbo_height != height) &&
+        !hwr_create_framebuffer(width, height))
+        return NULL;
+    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                          GL_RGBA, GL_UNSIGNED_BYTE, palette_rgba);
+
+    g_gl.bind_vertex_array(g_scene_vao);
+    g_gl.bind_buffer(GL_ARRAY_BUFFER, g_scene_vbo);
+    g_gl.buffer_data(GL_ARRAY_BUFFER, (GLsizeiptr)(total * sizeof *vertices),
+                     NULL, GL_STREAM_DRAW);
+    g_gl.buffer_data(GL_ARRAY_BUFFER, (GLsizeiptr)(total * sizeof *vertices),
+                     vertices, GL_STREAM_DRAW);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
+    g_gl.clear(GL_DEPTH_BUFFER_BIT);
+    g_gl.enable(GL_DEPTH_TEST);
+    g_gl.depth_func(GL_LESS);
+    g_gl.depth_mask(GL_TRUE);
+    g_gl.disable(GL_BLEND);
+    g_gl.use_program(g_geometry_program);
+    hwr_bind_scene_textures();
+    hwr_uniform_2i(g_geometry_program, "u_view_offset",
+                   camera->view_offset_x, camera->view_offset_y);
+    hwr_uniform_1i(g_geometry_program, "u_eye_z", camera->eye_z);
+    hwr_uniform_2f(g_geometry_program, "u_basis",
+                   (GLfloat)camera->yaw_sin / 16384.0f,
+                   (GLfloat)camera->yaw_cos / 16384.0f);
+    hwr_uniform_2f(g_geometry_program, "u_focal",
+                   (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
+    hwr_uniform_2f(g_geometry_program, "u_center",
+                   (GLfloat)camera->center_x, (GLfloat)camera->horizon);
+    hwr_uniform_2f(g_geometry_program, "u_viewport", (GLfloat)width, (GLfloat)height);
+    hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
+    hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
+    hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
+    hwr_uniform_1i(g_geometry_program, "u_glow_phase", camera->glow_phase);
+    blend_location = g_gl.get_uniform_location(g_geometry_program, "u_blend_pass");
+    if (blend_location >= 0)
+        g_gl.uniform_1i(blend_location, 0);
+    if (opaque_vertices != 0)
+        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)opaque_vertices);
+    if (translucent_vertices != 0) {
+        g_gl.active_texture(GL_TEXTURE5);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
+        g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                   (GLsizei)width, (GLsizei)height);
+        g_gl.depth_mask(GL_FALSE);
+        if (blend_location >= 0)
+            g_gl.uniform_1i(blend_location, 1);
+        g_gl.draw_arrays(GL_TRIANGLES, (GLint)opaque_vertices,
+                         (GLsizei)translucent_vertices);
+        g_gl.depth_mask(GL_TRUE);
+    }
+
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.use_program(g_resolve_program);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
+    return g_pixels;
+}
+
+void hwr_gl_scene_clear(void)
+{
+    if (g_initialized && hwr_platform_make_current())
+        hwr_destroy_scene_objects();
+}
+
 void hwr_gl_resize(uint32_t width, uint32_t height)
 {
     if (!g_initialized)
@@ -529,8 +1149,10 @@ void hwr_gl_resize(uint32_t width, uint32_t height)
 
 void hwr_gl_shutdown(void)
 {
-    if (g_initialized && hwr_platform_make_current())
+    if (g_initialized && hwr_platform_make_current()) {
+        hwr_destroy_scene_objects();
         hwr_destroy_framebuffer();
+    }
     hwr_platform_shutdown();
     free(g_pixels);
     g_pixels = NULL;

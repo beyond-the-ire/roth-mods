@@ -41,11 +41,6 @@ static int hwr_seek_read(FILE *file, uint32_t offset, void *destination, size_t 
     return fread(destination, 1, size, file) == size ? 0 : -1;
 }
 
-static int hwr_is_power_of_two(uint16_t value)
-{
-    return value != 0 && (value & (uint16_t)(value - 1u)) == 0;
-}
-
 static void hwr_das_free_entry(struct hwr_das_entry *entry)
 {
     size_t i;
@@ -370,11 +365,17 @@ int hwr_das_decode(struct hwr_das_archive *archive, size_t id)
         entry->decode_failed = result != 0;
         return result;
     }
+    if ((entry->payload_flags & 0x40u) != 0) {
+        entry->resource_class = HWR_DAS_CLASS_GROUPED;
+        return 0;
+    }
     entry->width = hwr_read_u16(entry->raw_payload + 2);
     entry->height = hwr_read_u16(entry->raw_payload + 4);
     pixel_count = (uint64_t)entry->width * entry->height;
-    if ((entry->payload_flags & 0x40u) == 0 &&
-        hwr_is_power_of_two(entry->width) && hwr_is_power_of_two(entry->height) &&
+    /* Dimensions need not be powers of two: many world textures are authored to
+     * fit their surface exactly, and the engine's mask-based wrap simply never
+     * engages on them. The renderer reproduces the same mask behavior. */
+    if (entry->width != 0 && entry->height != 0 &&
         entry->width <= HWR_DAS_MAX_DIMENSION && entry->height <= HWR_DAS_MAX_DIMENSION &&
         pixel_count <= entry->raw_payload_size - 6u) {
         entry->resource_class = HWR_DAS_CLASS_PLAIN;
@@ -382,6 +383,71 @@ int hwr_das_decode(struct hwr_das_archive *archive, size_t id)
         entry->resource_class = HWR_DAS_CLASS_OTHER;
     }
     return 0;
+}
+
+int hwr_das_group_child_offset(const struct hwr_das_entry *entry,
+                               uint16_t child_word, size_t *child_offset,
+                               int *flip_toggle)
+{
+    size_t offset;
+    if (entry == NULL || child_offset == NULL || flip_toggle == NULL ||
+        entry->resource_class != HWR_DAS_CLASS_GROUPED ||
+        entry->raw_payload == NULL)
+        return -1;
+    offset = (size_t)(child_word & 0x7fffu) * 16u;
+    if (offset > entry->raw_payload_size ||
+        entry->raw_payload_size - offset < 6u)
+        return -1;
+    *child_offset = offset;
+    *flip_toggle = (child_word & 0x8000u) != 0;
+    return 0;
+}
+
+int hwr_das_group_child_view(const struct hwr_das_entry *entry,
+                             size_t child_offset,
+                             struct hwr_das_texture_view *view)
+{
+    const uint8_t *child;
+    uint16_t width;
+    uint16_t height;
+    size_t pixel_count;
+    if (entry == NULL || view == NULL ||
+        entry->resource_class != HWR_DAS_CLASS_GROUPED ||
+        entry->raw_payload == NULL || child_offset > entry->raw_payload_size ||
+        entry->raw_payload_size - child_offset < 6u)
+        return -1;
+    child = entry->raw_payload + child_offset;
+    width = hwr_read_u16(child + 2u);
+    height = hwr_read_u16(child + 4u);
+    if (width == 0 || height == 0 ||
+        width > HWR_DAS_MAX_DIMENSION || height > HWR_DAS_MAX_DIMENSION)
+        return -1;
+    pixel_count = (size_t)width * height;
+    if (pixel_count > entry->raw_payload_size - child_offset - 6u)
+        return -1;
+    view->flags = hwr_read_u16(child);
+    view->width = width;
+    view->height = height;
+    view->pixels = child + 6u;
+    view->pixel_count = pixel_count;
+    return 0;
+}
+
+void hwr_das_release_decoded(struct hwr_das_archive *archive, size_t id)
+{
+    struct hwr_das_entry *entry;
+    size_t i;
+    if (archive == NULL || id >= archive->entry_count)
+        return;
+    entry = &archive->entries[id];
+    for (i = 0; i < entry->frame_count; i++)
+        free(entry->frames[i].pixels);
+    free(entry->frames);
+    free(entry->raw_payload);
+    entry->frames = NULL;
+    entry->frame_count = 0;
+    entry->raw_payload = NULL;
+    entry->raw_payload_size = 0;
 }
 
 void hwr_das_build_census(struct hwr_das_archive *archive,
@@ -415,7 +481,7 @@ const struct hwr_das_entry *hwr_das_entry(const struct hwr_das_archive *archive,
 const char *hwr_das_class_name(enum hwr_das_class resource_class)
 {
     static const char *const names[HWR_DAS_CLASS_COUNT] = {
-        "unread", "plain", "animated", "space", "dollar", "other"
+        "unread", "plain", "grouped", "animated", "space", "dollar", "other"
     };
     return (unsigned)resource_class < HWR_DAS_CLASS_COUNT
          ? names[resource_class] : "invalid";

@@ -8,6 +8,7 @@
 enum hwr_das_class {
     HWR_DAS_CLASS_UNREAD = 0,
     HWR_DAS_CLASS_PLAIN,
+    HWR_DAS_CLASS_GROUPED,
     HWR_DAS_CLASS_ANIMATED,
     HWR_DAS_CLASS_PLACEHOLDER_SPACE,
     HWR_DAS_CLASS_PLACEHOLDER_DOLLAR,
@@ -19,6 +20,14 @@ struct hwr_das_frame {
     uint16_t width;
     uint16_t height;
     uint8_t *pixels;
+};
+
+struct hwr_das_texture_view {
+    uint16_t flags;
+    uint16_t width;
+    uint16_t height;
+    const uint8_t *pixels;
+    size_t pixel_count;
 };
 
 struct hwr_das_entry {
@@ -76,6 +85,19 @@ void hwr_das_close(struct hwr_das_archive *archive);
 
 /* Loads and classifies one FAT entry. Unknown resource kinds retain their raw bytes. */
 int hwr_das_decode(struct hwr_das_archive *archive, size_t id);
+
+/* Releases decoded byte/frame storage while retaining classification metadata. */
+void hwr_das_release_decoded(struct hwr_das_archive *archive, size_t id);
+
+/* Resolves a grouped child word to its payload-relative 16-byte-unit offset. */
+int hwr_das_group_child_offset(const struct hwr_das_entry *entry,
+                               uint16_t child_word, size_t *child_offset,
+                               int *flip_toggle);
+
+/* Validates and returns the standard texture block at a grouped child offset. */
+int hwr_das_group_child_view(const struct hwr_das_entry *entry,
+                             size_t child_offset,
+                             struct hwr_das_texture_view *view);
 
 /* Decodes every entry and returns aggregate class and failure counts. */
 void hwr_das_build_census(struct hwr_das_archive *archive,

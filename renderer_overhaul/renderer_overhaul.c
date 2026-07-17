@@ -3,6 +3,7 @@
 #include "hwr_gl.h"
 #include "hwr_das.h"
 #include "hwr_settings.h"
+#include "hwr_scene.h"
 #include "hwr_world.h"
 
 #include <ctype.h>
@@ -76,10 +77,13 @@ static int g_viewport_error_logged;
 static int g_sentinel_error_logged;
 static int g_submit_error_logged;
 static int g_debug_enabled;
+static int g_scene_rebuild_pending;
+static int g_scene_error_logged;
 static char g_plugin_dir[2600];
 static struct hwr_world g_world;
 static struct hwr_das_archive g_map_archive;
 static struct hwr_das_archive g_shared_archive;
+static struct hwr_scene g_scene;
 
 static int hwr_ascii_equal_ci(const char *a, const char *b)
 {
@@ -404,22 +408,6 @@ static int hwr_find_archive_path(const char *root, const char *name,
     return -1;
 }
 
-static void hwr_print_das_summary(const char *label,
-                                  const struct hwr_das_archive *archive,
-                                  const struct hwr_das_census *census)
-{
-    fprintf(stderr,
-            "  %s DAS: entries=%u plain=%u animated=%u space=%u dollar=%u other=%u decoded=%u frames=%u failures=%u\n",
-            label, (unsigned)archive->entry_count,
-            (unsigned)census->classes[HWR_DAS_CLASS_PLAIN],
-            (unsigned)census->classes[HWR_DAS_CLASS_ANIMATED],
-            (unsigned)census->classes[HWR_DAS_CLASS_PLACEHOLDER_SPACE],
-            (unsigned)census->classes[HWR_DAS_CLASS_PLACEHOLDER_DOLLAR],
-            (unsigned)census->classes[HWR_DAS_CLASS_OTHER],
-            (unsigned)census->decoded_textures,
-            (unsigned)census->animation_frames, (unsigned)census->failures);
-}
-
 static void hwr_gl_settings_apply(uint32_t mask,
                                   const struct hwr_settings *settings,
                                   void *userdata)
@@ -679,18 +667,45 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     }
     g_channel_api = api;   /* the world pass is the canonical channel-ownership identity */
 
-    render_width = g_render_settings.internal_w != 0
-                 ? g_render_settings.internal_w : viewport.width;
-    render_height = g_render_settings.internal_h != 0
-                  ? g_render_settings.internal_h : viewport.height;
+    render_width = viewport.width;
+    render_height = viewport.height;
     hwr_check_present_caps(api);
     if (g_present_caps_valid &&
         (render_width > g_present_max_w || render_height > g_present_max_h)) {
         hwr_withdraw_if_owned(api);
         return;
     }
-    pixels = hwr_gl_render_frame(render_width, render_height,
-                                 g_render_settings.solid_color);
+    if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
+        hwr_world_refresh_lut_state(&g_world, api) == 0) {
+        if (g_scene_rebuild_pending) {
+            if (hwr_scene_rebuild(&g_scene, &g_world, &g_map_archive,
+                                  &g_shared_archive, api, g_debug_enabled) != 0) {
+                if (!g_scene_error_logged) {
+                    fprintf(stderr, "[renderer_overhaul] GL scene unavailable: %s; using solid fallback\n",
+                            hwr_scene_error(&g_scene));
+                    g_scene_error_logged = 1;
+                }
+            }
+            g_scene_rebuild_pending = 0;
+        }
+        pixels = g_scene.valid
+               ? hwr_scene_render(&g_scene, &g_world, api, render_width, render_height)
+               : NULL;
+        if (pixels == NULL && g_scene.valid && !g_scene_error_logged) {
+            fprintf(stderr, "[renderer_overhaul] scene render failed: %s; using solid fallback\n",
+                    hwr_gl_last_error());
+            g_scene_error_logged = 1;
+        }
+    } else {
+        pixels = NULL;
+        if (g_scene_rebuild_pending) {
+            hwr_scene_clear(&g_scene);
+            g_scene_rebuild_pending = 0;
+        }
+    }
+    if (pixels == NULL)
+        pixels = hwr_gl_render_frame(render_width, render_height,
+                                     g_render_settings.solid_color);
     if (pixels == NULL) {
         hwr_fail_gl(api);
         return;
@@ -848,8 +863,6 @@ static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
 static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
                                           const struct roth_map_event_v1 *event)
 {
-    struct hwr_das_census map_census;
-    struct hwr_das_census shared_census;
     char map_name[81];
     char shared_name[81];
     char root[2600];
@@ -860,6 +873,8 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
     hwr_withdraw_if_owned(api);
     hwr_settings_apply_pending();
     hwr_map_data_clear();
+    g_scene_rebuild_pending = 1;
+    g_scene_error_logged = 0;
     failure[0] = 0;
     if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
         hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
@@ -890,13 +905,6 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
                  hwr_das_error(&g_shared_archive));
         goto failed;
     }
-    hwr_das_build_census(&g_map_archive, &map_census);
-    hwr_das_build_census(&g_shared_archive, &shared_census);
-    if (map_census.failures != 0 || shared_census.failures != 0) {
-        snprintf(failure, sizeof failure, "DAS decode failures: map=%u shared=%u",
-                 (unsigned)map_census.failures, (unsigned)shared_census.failures);
-        goto failed;
-    }
     if (hwr_world_snapshot(&g_world, api) != 0) {
         snprintf(failure, sizeof failure, "geometry: %.220s", hwr_world_error(&g_world));
         goto failed;
@@ -909,8 +917,9 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
         fprintf(stderr, "[renderer_overhaul] map data (gen=%u map=%s shared=%s)\n",
                 event->generation, map_name, shared_name);
         hwr_world_summary(&g_world, stderr);
-        hwr_print_das_summary("map", &g_map_archive, &map_census);
-        hwr_print_das_summary("shared", &g_shared_archive, &shared_census);
+        fprintf(stderr, "  archives: map_entries=%u shared_entries=%u (referenced entries decode on scene upload)\n",
+                (unsigned)g_map_archive.entry_count,
+                (unsigned)g_shared_archive.entry_count);
         fprintf(stderr, "  color tables: palette=768 colormap=8192 tint=8192 glow=512 blend=65536 damage=%u shade=%u/%u\n",
                 g_world.luts.damage_flash_level, g_world.luts.shade_level,
                 g_world.luts.tint_shade_level);
@@ -921,6 +930,7 @@ failed:
     fprintf(stderr, "[renderer_overhaul] map data unavailable (gen=%u): %s\n",
             event->generation, failure);
     hwr_map_data_clear();
+    g_scene_rebuild_pending = 1;
 }
 
 static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
@@ -939,6 +949,7 @@ static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
     hwr_withdraw_if_owned(api);
     hwr_map_data_clear();
+    hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();
     g_channel_api = NULL;
     g_api = NULL;
