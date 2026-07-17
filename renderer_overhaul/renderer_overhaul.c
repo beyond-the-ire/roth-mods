@@ -83,6 +83,7 @@ static int g_sentinel_error_logged;
 static int g_submit_error_logged;
 static int g_debug_enabled;
 static int g_scene_rebuild_pending;
+static int g_luts_recheck_pending;
 static int g_scene_error_logged;
 static int g_selfheal_retry;
 static uint32_t g_selfheal_tick;
@@ -722,6 +723,18 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     world_was_valid = g_world.valid;
     if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
         hwr_world_refresh_lut_state(&g_world, api) == 0) {
+        /* The engine finishes repointing its color tables after the load
+         * event fires; the first staged frame is the earliest safe moment to
+         * confirm the snapshot saw the final tables. */
+        if (g_luts_recheck_pending) {
+            int luts_changed = hwr_world_resnapshot_luts(&g_world, api);
+            g_luts_recheck_pending = 0;
+            if (luts_changed > 0) {
+                if (g_debug_enabled)
+                    fprintf(stderr, "[renderer_overhaul] color tables settled after load; re-uploading\n");
+                g_scene_rebuild_pending = 1;
+            }
+        }
         if (g_scene_rebuild_pending) {
             int rebuild_result;
             unsigned upload_errors;
@@ -1011,6 +1024,7 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
                 g_world.luts.damage_flash_level, g_world.luts.shade_level,
                 g_world.luts.tint_shade_level);
     }
+    g_luts_recheck_pending = 1;
     return;
 
 failed:

@@ -408,6 +408,43 @@ int hwr_world_refresh_lut_state(struct hwr_world *world,
     return 0;
 }
 
+/* The engine repoints the color-table globals late in its map-load sequence
+ * (the tint table in particular may become an alias of the shading table), so
+ * a snapshot taken at the load event can capture superseded tables. Re-reads
+ * the tables and reports whether anything differed from the snapshot.
+ * Returns 1 when the stored tables changed, 0 when identical, -1 on failure. */
+int hwr_world_resnapshot_luts(struct hwr_world *world,
+                              const struct roth_api_v1 *api)
+{
+    static struct hwr_luts fresh;
+    if (world == NULL || !world->valid || !world->luts.valid ||
+        api == NULL || api->game_ram == NULL)
+        return -1;
+    if (hwr_copy_pointer_region(api, VA_G_PALETTE_RGB_PTR, fresh.palette,
+                                sizeof fresh.palette) != 0 ||
+        hwr_copy_pointer_region(api, VA_G_COLORMAP_PTR, fresh.colormap,
+                                sizeof fresh.colormap) != 0 ||
+        hwr_copy_pointer_region(api, VA_G_TINT_PTR, fresh.tint,
+                                sizeof fresh.tint) != 0 ||
+        hwr_copy_pointer_region(api, VA_G_GLOW_PTR, fresh.glow,
+                                sizeof fresh.glow) != 0 ||
+        hwr_copy_pointer_region(api, VA_G_BLEND_PTR, fresh.blend,
+                                sizeof fresh.blend) != 0)
+        return -1;
+    if (memcmp(fresh.palette, world->luts.palette, sizeof fresh.palette) == 0 &&
+        memcmp(fresh.colormap, world->luts.colormap, sizeof fresh.colormap) == 0 &&
+        memcmp(fresh.tint, world->luts.tint, sizeof fresh.tint) == 0 &&
+        memcmp(fresh.glow, world->luts.glow, sizeof fresh.glow) == 0 &&
+        memcmp(fresh.blend, world->luts.blend, sizeof fresh.blend) == 0)
+        return 0;
+    memcpy(world->luts.palette, fresh.palette, sizeof fresh.palette);
+    memcpy(world->luts.colormap, fresh.colormap, sizeof fresh.colormap);
+    memcpy(world->luts.tint, fresh.tint, sizeof fresh.tint);
+    memcpy(world->luts.glow, fresh.glow, sizeof fresh.glow);
+    memcpy(world->luts.blend, fresh.blend, sizeof fresh.blend);
+    return 1;
+}
+
 static void hwr_mark_texture(uint8_t bits[0x2000], uint16_t id, size_t *count)
 {
     uint8_t mask = (uint8_t)(1u << (id & 7u));

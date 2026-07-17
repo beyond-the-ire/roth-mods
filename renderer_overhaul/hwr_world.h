@@ -112,6 +112,11 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api);
 /* Copies the engine-staged palette and color lookup tables into mod-owned memory. */
 int hwr_world_snapshot_luts(struct hwr_world *world, const struct roth_api_v1 *api);
 
+/* Re-reads all color tables and reports whether they changed since the
+ * snapshot (1 = changed and updated, 0 = identical, -1 = failure). */
+int hwr_world_resnapshot_luts(struct hwr_world *world,
+                              const struct roth_api_v1 *api);
+
 /* Refreshes the small per-frame palette-effect and map shade inputs. */
 int hwr_world_refresh_lut_state(struct hwr_world *world,
                                 const struct roth_api_v1 *api);
