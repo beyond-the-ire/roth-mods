@@ -647,9 +647,13 @@ static const char g_geometry_fragment_shader[] =
     /* The span fillers fetch the accumulator before adding its per-pixel
      * step. Move the center-sampled interpolation back to that lattice. */
     "    vec2 world_sample=v_world.xy-0.5*dFdx(v_world.xy);\n"
-    "    ix=int(floor(world_sample.x/divisor+float(v_aux & 255u)*0.5)) & (w-1);\n"
-    "    iy=int(floor(world_sample.y/divisor+float(v_aux >> 8)*0.5)) & (h-1);\n"
-    "    if ((flags & 32u)!=0u) iy=(h-1)-iy;\n"
+    "    vec2 mapped=world_sample/divisor+vec2(float(v_aux & 255u),float(v_aux >> 8))*0.5;\n"
+    /* The engine's flat h-flip negates the X fixed-point accumulator before
+     * integer extraction.  Negating after floor(), or mirroring Y, changes
+     * every integral boundary. */
+    "    if ((flags & 32u)!=0u) mapped.x=-mapped.x;\n"
+    "    ix=int(floor(mapped.x)) & (w-1);\n"
+    "    iy=int(floor(mapped.y)) & (h-1);\n"
     "  } else {\n"
     /* Wall columns likewise consume S before advancing the column
      * accumulator. The pan remains after integer S truncation and before

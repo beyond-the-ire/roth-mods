@@ -405,6 +405,11 @@ int hwr_world_refresh_lut_state(struct hwr_world *world,
     world->luts.damage_flash_level = api->game_ram->u8(VA_G_DAMAGE_FLASH_LEVEL);
     world->luts.shade_level = api->game_ram->u16(VA_G_SHADE_LEVEL);
     world->luts.tint_shade_level = api->game_ram->u16(VA_G_TINT_SHADE_LEVEL);
+    /* The palette buffer is populated late on some load paths (a quickload
+     * can stage frames before it lands) and screen effects rewrite it, so it
+     * is re-read every frame rather than trusted from the load snapshot. */
+    hwr_copy_pointer_region(api, VA_G_PALETTE_RGB_PTR, world->luts.palette,
+                            sizeof world->luts.palette);
     return 0;
 }
 
