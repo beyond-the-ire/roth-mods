@@ -79,11 +79,15 @@ static int g_submit_error_logged;
 static int g_debug_enabled;
 static int g_scene_rebuild_pending;
 static int g_scene_error_logged;
+static int g_selfheal_retry;
+static uint32_t g_selfheal_tick;
 static char g_plugin_dir[2600];
 static struct hwr_world g_world;
 static struct hwr_das_archive g_map_archive;
 static struct hwr_das_archive g_shared_archive;
 static struct hwr_scene g_scene;
+
+static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation);
 
 static int hwr_ascii_equal_ci(const char *a, const char *b)
 {
@@ -605,6 +609,7 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     uint32_t render_width;
     uint32_t render_height;
     int32_t result;
+    int world_was_valid;
 
     g_wrap_serial++;
     hwr_settings_apply_pending();
@@ -675,6 +680,7 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_withdraw_if_owned(api);
         return;
     }
+    world_was_valid = g_world.valid;
     if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
         hwr_world_refresh_lut_state(&g_world, api) == 0) {
         if (g_scene_rebuild_pending) {
@@ -701,6 +707,16 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         if (g_scene_rebuild_pending) {
             hwr_scene_clear(&g_scene);
             g_scene_rebuild_pending = 0;
+        }
+        /* Self-heal: some in-gameplay map transitions replace the geometry
+         * sections without a detectable load boundary, so the refresh guard is
+         * the only signal. The wrap runs only on fully staged frames, so an
+         * immediate reload can succeed; keep a slow retry in case it did not. */
+        if (world_was_valid ||
+            (g_selfheal_retry && ++g_selfheal_tick >= 60)) {
+            g_selfheal_tick = 0;
+            hwr_reload_map_data(api, 0);
+            g_selfheal_retry = !g_world.valid;
         }
     }
     if (pixels == NULL)
@@ -860,8 +876,11 @@ static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
         hwr_resubmit_if_stalled(api);
 }
 
-static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
-                                          const struct roth_map_event_v1 *event)
+/* (Re)loads every mod-side map dependency: archives, geometry snapshot, colour
+ * tables. Called from the map notification AND from the render wrap's self-heal
+ * path — some in-gameplay map transitions replace the geometry sections without
+ * a detectable load boundary, and the per-frame refresh guard is what notices. */
+static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation)
 {
     char map_name[81];
     char shared_name[81];
@@ -870,7 +889,6 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
     char shared_path[2600];
     char failure[256];
 
-    hwr_withdraw_if_owned(api);
     hwr_settings_apply_pending();
     hwr_map_data_clear();
     g_scene_rebuild_pending = 1;
@@ -915,7 +933,7 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
     }
     if (g_debug_enabled) {
         fprintf(stderr, "[renderer_overhaul] map data (gen=%u map=%s shared=%s)\n",
-                event->generation, map_name, shared_name);
+                generation, map_name, shared_name);
         hwr_world_summary(&g_world, stderr);
         fprintf(stderr, "  archives: map_entries=%u shared_entries=%u (referenced entries decode on scene upload)\n",
                 (unsigned)g_map_archive.entry_count,
@@ -928,9 +946,16 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
 
 failed:
     fprintf(stderr, "[renderer_overhaul] map data unavailable (gen=%u): %s\n",
-            event->generation, failure);
+            generation, failure);
     hwr_map_data_clear();
     g_scene_rebuild_pending = 1;
+}
+
+static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
+                                          const struct roth_map_event_v1 *event)
+{
+    hwr_withdraw_if_owned(api);
+    hwr_reload_map_data(api, event->generation);
 }
 
 static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
