@@ -647,11 +647,15 @@ static const char g_resolve_vertex_shader[] =
     "  gl_Position=vec4(p*2.0-1.0,0.0,1.0);\n"
     "}\n";
 
+/* The readback returns rows bottom-up while the present channel expects top-down,
+ * so the resolve pass samples the index buffer vertically mirrored. */
 static const char g_resolve_fragment_shader[] =
     "#version 330 core\n"
     "layout(location=0) out vec4 out_color;\n"
     "uniform usampler2D u_index; uniform sampler2D u_palette;\n"
-    "void main() { uint i=texelFetch(u_index,ivec2(gl_FragCoord.xy),0).r;"
+    "uniform int u_height;\n"
+    "void main() { ivec2 p=ivec2(gl_FragCoord.xy); p.y=u_height-1-p.y;"
+    " uint i=texelFetch(u_index,p,0).r;"
     " out_color=texelFetch(u_palette,ivec2(int(i),0),0); }\n";
 
 static GLuint hwr_compile_shader(GLenum type, const char *source)
@@ -1120,6 +1124,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.disable(GL_DEPTH_TEST);
     g_gl.use_program(g_resolve_program);
+    hwr_uniform_1i(g_resolve_program, "u_height", (GLint)height);
     g_gl.bind_vertex_array(g_resolve_vao);
     g_gl.active_texture(GL_TEXTURE0);
     g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
