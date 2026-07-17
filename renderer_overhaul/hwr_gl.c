@@ -640,11 +640,18 @@ static const char g_geometry_fragment_shader[] =
     "  int w=int(v_dims.x), h=int(v_dims.y); int ix,iy;\n"
     "  if ((flags & 8u)!=0u) {\n"
     "    float divisor=float(1u << v_pan_scale_flags.z);\n"
-    "    ix=int(floor(v_world.x/divisor+float(v_aux & 255u)*0.5)) & (w-1);\n"
-    "    iy=int(floor(v_world.y/divisor+float(v_aux >> 8)*0.5)) & (h-1);\n"
+    /* The span fillers fetch the accumulator before adding its per-pixel
+     * step. Move the center-sampled interpolation back to that lattice. */
+    "    vec2 world_sample=v_world.xy-0.5*dFdx(v_world.xy);\n"
+    "    ix=int(floor(world_sample.x/divisor+float(v_aux & 255u)*0.5)) & (w-1);\n"
+    "    iy=int(floor(world_sample.y/divisor+float(v_aux >> 8)*0.5)) & (h-1);\n"
     "    if ((flags & 32u)!=0u) iy=(h-1)-iy;\n"
     "  } else {\n"
-    "    int base=(int(floor(v_wall.x))+int(v_pan_scale_flags.x)*2) >> 1;\n"
+    /* Wall columns likewise consume S before advancing the column
+     * accumulator. The pan remains after integer S truncation and before
+     * the engine's unsigned coordinate halving. */
+    "    float wall_s=v_wall.x-0.5*dFdx(v_wall.x);\n"
+    "    int base=(int(floor(wall_s))+int(v_pan_scale_flags.x)*2) >> 1;\n"
     "    if ((flags & 32u)!=0u) base=(h-1)-base;\n"
     "    iy=base & (h-1);\n"
     "    ix=((int(floor(v_wall.y-v_world.z)) >> 1)+int(v_pan_scale_flags.y)) & (w-1);\n"
@@ -677,6 +684,17 @@ static const char g_geometry_fragment_shader[] =
     "  r=depth_q-bias; r=((r+32768) & 65535)-32768;\n"
     "  return clamp(r,0,min(scale,31));\n"
     "}\n"
+    /* The software seed tests the pre-halved wall quotient. Its reciprocal
+     * endpoint accumulator is not available here, so use the same depth word;
+     * integer reciprocal boundaries are the remaining exceptional columns. */
+    "int dithered_row(int row, int selected_level, bool tinted) {\n"
+    "  if (tinted || (v_light_material.y & 8u)!=0u) return row;\n"
+    "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
+    "  int depth=(transformed >> 8) & 65535;\n"
+    "  int q=depth/(8*(2 << selected_level));\n"
+    "  int checker=(int(gl_FragCoord.x)+int(gl_FragCoord.y)) & 1;\n"
+    "  return ((q & 1)==0 && checker!=0) ? max(row-1,0) : row;\n"
+    "}\n"
     "uniform int u_debug_vis;\n"
     "void main() {\n"
     "  uint texel=sample_texel(); uint material=v_light_material.y;\n"
@@ -687,6 +705,7 @@ static const char g_geometry_fragment_shader[] =
     " mapped=texelFetch(u_glow,ivec2(int(texel),1),0).r;\n"
     "  else { bool tinted=(face_flags & 2u)!=0u;"
     " int row=shade_row(tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
+    "    row=dithered_row(row,tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
     "    if (u_debug_vis==1) { out_index=uint(row)|(tinted ? 64u : 0u); return; }\n"
     "    mapped=tinted ?"
     " texelFetch(u_tint,ivec2(int(texel),row),0).r :"

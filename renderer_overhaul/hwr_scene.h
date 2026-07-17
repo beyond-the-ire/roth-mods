@@ -94,6 +94,9 @@ struct hwr_scene {
         uint8_t direct;
         uint8_t direct_index;
         uint8_t flip_toggle;
+        /* Placeholder archive resources mark surfaces another renderer owns
+         * (doors); those faces are dropped rather than filled. */
+        uint8_t skip;
     } textures[0x1600];
     struct hwr_gl_vertex *stream_vertices;
     size_t stream_capacity;

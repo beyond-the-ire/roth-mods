@@ -710,6 +710,15 @@ static struct hwr_das_entry *hwr_resolve_entry(struct hwr_das_archive *map_archi
     if (logical < 0x1200u) {
         *owner = map_archive;
         *entry_id = logical;
+        /* Empty map slots fall through to the shared archive at the same
+         * index (the door composite records live there, among others). */
+        if (map_archive != NULL && logical < map_archive->entry_count &&
+            map_archive->entries[logical].file_offset == 0 &&
+            map_archive->entries[logical].payload_size == 0 &&
+            shared_archive != NULL &&
+            logical < shared_archive->entry_count) {
+            *owner = shared_archive;
+        }
     } else if (logical < 0x1600u) {
         *owner = shared_archive;
         *entry_id = logical - 0x1200u;
@@ -849,6 +858,13 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                 stats.grouped++;
             else if (resolved_class == HWR_DAS_CLASS_ANIMATED)
                 stats.animated_frame0++;
+        } else if (entry != NULL &&
+                   (entry->resource_class == HWR_DAS_CLASS_PLACEHOLDER_SPACE ||
+                    entry->resource_class == HWR_DAS_CLASS_PLACEHOLDER_DOLLAR)) {
+            scene->textures[logical].skip = 1;
+            if (debug)
+                fprintf(stderr, "[renderer_overhaul] texture %u is a placeholder resource; surfaces skipped\n",
+                        logical);
         } else {
             scene->textures[logical].direct = 1;
             scene->textures[logical].direct_index = (uint8_t)logical;
@@ -943,10 +959,16 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->shade_depth_scale = hwr_settings_get()->shade_depth_scale;
 }
 
-static int hwr_surface_visible(const struct hwr_mesh_surface *surface,
-                               const struct hwr_scene_mesh *mesh, int16_t eye_z)
+static int hwr_surface_visible(const struct hwr_scene *scene,
+                               const struct hwr_mesh_surface *surface,
+                               int16_t eye_z)
 {
+    const struct hwr_scene_mesh *mesh = &scene->mesh;
     int16_t z;
+    if (surface->texture_id >= 0 &&
+        (uint16_t)surface->texture_id < 0x1600u &&
+        scene->textures[(uint16_t)surface->texture_id].skip)
+        return 0;
     if ((surface->flags & HWR_SURFACE_FLAT) == 0)
         return 1;
     z = mesh->vertices[surface->first_vertex].z;
@@ -1159,7 +1181,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
         surface->flags &= (uint8_t)~HWR_SURFACE_TRANSLUCENT;
-        if (!hwr_surface_visible(surface, &scene->mesh, camera->eye_z))
+        if (!hwr_surface_visible(scene, surface, camera->eye_z))
             continue;
         if (hwr_surface_translucent(scene, surface)) {
             surface->flags |= HWR_SURFACE_TRANSLUCENT;
@@ -1187,7 +1209,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     translucent_surfaces = 0;
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
-        if (!hwr_surface_visible(surface, &scene->mesh, camera->eye_z))
+        if (!hwr_surface_visible(scene, surface, camera->eye_z))
             continue;
         if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
             hwr_copy_gpu_surface(scene, surface, camera, width, height,
