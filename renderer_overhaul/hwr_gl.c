@@ -644,10 +644,14 @@ static const char g_geometry_fragment_shader[] =
     "  int w=int(v_dims.x), h=int(v_dims.y); int ix,iy;\n"
     "  if ((flags & 8u)!=0u) {\n"
     "    float divisor=float(1u << v_pan_scale_flags.z);\n"
+    /* The scaled-sprite driver treats a 256x256 source as its byte-degenerate
+     * dimension class.  That path doubles both the map-coordinate and pan
+     * seeds before the same fixed-point extraction. */
+    "    float dimension_scale=(w==256 && h==256) ? 2.0 : 1.0;\n"
     /* The span fillers fetch the accumulator before adding its per-pixel
      * step. Move the center-sampled interpolation back to that lattice. */
     "    vec2 world_sample=v_world.xy-0.5*dFdx(v_world.xy);\n"
-    "    vec2 mapped=world_sample/divisor+vec2(float(v_aux & 255u),float(v_aux >> 8))*0.5;\n"
+    "    vec2 mapped=(world_sample/divisor+vec2(float(v_aux & 255u),float(v_aux >> 8))*0.5)*dimension_scale;\n"
     /* The engine's flat h-flip negates the X fixed-point accumulator before
      * integer extraction.  Negating after floor(), or mirroring Y, changes
      * every integral boundary. */
