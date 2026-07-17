@@ -17,7 +17,6 @@ static uint32_t g_dirty;
 
 void hwr_settings_init_defaults(void)
 {
-    g_settings.shade_depth_scale = 1.0f;
     memset(&g_settings, 0, sizeof g_settings);
     g_settings.enabled = 1;
     g_settings.solid_color = 0xff8800u;
@@ -25,6 +24,7 @@ void hwr_settings_init_defaults(void)
     g_settings.present_mode = HWR_PRESENT_FIFO;
     g_settings.pitch_mode = HWR_PITCH_HORIZON_SHIFT;
     g_settings.render_mode = HWR_RENDER_AUTHENTIC;
+    g_settings.shade_depth_scale = 1.0f;
     g_hook_count = 0;
     g_dirty = HWR_CHANGE_ALL;
 }

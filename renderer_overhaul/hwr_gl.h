@@ -49,6 +49,7 @@ struct hwr_gl_camera {
     uint8_t tint_shade_level;
     uint8_t global_light_bias;
     uint8_t glow_phase;
+    uint16_t flat_edge_bias;
     float shade_depth_scale;
 };
 

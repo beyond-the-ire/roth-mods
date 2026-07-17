@@ -210,6 +210,7 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *v;
     uint16_t extent;
+    uint16_t mapped_extent;
     float sa;
     float sb;
     if (id >= 0 && (uint16_t)id == world->world_span_colorkey)
@@ -220,8 +221,10 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     b = &world->vertices[wall->vertex_b_index];
     extent = wall->extent < 0 ? (uint16_t)wall->extent & 0x0fffu
                               : (uint16_t)wall->extent;
-    sa = HWR_WALL_U_REVERSED ? (float)extent : 0.0f;
-    sb = HWR_WALL_U_REVERSED ? 0.0f : (float)extent;
+    mapped_extent = (mapping_flags & 0x20u) != 0
+        ? (uint16_t)(extent + extent) : extent;
+    sa = HWR_WALL_U_REVERSED ? (float)mapped_extent : 0.0f;
+    sb = HWR_WALL_U_REVERSED ? 0.0f : (float)mapped_extent;
     surface = hwr_add_surface(mesh, kind, 6);
     if (surface == NULL)
         return -1;
@@ -836,6 +839,8 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
 #define VA_G_HORIZON             0x909a4u
 #define VA_G_GLOBAL_LIGHT_BIAS   0x853f6u
 #define VA_G_GLOW_PHASE          0x8a355u
+#define VA_G_VIEW_PARAMS_A       0x85270u
+#define VA_G_PLAYER_LIGHT_BIAS   0x8c1d8u
 
 static void hwr_read_camera(struct hwr_gl_camera *camera,
                             const struct hwr_world *world,
@@ -855,6 +860,13 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->tint_shade_level = (uint8_t)world->luts.tint_shade_level;
     camera->global_light_bias = api->game_ram->u8(VA_G_GLOBAL_LIGHT_BIAS);
     camera->glow_phase = api->game_ram->u8(VA_G_GLOW_PHASE);
+    {
+        uintptr_t params = (uintptr_t)api->game_ram->u32(VA_G_VIEW_PARAMS_A);
+        uint16_t view_bias = params >= 0x1000u
+            ? hwr_scene_read_u16((const uint8_t *)params + 0x1c) : 0;
+        camera->flat_edge_bias = (uint16_t)(view_bias +
+            api->game_ram->u16(VA_G_PLAYER_LIGHT_BIAS));
+    }
     camera->shade_depth_scale = hwr_settings_get()->shade_depth_scale;
 }
 
