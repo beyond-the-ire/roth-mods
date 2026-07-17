@@ -658,7 +658,10 @@ static const char g_geometry_fragment_shader[] =
     /* Wall columns likewise consume S before advancing the column
      * accumulator. The pan remains after integer S truncation and before
      * the engine's unsigned coordinate halving. */
-    "    float wall_s=v_wall.x-0.5*dFdx(v_wall.x);\n"
+    /* The engine's column accumulator is integral and never negative; the
+     * half-derivative correction can cross S=0 at a wall's first screen
+     * column, so clamp back onto the engine-reachable range. */
+    "    float wall_s=max(v_wall.x-0.5*dFdx(v_wall.x),0.0);\n"
     "    int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
     "    if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
     /* Non-power-of-two wall classes stage 0xffff: the AND is an identity,
@@ -667,7 +670,7 @@ static const char g_geometry_fragment_shader[] =
     /* Like S, the vertical mapper fetches before advancing its fixed-point
      * accumulator. v_wall.y is the CPU-selected stored-extent or texture-fit
      * coordinate, including flag-0x20 scaling where that class uses it. */
-    "    float wall_v=v_wall.y-0.5*dFdy(v_wall.y);\n"
+    "    float wall_v=max(v_wall.y-0.5*dFdy(v_wall.y),0.0);\n"
     "    int vertical=(((int(floor(wall_v)) & 65535) >> 1)+int(v_pan_scale_flags.y)) & 65535;\n"
     "    ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical;\n"
     "  }\n"
