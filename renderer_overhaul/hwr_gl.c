@@ -620,10 +620,8 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_tint_shade_level;\n"
     "uniform int u_light_bias;\n"
     "uniform int u_glow_phase;\n"
-    "uniform int u_flat_edge_bias;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
-    "uniform ivec2 u_shade_origin;\n"
     "uniform float u_depth_scale;\n"
     "uniform int u_blend_pass;\n"
     "in vec3 v_world;\n"
@@ -664,22 +662,14 @@ static const char g_geometry_fragment_shader[] =
     "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
     "  int depth=(transformed >> 8) & 65535;\n"  /* the span vertex depth word: world units */
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; int r;\n"
+    /* Tinted surfaces (flats and walls alike) carry a per-vertex shade word
+     * evaluated at span edges and interpolated across the surface, exactly
+     * like the span rasterizer; the jittered origin enters that word. */
+    "  if (tinted) return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  if (flat_surface) {\n"
-    "    if (tinted) {\n"
-    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
-    /* The edge term measures from the jittered shade origin (the light
-     * position), not the static view center; the jitter is the flicker. */
-    "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
-    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
-    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
-    "      r=(edge_depth >> shr)-bias-u_flat_edge_bias;\n"
-    "      r=((r+32768) & 65535)-32768;\n"
-    "      return r<=0 ? 1 : min(r,31);\n"
-    "    }\n"
     "    r=(depth >> shr)-bias;\n"
     "    return clamp(((r+32768) & 65535)-32768,0,31);\n"
     "  }\n"
-    "  if (tinted) return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  int dividend=2 << level;\n"
     /* The wall span divisors are the 16-bit vertex depth words, already in
      * world units, so the column ratio reduces to depth/(16*dividend). */
@@ -1203,15 +1193,23 @@ static void hwr_gl_scene_self_test(int first_run)
     int status;
     unsigned pre_errors = hwr_gl_drain_errors();
     unsigned post_errors;
-    uint8_t *store_read = (uint8_t *)malloc(g_verify_store_size);
 
-    if (store_read != NULL) {
-        g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
-        g_gl.get_buffer_sub_data(GL_TEXTURE_BUFFER, 0,
-                                 (GLsizeiptr)g_verify_store_size, store_read);
-        store_ok = hwr_hash_bytes(store_read, g_verify_store_size) ==
-                   g_verify_store_hash;
-        free(store_read);
+    if (first_run) {
+        /* Reading the whole store back stalls the pipeline for a visible
+         * fraction of a second, so it runs only on the frame after an
+         * upload; the recurring checks rely on the probe fetches instead. */
+        uint8_t *store_read = (uint8_t *)malloc(g_verify_store_size);
+        if (store_read != NULL) {
+            g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
+            g_gl.get_buffer_sub_data(GL_TEXTURE_BUFFER, 0,
+                                     (GLsizeiptr)g_verify_store_size,
+                                     store_read);
+            store_ok = hwr_hash_bytes(store_read, g_verify_store_size) ==
+                       g_verify_store_hash;
+            free(store_read);
+        }
+    } else {
+        store_ok = (g_verify_last_status & 1) != 0;
     }
 
     g_gl.active_texture(GL_TEXTURE1);
@@ -1352,14 +1350,11 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
     hwr_uniform_2f(g_geometry_program, "u_center",
                    (GLfloat)camera->center_x, (GLfloat)camera->horizon);
-    hwr_uniform_2i(g_geometry_program, "u_shade_origin",
-                   camera->shade_origin_x, camera->shade_origin_y);
     hwr_uniform_2f(g_geometry_program, "u_viewport", (GLfloat)width, (GLfloat)height);
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
     hwr_uniform_1i(g_geometry_program, "u_glow_phase", camera->glow_phase);
-    hwr_uniform_1i(g_geometry_program, "u_flat_edge_bias", camera->flat_edge_bias);
     {
         GLint scale_location = g_gl.get_uniform_location(g_geometry_program, "u_depth_scale");
         if (scale_location >= 0)
