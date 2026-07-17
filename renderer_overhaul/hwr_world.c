@@ -335,9 +335,11 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
                 fprintf(f, "colorkey %u\n", next.world_span_colorkey);
                 for (n = 0; n < next.sector_count; n++) {
                     const struct hwr_sector *s = &next.sectors[n];
-                    fprintf(f, "sector %zu off=%#x floor=%d ceil=%d flags=%#x light=%u walls=%zu+%u",
+                    fprintf(f, "sector %zu off=%#x floor=%d ceil=%d flags=%#x light=%u walls=%zu+%u fid=%d cid=%d fpan=%#x cpan=%#x",
                             n, s->section_offset, s->floor_z, s->ceiling_z,
-                            s->flags, s->light, s->first_wall, s->wall_count);
+                            s->flags, s->light, s->first_wall, s->wall_count,
+                            s->floor_flat_id, s->ceiling_flat_id,
+                            s->floor_pan, s->ceiling_pan);
                     if (s->slab_index != SIZE_MAX) {
                         const struct hwr_slab *sl = &next.slabs[s->slab_index];
                         fprintf(f, " slab=%zu lo=%d(%u) hi=%d(%u)",
