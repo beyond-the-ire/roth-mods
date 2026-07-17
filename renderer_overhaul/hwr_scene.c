@@ -837,6 +837,8 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
 #define VA_G_FOCAL_Y             0x90998u
 #define VA_G_CENTER_X            0x909a0u
 #define VA_G_HORIZON             0x909a4u
+#define VA_G_SHADE_ORIGIN_X      0x90990u
+#define VA_G_SHADE_ORIGIN_Y      0x90992u
 #define VA_G_GLOBAL_LIGHT_BIAS   0x853f6u
 #define VA_G_GLOW_PHASE          0x8a355u
 #define VA_G_VIEW_PARAMS_A       0x85270u
@@ -856,6 +858,8 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->focal_y = api->game_ram->u16(VA_G_FOCAL_Y);
     camera->center_x = (int32_t)api->game_ram->u32(VA_G_CENTER_X);
     camera->horizon = (int32_t)api->game_ram->u32(VA_G_HORIZON);
+    camera->shade_origin_x = (int16_t)api->game_ram->u16(VA_G_SHADE_ORIGIN_X);
+    camera->shade_origin_y = (int16_t)api->game_ram->u16(VA_G_SHADE_ORIGIN_Y);
     camera->shade_level = (uint8_t)world->luts.shade_level;
     camera->tint_shade_level = (uint8_t)world->luts.tint_shade_level;
     camera->global_light_bias = api->game_ram->u8(VA_G_GLOBAL_LIGHT_BIAS);
@@ -916,8 +920,91 @@ static float hwr_surface_depth(const struct hwr_mesh_surface *surface,
     return s * y - c * x;
 }
 
+static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
+                                       const struct hwr_mesh_vertex *vertex,
+                                       int16_t bottom_z,
+                                       const struct hwr_gl_camera *camera,
+                                       uint32_t width, uint32_t height)
+{
+    int dx = (int16_t)((uint16_t)vertex->x + (uint16_t)camera->view_offset_x);
+    int dy = (int16_t)((uint16_t)vertex->y + (uint16_t)camera->view_offset_y);
+    double sine = (double)camera->yaw_sin / 16384.0;
+    double cosine = (double)camera->yaw_cos / 16384.0;
+    double view_x = sine * (double)dx + cosine * (double)dy;
+    double depth_f = sine * (double)dy - cosine * (double)dx;
+    int depth;
+    int screen_x;
+    int screen_y;
+    int16_t delta;
+    uint16_t magnitude;
+    uint16_t scale_x;
+    uint16_t scale_y;
+    uint16_t distance_x;
+    uint16_t distance_y;
+    uint16_t projected;
+    uint8_t light = surface->light;
+    int axv;
+    int bias;
+    int clip_scale;
+    int level = camera->tint_shade_level;
+    int shade;
+
+    if (depth_f < 16.0)
+        depth_f = 16.0;
+    depth = (int)(depth_f * (camera->shade_depth_scale > 0.0f
+                          ? camera->shade_depth_scale : 1.0f));
+    if (depth < 16)
+        depth = 16;
+    screen_x = (int)(view_x * (double)camera->focal_x / depth_f) +
+               camera->center_x;
+    screen_y = (int)(((double)camera->eye_z - (double)bottom_z) *
+                     (double)camera->focal_y / depth_f) + camera->horizon;
+    if (screen_y < 0)
+        screen_y = 0;
+    else if (height != 0 && screen_y >= (int)height)
+        screen_y = (int)height - 1;
+    if (width != 0) {
+        if (screen_x < 0)
+            screen_x = 0;
+        else if (screen_x >= (int)width)
+            screen_x = (int)width - 1;
+    }
+
+    scale_x = camera->focal_x != 0
+        ? (uint16_t)(0x40000u / camera->focal_x) : 0;
+    scale_y = camera->focal_y != 0
+        ? (uint16_t)(0x40000u / camera->focal_y) : 0;
+    delta = (int16_t)((uint16_t)screen_x - (uint16_t)camera->shade_origin_x);
+    magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
+    distance_x = (uint16_t)(((uint32_t)magnitude * scale_x) >> 8);
+    delta = (int16_t)((uint16_t)screen_y - (uint16_t)camera->shade_origin_y);
+    magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
+    distance_y = (uint16_t)(((uint32_t)magnitude * scale_y) >> 8);
+    projected = distance_y > distance_x ? distance_y : distance_x;
+    projected = (uint16_t)(projected + (uint16_t)depth);
+
+    if (light != 0)
+        light = (uint8_t)(light + camera->global_light_bias);
+    axv = light == 0 ? 0 : (int)light - 128;
+    bias = 8 + axv;
+    clip_scale = light == 0 ? 32 : 32 - ((axv + 4 > 0 ? axv + 4 : 0) >> 2);
+    shade = (int)(projected >> (5 + level));
+    shade = (int16_t)(shade - bias);
+    shade = (int16_t)(shade - (int16_t)camera->flat_edge_bias);
+    if (shade <= 0)
+        return 0x0100u;
+    if (shade >= clip_scale)
+        shade = clip_scale;
+    if (shade >= 31)
+        return 0x1fffu;
+    return (uint16_t)(((uint16_t)(uint8_t)shade << 8) |
+        (uint8_t)((uint8_t)projected << (3 - level)));
+}
+
 static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                                  const struct hwr_mesh_surface *surface,
+                                 const struct hwr_gl_camera *camera,
+                                 uint32_t width, uint32_t height,
                                  struct hwr_gl_vertex *destination)
 {
     uint16_t logical = (uint16_t)surface->texture_id;
@@ -950,6 +1037,20 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         target->x = source->x;
         target->y = source->y;
         target->z = source->z;
+        if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
+            const struct hwr_mesh_vertex *wall_vertices =
+                &scene->mesh.vertices[surface->first_vertex];
+            int16_t bottom_z = source->z;
+            size_t j;
+            for (j = 0; j < surface->vertex_count; j++) {
+                if (wall_vertices[j].x == source->x &&
+                    wall_vertices[j].y == source->y &&
+                    wall_vertices[j].z < bottom_z)
+                    bottom_z = wall_vertices[j].z;
+            }
+            target->wall_shade_endpoint = hwr_wall_endpoint_word(
+                surface, source, bottom_z, camera, width, height);
+        }
         target->wall_s = source->wall_s;
         target->wall_top = source->wall_top;
         if (logical < 0x1600u) {
@@ -970,6 +1071,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
 
 static int hwr_prepare_stream(struct hwr_scene *scene,
                               const struct hwr_gl_camera *camera,
+                              uint32_t width, uint32_t height,
                               size_t *opaque_count, size_t *translucent_count)
 {
     size_t *translucent_order;
@@ -1013,7 +1115,8 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         if (!hwr_surface_visible(surface, &scene->mesh, camera->eye_z))
             continue;
         if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
-            hwr_copy_gpu_surface(scene, surface, scene->stream_vertices + opaque_cursor);
+            hwr_copy_gpu_surface(scene, surface, camera, width, height,
+                                 scene->stream_vertices + opaque_cursor);
             opaque_cursor += surface->vertex_count;
         } else {
             size_t position = translucent_surfaces;
@@ -1032,7 +1135,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     for (i = 0; i < translucent_surfaces; i++) {
         const struct hwr_mesh_surface *surface =
             &scene->mesh.surfaces[translucent_order[i]];
-        hwr_copy_gpu_surface(scene, surface,
+        hwr_copy_gpu_surface(scene, surface, camera, width, height,
                              scene->stream_vertices + translucent_cursor);
         translucent_cursor += surface->vertex_count;
     }
@@ -1083,7 +1186,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         return NULL;
     }
     hwr_read_camera(&camera, world, api);
-    if (hwr_prepare_stream(scene, &camera, &opaque_count, &translucent_count) != 0)
+    if (hwr_prepare_stream(scene, &camera, width, height,
+                           &opaque_count, &translucent_count) != 0)
         return NULL;
     hwr_build_palette(world, palette);
     return hwr_gl_scene_render(scene->stream_vertices, opaque_count,

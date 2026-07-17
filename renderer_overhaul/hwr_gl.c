@@ -37,6 +37,9 @@
 #ifndef GL_FRAMEBUFFER_COMPLETE
 #define GL_FRAMEBUFFER_COMPLETE 0x8cd5
 #endif
+#ifndef GL_MAX_TEXTURE_BUFFER_SIZE
+#define GL_MAX_TEXTURE_BUFFER_SIZE 0x8c2b
+#endif
 
 typedef GLenum (APIENTRY *hwr_gl_get_error_fn)(void);
 typedef const GLubyte *(APIENTRY *hwr_gl_get_string_fn)(GLenum);
@@ -72,6 +75,9 @@ typedef void (APIENTRY *hwr_gl_copy_tex_sub_image_2d_fn)(GLenum, GLint, GLint,
                                                          GLint, GLint, GLint,
                                                          GLsizei, GLsizei);
 typedef void (APIENTRY *hwr_gl_pixel_store_i_fn)(GLenum, GLint);
+typedef void (APIENTRY *hwr_gl_get_tex_image_fn)(GLenum, GLint, GLenum, GLenum,
+                                                 GLvoid *);
+typedef void (APIENTRY *hwr_gl_get_integer_v_fn)(GLenum, GLint *);
 
 struct hwr_gl_functions {
     hwr_gl_get_error_fn get_error;
@@ -134,6 +140,10 @@ struct hwr_gl_functions {
     PFNGLCLEARBUFFERUIVPROC clear_buffer_uiv;
     hwr_gl_copy_tex_sub_image_2d_fn copy_tex_sub_image_2d;
     hwr_gl_pixel_store_i_fn pixel_store_i;
+    hwr_gl_get_tex_image_fn get_tex_image;
+    PFNGLGETBUFFERSUBDATAPROC get_buffer_sub_data;
+    hwr_gl_get_integer_v_fn get_integer_v;
+    PFNGLGETUNIFORMIVPROC get_uniform_iv;
 };
 
 static struct hwr_gl_functions g_gl;
@@ -155,7 +165,23 @@ static GLuint g_scene_vao;
 static GLuint g_resolve_vao;
 static GLuint g_geometry_program;
 static GLuint g_resolve_program;
+static GLuint g_probe_program;
 static int g_scene_uploaded;
+/* Reference data for the sampling self-test: a rare state has been observed
+ * where every lookup-table fetch returns zero (the world renders black while
+ * solid-fill surfaces stay visible). The self-test splits "the uploaded data
+ * is gone" from "the data is intact but sampling it fails". */
+static uint8_t g_verify_colormap[0x2000];
+static uint32_t g_verify_store_hash;
+static size_t g_verify_store_size;
+static int g_verify_probe_offset;
+static uint8_t g_verify_probe_texel;
+static uint8_t g_verify_first_texel;
+static uint8_t g_verify_last_texel;
+static int g_verify_pending;
+static int g_verify_last_status = -1;
+static unsigned g_render_count;
+static int g_debug_vis = -1;   /* HWR_SHADE_VIS=1: render the shade-row map */
 static uint32_t g_fbo_width;
 static uint32_t g_fbo_height;
 static uint32_t *g_pixels;
@@ -526,6 +552,10 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(clear_buffer_uiv, PFNGLCLEARBUFFERUIVPROC, "glClearBufferuiv");
     HWR_LOAD_GL(copy_tex_sub_image_2d, hwr_gl_copy_tex_sub_image_2d_fn, "glCopyTexSubImage2D");
     HWR_LOAD_GL(pixel_store_i, hwr_gl_pixel_store_i_fn, "glPixelStorei");
+    HWR_LOAD_GL(get_tex_image, hwr_gl_get_tex_image_fn, "glGetTexImage");
+    HWR_LOAD_GL(get_buffer_sub_data, PFNGLGETBUFFERSUBDATAPROC, "glGetBufferSubData");
+    HWR_LOAD_GL(get_integer_v, hwr_gl_get_integer_v_fn, "glGetIntegerv");
+    HWR_LOAD_GL(get_uniform_iv, PFNGLGETUNIFORMIVPROC, "glGetUniformiv");
     return 1;
 }
 
@@ -540,6 +570,7 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=4) in uint a_aux;\n"
     "layout(location=5) in uvec4 a_pan_scale_flags;\n"
     "layout(location=6) in uvec4 a_light_material;\n"
+    "layout(location=7) in uint a_wall_shade_endpoint;\n"
     "uniform ivec2 u_view_offset;\n"
     "uniform int u_eye_z;\n"
     "uniform vec2 u_basis;\n"
@@ -554,6 +585,7 @@ static const char g_geometry_vertex_shader[] =
     "flat out uint v_aux;\n"
     "flat out uvec4 v_pan_scale_flags;\n"
     "flat out uvec4 v_light_material;\n"
+    "noperspective out float v_wall_shade_endpoint;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
     "void main() {\n"
     "  int dx=wrap16(a_pos.x+u_view_offset.x);\n"
@@ -572,6 +604,7 @@ static const char g_geometry_vertex_shader[] =
     "  v_world=vec3(a_pos); v_depth_fixed=depth; v_wall=a_wall;\n"
     "  v_offset=a_offset; v_dims=a_dims; v_aux=a_aux;\n"
     "  v_pan_scale_flags=a_pan_scale_flags; v_light_material=a_light_material;\n"
+    "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
     "}\n";
 
 static const char g_geometry_fragment_shader[] =
@@ -590,6 +623,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_flat_edge_bias;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
+    "uniform ivec2 u_shade_origin;\n"
     "uniform float u_depth_scale;\n"
     "uniform int u_blend_pass;\n"
     "in vec3 v_world;\n"
@@ -600,6 +634,7 @@ static const char g_geometry_fragment_shader[] =
     "flat in uint v_aux;\n"
     "flat in uvec4 v_pan_scale_flags;\n"
     "flat in uvec4 v_light_material;\n"
+    "noperspective in float v_wall_shade_endpoint;\n"
     "uint sample_texel() {\n"
     "  uint flags=v_light_material.y;\n"
     "  if ((flags & 4u)!=0u) return v_light_material.z;\n"
@@ -627,13 +662,15 @@ static const char g_geometry_fragment_shader[] =
     "  int bias=8+axv;\n"
     "  int scale=light==0 ? 32 : 32-(max(axv+4,0) >> 2);\n"
     "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
+    "  int depth=(transformed >> 8) & 65535;\n"  /* the span vertex depth word: world units */
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; int r;\n"
     "  if (flat_surface) {\n"
-    "    int depth=(transformed >> 8) & 65535;\n"
     "    if (tinted) {\n"
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
-    "      int px=(abs(wrap16(int(gl_FragCoord.x)-int(u_center.x))) * sx) >> 8;\n"
-    "      int py=(abs(wrap16(int(gl_FragCoord.y)-int(u_center.y))) * sy) >> 8;\n"
+    /* The edge term measures from the jittered shade origin (the light
+     * position), not the static view center; the jitter is the flicker. */
+    "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
     "      int edge_depth=(depth+max(px,py)) & 65535;\n"
     "      r=(edge_depth >> shr)-bias-u_flat_edge_bias;\n"
     "      r=((r+32768) & 65535)-32768;\n"
@@ -642,11 +679,15 @@ static const char g_geometry_fragment_shader[] =
     "    r=(depth >> shr)-bias;\n"
     "    return clamp(((r+32768) & 65535)-32768,0,31);\n"
     "  }\n"
+    "  if (tinted) return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  int dividend=2 << level;\n"
-    "  int depth_q=transformed/(16*dividend);\n"
+    /* The wall span divisors are the 16-bit vertex depth words, already in
+     * world units, so the column ratio reduces to depth/(16*dividend). */
+    "  int depth_q=depth/(16*dividend);\n"
     "  r=depth_q-bias; r=((r+32768) & 65535)-32768;\n"
     "  return clamp(r,0,min(scale,31));\n"
     "}\n"
+    "uniform int u_debug_vis;\n"
     "void main() {\n"
     "  uint texel=sample_texel(); uint material=v_light_material.y;\n"
     "  if ((material & 1u)!=0u && texel==0u) discard;\n"
@@ -655,9 +696,12 @@ static const char g_geometry_fragment_shader[] =
     "  else if ((face_flags & 64u)!=0u && (u_glow_phase & 73)!=0)"
     " mapped=texelFetch(u_glow,ivec2(int(texel),1),0).r;\n"
     "  else { bool tinted=(face_flags & 2u)!=0u;"
-    " int row=shade_row(tinted ? u_tint_shade_level : u_shade_level,tinted); mapped=tinted ?"
+    " int row=shade_row(tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
+    "    if (u_debug_vis==1) { out_index=uint(row)|(tinted ? 64u : 0u); return; }\n"
+    "    mapped=tinted ?"
     " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
     " texelFetch(u_colormap,ivec2(int(texel),row),0).r; }\n"
+    "  if (u_debug_vis==1) { out_index=255u; return; }\n"  /* direct/glow marker */
     "  if (u_blend_pass!=0 && (material & 16u)!=0u && (texel & 128u)!=0u) {\n"
     "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(dst)),0).r;\n"
@@ -676,8 +720,34 @@ static const char g_resolve_fragment_shader[] =
     "#version 330 core\n"
     "layout(location=0) out vec4 out_color;\n"
     "uniform usampler2D u_index; uniform sampler2D u_palette;\n"
-    "void main() { uint i=texelFetch(u_index,ivec2(gl_FragCoord.xy),0).r;"
-    " out_color=texelFetch(u_palette,ivec2(int(i),0),0); }\n";
+    "uniform int u_debug_vis;\n"
+    "void main() { uint i=texelFetch(u_index,ivec2(gl_FragCoord.xy),0).r;\n"
+    "  if (u_debug_vis==1) {\n"          /* shade-row map: gray=plain, red=tint */
+    "    if (i==255u) { out_color=vec4(0.0,0.0,1.0,1.0); return; }\n"
+    "    float v=1.0-float(i & 31u)/31.0*0.9;\n"
+    "    out_color=(i & 64u)!=0u ? vec4(v,0.0,0.0,1.0) : vec4(v,v,v,1.0);\n"
+    "    return;\n"
+    "  }\n"
+    "  out_color=texelFetch(u_palette,ivec2(int(i),0),0); }\n";
+
+/* Fetches known texels from the texture store and the colormap through the
+ * same texture units the world pass uses; pixel 0 receives the store byte at
+ * the configured offset, pixel 1 the colormap byte, pixel 2 the first store
+ * byte, pixel 3 the last store byte. */
+static const char g_probe_fragment_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) out uint out_index;\n"
+    "uniform usamplerBuffer u_texels;\n"
+    "uniform usampler2D u_colormap;\n"
+    "uniform int u_offset;\n"
+    "uniform int u_last;\n"
+    "void main() {\n"
+    "  int x=int(gl_FragCoord.x);\n"
+    "  if (x==0) out_index=texelFetch(u_texels,u_offset).r;\n"
+    "  else if (x==1) out_index=texelFetch(u_colormap,ivec2(128,16),0).r;\n"
+    "  else if (x==2) out_index=texelFetch(u_texels,0).r;\n"
+    "  else out_index=texelFetch(u_texels,u_last).r;\n"
+    "}\n";
 
 static GLuint hwr_compile_shader(GLenum type, const char *source)
 {
@@ -744,8 +814,11 @@ static void hwr_destroy_scene_objects(void)
         g_gl.delete_program(g_geometry_program);
     if (g_resolve_program != 0)
         g_gl.delete_program(g_resolve_program);
+    if (g_probe_program != 0)
+        g_gl.delete_program(g_probe_program);
     g_geometry_program = 0;
     g_resolve_program = 0;
+    g_probe_program = 0;
     if (g_scene_vao != 0)
         g_gl.delete_vertex_arrays(1, &g_scene_vao);
     if (g_resolve_vao != 0)
@@ -946,6 +1019,15 @@ static void hwr_set_sampler(GLuint program, const char *name, GLint unit)
         g_gl.uniform_1i(location, unit);
 }
 
+static uint32_t hwr_hash_bytes(const uint8_t *bytes, size_t count)
+{
+    uint32_t hash = 2166136261u;
+    size_t i;
+    for (i = 0; i < count; i++)
+        hash = (hash ^ bytes[i]) * 16777619u;
+    return hash;
+}
+
 int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                         const uint8_t colormap[0x2000],
                         const uint8_t tint[0x2000],
@@ -963,7 +1045,10 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                                           g_geometry_fragment_shader);
     g_resolve_program = hwr_link_program(g_resolve_vertex_shader,
                                          g_resolve_fragment_shader);
-    if (g_geometry_program == 0 || g_resolve_program == 0) {
+    g_probe_program = hwr_link_program(g_resolve_vertex_shader,
+                                       g_probe_fragment_shader);
+    if (g_geometry_program == 0 || g_resolve_program == 0 ||
+        g_probe_program == 0) {
         hwr_destroy_scene_objects();
         return 0;
     }
@@ -1011,6 +1096,9 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(6);
     g_gl.vertex_attrib_i_pointer(6, 4, GL_UNSIGNED_BYTE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, light));
+    g_gl.enable_vertex_attrib_array(7);
+    g_gl.vertex_attrib_i_pointer(7, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint));
     g_gl.gen_vertex_arrays(1, &g_resolve_vao);
 
     g_gl.use_program(g_geometry_program);
@@ -1023,7 +1111,33 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.use_program(g_resolve_program);
     hwr_set_sampler(g_resolve_program, "u_index", 0);
     hwr_set_sampler(g_resolve_program, "u_palette", 1);
+    g_gl.use_program(g_probe_program);
+    hwr_set_sampler(g_probe_program, "u_texels", 0);
+    hwr_set_sampler(g_probe_program, "u_colormap", 1);
     g_gl.use_program(0);
+
+    memcpy(g_verify_colormap, colormap, sizeof g_verify_colormap);
+    g_verify_store_hash = hwr_hash_bytes(texture_bytes, texture_size);
+    g_verify_store_size = texture_size;
+    g_verify_probe_offset = (int)(texture_size / 2u);
+    g_verify_probe_texel = texture_bytes[texture_size / 2u];
+    g_verify_first_texel = texture_bytes[0];
+    g_verify_last_texel = texture_bytes[texture_size - 1u];
+    g_verify_pending = 1;
+    g_verify_last_status = -1;
+    {
+        GLint max_texels = 0;
+        GLint colormap_unit = -1;
+        GLint location = g_gl.get_uniform_location(g_geometry_program,
+                                                   "u_colormap");
+        g_gl.get_integer_v(GL_MAX_TEXTURE_BUFFER_SIZE, &max_texels);
+        if (location >= 0)
+            g_gl.get_uniform_iv(g_geometry_program, location, &colormap_unit);
+        fprintf(stderr, "[renderer_overhaul] texture store %u bytes "
+                "(driver texel limit %d, colormap sampler unit %d)\n",
+                (unsigned)texture_size, (int)max_texels, (int)colormap_unit);
+    }
+
     g_scene_uploaded = 1;
     return 1;
 }
@@ -1043,6 +1157,13 @@ static void hwr_bind_scene_textures(void)
         g_gl.active_texture(GL_TEXTURE0 + i);
         g_gl.bind_texture(targets[i], textures[i]);
     }
+    /* The final pass of the previous frame leaves the index framebuffer's
+     * color attachment bound to unit 0's two-dimensional slot. Sampling
+     * anything on that unit while drawing into that framebuffer is then a
+     * feedback hazard, and drivers may legally return zeros for the unit's
+     * fetches; clear the stale binding before the world pass. */
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
 }
 
 static void hwr_uniform_1i(GLuint program, const char *name, GLint value)
@@ -1064,6 +1185,105 @@ static void hwr_uniform_2f(GLuint program, const char *name, GLfloat x, GLfloat 
     GLint location = g_gl.get_uniform_location(program, name);
     if (location >= 0)
         g_gl.uniform_2f(location, x, y);
+}
+
+/* Verifies the uploaded lookup data three ways: the texture store bytes read
+ * back from the buffer object, the colormap bytes read back from the texture,
+ * and a live two-pixel draw that samples both through the world pass's texture
+ * units. Runs on the first frame after every upload and re-checks quietly
+ * afterwards, logging only failures and changes. Leaves no state behind that
+ * the world pass does not reset itself. */
+static void hwr_gl_scene_self_test(int first_run)
+{
+    int store_ok = 0, colormap_ok = 0, probe_ok = 0, samplers_ok = 1;
+    GLint samplers[6] = { -1, -1, -1, -1, -1, -1 };
+    uint8_t colormap_read[0x2000];
+    uint8_t probe_read[4] = { 0, 0, 0, 0 };
+    uint8_t expected_colormap = g_verify_colormap[16 * 256 + 128];
+    int status;
+    unsigned pre_errors = hwr_gl_drain_errors();
+    unsigned post_errors;
+    uint8_t *store_read = (uint8_t *)malloc(g_verify_store_size);
+
+    if (store_read != NULL) {
+        g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
+        g_gl.get_buffer_sub_data(GL_TEXTURE_BUFFER, 0,
+                                 (GLsizeiptr)g_verify_store_size, store_read);
+        store_ok = hwr_hash_bytes(store_read, g_verify_store_size) ==
+                   g_verify_store_hash;
+        free(store_read);
+    }
+
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_colormap_texture);
+    g_gl.pixel_store_i(GL_PACK_ALIGNMENT, 1);
+    g_gl.get_tex_image(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE,
+                       colormap_read);
+    colormap_ok = memcmp(colormap_read, g_verify_colormap,
+                         sizeof colormap_read) == 0;
+
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.viewport(0, 0, 4, 1);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.use_program(g_probe_program);
+    hwr_uniform_1i(g_probe_program, "u_offset", g_verify_probe_offset);
+    hwr_uniform_1i(g_probe_program, "u_last",
+                   (int)(g_verify_store_size - 1u));
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_BUFFER, g_texture_buffer_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);   /* the resolve pass left the index
+                                            * attachment bound here: feedback
+                                            * hazard while drawing into it */
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_colormap_texture);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    g_gl.read_pixels(0, 0, 4, 1, GL_RED_INTEGER, GL_UNSIGNED_BYTE, probe_read);
+    probe_ok = probe_read[0] == g_verify_probe_texel &&
+               probe_read[1] == expected_colormap &&
+               probe_read[2] == g_verify_first_texel &&
+               probe_read[3] == g_verify_last_texel;
+
+    {
+        /* The world pass depends on the geometry program's sampler uniforms
+         * holding units 0..5; read the live values so a lost assignment is
+         * visible in the report. */
+        static const char *const names[6] = {
+            "u_texels", "u_colormap", "u_tint", "u_glow", "u_blend", "u_dst"
+        };
+        int i;
+        for (i = 0; i < 6; i++) {
+            GLint location = g_gl.get_uniform_location(g_geometry_program,
+                                                       names[i]);
+            samplers[i] = -1;
+            if (location >= 0)
+                g_gl.get_uniform_iv(g_geometry_program, location, &samplers[i]);
+            samplers_ok = samplers_ok && samplers[i] == i;
+        }
+    }
+
+    post_errors = hwr_gl_drain_errors();
+    status = (store_ok ? 1 : 0) | (colormap_ok ? 2 : 0) | (probe_ok ? 4 : 0) |
+             (samplers_ok ? 8 : 0);
+    if (first_run || status != g_verify_last_status || status != 15 ||
+        pre_errors != 0 || post_errors != 0)
+        fprintf(stderr,
+                "[renderer_overhaul] sampling self-test: store=%s colormap=%s "
+                "probe=%s samplers=%s [%d %d %d %d %d %d] (store mid %u/%u "
+                "first %u/%u last %u/%u, colormap %u/%u, GL errors %u before "
+                "/ %u during)\n",
+                store_ok ? "ok" : "MISMATCH",
+                colormap_ok ? "ok" : "MISMATCH",
+                probe_ok ? "ok" : "MISMATCH",
+                samplers_ok ? "ok" : "WRONG",
+                samplers[0], samplers[1], samplers[2],
+                samplers[3], samplers[4], samplers[5],
+                probe_read[0], g_verify_probe_texel,
+                probe_read[2], g_verify_first_texel,
+                probe_read[3], g_verify_last_texel,
+                probe_read[1], expected_colormap,
+                pre_errors, post_errors);
+    g_verify_last_status = status;
 }
 
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
@@ -1108,6 +1328,20 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     g_gl.disable(GL_BLEND);
     g_gl.use_program(g_geometry_program);
     hwr_bind_scene_textures();
+    /* Sampler assignments have been observed to come up lost on some runs
+     * (every lookup then lands on unit 0 and the world renders black);
+     * re-asserting them each frame costs nothing and heals that state. */
+    hwr_set_sampler(g_geometry_program, "u_texels", 0);
+    hwr_set_sampler(g_geometry_program, "u_colormap", 1);
+    hwr_set_sampler(g_geometry_program, "u_tint", 2);
+    hwr_set_sampler(g_geometry_program, "u_glow", 3);
+    hwr_set_sampler(g_geometry_program, "u_blend", 4);
+    hwr_set_sampler(g_geometry_program, "u_dst", 5);
+    if (g_debug_vis < 0) {
+        const char *vis = getenv("HWR_SHADE_VIS");
+        g_debug_vis = vis != NULL && vis[0] == '1' ? 1 : 0;
+    }
+    hwr_uniform_1i(g_geometry_program, "u_debug_vis", g_debug_vis);
     hwr_uniform_2i(g_geometry_program, "u_view_offset",
                    camera->view_offset_x, camera->view_offset_y);
     hwr_uniform_1i(g_geometry_program, "u_eye_z", camera->eye_z);
@@ -1118,6 +1352,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
     hwr_uniform_2f(g_geometry_program, "u_center",
                    (GLfloat)camera->center_x, (GLfloat)camera->horizon);
+    hwr_uniform_2i(g_geometry_program, "u_shade_origin",
+                   camera->shade_origin_x, camera->shade_origin_y);
     hwr_uniform_2f(g_geometry_program, "u_viewport", (GLfloat)width, (GLfloat)height);
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
@@ -1152,6 +1388,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.disable(GL_DEPTH_TEST);
     g_gl.use_program(g_resolve_program);
+    hwr_uniform_1i(g_resolve_program, "u_debug_vis", g_debug_vis);
     g_gl.bind_vertex_array(g_resolve_vao);
     g_gl.active_texture(GL_TEXTURE0);
     g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
@@ -1160,6 +1397,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
+    g_render_count++;
+    if (g_verify_pending || (g_render_count & 1023u) == 0u) {
+        int first_run = g_verify_pending;
+        g_verify_pending = 0;
+        hwr_gl_scene_self_test(first_run);
+    }
     return g_pixels;
 }
 

@@ -18,7 +18,9 @@ struct hwr_gl_vertex {
     int16_t x;
     int16_t y;
     int16_t z;
-    int16_t reserved;
+    /* Packed wall endpoint: shade row in the high byte and interpolation
+     * fraction in the low byte. It is zero for non-wall geometry. */
+    uint16_t wall_shade_endpoint;
     float wall_s;
     float wall_top;
     uint32_t texture_offset;
@@ -45,6 +47,8 @@ struct hwr_gl_camera {
     uint16_t focal_y;
     int32_t center_x;
     int32_t horizon;
+    int16_t shade_origin_x;
+    int16_t shade_origin_y;
     uint8_t shade_level;
     uint8_t tint_shade_level;
     uint8_t global_light_bias;
