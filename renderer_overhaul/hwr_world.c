@@ -1,6 +1,7 @@
 #include "hwr_world.h"
 
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -322,6 +323,38 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     }
     next.world_span_colorkey = api->game_ram->u16(VA_G_WORLD_SPAN_COLORKEY);
     next.valid = 1;
+    /* Development aid: HWR_WORLD_DUMP=<path> writes the parsed geometry as
+     * text (sectors, then walls with endpoint coordinates) for offline
+     * inspection. */
+    {
+        const char *dump = getenv("HWR_WORLD_DUMP");
+        if (dump != NULL && dump[0] != 0) {
+            FILE *f = fopen(dump, "w");
+            if (f != NULL) {
+                size_t n;
+                for (n = 0; n < next.sector_count; n++) {
+                    const struct hwr_sector *s = &next.sectors[n];
+                    fprintf(f, "sector %zu off=%#x floor=%d ceil=%d flags=%#x light=%u walls=%zu+%u\n",
+                            n, s->section_offset, s->floor_z, s->ceiling_z,
+                            s->flags, s->light, s->first_wall, s->wall_count);
+                }
+                for (n = 0; n < next.wall_count; n++) {
+                    const struct hwr_wall *w = &next.walls[n];
+                    const struct hwr_vertex *a = &next.vertices[w->vertex_a_index];
+                    const struct hwr_vertex *b = &next.vertices[w->vertex_b_index];
+                    fprintf(f, "wall %zu sec=%zu nbr=%ld va=%zu(%d,%d) vb=%zu(%d,%d) mid=%u up=%u low=%u ext=%d mf=%#x scale=%#x\n",
+                            n, w->sector_index,
+                            w->neighbor_sector_offset == UINT16_MAX
+                                ? -1L : (long)w->neighbor_sector_index,
+                            w->vertex_a_index, a->world_x, a->world_y,
+                            w->vertex_b_index, b->world_x, b->world_y,
+                            w->middle_id, w->upper_id, w->lower_id,
+                            w->extent, w->mapping_flags, w->scale);
+                }
+                fclose(f);
+            }
+        }
+    }
     hwr_world_clear(world);
     *world = next;
     return 0;
