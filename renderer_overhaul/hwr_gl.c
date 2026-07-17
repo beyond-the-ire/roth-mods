@@ -659,14 +659,17 @@ static const char g_geometry_fragment_shader[] =
      * accumulator. The pan remains after integer S truncation and before
      * the engine's unsigned coordinate halving. */
     "    float wall_s=v_wall.x-0.5*dFdx(v_wall.x);\n"
-    "    int base=(int(floor(wall_s))+int(v_pan_scale_flags.x)*2) >> 1;\n"
-    "    if ((flags & 32u)!=0u) base=(h-1)-base;\n"
-    "    iy=base & (h-1);\n"
+    "    int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
+    "    if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
+    /* Non-power-of-two wall classes stage 0xffff: the AND is an identity,
+     * so their 16-bit coordinate is deliberately not texture-wrapped. */
+    "    iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base;\n"
     /* Like S, the vertical mapper fetches before advancing its fixed-point
      * accumulator. v_wall.y is the CPU-selected stored-extent or texture-fit
      * coordinate, including flag-0x20 scaling where that class uses it. */
     "    float wall_v=v_wall.y-0.5*dFdy(v_wall.y);\n"
-    "    ix=((int(floor(wall_v)) >> 1)+int(v_pan_scale_flags.y)) & (w-1);\n"
+    "    int vertical=(((int(floor(wall_v)) & 65535) >> 1)+int(v_pan_scale_flags.y)) & 65535;\n"
+    "    ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical;\n"
     "  }\n"
     "  return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "}\n"

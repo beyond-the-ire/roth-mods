@@ -14,6 +14,11 @@ enum hwr_gl_material_flags {
     HWR_GL_MATERIAL_HFLIP       = 1u << 5
 };
 
+enum hwr_gl_wall_wrap_flags {
+    HWR_GL_WALL_WRAP_ALONG    = 1u << 0,
+    HWR_GL_WALL_WRAP_VERTICAL = 1u << 1
+};
+
 struct hwr_gl_vertex {
     int16_t x;
     int16_t y;
@@ -34,7 +39,9 @@ struct hwr_gl_vertex {
     uint8_t light;
     uint8_t material_flags;
     uint8_t direct_index;
-    uint8_t reserved2;
+    /* The original wall driver selects masked or linear sampling separately
+     * for the along-wall and vertical texture axes. */
+    uint8_t wall_wrap_flags;
 };
 
 struct hwr_gl_camera {

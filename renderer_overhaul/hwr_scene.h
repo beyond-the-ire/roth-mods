@@ -30,6 +30,12 @@ enum hwr_surface_flags {
     HWR_SURFACE_TRANSLUCENT  = 1u << 5
 };
 
+enum hwr_wall_corner_role {
+    HWR_WALL_CORNER_NONE   = 0,
+    HWR_WALL_CORNER_END_B  = 1u << 0,
+    HWR_WALL_CORNER_BOTTOM = 1u << 1
+};
+
 struct hwr_mesh_vertex {
     int16_t x;
     int16_t y;

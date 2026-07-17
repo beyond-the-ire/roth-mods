@@ -241,6 +241,12 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     hwr_set_vertex(&v[3], a->world_x, a->world_y, top_a, sa, (float)top_a);
     hwr_set_vertex(&v[4], b->world_x, b->world_y, bottom_b, sb, (float)top_b);
     hwr_set_vertex(&v[5], b->world_x, b->world_y, top_b, sb, (float)top_b);
+    v[0].reserved = HWR_WALL_CORNER_NONE;
+    v[1].reserved = HWR_WALL_CORNER_BOTTOM;
+    v[2].reserved = HWR_WALL_CORNER_END_B | HWR_WALL_CORNER_BOTTOM;
+    v[3].reserved = HWR_WALL_CORNER_NONE;
+    v[4].reserved = HWR_WALL_CORNER_END_B | HWR_WALL_CORNER_BOTTOM;
+    v[5].reserved = HWR_WALL_CORNER_END_B;
     mesh->vertex_count += 6;
     return 0;
 }
@@ -1082,30 +1088,35 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
             const struct hwr_mesh_vertex *wall_vertices =
                 &scene->mesh.vertices[surface->first_vertex];
+            int end_b = (source->reserved & HWR_WALL_CORNER_END_B) != 0;
             int16_t bottom_z = source->z;
             int fit_texture = (surface->mapping_flags & 4u) != 0 &&
                               texture_width != 0 && texture_height != 0;
+            int wrap_along = texture_height != 0 &&
+                (texture_height & (uint16_t)(texture_height - 1u)) == 0;
+            int wrap_vertical = texture_width != 0 &&
+                (texture_width & (uint16_t)(texture_width - 1u)) == 0;
             size_t j;
             for (j = 0; j < surface->vertex_count; j++) {
-                if (wall_vertices[j].x == source->x &&
-                    wall_vertices[j].y == source->y &&
-                    wall_vertices[j].z < bottom_z)
+                int candidate_end_b =
+                    (wall_vertices[j].reserved & HWR_WALL_CORNER_END_B) != 0;
+                if (candidate_end_b == end_b &&
+                    (wall_vertices[j].reserved & HWR_WALL_CORNER_BOTTOM) != 0)
                     bottom_z = wall_vertices[j].z;
             }
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height);
             if (fit_texture) {
-                unsigned scale_u = surface->scale & 0x0fu;
-                unsigned scale_v = surface->scale >> 4;
+                unsigned scale_u = wrap_along ? surface->scale & 0x0fu : 0u;
+                unsigned scale_v = wrap_vertical ? surface->scale >> 4 : 0u;
                 float along_extent = 2.0f * (float)texture_height *
                     (float)(scale_u != 0 ? scale_u + 1u : 1u);
                 float vertical_extent = 2.0f * (float)texture_width *
                     (float)(scale_v != 0 ? scale_v + 1u : 1u);
-                target->wall_s = source->x == wall_vertices[0].x &&
-                                 source->y == wall_vertices[0].y
-                    ? 0.0f : along_extent;
-                target->wall_top = source->z == source->wall_top
-                    ? 0.0f : vertical_extent;
+                target->wall_s = end_b ? along_extent : 0.0f;
+                target->wall_top =
+                    (source->reserved & HWR_WALL_CORNER_BOTTOM) != 0
+                    ? vertical_extent : 0.0f;
             } else {
                 target->wall_s = source->wall_s;
                 target->wall_top = (float)(source->wall_top - source->z) *
@@ -1113,6 +1124,10 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             }
             target->pan_u = fit_texture ? 0 : surface->pan_u;
             target->pan_v = fit_texture ? 0 : surface->pan_v;
+            if (wrap_along)
+                target->wall_wrap_flags |= HWR_GL_WALL_WRAP_ALONG;
+            if (wrap_vertical)
+                target->wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
         } else {
             target->wall_s = source->wall_s;
             target->wall_top = source->wall_top;
