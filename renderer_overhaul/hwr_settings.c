@@ -64,6 +64,15 @@ void hwr_settings_set_enabled(int enabled)
     }
 }
 
+void hwr_settings_set_debug(int debug)
+{
+    debug = debug != 0;
+    if (g_settings.debug != debug) {
+        g_settings.debug = debug;
+        g_dirty |= HWR_CHANGE_DEBUG;
+    }
+}
+
 void hwr_settings_set_solid_color(uint32_t color)
 {
     color &= 0x00ffffffu;

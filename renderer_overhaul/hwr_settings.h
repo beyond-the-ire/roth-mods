@@ -27,6 +27,7 @@ enum hwr_render_mode {
 
 struct hwr_settings {
     int enabled;
+    int debug;
     uint32_t solid_color;
     uint32_t internal_w;
     uint32_t internal_h;
@@ -50,7 +51,8 @@ enum hwr_settings_change {
     HWR_CHANGE_FOV              = 1u << 6,
     HWR_CHANGE_PITCH_MODE       = 1u << 7,
     HWR_CHANGE_RENDER_MODE      = 1u << 8,
-    HWR_CHANGE_ALL              = (1u << 9) - 1u
+    HWR_CHANGE_DEBUG            = 1u << 9,
+    HWR_CHANGE_ALL              = (1u << 10) - 1u
 };
 
 typedef void (*hwr_settings_apply_fn)(uint32_t mask,
@@ -63,6 +65,7 @@ int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata);
 void hwr_settings_apply_pending(void);
 
 void hwr_settings_set_enabled(int enabled);
+void hwr_settings_set_debug(int debug);
 void hwr_settings_set_solid_color(uint32_t color);
 void hwr_settings_set_internal_size(uint32_t width, uint32_t height);
 void hwr_settings_set_window_mode(enum hwr_window_mode mode);

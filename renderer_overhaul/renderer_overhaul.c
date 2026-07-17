@@ -1,7 +1,9 @@
 #include "roth_sdk.h"
 
 #include "hwr_gl.h"
+#include "hwr_das.h"
 #include "hwr_settings.h"
+#include "hwr_world.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -9,6 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
 
 #define VA_G_SCREEN_PITCH              0x85498u
 #define VA_G_SCREEN_HEIGHT             0x854a0u
@@ -19,6 +27,8 @@
 #define VA_G_RENDER_HEIGHT             0x90bf6u
 #define VA_G_VIEW_SCALE_FLAGS          0x90bd4u
 #define VA_G_LINE_DOUBLING_FLAG        0x90cbdu
+#define VA_G_MAP_DAS_NAME              0x7023cu
+#define VA_G_SHARED_DAS_NAME           0x702dcu
 
 struct hwr_viewport {
     int32_t x;
@@ -65,6 +75,11 @@ static int g_missing_window_logged;
 static int g_viewport_error_logged;
 static int g_sentinel_error_logged;
 static int g_submit_error_logged;
+static int g_debug_enabled;
+static char g_plugin_dir[2600];
+static struct hwr_world g_world;
+static struct hwr_das_archive g_map_archive;
+static struct hwr_das_archive g_shared_archive;
 
 static int hwr_ascii_equal_ci(const char *a, const char *b)
 {
@@ -145,6 +160,10 @@ static int hwr_apply_config_value(const char *key, const char *value)
         if (!hwr_parse_bool(value, &boolean))
             return 0;
         hwr_settings_set_enabled(boolean);
+    } else if (hwr_ascii_equal_ci(key, "debug")) {
+        if (!hwr_parse_bool(value, &boolean))
+            return 0;
+        hwr_settings_set_debug(boolean);
     } else if (hwr_ascii_equal_ci(key, "solid_color")) {
         if (!hwr_parse_u32(value, 16, 0x00ffffffu, &number))
             return 0;
@@ -266,6 +285,139 @@ static void hwr_render_settings_apply(uint32_t mask,
         g_render_settings.internal_w = settings->internal_w;
         g_render_settings.internal_h = settings->internal_h;
     }
+}
+
+static void hwr_data_settings_apply(uint32_t mask,
+                                    const struct hwr_settings *settings,
+                                    void *userdata)
+{
+    (void)userdata;
+    if ((mask & HWR_CHANGE_DEBUG) != 0)
+        g_debug_enabled = settings->debug;
+}
+
+static void hwr_map_data_clear(void)
+{
+    hwr_world_clear(&g_world);
+    hwr_das_close(&g_map_archive);
+    hwr_das_close(&g_shared_archive);
+}
+
+static int hwr_read_archive_basename(const struct roth_api_v1 *api,
+                                     uint32_t address, char name[81])
+{
+    char *base;
+    char *cursor;
+    if (api->game_ram->read_block(address, name, 80) != 0)
+        return -1;
+    name[80] = 0;
+    base = name;
+    for (cursor = name; *cursor != 0; cursor++) {
+        if (*cursor == '/' || *cursor == '\\' || *cursor == ':')
+            base = cursor + 1;
+    }
+    if (*base == 0)
+        return -1;
+    if (base != name)
+        memmove(name, base, strlen(base) + 1u);
+    return 0;
+}
+
+static int hwr_parent_path(char *path)
+{
+    char *cursor;
+    char *last = NULL;
+    size_t length = strlen(path);
+    while (length != 0 && (path[length - 1] == '/' || path[length - 1] == '\\'))
+        path[--length] = 0;
+    for (cursor = path; *cursor != 0; cursor++) {
+        if (*cursor == '/' || *cursor == '\\')
+            last = cursor;
+    }
+    if (last == NULL)
+        return -1;
+    *last = 0;
+    return 0;
+}
+
+static int hwr_path_join(char *destination, size_t capacity,
+                         const char *left, const char *right)
+{
+    int result = snprintf(destination, capacity, "%s/%s", left, right);
+    return result >= 0 && (size_t)result < capacity ? 0 : -1;
+}
+
+static int hwr_regular_file_exists(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+        return 0;
+    fclose(file);
+    return 1;
+}
+
+static int hwr_find_archive_path(const char *root, const char *name,
+                                 char *path, size_t capacity)
+{
+    char directory[2600];
+    if (hwr_path_join(directory, sizeof directory, root, "M") != 0 ||
+        hwr_path_join(path, capacity, directory, name) != 0)
+        return -1;
+    if (hwr_regular_file_exists(path))
+        return 0;
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATAA data;
+        HANDLE search;
+        char pattern[2600];
+        if (hwr_path_join(pattern, sizeof pattern, directory, "*") != 0)
+            return -1;
+        search = FindFirstFileA(pattern, &data);
+        if (search == INVALID_HANDLE_VALUE)
+            return -1;
+        do {
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                hwr_ascii_equal_ci(data.cFileName, name)) {
+                int result = hwr_path_join(path, capacity, directory, data.cFileName);
+                FindClose(search);
+                return result;
+            }
+        } while (FindNextFileA(search, &data));
+        FindClose(search);
+    }
+#else
+    {
+        DIR *stream = opendir(directory);
+        struct dirent *entry;
+        if (stream == NULL)
+            return -1;
+        while ((entry = readdir(stream)) != NULL) {
+            if (hwr_ascii_equal_ci(entry->d_name, name)) {
+                int result = hwr_path_join(path, capacity, directory, entry->d_name);
+                closedir(stream);
+                return result;
+            }
+        }
+        closedir(stream);
+    }
+#endif
+    return -1;
+}
+
+static void hwr_print_das_summary(const char *label,
+                                  const struct hwr_das_archive *archive,
+                                  const struct hwr_das_census *census)
+{
+    fprintf(stderr,
+            "  %s DAS: entries=%u plain=%u animated=%u space=%u dollar=%u other=%u decoded=%u frames=%u failures=%u\n",
+            label, (unsigned)archive->entry_count,
+            (unsigned)census->classes[HWR_DAS_CLASS_PLAIN],
+            (unsigned)census->classes[HWR_DAS_CLASS_ANIMATED],
+            (unsigned)census->classes[HWR_DAS_CLASS_PLACEHOLDER_SPACE],
+            (unsigned)census->classes[HWR_DAS_CLASS_PLACEHOLDER_DOLLAR],
+            (unsigned)census->classes[HWR_DAS_CLASS_OTHER],
+            (unsigned)census->decoded_textures,
+            (unsigned)census->animation_frames, (unsigned)census->failures);
 }
 
 static void hwr_gl_settings_apply(uint32_t mask,
@@ -642,9 +794,15 @@ static void ROTH_CDECL hwr_render_world_sprite(struct roth_chain *chain,
 
 static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
 {
+    const char *plugin_dir;
     g_api = api;
+    plugin_dir = api->plugin_dir();
+    if (plugin_dir == NULL)
+        plugin_dir = "";
+    snprintf(g_plugin_dir, sizeof g_plugin_dir, "%s", plugin_dir);
     hwr_settings_init_defaults();
     if (hwr_settings_register_apply(hwr_render_settings_apply, NULL) != 0 ||
+        hwr_settings_register_apply(hwr_data_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_gl_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_window_settings_apply, NULL) != 0)
         fprintf(stderr, "[renderer_overhaul] settings apply-hook registration failed\n");
@@ -690,13 +848,79 @@ static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
 static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
                                           const struct roth_map_event_v1 *event)
 {
-    static int logged;
-    if (!logged) {
-        fprintf(stderr, "[renderer_overhaul] map loaded (gen=%u): world frame withdrawn until the next render\n",
-                event->generation);
-        logged = 1;
-    }
+    struct hwr_das_census map_census;
+    struct hwr_das_census shared_census;
+    char map_name[81];
+    char shared_name[81];
+    char root[2600];
+    char map_path[2600];
+    char shared_path[2600];
+    char failure[256];
+
     hwr_withdraw_if_owned(api);
+    hwr_settings_apply_pending();
+    hwr_map_data_clear();
+    failure[0] = 0;
+    if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
+        hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
+        snprintf(failure, sizeof failure, "archive name is unavailable");
+        goto failed;
+    }
+    if (g_plugin_dir[0] == 0) {
+        snprintf(failure, sizeof failure, "plugin directory was not captured");
+        goto failed;
+    }
+    snprintf(root, sizeof root, "%s", g_plugin_dir);
+    if (hwr_parent_path(root) != 0 || hwr_parent_path(root) != 0) {
+        snprintf(failure, sizeof failure, "plugin directory has no game-root parent");
+        goto failed;
+    }
+    if (hwr_find_archive_path(root, map_name, map_path, sizeof map_path) != 0 ||
+        hwr_find_archive_path(root, shared_name, shared_path, sizeof shared_path) != 0) {
+        snprintf(failure, sizeof failure, "cannot resolve DAS files '%s' and '%s'", map_name,
+                 shared_name);
+        goto failed;
+    }
+    if (hwr_das_open(&g_map_archive, map_path) != 0) {
+        snprintf(failure, sizeof failure, "map DAS: %.220s", hwr_das_error(&g_map_archive));
+        goto failed;
+    }
+    if (hwr_das_open(&g_shared_archive, shared_path) != 0) {
+        snprintf(failure, sizeof failure, "shared DAS: %.217s",
+                 hwr_das_error(&g_shared_archive));
+        goto failed;
+    }
+    hwr_das_build_census(&g_map_archive, &map_census);
+    hwr_das_build_census(&g_shared_archive, &shared_census);
+    if (map_census.failures != 0 || shared_census.failures != 0) {
+        snprintf(failure, sizeof failure, "DAS decode failures: map=%u shared=%u",
+                 (unsigned)map_census.failures, (unsigned)shared_census.failures);
+        goto failed;
+    }
+    if (hwr_world_snapshot(&g_world, api) != 0) {
+        snprintf(failure, sizeof failure, "geometry: %.220s", hwr_world_error(&g_world));
+        goto failed;
+    }
+    if (hwr_world_snapshot_luts(&g_world, api) != 0) {
+        snprintf(failure, sizeof failure, "color tables: %.216s", hwr_world_error(&g_world));
+        goto failed;
+    }
+    if (g_debug_enabled) {
+        fprintf(stderr, "[renderer_overhaul] map data (gen=%u map=%s shared=%s)\n",
+                event->generation, map_name, shared_name);
+        hwr_world_summary(&g_world, stderr);
+        hwr_print_das_summary("map", &g_map_archive, &map_census);
+        hwr_print_das_summary("shared", &g_shared_archive, &shared_census);
+        fprintf(stderr, "  color tables: palette=768 colormap=8192 tint=8192 glow=512 blend=65536 damage=%u shade=%u/%u\n",
+                g_world.luts.damage_flash_level, g_world.luts.shade_level,
+                g_world.luts.tint_shade_level);
+    }
+    return;
+
+failed:
+    fprintf(stderr, "[renderer_overhaul] map data unavailable (gen=%u): %s\n",
+            event->generation, failure);
+    hwr_map_data_clear();
 }
 
 static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
@@ -714,9 +938,11 @@ static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
 static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
     hwr_withdraw_if_owned(api);
+    hwr_map_data_clear();
     hwr_gl_shutdown();
     g_channel_api = NULL;
     g_api = NULL;
+    g_plugin_dir[0] = 0;
 }
 
 static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,

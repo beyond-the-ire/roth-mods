@@ -19,6 +19,7 @@ Edit `renderer_overhaul.cfg` using `key=value` lines. Keys are case-insensitive 
 comment.
 
 - `enabled`: `1` or `0`. When disabled, every rendering call passes through unchanged.
+- `debug`: `1` prints map geometry and texture archive statistics; `0` keeps them quiet.
 - `solid_color`: the world color as six hexadecimal `RRGGBB` digits.
 - `internal_w`, `internal_h`: offscreen render dimensions. Zero follows the current world
   viewport for that dimension.
