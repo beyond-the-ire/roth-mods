@@ -44,31 +44,25 @@ static int hwr_section_fits(uint16_t offset, uint32_t size, uint32_t extent)
     return (uint32_t)offset <= extent && size <= extent - (uint32_t)offset;
 }
 
-static int hwr_resolve_pointer_global(const struct roth_api_v1 *api,
-                                      uint32_t pointer_global, uint32_t extent,
-                                      uint32_t *offset)
+/* The engine's map sections and colour tables are heap allocations that sit
+ * outside the plugin accessor window, so the bounded accessors cannot reach
+ * them. The engine stores their real addresses in pointer globals (which ARE
+ * inside the window); the plugin shares the process address space and reads
+ * the published regions directly, exactly like the framebuffer pointer. */
+static const uint8_t *hwr_stored_pointer(const struct roth_api_v1 *api,
+                                         uint32_t pointer_global)
 {
-    uintptr_t arena = (uintptr_t)api->game_ram->to_ptr(0);
     uintptr_t stored = (uintptr_t)api->game_ram->u32(pointer_global);
-    uint32_t size = api->game_ram->size();
-    uintptr_t delta;
-    if (arena == 0 || stored < arena)
-        return -1;
-    delta = stored - arena;
-    if (delta > UINT32_MAX || (uint32_t)delta >= size ||
-        extent > size - (uint32_t)delta)
-        return -1;
-    *offset = (uint32_t)delta;
-    return 0;
+    return stored >= 0x1000u ? (const uint8_t *)stored : NULL;
 }
 
-static int hwr_section_read(const struct roth_api_v1 *api, uint32_t base,
-                            uint32_t extent, uint16_t offset,
-                            void *destination, uint32_t size)
+static int hwr_section_read(const uint8_t *section, uint32_t extent,
+                            uint16_t offset, void *destination, uint32_t size)
 {
-    if (!hwr_section_fits(offset, size, extent))
+    if (section == NULL || !hwr_section_fits(offset, size, extent))
         return -1;
-    return api->game_ram->read_block(base + offset, destination, size);
+    memcpy(destination, section + offset, size);
+    return 0;
 }
 
 static void hwr_parse_sector(struct hwr_sector *sector)
@@ -135,9 +129,8 @@ void hwr_world_clear(struct hwr_world *world)
 int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
 {
     struct hwr_world next;
-    uint32_t ram_size;
-    uint32_t sector_extent;
-    uint32_t vertex_extent;
+    uint32_t sector_extent = HWR_SECTION_EXTENT;
+    uint32_t vertex_extent = HWR_SECTION_EXTENT;
     uint16_t first_sector;
     uint16_t first_vertex;
     uint16_t count16;
@@ -152,27 +145,19 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
         return -1;
     hwr_world_clear(world);
     memset(&next, 0, sizeof next);
-    ram_size = api->game_ram->size();
-    if (hwr_resolve_pointer_global(api, VA_G_MAP_GEOMETRY_BUFFER, 6,
-                                   &next.sector_section_base) != 0 ||
-        hwr_resolve_pointer_global(api, VA_G_VERTEX_GEOMETRY_BASE, 4,
-                                   &next.vertex_section_base) != 0)
-        return hwr_world_fail(world, "geometry section pointer is outside game memory");
-    sector_extent = ram_size - next.sector_section_base;
-    vertex_extent = ram_size - next.vertex_section_base;
-    if (sector_extent > HWR_SECTION_EXTENT)
-        sector_extent = HWR_SECTION_EXTENT;
-    if (vertex_extent > HWR_SECTION_EXTENT)
-        vertex_extent = HWR_SECTION_EXTENT;
+    next.sector_section = hwr_stored_pointer(api, VA_G_MAP_GEOMETRY_BUFFER);
+    next.vertex_section = hwr_stored_pointer(api, VA_G_VERTEX_GEOMETRY_BASE);
+    if (next.sector_section == NULL || next.vertex_section == NULL)
+        return hwr_world_fail(world, "geometry sections are not staged");
 
-    if (hwr_section_read(api, next.sector_section_base, sector_extent, 4,
+    if (hwr_section_read(next.sector_section, sector_extent, 4,
                          header_word, sizeof header_word) != 0) {
         hwr_world_clear(&next);
         return hwr_world_fail(world, "cannot read sector array offset");
     }
     first_sector = hwr_u16(header_word);
     if (first_sector < 2 ||
-        hwr_section_read(api, next.sector_section_base, sector_extent,
+        hwr_section_read(next.sector_section, sector_extent,
                          (uint16_t)(first_sector - 2u), &count16, 2) != 0) {
         hwr_world_clear(&next);
         return hwr_world_fail(world, "sector array header is invalid");
@@ -196,7 +181,7 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
         uint32_t offset32 = (uint32_t)first_sector + (uint32_t)i * 0x1au;
         sector->section_offset = (uint16_t)offset32;
         sector->slab_index = SIZE_MAX;
-        if (hwr_section_read(api, next.sector_section_base, sector_extent,
+        if (hwr_section_read(next.sector_section, sector_extent,
                              sector->section_offset, sector->raw, sizeof sector->raw) != 0) {
             hwr_world_clear(&next);
             return hwr_world_fail(world, "sector %u cannot be read", (unsigned)i);
@@ -219,14 +204,14 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
         }
     }
 
-    if (hwr_section_read(api, next.vertex_section_base, vertex_extent, 2,
+    if (hwr_section_read(next.vertex_section, vertex_extent, 2,
                          header_word, 2) != 0) {
         hwr_world_clear(&next);
         return hwr_world_fail(world, "cannot read vertex array offset");
     }
     first_vertex = hwr_u16(header_word);
     if (first_vertex < 2 ||
-        hwr_section_read(api, next.vertex_section_base, vertex_extent,
+        hwr_section_read(next.vertex_section, vertex_extent,
                          (uint16_t)(first_vertex - 2u), &count16, 2) != 0) {
         hwr_world_clear(&next);
         return hwr_world_fail(world, "vertex array header is invalid");
@@ -255,7 +240,7 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     for (i = 0; i < next.vertex_count; i++) {
         struct hwr_vertex *vertex = &next.vertices[i];
         vertex->section_offset = (uint16_t)((uint32_t)first_vertex + (uint32_t)i * 0x0cu);
-        if (hwr_section_read(api, next.vertex_section_base, vertex_extent,
+        if (hwr_section_read(next.vertex_section, vertex_extent,
                              vertex->section_offset, vertex->raw, sizeof vertex->raw) != 0) {
             hwr_world_clear(&next);
             return hwr_world_fail(world, "vertex %u cannot be read", (unsigned)i);
@@ -273,7 +258,7 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
         if (sector->slab_offset != 0) {
             struct hwr_slab *slab = &next.slabs[slab_index];
             slab->section_offset = sector->slab_offset;
-            if (hwr_section_read(api, next.sector_section_base, sector_extent,
+            if (hwr_section_read(next.sector_section, sector_extent,
                                  slab->section_offset, slab->raw, sizeof slab->raw) != 0) {
                 hwr_world_clear(&next);
                 return hwr_world_fail(world, "sector %u slab cannot be read", (unsigned)i);
@@ -290,13 +275,13 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
                                               (uint32_t)j * 0x0cu);
             wall->sector_index = i;
             wall->neighbor_sector_index = SIZE_MAX;
-            if (hwr_section_read(api, next.sector_section_base, sector_extent,
+            if (hwr_section_read(next.sector_section, sector_extent,
                                  wall->section_offset, wall->raw, sizeof wall->raw) != 0) {
                 hwr_world_clear(&next);
                 return hwr_world_fail(world, "wall %u cannot be read", (unsigned)wall_index);
             }
             wall->mapping_offset = hwr_u16(wall->raw + 4);
-            if (hwr_section_read(api, next.sector_section_base, sector_extent,
+            if (hwr_section_read(next.sector_section, sector_extent,
                                  wall->mapping_offset, wall->mapping_raw,
                                  sizeof wall->mapping_raw) != 0) {
                 hwr_world_clear(&next);
@@ -320,8 +305,8 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
                     hwr_world_clear(&next);
                     return hwr_world_fail(world, "wall %u has an invalid portal link", (unsigned)wall_index);
                 }
-                neighbor = api->game_ram->u16(next.sector_section_base +
-                                              wall->portal_link_offset + 6u);
+                neighbor = hwr_u16(next.sector_section +
+                                   wall->portal_link_offset + 6u);
                 wall->neighbor_sector_offset = neighbor;
                 if (next.sector_offset_to_index[neighbor] == HWR_NO_INDEX) {
                     hwr_world_clear(&next);
@@ -344,44 +329,37 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
 int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
 {
     size_t i;
-    uint8_t mutable_sector[4];
-    uint8_t bytes[4];
     if (world == NULL || !world->valid || api == NULL || api->game_ram == NULL)
         return -1;
+    /* A map change replaces the sections; a stale snapshot must fail closed
+     * instead of reading through a dangling pointer. */
+    if (hwr_stored_pointer(api, VA_G_MAP_GEOMETRY_BUFFER) != world->sector_section ||
+        hwr_stored_pointer(api, VA_G_VERTEX_GEOMETRY_BASE) != world->vertex_section)
+        return hwr_world_fail(world, "geometry sections moved since the snapshot");
     for (i = 0; i < world->sector_count; i++) {
         struct hwr_sector *sector = &world->sectors[i];
-        if (api->game_ram->read_block(world->sector_section_base + sector->section_offset,
-                                      mutable_sector, sizeof mutable_sector) != 0 ||
-            api->game_ram->read_block(world->sector_section_base + sector->section_offset + 0x0au,
-                                      bytes, 2) != 0)
-            return hwr_world_fail(world, "sector refresh failed at index %u", (unsigned)i);
-        memcpy(sector->raw, mutable_sector, 4);
-        memcpy(sector->raw + 0x0a, bytes, 2);
-        sector->ceiling_z = hwr_i16(mutable_sector);
-        sector->floor_z = hwr_i16(mutable_sector + 2);
-        sector->flags = bytes[0];
-        sector->light = bytes[1];
+        const uint8_t *record = world->sector_section + sector->section_offset;
+        memcpy(sector->raw, record, 4);
+        memcpy(sector->raw + 0x0a, record + 0x0a, 2);
+        sector->ceiling_z = hwr_i16(sector->raw);
+        sector->floor_z = hwr_i16(sector->raw + 2);
+        sector->flags = sector->raw[0x0a];
+        sector->light = sector->raw[0x0b];
     }
     for (i = 0; i < world->slab_count; i++) {
         struct hwr_slab *slab = &world->slabs[i];
-        if (api->game_ram->read_block(world->sector_section_base + slab->section_offset + 2u,
-                                      bytes, 2) != 0 ||
-            api->game_ram->read_block(world->sector_section_base + slab->section_offset + 8u,
-                                      bytes + 2, 2) != 0)
-            return hwr_world_fail(world, "slab refresh failed at index %u", (unsigned)i);
-        memcpy(slab->raw + 2, bytes, 2);
-        memcpy(slab->raw + 8, bytes + 2, 2);
-        slab->lower_z = hwr_i16(bytes);
-        slab->upper_z = hwr_i16(bytes + 2);
+        const uint8_t *record = world->sector_section + slab->section_offset;
+        memcpy(slab->raw + 2, record + 2, 2);
+        memcpy(slab->raw + 8, record + 8, 2);
+        slab->lower_z = hwr_i16(slab->raw + 2);
+        slab->upper_z = hwr_i16(slab->raw + 8);
     }
     for (i = 0; i < world->vertex_count; i++) {
         struct hwr_vertex *vertex = &world->vertices[i];
-        if (api->game_ram->read_block(world->vertex_section_base +
-                                      vertex->section_offset + 8u, bytes, 4) != 0)
-            return hwr_world_fail(world, "vertex refresh failed at index %u", (unsigned)i);
-        memcpy(vertex->raw + 8, bytes, 4);
-        vertex->world_x = hwr_i16(bytes);
-        vertex->world_y = hwr_i16(bytes + 2);
+        const uint8_t *record = world->vertex_section + vertex->section_offset;
+        memcpy(vertex->raw + 8, record + 8, 4);
+        vertex->world_x = hwr_i16(vertex->raw + 8);
+        vertex->world_y = hwr_i16(vertex->raw + 0x0a);
     }
     return 0;
 }
@@ -390,9 +368,11 @@ static int hwr_copy_pointer_region(const struct roth_api_v1 *api,
                                    uint32_t pointer_global, void *destination,
                                    uint32_t size)
 {
-    uint32_t offset;
-    return hwr_resolve_pointer_global(api, pointer_global, size, &offset) == 0
-        ? api->game_ram->read_block(offset, destination, size) : -1;
+    const uint8_t *region = hwr_stored_pointer(api, pointer_global);
+    if (region == NULL)
+        return -1;
+    memcpy(destination, region, size);
+    return 0;
 }
 
 int hwr_world_snapshot_luts(struct hwr_world *world, const struct roth_api_v1 *api)

@@ -91,8 +91,11 @@ struct hwr_world {
     size_t vertex_count;
     size_t slab_count;
     size_t portal_count;
-    uint32_t sector_section_base;
-    uint32_t vertex_section_base;
+    /* Map sections live in engine heap allocations outside the plugin accessor
+     * window; the engine publishes their addresses in globals, and the plugin
+     * shares the process address space, so they are read through these pointers. */
+    const uint8_t *sector_section;
+    const uint8_t *vertex_section;
     uint16_t first_vertex_offset;
     uint16_t world_span_colorkey;
     struct hwr_luts luts;
