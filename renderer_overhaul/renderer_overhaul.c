@@ -18,7 +18,6 @@
 #define VA_G_VIEW_BOUND_LEFT           0x9096au
 #define VA_G_VIEW_BOUND_BOTTOM         0x9096cu
 #define VA_G_VIEW_BOUND_TOP            0x9096eu
-#define VA_G_WORLD_RENDER_SUBPASS_KIND 0x90a48u
 #define VA_G_FRAMEBUFFER_PTR           0x90a98u
 #define VA_G_VIEW_SCALE_FLAGS          0x90bd4u
 #define VA_G_LINE_DOUBLING_FLAG        0x90cbdu
@@ -586,6 +585,11 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     }
 }
 
+/* Suppress every world-span leaf while inside our render wrap. Gating on the subpass byte alone
+ * is not enough: portal, mirror, and door edge surfaces (the secondary-surface pass) reach the
+ * wall driver with the subpass byte set non-zero, so a subpass-gated no-op lets those seam edges
+ * paint through. The interaction-cursor classify pass runs in a separate frame stage outside the
+ * wrap (suppress flag clear), so it still records its pick from the real leaf. */
 static void ROTH_CDECL hwr_draw_world_surface_spans(struct roth_chain *chain,
                                                      const struct roth_api_v1 *api,
                                                      uint32_t ecx_entry,
@@ -593,7 +597,8 @@ static void ROTH_CDECL hwr_draw_world_surface_spans(struct roth_chain *chain,
                                                      uint32_t es_base,
                                                      uint32_t fs_base)
 {
-    if (g_suppress_active && api->game_ram->u8(VA_G_WORLD_RENDER_SUBPASS_KIND) == 0)
+    (void)api;
+    if (g_suppress_active)
         return;
     roth_next_draw_world_surface_spans(chain, ecx_entry, gs_base, es_base, fs_base);
 }
@@ -607,7 +612,8 @@ static void ROTH_CDECL hwr_draw_scaled_sprite_spans(struct roth_chain *chain,
                                                      uint16_t es_sel,
                                                      uint16_t fs_sel)
 {
-    if (g_suppress_active && api->game_ram->u8(VA_G_WORLD_RENDER_SUBPASS_KIND) == 0)
+    (void)api;
+    if (g_suppress_active)
         return;
     roth_next_draw_scaled_sprite_spans(chain, esi, gs_base, es_base, fs_base,
                                        es_sel, fs_sel);
@@ -623,7 +629,8 @@ static void ROTH_CDECL hwr_draw_floorceil_surface(struct roth_chain *chain,
                                                    uint16_t es_sel,
                                                    uint16_t fs_sel)
 {
-    if (g_suppress_active && api->game_ram->u8(VA_G_WORLD_RENDER_SUBPASS_KIND) == 0)
+    (void)api;
+    if (g_suppress_active)
         return;
     roth_next_draw_floorceil_surface(chain, esi, gs_base, fs_base, es_fb_base,
                                      blend_base, es_sel, fs_sel);
@@ -636,7 +643,8 @@ static void ROTH_CDECL hwr_render_world_sprite(struct roth_chain *chain,
                                                 uint16_t fs,
                                                 uint16_t gs)
 {
-    if (g_suppress_active && api->game_ram->u8(VA_G_WORLD_RENDER_SUBPASS_KIND) == 0)
+    (void)api;
+    if (g_suppress_active)
         return;
     roth_next_render_world_sprite(chain, esi_record, es, fs, gs);
 }
