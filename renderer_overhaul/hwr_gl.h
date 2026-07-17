@@ -49,6 +49,7 @@ struct hwr_gl_camera {
     uint8_t tint_shade_level;
     uint8_t global_light_bias;
     uint8_t glow_phase;
+    float shade_depth_scale;
 };
 
 int hwr_gl_init(void);
@@ -69,5 +70,6 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
 void hwr_gl_scene_clear(void);
 void hwr_gl_shutdown(void);
 const char *hwr_gl_last_error(void);
+unsigned hwr_gl_drain_errors(void);
 
 #endif

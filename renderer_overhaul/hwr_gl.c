@@ -38,6 +38,7 @@
 #define GL_FRAMEBUFFER_COMPLETE 0x8cd5
 #endif
 
+typedef GLenum (APIENTRY *hwr_gl_get_error_fn)(void);
 typedef const GLubyte *(APIENTRY *hwr_gl_get_string_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_viewport_fn)(GLint, GLint, GLsizei, GLsizei);
 typedef void (APIENTRY *hwr_gl_clear_color_fn)(GLclampf, GLclampf, GLclampf, GLclampf);
@@ -73,6 +74,7 @@ typedef void (APIENTRY *hwr_gl_copy_tex_sub_image_2d_fn)(GLenum, GLint, GLint,
 typedef void (APIENTRY *hwr_gl_pixel_store_i_fn)(GLenum, GLint);
 
 struct hwr_gl_functions {
+    hwr_gl_get_error_fn get_error;
     hwr_gl_get_string_fn get_string;
     hwr_gl_viewport_fn viewport;
     hwr_gl_clear_color_fn clear_color;
@@ -464,6 +466,7 @@ static void hwr_platform_shutdown(void)
 
 static int hwr_load_gl_functions(void)
 {
+    HWR_LOAD_GL(get_error, hwr_gl_get_error_fn, "glGetError");
     HWR_LOAD_GL(get_string, hwr_gl_get_string_fn, "glGetString");
     HWR_LOAD_GL(viewport, hwr_gl_viewport_fn, "glViewport");
     HWR_LOAD_GL(clear_color, hwr_gl_clear_color_fn, "glClearColor");
@@ -584,6 +587,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_tint_shade_level;\n"
     "uniform int u_light_bias;\n"
     "uniform int u_glow_phase;\n"
+    "uniform float u_depth_scale;\n"
     "uniform int u_blend_pass;\n"
     "in vec3 v_world;\n"
     "in float v_depth_fixed;\n"
@@ -618,7 +622,7 @@ static const char g_geometry_fragment_shader[] =
     "  int axv=authored==0 ? -8 : light-128;\n"
     "  int bias=authored==0 ? 8 : 8+axv;\n"
     "  int scale=authored==0 ? 32 : 32-(max(axv+4,0) >> 2);\n"
-    "  int depth_term=int(max(abs(v_depth_fixed),0.0));\n"
+    "  int depth_term=int(max(abs(v_depth_fixed)*u_depth_scale,0.0));\n"
     "  int r=(depth_term >> shr)-bias; r=((r+32768) & 65535)-32768;\n"
     "  return clamp(r,0,min(scale,31));\n"
     "}\n"
@@ -1098,6 +1102,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
     hwr_uniform_1i(g_geometry_program, "u_glow_phase", camera->glow_phase);
+    {
+        GLint scale_location = g_gl.get_uniform_location(g_geometry_program, "u_depth_scale");
+        if (scale_location >= 0)
+            g_gl.uniform_1f(scale_location, camera->shade_depth_scale > 0.0f
+                                          ? camera->shade_depth_scale : 1.0f);
+    }
     blend_location = g_gl.get_uniform_location(g_geometry_program, "u_blend_pass");
     if (blend_location >= 0)
         g_gl.uniform_1i(blend_location, 0);
@@ -1159,6 +1169,18 @@ void hwr_gl_shutdown(void)
     g_pixels_bytes = 0;
     g_initialized = 0;
     memset(&g_gl, 0, sizeof g_gl);
+}
+
+/* Drains and counts pending driver errors; used to verify the one-time scene
+ * uploads actually took (a silent upload failure leaves lookup tables empty). */
+unsigned hwr_gl_drain_errors(void)
+{
+    unsigned count = 0;
+    if (!g_initialized || g_gl.get_error == NULL)
+        return 0;
+    while (g_gl.get_error() != 0 && count < 32u)
+        count++;
+    return count;
 }
 
 const char *hwr_gl_last_error(void)

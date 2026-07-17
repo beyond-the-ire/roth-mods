@@ -1,5 +1,7 @@
 #include "hwr_scene.h"
 
+#include "hwr_settings.h"
+
 #include "hwr_gl.h"
 
 #include <math.h>
@@ -853,6 +855,7 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->tint_shade_level = (uint8_t)world->luts.tint_shade_level;
     camera->global_light_bias = api->game_ram->u8(VA_G_GLOBAL_LIGHT_BIAS);
     camera->glow_phase = api->game_ram->u8(VA_G_GLOW_PHASE);
+    camera->shade_depth_scale = hwr_settings_get()->shade_depth_scale;
 }
 
 static int hwr_surface_visible(const struct hwr_mesh_surface *surface,

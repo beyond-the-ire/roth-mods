@@ -1,3 +1,7 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "roth_sdk.h"
 
 #include "hwr_gl.h"
@@ -17,6 +21,7 @@
 #include <windows.h>
 #else
 #include <dirent.h>
+#include <signal.h>
 #endif
 
 #define VA_G_SCREEN_PITCH              0x85498u
@@ -81,6 +86,11 @@ static int g_scene_rebuild_pending;
 static int g_scene_error_logged;
 static int g_selfheal_retry;
 static uint32_t g_selfheal_tick;
+/* Development aid: HWR_DUMP_FRAME=<path.ppm> periodically writes the submitted
+ * world frame (atomically, via rename) for offline comparison against the
+ * original renderer's output. */
+static char g_dump_path[2600];
+static uint32_t g_dump_counter;
 static char g_plugin_dir[2600];
 static struct hwr_world g_world;
 static struct hwr_das_archive g_map_archive;
@@ -88,6 +98,27 @@ static struct hwr_das_archive g_shared_archive;
 static struct hwr_scene g_scene;
 
 static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation);
+
+static void hwr_dump_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
+{
+    char temp_path[2620];
+    FILE *file;
+    uint32_t i;
+    snprintf(temp_path, sizeof temp_path, "%s.tmp", g_dump_path);
+    file = fopen(temp_path, "wb");
+    if (file == NULL)
+        return;
+    fprintf(file, "P6\n%u %u\n255\n", width, height);
+    for (i = 0; i < width * height; i++) {
+        uint8_t rgb[3];
+        rgb[0] = (uint8_t)(pixels[i] >> 16);
+        rgb[1] = (uint8_t)(pixels[i] >> 8);
+        rgb[2] = (uint8_t)pixels[i];
+        fwrite(rgb, 1, 3, file);
+    }
+    fclose(file);
+    rename(temp_path, g_dump_path);
+}
 
 static int hwr_ascii_equal_ci(const char *a, const char *b)
 {
@@ -210,6 +241,14 @@ static int hwr_apply_config_value(const char *key, const char *value)
         if (!hwr_parse_u32(value, 10, 1000000u, &number))
             return 0;
         hwr_settings_set_min_present_interval_us(number == 0 ? 0 : 1000000u / number);
+    } else if (hwr_ascii_equal_ci(key, "shade_depth_scale")) {
+        float scale;
+        char *end;
+        errno = 0;
+        scale = (float)strtod(value, &end);
+        if (errno != 0 || end == value || *hwr_trim(end) != 0)
+            return 0;
+        hwr_settings_set_shade_depth_scale(scale);
     } else if (hwr_ascii_equal_ci(key, "fov_deg")) {
         if (!hwr_parse_float(value, &real))
             return 0;
@@ -684,15 +723,38 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
         hwr_world_refresh_lut_state(&g_world, api) == 0) {
         if (g_scene_rebuild_pending) {
-            if (hwr_scene_rebuild(&g_scene, &g_world, &g_map_archive,
-                                  &g_shared_archive, api, g_debug_enabled) != 0) {
+            int rebuild_result;
+            unsigned upload_errors;
+            /* The host's timer signal may interrupt driver calls mid-upload and
+             * leave textures silently empty; keep it out of the one-time scene
+             * upload, and verify the driver reported no errors afterwards. */
+#ifndef _WIN32
+            sigset_t block_set, old_set;
+            sigemptyset(&block_set);
+            sigaddset(&block_set, SIGALRM);
+            sigprocmask(SIG_BLOCK, &block_set, &old_set);
+#endif
+            hwr_gl_drain_errors();
+            rebuild_result = hwr_scene_rebuild(&g_scene, &g_world, &g_map_archive,
+                                               &g_shared_archive, api, g_debug_enabled);
+            upload_errors = hwr_gl_drain_errors();
+#ifndef _WIN32
+            sigprocmask(SIG_SETMASK, &old_set, NULL);
+#endif
+            if (rebuild_result != 0) {
                 if (!g_scene_error_logged) {
                     fprintf(stderr, "[renderer_overhaul] GL scene unavailable: %s; using solid fallback\n",
                             hwr_scene_error(&g_scene));
                     g_scene_error_logged = 1;
                 }
+                g_scene_rebuild_pending = 0;
+            } else if (upload_errors != 0) {
+                fprintf(stderr, "[renderer_overhaul] scene upload reported %u driver error(s); retrying\n",
+                        upload_errors);
+                hwr_scene_clear(&g_scene);
+            } else {
+                g_scene_rebuild_pending = 0;
             }
-            g_scene_rebuild_pending = 0;
         }
         pixels = g_scene.valid
                ? hwr_scene_render(&g_scene, &g_world, api, render_width, render_height)
@@ -746,6 +808,8 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         g_channel_owned = 1;
         g_last_frame = frame;
         g_last_frame_valid = 1;
+        if (g_dump_path[0] != 0 && ((g_dump_counter++) & 31u) == 0)
+            hwr_dump_frame(pixels, render_width, render_height);
     } else {
         if (!g_submit_error_logged) {
             fprintf(stderr, "[renderer_overhaul] world frame submit failed: rc=%d (%ux%u viewport %d,%d %ux%u)\n",
@@ -831,6 +895,11 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
     if (plugin_dir == NULL)
         plugin_dir = "";
     snprintf(g_plugin_dir, sizeof g_plugin_dir, "%s", plugin_dir);
+    {
+        const char *dump = getenv("HWR_DUMP_FRAME");
+        if (dump != NULL)
+            snprintf(g_dump_path, sizeof g_dump_path, "%s", dump);
+    }
     hwr_settings_init_defaults();
     if (hwr_settings_register_apply(hwr_render_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_data_settings_apply, NULL) != 0 ||

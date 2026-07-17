@@ -17,6 +17,7 @@ static uint32_t g_dirty;
 
 void hwr_settings_init_defaults(void)
 {
+    g_settings.shade_depth_scale = 1.0f;
     memset(&g_settings, 0, sizeof g_settings);
     g_settings.enabled = 1;
     g_settings.solid_color = 0xff8800u;
@@ -61,6 +62,16 @@ void hwr_settings_set_enabled(int enabled)
     if (g_settings.enabled != enabled) {
         g_settings.enabled = enabled;
         g_dirty |= HWR_CHANGE_ENABLED;
+    }
+}
+
+void hwr_settings_set_shade_depth_scale(float scale)
+{
+    if (scale <= 0.0f || scale > 4096.0f)
+        return;
+    if (g_settings.shade_depth_scale != scale) {
+        g_settings.shade_depth_scale = scale;
+        g_dirty |= HWR_CHANGE_SHADE_SCALE;
     }
 }
 

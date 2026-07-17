@@ -35,6 +35,9 @@ struct hwr_settings {
     enum hwr_present_mode present_mode;
     uint32_t min_present_interval_us;
 
+    /* Distance-shading calibration multiplier applied to the view depth. */
+    float shade_depth_scale;
+
     /* Reserved for renderer features that are not active yet. */
     float fov_deg;
     enum hwr_pitch_mode pitch_mode;
@@ -52,7 +55,8 @@ enum hwr_settings_change {
     HWR_CHANGE_PITCH_MODE       = 1u << 7,
     HWR_CHANGE_RENDER_MODE      = 1u << 8,
     HWR_CHANGE_DEBUG            = 1u << 9,
-    HWR_CHANGE_ALL              = (1u << 10) - 1u
+    HWR_CHANGE_SHADE_SCALE      = 1u << 10,
+    HWR_CHANGE_ALL              = (1u << 11) - 1u
 };
 
 typedef void (*hwr_settings_apply_fn)(uint32_t mask,
@@ -66,6 +70,7 @@ void hwr_settings_apply_pending(void);
 
 void hwr_settings_set_enabled(int enabled);
 void hwr_settings_set_debug(int debug);
+void hwr_settings_set_shade_depth_scale(float scale);
 void hwr_settings_set_solid_color(uint32_t color);
 void hwr_settings_set_internal_size(uint32_t width, uint32_t height);
 void hwr_settings_set_window_mode(enum hwr_window_mode mode);
