@@ -372,49 +372,6 @@ static int hwr_triangulate(const struct hwr_point *points, size_t count,
     return output == (count - 2u) * 3u ? 0 : -1;
 }
 
-/* The span rasterizer evaluates the tinted edge term per span edge and
- * interpolates across, so its shading never varies faster than the span
- * granularity. Interpolated per-vertex shade words reproduce that only if no
- * triangle is much wider than a typical span; large tinted flats are split
- * until every edge is short enough. */
-#define HWR_TINT_SUBDIV_LIMIT 256
-
-static void hwr_flat_emit_subdivided(int16_t ax, int16_t ay,
-                                     int16_t bx, int16_t by,
-                                     int16_t cx, int16_t cy,
-                                     int16_t z, int depth,
-                                     struct hwr_mesh_vertex *vertices,
-                                     size_t *cursor)
-{
-    int32_t dab = (int32_t)(ax - bx) * (ax - bx) + (int32_t)(ay - by) * (ay - by);
-    int32_t dbc = (int32_t)(bx - cx) * (bx - cx) + (int32_t)(by - cy) * (by - cy);
-    int32_t dca = (int32_t)(cx - ax) * (cx - ax) + (int32_t)(cy - ay) * (cy - ay);
-    int32_t longest = dab > dbc ? (dab > dca ? dab : dca) : (dbc > dca ? dbc : dca);
-    if (depth == 0 ||
-        longest <= (int32_t)HWR_TINT_SUBDIV_LIMIT * HWR_TINT_SUBDIV_LIMIT) {
-        if (vertices != NULL) {
-            hwr_set_vertex(&vertices[*cursor], ax, ay, z, 0.0f, 0.0f);
-            hwr_set_vertex(&vertices[*cursor + 1u], bx, by, z, 0.0f, 0.0f);
-            hwr_set_vertex(&vertices[*cursor + 2u], cx, cy, z, 0.0f, 0.0f);
-        }
-        *cursor += 3u;
-        return;
-    }
-    if (longest == dab) {
-        int16_t mx = (int16_t)((ax + bx) / 2), my = (int16_t)((ay + by) / 2);
-        hwr_flat_emit_subdivided(ax, ay, mx, my, cx, cy, z, depth - 1, vertices, cursor);
-        hwr_flat_emit_subdivided(mx, my, bx, by, cx, cy, z, depth - 1, vertices, cursor);
-    } else if (longest == dbc) {
-        int16_t mx = (int16_t)((bx + cx) / 2), my = (int16_t)((by + cy) / 2);
-        hwr_flat_emit_subdivided(ax, ay, bx, by, mx, my, z, depth - 1, vertices, cursor);
-        hwr_flat_emit_subdivided(ax, ay, mx, my, cx, cy, z, depth - 1, vertices, cursor);
-    } else {
-        int16_t mx = (int16_t)((cx + ax) / 2), my = (int16_t)((cy + ay) / 2);
-        hwr_flat_emit_subdivided(ax, ay, bx, by, mx, my, z, depth - 1, vertices, cursor);
-        hwr_flat_emit_subdivided(mx, my, bx, by, cx, cy, z, depth - 1, vertices, cursor);
-    }
-}
-
 static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *world,
                          const struct hwr_sector *sector, size_t sector_index,
                          const struct hwr_point *points, const uint16_t *triangles,
@@ -424,24 +381,10 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
 {
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *vertices;
-    int tinted = (sector->flags & 2u) != 0;
-    size_t count = 0;
+    size_t count = triangle_count * 3u;
     size_t i;
     if (id >= 0 && (uint16_t)id == world->world_span_colorkey)
         return 0;
-    for (i = 0; i < triangle_count; i++) {
-        uint16_t order[3];
-        order[0] = triangles[i * 3u];
-        order[1] = triangles[i * 3u + (face_down ? 2u : 1u)];
-        order[2] = triangles[i * 3u + (face_down ? 1u : 2u)];
-        if (tinted)
-            hwr_flat_emit_subdivided(points[order[0]].x, points[order[0]].y,
-                                     points[order[1]].x, points[order[1]].y,
-                                     points[order[2]].x, points[order[2]].y,
-                                     z, 8, NULL, &count);
-        else
-            count += 3u;
-    }
     surface = hwr_add_surface(mesh, kind, count);
     if (surface == NULL)
         return -1;
@@ -451,27 +394,15 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     surface->flags = HWR_SURFACE_FLAT | (face_down ? HWR_SURFACE_FACE_DOWN : 0);
     hwr_finish_material(mesh, surface, sector, id, 0, 0);
     vertices = mesh->vertices + mesh->vertex_count;
-    {
-        size_t cursor = 0;
-        for (i = 0; i < triangle_count; i++) {
-            uint16_t order[3];
-            size_t k;
-            order[0] = triangles[i * 3u];
-            order[1] = triangles[i * 3u + (face_down ? 2u : 1u)];
-            order[2] = triangles[i * 3u + (face_down ? 1u : 2u)];
-            if (tinted) {
-                hwr_flat_emit_subdivided(points[order[0]].x, points[order[0]].y,
-                                         points[order[1]].x, points[order[1]].y,
-                                         points[order[2]].x, points[order[2]].y,
-                                         z, 8, vertices, &cursor);
-            } else {
-                for (k = 0; k < 3; k++) {
-                    const struct hwr_point *point = &points[order[k]];
-                    hwr_set_vertex(&vertices[cursor + k], point->x, point->y,
-                                   z, 0.0f, 0.0f);
-                }
-                cursor += 3u;
-            }
+    for (i = 0; i < triangle_count; i++) {
+        uint16_t order[3];
+        size_t k;
+        order[0] = triangles[i * 3u];
+        order[1] = triangles[i * 3u + (face_down ? 2u : 1u)];
+        order[2] = triangles[i * 3u + (face_down ? 1u : 2u)];
+        for (k = 0; k < 3; k++) {
+            const struct hwr_point *point = &points[order[k]];
+            hwr_set_vertex(&vertices[i * 3u + k], point->x, point->y, z, 0.0f, 0.0f);
         }
     }
     mesh->vertex_count += count;
@@ -701,6 +632,29 @@ static int hwr_append_bytes(uint8_t **bytes, size_t *size, size_t *capacity,
     return 0;
 }
 
+/* An unresolvable id whose map slot is empty may still name a shared-archive
+ * placeholder at the same index: those mark surfaces another renderer owns
+ * (the door records live this way), so the faces are dropped, not filled. */
+static int hwr_texture_is_door_placeholder(struct hwr_das_archive *map_archive,
+                                           struct hwr_das_archive *shared_archive,
+                                           uint16_t logical,
+                                           const struct hwr_das_entry *entry)
+{
+    const struct hwr_das_entry *shared_entry;
+    if (entry == NULL || entry->file_offset != 0 || entry->payload_size != 0)
+        return 0;
+    if (map_archive == NULL || logical >= map_archive->entry_count ||
+        entry != &map_archive->entries[logical])
+        return 0;
+    if (shared_archive == NULL || logical >= shared_archive->entry_count)
+        return 0;
+    shared_entry = &shared_archive->entries[logical];
+    if (hwr_das_decode(shared_archive, logical) != 0)
+        return 0;
+    return shared_entry->resource_class == HWR_DAS_CLASS_PLACEHOLDER_SPACE ||
+           shared_entry->resource_class == HWR_DAS_CLASS_PLACEHOLDER_DOLLAR;
+}
+
 static struct hwr_das_entry *hwr_resolve_entry(struct hwr_das_archive *map_archive,
                                                 struct hwr_das_archive *shared_archive,
                                                 uint16_t logical,
@@ -710,15 +664,6 @@ static struct hwr_das_entry *hwr_resolve_entry(struct hwr_das_archive *map_archi
     if (logical < 0x1200u) {
         *owner = map_archive;
         *entry_id = logical;
-        /* Empty map slots fall through to the shared archive at the same
-         * index (the door composite records live there, among others). */
-        if (map_archive != NULL && logical < map_archive->entry_count &&
-            map_archive->entries[logical].file_offset == 0 &&
-            map_archive->entries[logical].payload_size == 0 &&
-            shared_archive != NULL &&
-            logical < shared_archive->entry_count) {
-            *owner = shared_archive;
-        }
     } else if (logical < 0x1600u) {
         *owner = shared_archive;
         *entry_id = logical - 0x1200u;
@@ -858,9 +803,8 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                 stats.grouped++;
             else if (resolved_class == HWR_DAS_CLASS_ANIMATED)
                 stats.animated_frame0++;
-        } else if (entry != NULL &&
-                   (entry->resource_class == HWR_DAS_CLASS_PLACEHOLDER_SPACE ||
-                    entry->resource_class == HWR_DAS_CLASS_PLACEHOLDER_DOLLAR)) {
+        } else if (hwr_texture_is_door_placeholder(map_archive, shared_archive,
+                                                   logical, entry)) {
             scene->textures[logical].skip = 1;
             if (debug)
                 fprintf(stderr, "[renderer_overhaul] texture %u is a placeholder resource; surfaces skipped\n",
@@ -1141,12 +1085,6 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             }
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height);
-        } else if ((surface->sector_flags & 2u) != 0) {
-            /* Tinted flats shade like walls: the edge term is evaluated at
-             * span edges and interpolated across, never per pixel, so a wide
-             * span shows no brightness dip at the origin column. */
-            target->wall_shade_endpoint = hwr_wall_endpoint_word(
-                surface, source, source->z, camera, width, height);
         }
         target->wall_s = source->wall_s;
         target->wall_top = source->wall_top;

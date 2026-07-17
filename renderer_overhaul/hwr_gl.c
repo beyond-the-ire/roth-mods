@@ -576,6 +576,8 @@ static const char g_geometry_vertex_shader[] =
     "uniform vec2 u_basis;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
+    "uniform ivec2 u_shade_origin;\n"
+    "uniform int u_flat_edge_bias;\n"
     "uniform vec2 u_viewport;\n"
     "out vec3 v_world;\n"
     "out float v_depth_fixed;\n"
@@ -622,6 +624,8 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_glow_phase;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
+    "uniform ivec2 u_shade_origin;\n"
+    "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
     "uniform int u_blend_pass;\n"
     "in vec3 v_world;\n"
@@ -669,14 +673,24 @@ static const char g_geometry_fragment_shader[] =
     "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
     "  int depth=(transformed >> 8) & 65535;\n"  /* the span vertex depth word: world units */
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; int r;\n"
-    /* Tinted surfaces (flats and walls alike) carry a per-vertex shade word
-     * evaluated at span edges and interpolated across the surface, exactly
-     * like the span rasterizer; the jittered origin enters that word. */
-    "  if (tinted) return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  if (flat_surface) {\n"
+    "    if (tinted) {\n"
+    /* The edge term measures from the jittered shade origin (the light
+     * position); the jitter is the flicker. */
+    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
+    "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
+    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
+    "      r=(edge_depth >> shr)-bias-u_flat_edge_bias;\n"
+    "      r=((r+32768) & 65535)-32768;\n"
+    "      return r<=0 ? 1 : min(r,31);\n"
+    "    }\n"
     "    r=(depth >> shr)-bias;\n"
     "    return clamp(((r+32768) & 65535)-32768,0,31);\n"
     "  }\n"
+    /* Tinted walls carry per-corner shade words interpolated across columns,
+     * matching the column rasterizer's endpoint stepping. */
+    "  if (tinted) return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  int dividend=2 << level;\n"
     /* The wall span divisors are the 16-bit vertex depth words, already in
      * world units, so the column ratio reduces to depth/(16*dividend). */
@@ -1369,6 +1383,9 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
     hwr_uniform_2f(g_geometry_program, "u_center",
                    (GLfloat)camera->center_x, (GLfloat)camera->horizon);
+    hwr_uniform_2i(g_geometry_program, "u_shade_origin",
+                   camera->shade_origin_x, camera->shade_origin_y);
+    hwr_uniform_1i(g_geometry_program, "u_flat_edge_bias", camera->flat_edge_bias);
     hwr_uniform_2f(g_geometry_program, "u_viewport", (GLfloat)width, (GLfloat)height);
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
