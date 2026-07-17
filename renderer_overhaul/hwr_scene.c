@@ -199,6 +199,40 @@ static void hwr_set_vertex(struct hwr_mesh_vertex *vertex, int16_t x, int16_t y,
     vertex->wall_top = wall_top;
 }
 
+static int hwr_compare_heights(const void *left, const void *right)
+{
+    int16_t a = *(const int16_t *)left;
+    int16_t b = *(const int16_t *)right;
+    return a < b ? -1 : a > b;
+}
+
+static void hwr_add_wall_cut(int16_t *cuts, size_t *count, int16_t z,
+                             int16_t bottom, int16_t top)
+{
+    size_t i;
+    if (z <= bottom || z >= top)
+        return;
+    for (i = 0; i < *count; i++) {
+        if (cuts[i] == z)
+            return;
+    }
+    cuts[(*count)++] = z;
+}
+
+static void hwr_add_sector_cuts(const struct hwr_world *world,
+                                const struct hwr_sector *sector,
+                                int16_t *cuts, size_t *count,
+                                int16_t bottom, int16_t top)
+{
+    hwr_add_wall_cut(cuts, count, sector->floor_z, bottom, top);
+    hwr_add_wall_cut(cuts, count, sector->ceiling_z, bottom, top);
+    if (sector->slab_index != SIZE_MAX) {
+        const struct hwr_slab *slab = &world->slabs[sector->slab_index];
+        hwr_add_wall_cut(cuts, count, slab->lower_z, bottom, top);
+        hwr_add_wall_cut(cuts, count, slab->upper_z, bottom, top);
+    }
+}
+
 static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *world,
                          const struct hwr_wall *wall, const struct hwr_sector *sector,
                          enum hwr_surface_kind kind, int16_t id,
@@ -209,6 +243,12 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     const struct hwr_vertex *b;
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *v;
+    int16_t *cuts = NULL;
+    int16_t *cuts_a = NULL;
+    int16_t *cuts_b = NULL;
+    size_t cut_count_a = 0;
+    size_t cut_count_b = 0;
+    size_t triangle_count;
     uint16_t extent;
     uint16_t mapped_extent;
     float sa;
@@ -225,9 +265,63 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
         ? (uint16_t)(extent + extent) : extent;
     sa = HWR_WALL_U_REVERSED ? (float)mapped_extent : 0.0f;
     sb = HWR_WALL_U_REVERSED ? 0.0f : (float)mapped_extent;
-    surface = hwr_add_surface(mesh, kind, 6);
-    if (surface == NULL)
+    if (world->wall_count != 0) {
+        size_t capacity;
+        size_t i;
+        if (world->wall_count > SIZE_MAX / 8u)
+            return hwr_mesh_fail(mesh, "wall cut count overflow");
+        capacity = world->wall_count * 8u;
+        if (capacity > SIZE_MAX / (2u * sizeof *cuts))
+            return hwr_mesh_fail(mesh, "wall cut allocation overflow");
+        cuts = (int16_t *)malloc(capacity * 2u * sizeof *cuts);
+        if (cuts == NULL)
+            return hwr_mesh_fail(mesh, "out of memory splitting wall edges");
+        cuts_a = cuts;
+        cuts_b = cuts + capacity;
+        for (i = 0; i < world->wall_count; i++) {
+            const struct hwr_wall *incident = &world->walls[i];
+            const struct hwr_sector *incident_sector;
+            int touches_a = incident->vertex_a_index == wall->vertex_a_index ||
+                            incident->vertex_b_index == wall->vertex_a_index;
+            int touches_b = incident->vertex_a_index == wall->vertex_b_index ||
+                            incident->vertex_b_index == wall->vertex_b_index;
+            if (!touches_a && !touches_b)
+                continue;
+            incident_sector = &world->sectors[incident->sector_index];
+            if (touches_a)
+                hwr_add_sector_cuts(world, incident_sector, cuts_a,
+                                    &cut_count_a, bottom_a, top_a);
+            if (touches_b)
+                hwr_add_sector_cuts(world, incident_sector, cuts_b,
+                                    &cut_count_b, bottom_b, top_b);
+            if (incident->neighbor_sector_index != SIZE_MAX) {
+                const struct hwr_sector *neighbor =
+                    &world->sectors[incident->neighbor_sector_index];
+                if (touches_a)
+                    hwr_add_sector_cuts(world, neighbor, cuts_a,
+                                        &cut_count_a, bottom_a, top_a);
+                if (touches_b)
+                    hwr_add_sector_cuts(world, neighbor, cuts_b,
+                                        &cut_count_b, bottom_b, top_b);
+            }
+        }
+        qsort(cuts_a, cut_count_a, sizeof *cuts_a, hwr_compare_heights);
+        qsort(cuts_b, cut_count_b, sizeof *cuts_b, hwr_compare_heights);
+    }
+    if (cut_count_a > SIZE_MAX - cut_count_b - 2u) {
+        free(cuts);
+        return hwr_mesh_fail(mesh, "wall triangle count overflow");
+    }
+    triangle_count = cut_count_a + cut_count_b + 2u;
+    if (triangle_count > SIZE_MAX / 3u) {
+        free(cuts);
+        return hwr_mesh_fail(mesh, "wall vertex count overflow");
+    }
+    surface = hwr_add_surface(mesh, kind, triangle_count * 3u);
+    if (surface == NULL) {
+        free(cuts);
         return -1;
+    }
     surface->sector_index = wall->sector_index;
     surface->extent = extent;
     surface->scale = wall->scale;
@@ -235,19 +329,52 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     surface->pan_v = wall->extent < 0 ? wall->pan_v : 0;
     hwr_finish_material(mesh, surface, sector, id, mapping_flags, masked);
     v = mesh->vertices + mesh->vertex_count;
-    hwr_set_vertex(&v[0], a->world_x, a->world_y, top_a, sa, (float)top_a);
-    hwr_set_vertex(&v[1], a->world_x, a->world_y, bottom_a, sa, (float)top_a);
-    hwr_set_vertex(&v[2], b->world_x, b->world_y, bottom_b, sb, (float)top_b);
-    hwr_set_vertex(&v[3], a->world_x, a->world_y, top_a, sa, (float)top_a);
-    hwr_set_vertex(&v[4], b->world_x, b->world_y, bottom_b, sb, (float)top_b);
-    hwr_set_vertex(&v[5], b->world_x, b->world_y, top_b, sb, (float)top_b);
-    v[0].reserved = HWR_WALL_CORNER_NONE;
-    v[1].reserved = HWR_WALL_CORNER_BOTTOM;
-    v[2].reserved = HWR_WALL_CORNER_END_B | HWR_WALL_CORNER_BOTTOM;
-    v[3].reserved = HWR_WALL_CORNER_NONE;
-    v[4].reserved = HWR_WALL_CORNER_END_B | HWR_WALL_CORNER_BOTTOM;
-    v[5].reserved = HWR_WALL_CORNER_END_B;
-    mesh->vertex_count += 6;
+    {
+        size_t ia = 0;
+        size_t ib = 0;
+        size_t triangle = 0;
+        int16_t current_a = bottom_a;
+        int16_t current_b = bottom_b;
+        while (ia <= cut_count_a || ib <= cut_count_b) {
+            int32_t next_a = ia < cut_count_a ? cuts_a[ia]
+                           : ia == cut_count_a ? top_a : INT32_MAX;
+            int32_t next_b = ib < cut_count_b ? cuts_b[ib]
+                           : ib == cut_count_b ? top_b : INT32_MAX;
+            struct hwr_mesh_vertex *q = v + triangle * 3u;
+            if (next_a <= next_b) {
+                hwr_set_vertex(&q[0], a->world_x, a->world_y,
+                               current_a, sa, (float)top_a);
+                hwr_set_vertex(&q[1], a->world_x, a->world_y,
+                               (int16_t)next_a, sa, (float)top_a);
+                hwr_set_vertex(&q[2], b->world_x, b->world_y,
+                               current_b, sb, (float)top_b);
+                q[0].reserved = current_a == bottom_a
+                              ? HWR_WALL_CORNER_BOTTOM : HWR_WALL_CORNER_NONE;
+                q[1].reserved = HWR_WALL_CORNER_NONE;
+                q[2].reserved = HWR_WALL_CORNER_END_B |
+                    (current_b == bottom_b ? HWR_WALL_CORNER_BOTTOM : 0);
+                current_a = (int16_t)next_a;
+                ia++;
+            } else {
+                hwr_set_vertex(&q[0], a->world_x, a->world_y,
+                               current_a, sa, (float)top_a);
+                hwr_set_vertex(&q[1], b->world_x, b->world_y,
+                               (int16_t)next_b, sb, (float)top_b);
+                hwr_set_vertex(&q[2], b->world_x, b->world_y,
+                               current_b, sb, (float)top_b);
+                q[0].reserved = current_a == bottom_a
+                              ? HWR_WALL_CORNER_BOTTOM : HWR_WALL_CORNER_NONE;
+                q[1].reserved = HWR_WALL_CORNER_END_B;
+                q[2].reserved = HWR_WALL_CORNER_END_B |
+                    (current_b == bottom_b ? HWR_WALL_CORNER_BOTTOM : 0);
+                current_b = (int16_t)next_b;
+                ib++;
+            }
+            triangle++;
+        }
+    }
+    mesh->vertex_count += triangle_count * 3u;
+    free(cuts);
     return 0;
 }
 
@@ -1090,6 +1217,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                 &scene->mesh.vertices[surface->first_vertex];
             int end_b = (source->reserved & HWR_WALL_CORNER_END_B) != 0;
             int16_t bottom_z = source->z;
+            int16_t top_z = source->z;
             int fit_texture = (surface->mapping_flags & 4u) != 0 &&
                               texture_width != 0 && texture_height != 0;
             int wrap_along = texture_height != 0 &&
@@ -1100,9 +1228,12 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             for (j = 0; j < surface->vertex_count; j++) {
                 int candidate_end_b =
                     (wall_vertices[j].reserved & HWR_WALL_CORNER_END_B) != 0;
-                if (candidate_end_b == end_b &&
-                    (wall_vertices[j].reserved & HWR_WALL_CORNER_BOTTOM) != 0)
-                    bottom_z = wall_vertices[j].z;
+                if (candidate_end_b == end_b) {
+                    if (wall_vertices[j].z < bottom_z)
+                        bottom_z = wall_vertices[j].z;
+                    if (wall_vertices[j].z > top_z)
+                        top_z = wall_vertices[j].z;
+                }
             }
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height);
@@ -1114,9 +1245,10 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                 float vertical_extent = 2.0f * (float)texture_width *
                     (float)(scale_v != 0 ? scale_v + 1u : 1u);
                 target->wall_s = end_b ? along_extent : 0.0f;
-                target->wall_top =
-                    (source->reserved & HWR_WALL_CORNER_BOTTOM) != 0
-                    ? vertical_extent : 0.0f;
+                target->wall_top = top_z != bottom_z
+                    ? vertical_extent * (float)(top_z - source->z) /
+                      (float)(top_z - bottom_z)
+                    : 0.0f;
             } else {
                 target->wall_s = source->wall_s;
                 target->wall_top = (float)(source->wall_top - source->z) *
