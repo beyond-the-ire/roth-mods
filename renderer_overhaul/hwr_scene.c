@@ -230,6 +230,7 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
         return -1;
     surface->sector_index = wall->sector_index;
     surface->extent = extent;
+    surface->scale = wall->scale;
     surface->pan_u = wall->extent < 0 ? wall->pan_u : 0;
     surface->pan_v = wall->extent < 0 ? wall->pan_v : 0;
     hwr_finish_material(mesh, surface, sector, id, mapping_flags, masked);
@@ -1043,9 +1044,15 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                                  struct hwr_gl_vertex *destination)
 {
     uint16_t logical = (uint16_t)surface->texture_id;
+    uint16_t texture_width = 0;
+    uint16_t texture_height = 0;
     uint8_t flags = 0;
     uint8_t direct_index = (uint8_t)surface->texture_id;
     size_t i;
+    if (logical < 0x1600u) {
+        texture_width = scene->textures[logical].width;
+        texture_height = scene->textures[logical].height;
+    }
     if ((surface->flags & HWR_SURFACE_MASKED) != 0)
         flags |= HWR_GL_MATERIAL_MASKED;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
@@ -1076,6 +1083,8 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             const struct hwr_mesh_vertex *wall_vertices =
                 &scene->mesh.vertices[surface->first_vertex];
             int16_t bottom_z = source->z;
+            int fit_texture = (surface->mapping_flags & 4u) != 0 &&
+                              texture_width != 0 && texture_height != 0;
             size_t j;
             for (j = 0; j < surface->vertex_count; j++) {
                 if (wall_vertices[j].x == source->x &&
@@ -1085,17 +1094,37 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             }
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height);
+            if (fit_texture) {
+                unsigned scale_u = surface->scale & 0x0fu;
+                unsigned scale_v = surface->scale >> 4;
+                float along_extent = 2.0f * (float)texture_height *
+                    (float)(scale_u != 0 ? scale_u + 1u : 1u);
+                float vertical_extent = 2.0f * (float)texture_width *
+                    (float)(scale_v != 0 ? scale_v + 1u : 1u);
+                target->wall_s = source->x == wall_vertices[0].x &&
+                                 source->y == wall_vertices[0].y
+                    ? 0.0f : along_extent;
+                target->wall_top = source->z == source->wall_top
+                    ? 0.0f : vertical_extent;
+            } else {
+                target->wall_s = source->wall_s;
+                target->wall_top = (float)(source->wall_top - source->z) *
+                    ((surface->mapping_flags & 0x20u) != 0 ? 2.0f : 1.0f);
+            }
+            target->pan_u = fit_texture ? 0 : surface->pan_u;
+            target->pan_v = fit_texture ? 0 : surface->pan_v;
+        } else {
+            target->wall_s = source->wall_s;
+            target->wall_top = source->wall_top;
+            target->pan_u = surface->pan_u;
+            target->pan_v = surface->pan_v;
         }
-        target->wall_s = source->wall_s;
-        target->wall_top = source->wall_top;
         if (logical < 0x1600u) {
             target->texture_offset = scene->textures[logical].offset;
-            target->texture_width = scene->textures[logical].width;
-            target->texture_height = scene->textures[logical].height;
+            target->texture_width = texture_width;
+            target->texture_height = texture_height;
         }
         target->aux = surface->aux;
-        target->pan_u = surface->pan_u;
-        target->pan_v = surface->pan_v;
         target->scale = surface->scale;
         target->sector_flags = surface->sector_flags;
         target->light = surface->light;

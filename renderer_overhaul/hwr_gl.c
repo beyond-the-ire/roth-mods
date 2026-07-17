@@ -662,7 +662,11 @@ static const char g_geometry_fragment_shader[] =
     "    int base=(int(floor(wall_s))+int(v_pan_scale_flags.x)*2) >> 1;\n"
     "    if ((flags & 32u)!=0u) base=(h-1)-base;\n"
     "    iy=base & (h-1);\n"
-    "    ix=((int(floor(v_wall.y-v_world.z)) >> 1)+int(v_pan_scale_flags.y)) & (w-1);\n"
+    /* Like S, the vertical mapper fetches before advancing its fixed-point
+     * accumulator. v_wall.y is the CPU-selected stored-extent or texture-fit
+     * coordinate, including flag-0x20 scaling where that class uses it. */
+    "    float wall_v=v_wall.y-0.5*dFdy(v_wall.y);\n"
+    "    ix=((int(floor(wall_v)) >> 1)+int(v_pan_scale_flags.y)) & (w-1);\n"
     "  }\n"
     "  return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "}\n"

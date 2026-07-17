@@ -38,6 +38,7 @@ struct hwr_wall {
     uint16_t upper_id;
     uint16_t lower_id;
     uint8_t mapping_flags;
+    uint8_t scale;
     uint8_t pan_u;
     uint8_t pan_v;
     uint16_t portal_link_offset;

@@ -92,6 +92,7 @@ static void hwr_parse_wall(struct hwr_wall *wall)
     wall->upper_id = hwr_u16(wall->mapping_raw + 4);
     wall->lower_id = hwr_u16(wall->mapping_raw + 6);
     wall->mapping_flags = wall->mapping_raw[8];
+    wall->scale = wall->mapping_raw[9];
     wall->pan_u = wall->mapping_raw[0x0a];
     wall->pan_v = wall->mapping_raw[0x0b];
 }
