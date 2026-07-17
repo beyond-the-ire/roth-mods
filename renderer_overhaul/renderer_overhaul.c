@@ -14,11 +14,9 @@
 #define VA_G_SCREEN_HEIGHT             0x854a0u
 #define VA_G_VIEW_X                    0x85ce0u
 #define VA_G_VIEW_Y                    0x85ce4u
-#define VA_G_VIEW_BOUND_RIGHT          0x90968u
-#define VA_G_VIEW_BOUND_LEFT           0x9096au
-#define VA_G_VIEW_BOUND_BOTTOM         0x9096cu
-#define VA_G_VIEW_BOUND_TOP            0x9096eu
 #define VA_G_FRAMEBUFFER_PTR           0x90a98u
+#define VA_G_RENDER_WIDTH              0x90bf2u
+#define VA_G_RENDER_HEIGHT             0x90bf6u
 #define VA_G_VIEW_SCALE_FLAGS          0x90bd4u
 #define VA_G_LINE_DOUBLING_FLAG        0x90cbdu
 
@@ -376,39 +374,35 @@ static void hwr_fail_gl(const struct roth_api_v1 *api)
     }
 }
 
+/* The world-viewport rect in final framebuffer coordinates. Use the STABLE per-frame viewport
+ * dimensions (origin + render size), NOT g_view_bound_left/right/top/bottom: those are transient
+ * per-surface clip registers the engine rewrites for every wall, portal, and mirror span, so
+ * reading them after the render leaves only the last surface's clip window. Filling and submitting
+ * that sliver would leave the rest of the frame's software walls exposed. */
 static int hwr_read_viewport(const struct roth_api_v1 *api,
                              struct hwr_viewport *viewport)
 {
-    int32_t left = (int32_t)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_LEFT);
-    int32_t right = (int32_t)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_RIGHT);
-    int32_t top = (int32_t)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_TOP);
-    int32_t bottom = (int32_t)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_BOTTOM);
+    uint32_t width = api->game_ram->u16(VA_G_RENDER_WIDTH);
+    uint32_t height = api->game_ram->u16(VA_G_RENDER_HEIGHT);
     uint32_t pitch = api->game_ram->u32(VA_G_SCREEN_PITCH);
     uint32_t screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
     uint32_t origin_x = api->game_ram->u32(VA_G_VIEW_X);
     uint64_t origin_y = api->game_ram->u32(VA_G_VIEW_Y);
-    uint64_t final_left;
-    uint64_t final_top;
-    uint64_t final_right;
-    uint64_t final_bottom;
 
     if (api->game_ram->u8(VA_G_LINE_DOUBLING_FLAG) != 0)
         origin_y *= 2u;
-    if (left < 0 || top < 0 || right < left || bottom < top || pitch == 0 ||
-        screen_height == 0)
+    if (width == 0 || height == 0 || pitch == 0 || screen_height == 0 ||
+        origin_x >= pitch || origin_y >= screen_height)
         return 0;
-    final_left = (uint64_t)origin_x + (uint32_t)left;
-    final_top = (uint64_t)origin_y + (uint32_t)top;
-    final_right = (uint64_t)origin_x + (uint32_t)right;
-    final_bottom = (uint64_t)origin_y + (uint32_t)bottom;
-    if (final_left > INT32_MAX || final_top > INT32_MAX || final_right >= pitch ||
-        final_bottom >= screen_height)
-        return 0;
-    viewport->x = (int32_t)final_left;
-    viewport->y = (int32_t)final_top;
-    viewport->width = (uint32_t)(right - left) + 1u;
-    viewport->height = (uint32_t)(bottom - top) + 1u;
-    return viewport->width != 0 && viewport->height != 0;
+    if (origin_x + width > pitch)
+        width = pitch - origin_x;
+    if (origin_y + height > screen_height)
+        height = (uint32_t)(screen_height - origin_y);
+    viewport->x = (int32_t)origin_x;
+    viewport->y = (int32_t)origin_y;
+    viewport->width = width;
+    viewport->height = height;
+    return width != 0 && height != 0;
 }
 
 /* The engine's linear back buffer is host-allocated outside the game_ram accessor range; the
@@ -505,11 +499,8 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
 
     if (!hwr_read_viewport(api, &viewport)) {
         if (!g_viewport_error_logged) {
-            fprintf(stderr, "[renderer_overhaul] world viewport rejected: bounds l=%d r=%d t=%d b=%d origin=%u,%u pitch=%u screen_h=%u\n",
-                    (int)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_LEFT),
-                    (int)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_RIGHT),
-                    (int)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_TOP),
-                    (int)(int16_t)api->game_ram->u16(VA_G_VIEW_BOUND_BOTTOM),
+            fprintf(stderr, "[renderer_overhaul] world viewport rejected: render %ux%u origin %u,%u pitch=%u screen_h=%u\n",
+                    api->game_ram->u16(VA_G_RENDER_WIDTH), api->game_ram->u16(VA_G_RENDER_HEIGHT),
                     api->game_ram->u32(VA_G_VIEW_X), api->game_ram->u32(VA_G_VIEW_Y),
                     api->game_ram->u32(VA_G_SCREEN_PITCH),
                     api->game_ram->u32(VA_G_SCREEN_HEIGHT));
