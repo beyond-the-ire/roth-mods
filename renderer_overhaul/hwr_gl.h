@@ -84,6 +84,7 @@ struct hwr_gl_camera {
     float shade_depth_scale;
     uint32_t sky_texture_offset;
     uint32_t sky_projection_offset;
+    uint16_t sky_source_offset;
     uint16_t sky_texture_height;
     int16_t sky_start_row;
     uint16_t sky_yaw;

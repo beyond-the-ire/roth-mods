@@ -108,6 +108,7 @@ struct hwr_scene {
     size_t stream_capacity;
     uint32_t sky_texture_offset;
     uint32_t sky_projection_offset;
+    uint16_t sky_source_offset;
     uint16_t sky_texture_height;
     uint8_t sky_row_bias;
     uint8_t sky_valid;

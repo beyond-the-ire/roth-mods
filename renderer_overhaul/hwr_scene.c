@@ -1038,7 +1038,9 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         size_t pixel_count = 0;
         uint16_t sky_width = 0;
         uint16_t sky_height = 0;
+        uint16_t sky_source_offset = 0;
         uint8_t projection[HWR_SKY_PROJECTION_TABLE_SIZE];
+        size_t packed_pixel_count = 0;
         size_t i;
 
         entry = has_sky ? hwr_resolve_entry(map_archive, shared_archive,
@@ -1051,22 +1053,39 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                 sky_width = entry->width;
                 sky_height = entry->height;
                 pixel_count = (size_t)sky_width * sky_height;
+                packed_pixel_count = pixel_count;
+                /* DAS selectors normally address the pixels at block+0x10.
+                 * Flag 0x100 adds the block's word at 0x14 to that base. */
+                if ((entry->payload_flags & 0x100u) != 0 &&
+                    entry->raw_payload_size >= 0x0cu) {
+                    size_t available = entry->raw_payload_size - 6u;
+                    sky_source_offset = hwr_scene_read_u16(
+                        entry->raw_payload + 0x0au);
+                    if (pixel_count > available ||
+                        sky_source_offset > available - pixel_count) {
+                        pixels = NULL;
+                    } else {
+                        packed_pixel_count += sky_source_offset;
+                    }
+                }
             } else if (entry->resource_class == HWR_DAS_CLASS_ANIMATED &&
                        entry->frame_count != 0 && entry->frames[0].pixels != NULL) {
                 pixels = entry->frames[0].pixels;
                 sky_width = entry->frames[0].width;
                 sky_height = entry->frames[0].height;
                 pixel_count = (size_t)sky_width * sky_height;
+                packed_pixel_count = pixel_count;
             }
         }
         if (pixels != NULL && sky_width == 256u && sky_height <= 256u &&
-            size <= UINT32_MAX && pixel_count <= UINT32_MAX - size) {
+            size <= UINT32_MAX && packed_pixel_count <= UINT32_MAX - size) {
             scene->sky_texture_offset = (uint32_t)size;
+            scene->sky_source_offset = sky_source_offset;
             scene->sky_texture_height = sky_height;
             scene->sky_row_bias = entry != NULL && (entry->fat_flags & 2u) != 0
                                 ? entry->captured_first_byte : 0;
             if (hwr_append_bytes(&bytes, &size, &capacity,
-                                 pixels, pixel_count) != 0) {
+                                 pixels, packed_pixel_count) != 0) {
                 if (entry != NULL)
                     hwr_das_release_decoded(owner, entry_id);
                 free(bytes);
@@ -1092,8 +1111,9 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
             }
             scene->sky_valid = 1;
             if (debug)
-                fprintf(stderr, "[renderer_overhaul] sky texture %u: 256x%u, row bias %u\n",
-                        world->sky_fat_index, sky_height, scene->sky_row_bias);
+                fprintf(stderr, "[renderer_overhaul] sky texture %u: 256x%u, row bias %u, source offset %u\n",
+                        world->sky_fat_index, sky_height, scene->sky_row_bias,
+                        scene->sky_source_offset);
         } else if (has_sky && debug) {
             fprintf(stderr, "[renderer_overhaul] sky texture %u could not be resolved\n",
                     world->sky_fat_index);
@@ -1880,6 +1900,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     hwr_read_camera(&camera, world, api);
     camera.sky_texture_offset = scene->sky_texture_offset;
     camera.sky_projection_offset = scene->sky_projection_offset;
+    camera.sky_source_offset = scene->sky_source_offset;
     camera.sky_texture_height = scene->sky_texture_height;
     camera.sky_start_row = (int16_t)(api->game_ram->u16(VA_G_SKY_START_ROW) +
                                      scene->sky_row_bias);

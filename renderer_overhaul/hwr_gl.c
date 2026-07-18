@@ -855,6 +855,7 @@ static const char g_sky_fragment_shader[] =
     "layout(location=0) out uint out_index;\n"
     "uniform usamplerBuffer u_texels;\n"
     "uniform int u_texture_offset;\n"
+    "uniform int u_source_offset;\n"
     "uniform int u_projection_offset;\n"
     "uniform int u_texture_height;\n"
     "uniform int u_start_row;\n"
@@ -867,7 +868,7 @@ static const char g_sky_fragment_shader[] =
     "  column=(column-(u_yaw << 1)) & 255;\n"
     "  int row=u_start_row+(u_double_scanline!=0 ? (y >> 1) : y);\n"
     "  row=clamp(row,0,u_texture_height-1);\n"
-    "  uint texel=texelFetch(u_texels,u_texture_offset+row*256+column).r;\n"
+    "  uint texel=texelFetch(u_texels,u_texture_offset+u_source_offset+row*256+column).r;\n"
     "  out_index=u_debug_vis==1 ? 255u : texel;\n"
     "}\n";
 
@@ -1522,6 +1523,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         hwr_set_sampler(g_sky_program, "u_texels", 0);
         hwr_uniform_1i(g_sky_program, "u_texture_offset",
                        (GLint)camera->sky_texture_offset);
+        hwr_uniform_1i(g_sky_program, "u_source_offset",
+                       camera->sky_source_offset);
         hwr_uniform_1i(g_sky_program, "u_projection_offset",
                        (GLint)camera->sky_projection_offset);
         hwr_uniform_1i(g_sky_program, "u_texture_height",
