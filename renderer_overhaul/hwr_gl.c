@@ -164,6 +164,7 @@ static GLuint g_scene_vbo;
 static GLuint g_scene_vao;
 static GLuint g_resolve_vao;
 static GLuint g_geometry_program;
+static GLuint g_sky_program;
 static GLuint g_resolve_program;
 static GLuint g_probe_program;
 static int g_scene_uploaded;
@@ -844,6 +845,27 @@ static const char g_resolve_vertex_shader[] =
     "  gl_Position=vec4(p*2.0-1.0,0.0,1.0);\n"
     "}\n";
 
+static const char g_sky_fragment_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) out uint out_index;\n"
+    "uniform usamplerBuffer u_texels;\n"
+    "uniform int u_texture_offset;\n"
+    "uniform int u_projection_offset;\n"
+    "uniform int u_texture_height;\n"
+    "uniform int u_start_row;\n"
+    "uniform int u_yaw;\n"
+    "uniform int u_double_scanline;\n"
+    "uniform int u_debug_vis;\n"
+    "void main() {\n"
+    "  int x=int(gl_FragCoord.x), y=int(gl_FragCoord.y);\n"
+    "  int column=int(texelFetch(u_texels,u_projection_offset+x).r);\n"
+    "  column=(column-(u_yaw << 1)) & 255;\n"
+    "  int row=u_start_row+(u_double_scanline!=0 ? (y >> 1) : y);\n"
+    "  row=clamp(row,0,u_texture_height-1);\n"
+    "  uint texel=texelFetch(u_texels,u_texture_offset+row*256+column).r;\n"
+    "  out_index=u_debug_vis==1 ? 255u : texel;\n"
+    "}\n";
+
 static const char g_resolve_fragment_shader[] =
     "#version 330 core\n"
     "layout(location=0) out vec4 out_color;\n"
@@ -940,11 +962,14 @@ static void hwr_destroy_scene_objects(void)
 {
     if (g_geometry_program != 0)
         g_gl.delete_program(g_geometry_program);
+    if (g_sky_program != 0)
+        g_gl.delete_program(g_sky_program);
     if (g_resolve_program != 0)
         g_gl.delete_program(g_resolve_program);
     if (g_probe_program != 0)
         g_gl.delete_program(g_probe_program);
     g_geometry_program = 0;
+    g_sky_program = 0;
     g_resolve_program = 0;
     g_probe_program = 0;
     if (g_scene_vao != 0)
@@ -1171,11 +1196,13 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     hwr_destroy_scene_objects();
     g_geometry_program = hwr_link_program(g_geometry_vertex_shader,
                                           g_geometry_fragment_shader);
+    g_sky_program = hwr_link_program(g_resolve_vertex_shader,
+                                     g_sky_fragment_shader);
     g_resolve_program = hwr_link_program(g_resolve_vertex_shader,
                                          g_resolve_fragment_shader);
     g_probe_program = hwr_link_program(g_resolve_vertex_shader,
                                        g_probe_fragment_shader);
-    if (g_geometry_program == 0 || g_resolve_program == 0 ||
+    if (g_geometry_program == 0 || g_sky_program == 0 || g_resolve_program == 0 ||
         g_probe_program == 0) {
         hwr_destroy_scene_objects();
         return 0;
@@ -1254,6 +1281,8 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.use_program(g_resolve_program);
     hwr_set_sampler(g_resolve_program, "u_index", 0);
     hwr_set_sampler(g_resolve_program, "u_palette", 1);
+    g_gl.use_program(g_sky_program);
+    hwr_set_sampler(g_sky_program, "u_texels", 0);
     g_gl.use_program(g_probe_program);
     hwr_set_sampler(g_probe_program, "u_texels", 0);
     hwr_set_sampler(g_probe_program, "u_colormap", 1);
@@ -1473,12 +1502,42 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
     g_gl.clear(GL_DEPTH_BUFFER_BIT);
+    hwr_bind_scene_textures();
+    if (g_debug_vis < 0) {
+        const char *vis = getenv("HWR_SHADE_VIS");
+        g_debug_vis = vis != NULL && vis[0] == '1' ? 1 : 0;
+    }
+    if (camera->sky_valid && camera->sky_texture_height != 0 &&
+        width <= 0x288u) {
+        /* The software wall driver establishes the parallax image as the
+         * destination behind sky boundaries. Drawing it before depth-tested
+         * geometry gives masked walls and open portals the same destination. */
+        g_gl.disable(GL_DEPTH_TEST);
+        g_gl.use_program(g_sky_program);
+        hwr_set_sampler(g_sky_program, "u_texels", 0);
+        hwr_uniform_1i(g_sky_program, "u_texture_offset",
+                       (GLint)camera->sky_texture_offset);
+        hwr_uniform_1i(g_sky_program, "u_projection_offset",
+                       (GLint)camera->sky_projection_offset);
+        hwr_uniform_1i(g_sky_program, "u_texture_height",
+                       camera->sky_texture_height);
+        hwr_uniform_1i(g_sky_program, "u_start_row", camera->sky_start_row);
+        hwr_uniform_1i(g_sky_program, "u_yaw", camera->sky_yaw);
+        hwr_uniform_1i(g_sky_program, "u_double_scanline",
+                       camera->sky_double_scanline);
+        hwr_uniform_1i(g_sky_program, "u_debug_vis", g_debug_vis);
+        g_gl.bind_vertex_array(g_resolve_vao);
+        g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    }
+    /* The sky prepass leaves the fullscreen-triangle VAO bound; restore the
+     * scene VAO so the geometry pass draws the actual world, not a stray
+     * triangle over the sky. */
+    g_gl.bind_vertex_array(g_scene_vao);
     g_gl.enable(GL_DEPTH_TEST);
     g_gl.depth_func(GL_LESS);
     g_gl.depth_mask(GL_TRUE);
     g_gl.disable(GL_BLEND);
     g_gl.use_program(g_geometry_program);
-    hwr_bind_scene_textures();
     /* Sampler assignments have been observed to come up lost on some runs
      * (every lookup then lands on unit 0 and the world renders black);
      * re-asserting them each frame costs nothing and heals that state. */
@@ -1488,10 +1547,6 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_set_sampler(g_geometry_program, "u_glow", 3);
     hwr_set_sampler(g_geometry_program, "u_blend", 4);
     hwr_set_sampler(g_geometry_program, "u_dst", 5);
-    if (g_debug_vis < 0) {
-        const char *vis = getenv("HWR_SHADE_VIS");
-        g_debug_vis = vis != NULL && vis[0] == '1' ? 1 : 0;
-    }
     hwr_uniform_1i(g_geometry_program, "u_debug_vis", g_debug_vis);
     hwr_uniform_2i(g_geometry_program, "u_view_offset",
                    camera->view_offset_x, camera->view_offset_y);

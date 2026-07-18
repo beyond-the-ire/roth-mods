@@ -82,6 +82,13 @@ struct hwr_gl_camera {
     uint8_t glow_phase;
     uint16_t flat_edge_bias;
     float shade_depth_scale;
+    uint32_t sky_texture_offset;
+    uint32_t sky_projection_offset;
+    uint16_t sky_texture_height;
+    int16_t sky_start_row;
+    uint16_t sky_yaw;
+    uint8_t sky_double_scanline;
+    uint8_t sky_valid;
 };
 
 int hwr_gl_init(void);

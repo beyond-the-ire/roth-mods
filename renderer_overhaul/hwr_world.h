@@ -100,6 +100,7 @@ struct hwr_world {
     const uint8_t *vertex_section;
     uint16_t first_vertex_offset;
     uint16_t world_span_colorkey;
+    uint16_t sky_fat_index;
     struct hwr_luts luts;
     int valid;
     char error[192];

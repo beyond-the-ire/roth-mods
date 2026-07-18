@@ -12,6 +12,7 @@
 #define VA_G_COLORMAP_PTR          0x86d28u
 #define VA_G_DAMAGE_FLASH_LEVEL    0x89f3bu
 #define VA_G_WORLD_SPAN_COLORKEY   0x90a2cu
+#define VA_G_SKY_FAT_INDEX         0x89f34u
 #define VA_G_MAP_GEOMETRY_BUFFER   0x90aa8u
 #define VA_G_VERTEX_GEOMETRY_BASE  0x90aacu
 #define VA_G_SHADE_LEVEL           0x90c16u
@@ -323,6 +324,7 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
         }
     }
     next.world_span_colorkey = api->game_ram->u16(VA_G_WORLD_SPAN_COLORKEY);
+    next.sky_fat_index = api->game_ram->u16(VA_G_SKY_FAT_INDEX);
     next.valid = 1;
     /* Development aid: HWR_WORLD_DUMP=<path> writes the parsed geometry as
      * text (sectors, then walls with endpoint coordinates) for offline

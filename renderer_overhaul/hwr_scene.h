@@ -106,6 +106,11 @@ struct hwr_scene {
     } textures[0x1600];
     struct hwr_gl_vertex *stream_vertices;
     size_t stream_capacity;
+    uint32_t sky_texture_offset;
+    uint32_t sky_projection_offset;
+    uint16_t sky_texture_height;
+    uint8_t sky_row_bias;
+    uint8_t sky_valid;
     int uploaded;
     int valid;
     int fallback_logged;

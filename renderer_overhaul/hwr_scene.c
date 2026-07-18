@@ -11,8 +11,9 @@
 #include <string.h>
 
 #define HWR_WALL_U_REVERSED 0
-#define HWR_SKY_FILL_INDEX 0x7fu
 #define HWR_GROUP_PART_TABLE_VA 0x909b4u
+#define HWR_SKY_PROJECTION_TABLE_VA 0x8c484u
+#define HWR_SKY_PROJECTION_TABLE_SIZE 0x288u
 
 struct hwr_point {
     int16_t x;
@@ -185,7 +186,7 @@ static void hwr_finish_material(struct hwr_scene_mesh *mesh,
     else
         hwr_mark_texture(mesh, id);
     if ((mapping_flags & 0x40u) != 0)
-        surface->flags |= HWR_SURFACE_SKY | HWR_SURFACE_DIRECT;
+        surface->flags |= HWR_SURFACE_SKY;
 }
 
 static void hwr_set_vertex(struct hwr_mesh_vertex *vertex, int16_t x, int16_t y,
@@ -876,11 +877,21 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
     size_t capacity = 0;
     uint8_t zero = 0;
     uint16_t logical;
+    int has_sky = 0;
+    size_t surface_index;
     struct hwr_scene_texture_stats stats;
     memset(&stats, 0, sizeof stats);
     if (hwr_append_bytes(&bytes, &size, &capacity, &zero, 1) != 0)
         return hwr_scene_fail(scene, "out of memory creating texture buffer");
     memset(scene->textures, 0, sizeof scene->textures);
+    scene->sky_valid = 0;
+    for (surface_index = 0; surface_index < scene->mesh.surface_count;
+         surface_index++) {
+        if ((scene->mesh.surfaces[surface_index].flags & HWR_SURFACE_SKY) != 0) {
+            has_sky = 1;
+            break;
+        }
+    }
     for (logical = 0; logical < 0x1600u; logical++) {
         struct hwr_das_archive *owner = NULL;
         struct hwr_das_entry *entry;
@@ -962,6 +973,77 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         if (entry != NULL)
             hwr_das_release_decoded(owner, entry_id);
     }
+    {
+        struct hwr_das_archive *owner = NULL;
+        struct hwr_das_entry *entry;
+        size_t entry_id = 0;
+        const uint8_t *pixels = NULL;
+        size_t pixel_count = 0;
+        uint16_t sky_width = 0;
+        uint16_t sky_height = 0;
+        uint8_t projection[HWR_SKY_PROJECTION_TABLE_SIZE];
+        size_t i;
+
+        entry = has_sky ? hwr_resolve_entry(map_archive, shared_archive,
+                                            world->sky_fat_index, &owner,
+                                            &entry_id) : NULL;
+        if (entry != NULL && hwr_das_decode(owner, entry_id) == 0) {
+            if (entry->resource_class == HWR_DAS_CLASS_PLAIN &&
+                entry->raw_payload != NULL && entry->raw_payload_size >= 6u) {
+                pixels = entry->raw_payload + 6u;
+                sky_width = entry->width;
+                sky_height = entry->height;
+                pixel_count = (size_t)sky_width * sky_height;
+            } else if (entry->resource_class == HWR_DAS_CLASS_ANIMATED &&
+                       entry->frame_count != 0 && entry->frames[0].pixels != NULL) {
+                pixels = entry->frames[0].pixels;
+                sky_width = entry->frames[0].width;
+                sky_height = entry->frames[0].height;
+                pixel_count = (size_t)sky_width * sky_height;
+            }
+        }
+        if (pixels != NULL && sky_width == 256u && sky_height <= 256u &&
+            size <= UINT32_MAX && pixel_count <= UINT32_MAX - size) {
+            scene->sky_texture_offset = (uint32_t)size;
+            scene->sky_texture_height = sky_height;
+            scene->sky_row_bias = entry != NULL && (entry->fat_flags & 2u) != 0
+                                ? entry->captured_first_byte : 0;
+            if (hwr_append_bytes(&bytes, &size, &capacity,
+                                 pixels, pixel_count) != 0) {
+                if (entry != NULL)
+                    hwr_das_release_decoded(owner, entry_id);
+                free(bytes);
+                return hwr_scene_fail(scene, "out of memory packing sky texture %u",
+                                      world->sky_fat_index);
+            }
+            if (size > UINT32_MAX - sizeof projection) {
+                if (entry != NULL)
+                    hwr_das_release_decoded(owner, entry_id);
+                free(bytes);
+                return hwr_scene_fail(scene, "sky projection table exceeds texture store");
+            }
+            for (i = 0; i < sizeof projection; i++)
+                projection[i] = api->game_ram->u8(
+                    HWR_SKY_PROJECTION_TABLE_VA + (uint32_t)i);
+            scene->sky_projection_offset = (uint32_t)size;
+            if (hwr_append_bytes(&bytes, &size, &capacity,
+                                 projection, sizeof projection) != 0) {
+                if (entry != NULL)
+                    hwr_das_release_decoded(owner, entry_id);
+                free(bytes);
+                return hwr_scene_fail(scene, "out of memory packing sky projection table");
+            }
+            scene->sky_valid = 1;
+            if (debug)
+                fprintf(stderr, "[renderer_overhaul] sky texture %u: 256x%u, row bias %u\n",
+                        world->sky_fat_index, sky_height, scene->sky_row_bias);
+        } else if (has_sky && debug) {
+            fprintf(stderr, "[renderer_overhaul] sky texture %u could not be resolved\n",
+                    world->sky_fat_index);
+        }
+        if (entry != NULL)
+            hwr_das_release_decoded(owner, entry_id);
+    }
     if (debug)
         fprintf(stderr, "[renderer_overhaul] scene stats: surfaces=%u quads=%u textures plain=%u grouped=%u anim-frame0=%u fill=%u fallbacks=%u\n",
                 (unsigned)scene->mesh.surface_count,
@@ -1011,6 +1093,9 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
 #define VA_G_GLOW_PHASE          0x8a355u
 #define VA_G_VIEW_PARAMS_A       0x85270u
 #define VA_G_PLAYER_LIGHT_BIAS   0x8c1d8u
+#define VA_G_SKY_START_ROW       0x909f6u
+#define VA_G_SKY_YAW             0x909f8u
+#define VA_G_DOUBLE_SCANLINE     0x8a310u
 
 static void hwr_read_camera(struct hwr_gl_camera *camera,
                             const struct hwr_world *world,
@@ -1063,8 +1148,8 @@ static int hwr_surface_translucent(struct hwr_scene *scene,
 {
     uint16_t logical;
     uint16_t qflags;
-    if ((surface->flags & (HWR_SURFACE_DIRECT | HWR_SURFACE_SKY |
-                           HWR_SURFACE_MASKED)) != HWR_SURFACE_MASKED)
+    if ((surface->flags & (HWR_SURFACE_DIRECT | HWR_SURFACE_MASKED)) !=
+        HWR_SURFACE_MASKED)
         return 0;
     logical = (uint16_t)surface->texture_id;
     qflags = logical < 0x1600u ? scene->textures[logical].qflags : 0;
@@ -1501,10 +1586,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         flags |= HWR_GL_MATERIAL_MASKED;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         flags |= HWR_GL_MATERIAL_FLAT;
-    if ((surface->flags & HWR_SURFACE_SKY) != 0) {
-        flags |= HWR_GL_MATERIAL_SKY | HWR_GL_MATERIAL_DIRECT;
-        direct_index = HWR_SKY_FILL_INDEX;
-    } else if ((surface->flags & HWR_SURFACE_DIRECT) != 0) {
+    if ((surface->flags & HWR_SURFACE_DIRECT) != 0) {
         flags |= HWR_GL_MATERIAL_DIRECT;
     } else if (logical < 0x1600u && scene->textures[logical].direct) {
         flags |= HWR_GL_MATERIAL_DIRECT;
@@ -1734,6 +1816,14 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         return NULL;
     }
     hwr_read_camera(&camera, world, api);
+    camera.sky_texture_offset = scene->sky_texture_offset;
+    camera.sky_projection_offset = scene->sky_projection_offset;
+    camera.sky_texture_height = scene->sky_texture_height;
+    camera.sky_start_row = (int16_t)(api->game_ram->u16(VA_G_SKY_START_ROW) +
+                                     scene->sky_row_bias);
+    camera.sky_yaw = api->game_ram->u16(VA_G_SKY_YAW);
+    camera.sky_double_scanline = api->game_ram->u8(VA_G_DOUBLE_SCANLINE) != 0;
+    camera.sky_valid = scene->sky_valid;
     if (hwr_prepare_stream(scene, &camera, width, height,
                            &opaque_count, &translucent_count) != 0)
         return NULL;

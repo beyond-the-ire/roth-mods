@@ -3,8 +3,8 @@
 Renderer Overhaul replaces ROTH.C's software-rendered 3D world view with a GPU renderer while
 leaving the game's interface, text, cursor, and other 2D drawing in the engine. It is under active
 development. The current build renders static map walls, floors, ceilings, and stacked slabs with
-the map's palette-index textures and colour tables. Doors, entities, mirrors, animated texture
-frames, and parallax sky remain on the development roadmap.
+the map's palette-index textures and colour tables, including the map's parallax backdrop. Doors,
+entities, mirrors, and animated texture frames remain on the development roadmap.
 
 ## Installation
 
