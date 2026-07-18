@@ -146,6 +146,30 @@ static void hwr_dump_pgm(const char *suffix, const uint8_t *bytes,
     rename(temp_path, path);
 }
 
+/* One atomic file per compare cycle: the soft, gl, and gl-texel planes stacked
+ * vertically, with the cycle serial in a header comment so sweep tooling can
+ * detect fresh sets. */
+static void hwr_dump_compare_set(const uint8_t *soft, const uint8_t *gl,
+                                 const uint8_t *gltex,
+                                 uint32_t width, uint32_t height,
+                                 uint32_t cycle)
+{
+    char path[2620];
+    char temp_path[2640];
+    FILE *file;
+    snprintf(path, sizeof path, "%s_set.pgm", g_compare_path);
+    snprintf(temp_path, sizeof temp_path, "%s.tmp", path);
+    file = fopen(temp_path, "wb");
+    if (file == NULL)
+        return;
+    fprintf(file, "P5\n# cycle %u\n%u %u\n255\n", cycle, width, height * 3u);
+    fwrite(soft, 1, (size_t)width * height, file);
+    fwrite(gl, 1, (size_t)width * height, file);
+    fwrite(gltex, 1, (size_t)width * height, file);
+    fclose(file);
+    rename(temp_path, path);
+}
+
 /* Copies the software renderer's just-drawn viewport region (8bpp palette
  * indices) row by row from the engine's linear back buffer. */
 static int hwr_copy_soft_indices(const struct roth_api_v1 *api,
@@ -849,35 +873,30 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         if (pixels != NULL && g_scene.valid &&
             ((g_compare_counter++) & 15u) == 0) {
             size_t plane = (size_t)render_width * render_height;
-            uint8_t *buffer = (uint8_t *)realloc(g_compare_buffer, plane);
+            uint8_t *buffer = (uint8_t *)realloc(g_compare_buffer, plane * 3u);
             if (buffer != NULL) {
-                int rd1;
-                int rd2 = 0;
-                const uint32_t *second;
-                uint32_t nonzero = 0;
-                uint32_t i;
+                uint8_t *soft = buffer;
+                uint8_t *gl = buffer + plane;
+                uint8_t *gltex = buffer + plane * 2u;
+                int ok;
                 g_compare_buffer = buffer;
-                if (hwr_copy_soft_indices(api, &viewport, buffer))
-                    hwr_dump_pgm("soft", buffer, render_width, render_height);
-                rd1 = hwr_gl_read_scene_indices(buffer, render_width, render_height);
-                if (rd1) {
-                    for (i = 0; i < plane; i++)
-                        nonzero += buffer[i] != 0;
-                    hwr_dump_pgm("gl", buffer, render_width, render_height);
-                }
+                ok = hwr_copy_soft_indices(api, &viewport, soft) &&
+                     hwr_gl_read_scene_indices(gl, render_width, render_height);
                 hwr_gl_set_debug_vis(2);
-                second = hwr_scene_render(&g_scene, &g_world, api, render_width,
-                                          render_height);
-                if (second != NULL &&
-                    (rd2 = hwr_gl_read_scene_indices(buffer, render_width,
-                                                     render_height)) != 0)
-                    hwr_dump_pgm("gltex", buffer, render_width, render_height);
+                ok = ok &&
+                     hwr_scene_render(&g_scene, &g_world, api, render_width,
+                                      render_height) != NULL &&
+                     hwr_gl_read_scene_indices(gltex, render_width, render_height);
                 hwr_gl_set_debug_vis(0);
-                hwr_dump_pgm("cmap", g_world.luts.colormap, 256, 32);
-                hwr_dump_pgm("tint", g_world.luts.tint, 256, 32);
-                if (g_debug_enabled)
-                    fprintf(stderr, "[renderer_overhaul] compare cycle: rd1=%d nonzero=%u second=%d rd2=%d\n",
-                            rd1, nonzero, second != NULL, rd2);
+                if (ok) {
+                    hwr_dump_compare_set(soft, gl, gltex, render_width,
+                                         render_height, g_compare_counter);
+                    hwr_dump_pgm("cmap", g_world.luts.colormap, 256, 32);
+                    hwr_dump_pgm("tint", g_world.luts.tint, 256, 32);
+                } else if (g_debug_enabled) {
+                    fprintf(stderr, "[renderer_overhaul] compare cycle %u incomplete\n",
+                            g_compare_counter);
+                }
             }
         }
         hwr_withdraw_if_owned(api);
