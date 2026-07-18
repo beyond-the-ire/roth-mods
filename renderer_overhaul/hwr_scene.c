@@ -16,6 +16,7 @@
 
 #define HWR_TEX_TRANSPARENT 0x01u
 #define HWR_TEX_IMAGE_FIT 0x04u
+#define HWR_TEX_TRANSPARENT_FIXED_SIZE 0x08u
 #define HWR_TEX_HALF_PIXEL 0x20u
 #define HWR_SECTOR_FLOOR_FLIP_X (1u << 8)
 #define HWR_SECTOR_FLOOR_FLIP_Y (1u << 9)
@@ -746,6 +747,25 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                                 ? sector->ceiling_z : neighbor->ceiling_z;
                     int16_t bottom = sector->floor_z > neighbor->floor_z
                                    ? sector->floor_z : neighbor->floor_z;
+                    if ((wall->mapping_flags &
+                         (HWR_TEX_TRANSPARENT |
+                          HWR_TEX_TRANSPARENT_FIXED_SIZE)) ==
+                        (HWR_TEX_TRANSPARENT |
+                         HWR_TEX_TRANSPARENT_FIXED_SIZE) &&
+                        sector->texture_map_override != 0) {
+                        int16_t height = (int16_t)(
+                            (sector->texture_map_override > 0
+                                 ? sector->texture_map_override
+                                 : -sector->texture_map_override) * 4);
+                        /* The engine pins positive overrides to the opening
+                         * ceiling and negative overrides to its floor. */
+                        if (sector->texture_map_override > 0)
+                            bottom = (int16_t)(top - height);
+                        else
+                            top = (int16_t)(bottom + height);
+                    }
+                    /* Span staging derives tiled vertical scale from this
+                     * emitted height; image-fit stretches over the same band. */
                     if (hwr_emit_wall(mesh, world, wall, sector,
                                       HWR_SURFACE_PORTAL_MIDDLE,
                                       (int16_t)wall->middle_id,

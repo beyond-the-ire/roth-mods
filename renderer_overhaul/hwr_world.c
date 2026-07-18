@@ -75,6 +75,7 @@ static void hwr_parse_sector(struct hwr_sector *sector)
     sector->floor_flat_id = hwr_i16(sector->raw + 8);
     sector->flags = sector->raw[0x0a];
     sector->light = sector->raw[0x0b];
+    sector->texture_map_override = (int8_t)sector->raw[0x0c];
     sector->wall_count = sector->raw[0x0d];
     sector->wall_offset = hwr_u16(sector->raw + 0x0e);
     sector->ceiling_pan = hwr_u16(sector->raw + 0x10);
@@ -338,9 +339,10 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
                 fprintf(f, "colorkey %u\n", next.world_span_colorkey);
                 for (n = 0; n < next.sector_count; n++) {
                     const struct hwr_sector *s = &next.sectors[n];
-                    fprintf(f, "sector %zu off=%#x floor=%d ceil=%d flags=%#x light=%u walls=%zu+%u fid=%d cid=%d fpan=%#x cpan=%#x",
+                    fprintf(f, "sector %zu off=%#x floor=%d ceil=%d flags=%#x light=%u map_override=%d walls=%zu+%u fid=%d cid=%d fpan=%#x cpan=%#x",
                             n, s->section_offset, s->floor_z, s->ceiling_z,
-                            s->flags, s->light, s->first_wall, s->wall_count,
+                            s->flags, s->light, (int)s->texture_map_override,
+                            s->first_wall, s->wall_count,
                             s->floor_flat_id, s->ceiling_flat_id,
                             s->floor_pan, s->ceiling_pan);
                     if (s->slab_index != SIZE_MAX) {
@@ -387,11 +389,12 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
         struct hwr_sector *sector = &world->sectors[i];
         const uint8_t *record = world->sector_section + sector->section_offset;
         memcpy(sector->raw, record, 4);
-        memcpy(sector->raw + 0x0a, record + 0x0a, 2);
+        memcpy(sector->raw + 0x0a, record + 0x0a, 3);
         sector->ceiling_z = hwr_i16(sector->raw);
         sector->floor_z = hwr_i16(sector->raw + 2);
         sector->flags = sector->raw[0x0a];
         sector->light = sector->raw[0x0b];
+        sector->texture_map_override = (int8_t)sector->raw[0x0c];
     }
     for (i = 0; i < world->slab_count; i++) {
         struct hwr_slab *slab = &world->slabs[i];

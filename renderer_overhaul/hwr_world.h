@@ -16,6 +16,7 @@ struct hwr_sector {
     int16_t floor_flat_id;
     uint8_t flags;
     uint8_t light;
+    int8_t texture_map_override;
     uint8_t wall_count;
     uint16_t wall_offset;
     uint16_t ceiling_pan;
