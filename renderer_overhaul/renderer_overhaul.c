@@ -92,6 +92,14 @@ static uint32_t g_selfheal_tick;
  * original renderer's output. */
 static char g_dump_path[2600];
 static uint32_t g_dump_counter;
+/* Development aid: HWR_COMPARE=<path-prefix> renders BOTH ways each frame —
+ * the original renderer draws normally (no suppression, no sentinel, no
+ * submit) while the GL scene renders from the same live state — and
+ * periodically writes <prefix>_soft.pgm / <prefix>_gl.pgm as raw palette
+ * indices for pixel-exact offline comparison. */
+static char g_compare_path[2560];
+static uint32_t g_compare_counter;
+static uint8_t *g_compare_buffer;
 static char g_plugin_dir[2600];
 static struct hwr_world g_world;
 static struct hwr_das_archive g_map_archive;
@@ -119,6 +127,45 @@ static void hwr_dump_frame(const uint32_t *pixels, uint32_t width, uint32_t heig
     }
     fclose(file);
     rename(temp_path, g_dump_path);
+}
+
+static void hwr_dump_pgm(const char *suffix, const uint8_t *bytes,
+                         uint32_t width, uint32_t height)
+{
+    char path[2620];
+    char temp_path[2640];
+    FILE *file;
+    snprintf(path, sizeof path, "%s_%s.pgm", g_compare_path, suffix);
+    snprintf(temp_path, sizeof temp_path, "%s.tmp", path);
+    file = fopen(temp_path, "wb");
+    if (file == NULL)
+        return;
+    fprintf(file, "P5\n%u %u\n255\n", width, height);
+    fwrite(bytes, 1, (size_t)width * height, file);
+    fclose(file);
+    rename(temp_path, path);
+}
+
+/* Copies the software renderer's just-drawn viewport region (8bpp palette
+ * indices) row by row from the engine's linear back buffer. */
+static int hwr_copy_soft_indices(const struct roth_api_v1 *api,
+                                 const struct hwr_viewport *viewport,
+                                 uint8_t *out)
+{
+    uint32_t pitch = api->game_ram->u32(VA_G_SCREEN_PITCH);
+    uint32_t screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
+    uintptr_t framebuffer = (uintptr_t)api->game_ram->u32(VA_G_FRAMEBUFFER_PTR);
+    uint32_t row;
+    if (framebuffer == 0 || pitch == 0 || pitch > 4096u || screen_height > 4096u)
+        return 0;
+    for (row = 0; row < viewport->height; row++) {
+        uintptr_t address = framebuffer +
+            ((uint64_t)((uint32_t)viewport->y + row)) * pitch +
+            (uint32_t)viewport->x;
+        memcpy(out + (size_t)row * viewport->width, (const void *)address,
+               viewport->width);
+    }
+    return 1;
 }
 
 static int hwr_ascii_equal_ci(const char *a, const char *b)
@@ -678,7 +725,8 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         return;
     }
 
-    g_suppress_active = 1;
+    if (g_compare_path[0] == 0)
+        g_suppress_active = 1;
     roth_next_render_world_view_pass(chain, eax_record);
     g_suppress_active = 0;
 
@@ -694,7 +742,7 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_withdraw_if_owned(api);
         return;
     }
-    if (!hwr_fill_sentinel(api, &viewport)) {
+    if (g_compare_path[0] == 0 && !hwr_fill_sentinel(api, &viewport)) {
         if (!g_sentinel_error_logged) {
             fprintf(stderr, "[renderer_overhaul] sentinel fill rejected: fb=0x%x arena=0x%x size=0x%x viewport=%d,%d %ux%u\n",
                     api->game_ram->u32(VA_G_FRAMEBUFFER_PTR),
@@ -793,6 +841,47 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
             hwr_reload_map_data(api, 0);
             g_selfheal_retry = !g_world.valid;
         }
+    }
+    if (g_compare_path[0] != 0) {
+        /* Compare mode: the software world is on screen; pair its indices
+         * with the GL index attachment (plus a raw-texel plane and the LUTs
+         * for shade-vs-texel attribution) and never submit. */
+        if (pixels != NULL && g_scene.valid &&
+            ((g_compare_counter++) & 15u) == 0) {
+            size_t plane = (size_t)render_width * render_height;
+            uint8_t *buffer = (uint8_t *)realloc(g_compare_buffer, plane);
+            if (buffer != NULL) {
+                int rd1;
+                int rd2 = 0;
+                const uint32_t *second;
+                uint32_t nonzero = 0;
+                uint32_t i;
+                g_compare_buffer = buffer;
+                if (hwr_copy_soft_indices(api, &viewport, buffer))
+                    hwr_dump_pgm("soft", buffer, render_width, render_height);
+                rd1 = hwr_gl_read_scene_indices(buffer, render_width, render_height);
+                if (rd1) {
+                    for (i = 0; i < plane; i++)
+                        nonzero += buffer[i] != 0;
+                    hwr_dump_pgm("gl", buffer, render_width, render_height);
+                }
+                hwr_gl_set_debug_vis(2);
+                second = hwr_scene_render(&g_scene, &g_world, api, render_width,
+                                          render_height);
+                if (second != NULL &&
+                    (rd2 = hwr_gl_read_scene_indices(buffer, render_width,
+                                                     render_height)) != 0)
+                    hwr_dump_pgm("gltex", buffer, render_width, render_height);
+                hwr_gl_set_debug_vis(0);
+                hwr_dump_pgm("cmap", g_world.luts.colormap, 256, 32);
+                hwr_dump_pgm("tint", g_world.luts.tint, 256, 32);
+                if (g_debug_enabled)
+                    fprintf(stderr, "[renderer_overhaul] compare cycle: rd1=%d nonzero=%u second=%d rd2=%d\n",
+                            rd1, nonzero, second != NULL, rd2);
+            }
+        }
+        hwr_withdraw_if_owned(api);
+        return;
     }
     if (pixels == NULL)
         pixels = hwr_gl_render_frame(render_width, render_height,
@@ -910,8 +999,11 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
     snprintf(g_plugin_dir, sizeof g_plugin_dir, "%s", plugin_dir);
     {
         const char *dump = getenv("HWR_DUMP_FRAME");
+        const char *compare = getenv("HWR_COMPARE");
         if (dump != NULL)
             snprintf(g_dump_path, sizeof g_dump_path, "%s", dump);
+        if (compare != NULL)
+            snprintf(g_compare_path, sizeof g_compare_path, "%s", compare);
     }
     hwr_settings_init_defaults();
     if (hwr_settings_register_apply(hwr_render_settings_apply, NULL) != 0 ||

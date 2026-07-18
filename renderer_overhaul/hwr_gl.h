@@ -83,5 +83,11 @@ void hwr_gl_scene_clear(void);
 void hwr_gl_shutdown(void);
 const char *hwr_gl_last_error(void);
 unsigned hwr_gl_drain_errors(void);
+/* Copies the palette-index attachment of the last scene render (row-major,
+ * same orientation as the submitted frame). Returns 0 on failure. */
+int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height);
+/* Overrides the debug visualisation mode (0=off, 1=shade rows, 2=raw texel
+ * bytes); -1 re-reads the environment default on the next frame. */
+void hwr_gl_set_debug_vis(int mode);
 
 #endif

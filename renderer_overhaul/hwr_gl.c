@@ -731,6 +731,9 @@ static const char g_geometry_fragment_shader[] =
     "void main() {\n"
     "  uint texel=sample_texel(); uint material=v_light_material.y;\n"
     "  if ((material & 1u)!=0u && texel==0u) discard;\n"
+    /* Mode 2: the raw pre-colormap texel byte, for offline texel-vs-shade
+     * mismatch attribution. */
+    "  if (u_debug_vis==2) { out_index=texel & 255u; return; }\n"
     "  uint mapped; uint face_flags=v_pan_scale_flags.w;\n"
     "  if ((material & 4u)!=0u) mapped=texel;\n"
     "  else if ((face_flags & 64u)!=0u && (u_glow_phase & 73)!=0)"
@@ -1459,6 +1462,24 @@ void hwr_gl_scene_clear(void)
 {
     if (g_initialized && hwr_platform_make_current())
         hwr_destroy_scene_objects();
+}
+
+void hwr_gl_set_debug_vis(int mode)
+{
+    g_debug_vis = mode;
+}
+
+int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height)
+{
+    if (!g_initialized || g_index_fbo == 0 || out == NULL ||
+        width != g_fbo_width || height != g_fbo_height ||
+        !hwr_platform_make_current())
+        return 0;
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
+                     GL_RED_INTEGER, GL_UNSIGNED_BYTE, out);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, 0);
+    return hwr_gl_drain_errors() == 0;
 }
 
 void hwr_gl_resize(uint32_t width, uint32_t height)
