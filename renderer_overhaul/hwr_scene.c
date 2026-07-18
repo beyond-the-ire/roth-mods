@@ -1206,7 +1206,7 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
 
 static int hwr_surface_visible(const struct hwr_scene *scene,
                                const struct hwr_mesh_surface *surface,
-                               int16_t eye_z)
+                               const struct hwr_gl_camera *camera)
 {
     const struct hwr_scene_mesh *mesh = &scene->mesh;
     int16_t z;
@@ -1214,10 +1214,43 @@ static int hwr_surface_visible(const struct hwr_scene *scene,
         (uint16_t)surface->texture_id < 0x1600u &&
         scene->textures[(uint16_t)surface->texture_id].skip)
         return 0;
-    if ((surface->flags & HWR_SURFACE_FLAT) == 0)
+    if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
+        if (surface->kind == HWR_SURFACE_PORTAL_MIDDLE) {
+            const struct hwr_mesh_vertex *vertices =
+                &mesh->vertices[surface->first_vertex];
+            const struct hwr_mesh_vertex *end_a = NULL;
+            const struct hwr_mesh_vertex *end_b = NULL;
+            int32_t ax, ay, bx, by;
+            size_t i;
+            for (i = 0; i < surface->vertex_count; i++) {
+                if ((vertices[i].reserved & HWR_WALL_CORNER_END_B) != 0) {
+                    if (end_b == NULL)
+                        end_b = &vertices[i];
+                } else if (end_a == NULL) {
+                    end_a = &vertices[i];
+                }
+            }
+            if (end_a == NULL || end_b == NULL)
+                return 0;
+            ax = (int16_t)((uint16_t)end_a->x +
+                           (uint16_t)camera->view_offset_x);
+            ay = (int16_t)((uint16_t)end_a->y +
+                           (uint16_t)camera->view_offset_y);
+            bx = (int16_t)((uint16_t)end_b->x +
+                           (uint16_t)camera->view_offset_x);
+            by = (int16_t)((uint16_t)end_b->y +
+                           (uint16_t)camera->view_offset_y);
+            /* Portal middles have a record on each side. The engine submits
+             * only the directed face whose projected endpoints run left to
+             * right; submitting both lets the back-side mapping win a depth
+             * tie and mirrors its along-wall texture coordinate. */
+            return (int64_t)ax * by - (int64_t)ay * bx < 0;
+        }
         return 1;
+    }
     z = mesh->vertices[surface->first_vertex].z;
-    return (surface->flags & HWR_SURFACE_FACE_DOWN) != 0 ? eye_z < z : eye_z > z;
+    return (surface->flags & HWR_SURFACE_FACE_DOWN) != 0
+        ? camera->eye_z < z : camera->eye_z > z;
 }
 
 static int hwr_surface_translucent(struct hwr_scene *scene,
@@ -1796,7 +1829,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
         surface->flags &= (uint8_t)~HWR_SURFACE_TRANSLUCENT;
-        if (!hwr_surface_visible(scene, surface, camera->eye_z))
+        if (!hwr_surface_visible(scene, surface, camera))
             continue;
         if (hwr_surface_translucent(scene, surface)) {
             surface->flags |= HWR_SURFACE_TRANSLUCENT;
@@ -1824,7 +1857,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     translucent_surfaces = 0;
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
-        if (!hwr_surface_visible(scene, surface, camera->eye_z))
+        if (!hwr_surface_visible(scene, surface, camera))
             continue;
         if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
             hwr_copy_gpu_surface(scene, surface, camera, width, height,
