@@ -4,7 +4,6 @@
 
 #include "hwr_gl.h"
 
-#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +13,14 @@
 #define HWR_GROUP_PART_TABLE_VA 0x909b4u
 #define HWR_SKY_PROJECTION_TABLE_VA 0x8c484u
 #define HWR_SKY_PROJECTION_TABLE_SIZE 0x288u
+
+#define HWR_TEX_TRANSPARENT 0x01u
+#define HWR_TEX_IMAGE_FIT 0x04u
+#define HWR_TEX_HALF_PIXEL 0x20u
+#define HWR_SECTOR_FLOOR_FLIP_X (1u << 8)
+#define HWR_SECTOR_FLOOR_FLIP_Y (1u << 9)
+#define HWR_SECTOR_CEILING_FLIP_X (1u << 10)
+#define HWR_SECTOR_CEILING_FLIP_Y (1u << 11)
 
 struct hwr_point {
     int16_t x;
@@ -234,6 +241,28 @@ static void hwr_add_sector_cuts(const struct hwr_world *world,
     }
 }
 
+static uint16_t hwr_wall_length(int16_t ax, int16_t ay,
+                                int16_t bx, int16_t by)
+{
+    int32_t dx = (int32_t)bx - ax;
+    int32_t dy = (int32_t)by - ay;
+    uint64_t squared = (uint64_t)((int64_t)dx * dx) +
+                       (uint64_t)((int64_t)dy * dy);
+    uint32_t low = 1u;
+    uint32_t high = UINT16_MAX;
+
+    if (squared >= (uint64_t)UINT16_MAX * UINT16_MAX)
+        return UINT16_MAX;
+    while (low < high) {
+        uint32_t middle = low + (high - low) / 2u;
+        if ((uint64_t)middle * middle < squared)
+            low = middle + 1u;
+        else
+            high = middle;
+    }
+    return (uint16_t)low;
+}
+
 static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *world,
                          const struct hwr_wall *wall, const struct hwr_sector *sector,
                          enum hwr_surface_kind kind, int16_t id,
@@ -251,7 +280,6 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     size_t cut_count_b = 0;
     size_t triangle_count;
     uint16_t extent;
-    uint16_t mapped_extent;
     float sa;
     float sb;
     if (id >= 0 && (uint16_t)id == world->world_span_colorkey)
@@ -260,12 +288,12 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
         return 0;
     a = &world->vertices[wall->vertex_a_index];
     b = &world->vertices[wall->vertex_b_index];
-    extent = wall->extent < 0 ? (uint16_t)wall->extent & 0x0fffu
-                              : (uint16_t)wall->extent;
-    mapped_extent = (mapping_flags & 0x20u) != 0
-        ? (uint16_t)(extent + extent) : extent;
-    sa = HWR_WALL_U_REVERSED ? (float)mapped_extent : 0.0f;
-    sb = HWR_WALL_U_REVERSED ? 0.0f : (float)mapped_extent;
+    extent = (uint16_t)wall->extent & 0x7fffu;
+    if (extent == 0)
+        extent = hwr_wall_length(a->world_x, a->world_y,
+                                 b->world_x, b->world_y);
+    sa = HWR_WALL_U_REVERSED ? (float)extent : 0.0f;
+    sb = HWR_WALL_U_REVERSED ? 0.0f : (float)extent;
     if (world->wall_count != 0) {
         size_t capacity;
         size_t i;
@@ -528,10 +556,19 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     surface->aux = aux;
     surface->scale = scale;
     surface->flags = HWR_SURFACE_FLAT | (face_down ? HWR_SURFACE_FACE_DOWN : 0);
-    if (kind == HWR_SURFACE_CEILING)
-        mapping_flags = (uint8_t)((sector->flat_orientation & 0x0cu) >> 1);
-    else if (kind == HWR_SURFACE_FLOOR)
-        mapping_flags = (uint8_t)((sector->flat_orientation & 0x03u) << 1);
+    if (face_down) {
+        mapping_flags = (uint8_t)(
+            ((sector->texture_flip_flags & HWR_SECTOR_CEILING_FLIP_X) != 0
+                 ? 2u : 0u) |
+            ((sector->texture_flip_flags & HWR_SECTOR_CEILING_FLIP_Y) != 0
+                 ? 4u : 0u));
+    } else {
+        mapping_flags = (uint8_t)(
+            ((sector->texture_flip_flags & HWR_SECTOR_FLOOR_FLIP_X) != 0
+                 ? 2u : 0u) |
+            ((sector->texture_flip_flags & HWR_SECTOR_FLOOR_FLIP_Y) != 0
+                 ? 4u : 0u));
+    }
     hwr_finish_material(mesh, surface, sector, id, mapping_flags, 0);
     vertices = mesh->vertices + mesh->vertex_count;
     for (i = 0; i < triangle_count; i++) {
@@ -691,7 +728,7 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                                       ? neighbor->ceiling_z : sector->floor_z,
                                   neighbor->ceiling_z > sector->floor_z
                                       ? neighbor->ceiling_z : sector->floor_z,
-                                  0, (uint8_t)(wall->mapping_flags & 0xfau)) != 0)
+                                  0, wall->mapping_flags) != 0)
                     goto failed;
                 if (neighbor->floor_z > sector->floor_z &&
                     hwr_emit_wall(mesh, world, wall, sector,
@@ -702,7 +739,7 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                                   neighbor->floor_z < sector->ceiling_z
                                       ? neighbor->floor_z : sector->ceiling_z,
                                   sector->floor_z, sector->floor_z,
-                                  0, (uint8_t)(wall->mapping_flags & 0xfau)) != 0)
+                                  0, wall->mapping_flags) != 0)
                     goto failed;
                 if ((wall->mapping_flags & 1u) != 0) {
                     int16_t top = sector->ceiling_z < neighbor->ceiling_z
@@ -1401,6 +1438,17 @@ static int32_t hwr_wall_row_step(int left, int right, int divisor)
     return numerator / divisor;
 }
 
+static int hwr_wall_uses_image_fit(const struct hwr_mesh_surface *surface,
+                                   uint16_t texture_width,
+                                   uint16_t texture_height)
+{
+    int middle = surface->kind == HWR_SURFACE_SOLID_MIDDLE ||
+                 surface->kind == HWR_SURFACE_PORTAL_MIDDLE;
+    return texture_width != 0 && texture_height != 0 &&
+           (surface->mapping_flags & HWR_TEX_IMAGE_FIT) != 0 &&
+           ((surface->mapping_flags & HWR_TEX_TRANSPARENT) == 0 || middle);
+}
+
 static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
                                 const struct hwr_mesh_surface *surface,
                                 const struct hwr_gl_camera *camera,
@@ -1424,8 +1472,6 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
     uint32_t dividend = 2u << camera->shade_level;
     uint64_t product;
     int fit_texture;
-    int wrap_along;
-    int wrap_vertical;
     size_t i;
 
     memset(state, 0, sizeof *state);
@@ -1446,25 +1492,19 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
     if (end_a == NULL || end_b == NULL)
         return;
 
-    fit_texture = (surface->mapping_flags & 4u) != 0 &&
-                  texture_width != 0 && texture_height != 0;
-    wrap_along = texture_height != 0 &&
-        (texture_height & (uint16_t)(texture_height - 1u)) == 0;
-    wrap_vertical = texture_width != 0 &&
-        (texture_width & (uint16_t)(texture_width - 1u)) == 0;
+    fit_texture = hwr_wall_uses_image_fit(surface, texture_width,
+                                          texture_height);
     if (fit_texture) {
-        unsigned scale_u = wrap_along ? surface->scale & 0x0fu : 0u;
-        unsigned scale_v = wrap_vertical ? surface->scale >> 4 : 0u;
-        state->along_extent = (uint16_t)(2u * texture_height *
-            (scale_u != 0 ? scale_u + 1u : 1u));
-        state->vertical_extent = (uint16_t)(2u * texture_width *
-            (scale_v != 0 ? scale_v + 1u : 1u));
+        state->along_extent = 2u * texture_height;
+        state->vertical_extent = 2u * texture_width;
     } else {
         state->along_extent = surface->extent;
         state->vertical_extent = (uint16_t)(top_a - bottom_a);
-        if ((surface->mapping_flags & 0x20u) != 0) {
-            state->along_extent = (uint16_t)(state->along_extent * 2u);
-            state->vertical_extent = (uint16_t)(state->vertical_extent * 2u);
+        if ((surface->mapping_flags & HWR_TEX_HALF_PIXEL) != 0) {
+            /* Halving the transposed wall dimensions doubles the texel rate
+             * without changing the face's authored mapping extent. */
+            state->along_extent *= 2u;
+            state->vertical_extent *= 2u;
         }
     }
 
@@ -1507,7 +1547,8 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
                  state->vertical_extent / wall_height;
         state->vertical_origin = -(int32_t)origin;
     } else {
-        int vertical_scale = (surface->mapping_flags & 0x20u) != 0 ? 2 : 1;
+        int vertical_scale =
+            (surface->mapping_flags & HWR_TEX_HALF_PIXEL) != 0 ? 2 : 1;
         state->vertical_origin =
             (camera->eye_z - top_a) * vertical_scale * 32768;
     }
@@ -1619,8 +1660,10 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             int end_b = (source->reserved & HWR_WALL_CORNER_END_B) != 0;
             int16_t bottom_z = source->z;
             int16_t top_z = source->z;
-            int fit_texture = (surface->mapping_flags & 4u) != 0 &&
-                              texture_width != 0 && texture_height != 0;
+            int fit_texture = hwr_wall_uses_image_fit(
+                surface, texture_width, texture_height);
+            int half_pixel =
+                (surface->mapping_flags & HWR_TEX_HALF_PIXEL) != 0;
             int wrap_along = texture_height != 0 &&
                 (texture_height & (uint16_t)(texture_height - 1u)) == 0;
             int wrap_vertical = texture_width != 0 &&
@@ -1639,24 +1682,23 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height);
             if (fit_texture) {
-                unsigned scale_u = wrap_along ? surface->scale & 0x0fu : 0u;
-                unsigned scale_v = wrap_vertical ? surface->scale >> 4 : 0u;
-                float along_extent = 2.0f * (float)texture_height *
-                    (float)(scale_u != 0 ? scale_u + 1u : 1u);
-                float vertical_extent = 2.0f * (float)texture_width *
-                    (float)(scale_v != 0 ? scale_v + 1u : 1u);
-                target->wall_s = end_b ? along_extent : 0.0f;
+                target->wall_s = end_b
+                    ? (float)wall_span.along_extent : 0.0f;
                 target->wall_top = top_z != bottom_z
-                    ? vertical_extent * (float)(top_z - source->z) /
+                    ? (float)wall_span.vertical_extent *
+                      (float)(top_z - source->z) /
                       (float)(top_z - bottom_z)
                     : 0.0f;
             } else {
-                target->wall_s = source->wall_s;
+                target->wall_s = source->wall_s *
+                    (half_pixel ? 2.0f : 1.0f);
                 target->wall_top = (float)(source->wall_top - source->z) *
-                    ((surface->mapping_flags & 0x20u) != 0 ? 2.0f : 1.0f);
+                    (half_pixel ? 2.0f : 1.0f);
             }
-            target->pan_u = fit_texture ? 0 : surface->pan_u;
-            target->pan_v = fit_texture ? 0 : surface->pan_v;
+            target->pan_u = (surface->mapping_flags & HWR_TEX_IMAGE_FIT) != 0
+                ? 0 : surface->pan_u;
+            target->pan_v = (surface->mapping_flags & HWR_TEX_IMAGE_FIT) != 0
+                ? 0 : surface->pan_v;
             if (wrap_along)
                 target->wall_wrap_flags |= HWR_GL_WALL_WRAP_ALONG;
             if (wrap_vertical)

@@ -21,7 +21,7 @@ struct hwr_sector {
     uint16_t ceiling_pan;
     uint16_t floor_pan;
     int16_t sentinel;
-    uint8_t flat_orientation;
+    uint16_t texture_flip_flags;
     uint16_t slab_offset;
     size_t first_wall;
     size_t slab_index;
