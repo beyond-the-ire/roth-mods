@@ -47,6 +47,21 @@ struct hwr_gl_vertex {
     uint32_t flat_guard_step;
     int32_t flat_guard_origin_y;
     uint32_t flat_mapping_flags;
+    /* Wall-column state staged after projection and viewport clipping. */
+    uint32_t wall_source_numerator;
+    uint32_t wall_source_denominator;
+    uint32_t wall_source_step;
+    int32_t wall_denominator_step;
+    uint32_t wall_top_accum;
+    uint32_t wall_bottom_accum;
+    int32_t wall_top_step;
+    int32_t wall_bottom_step;
+    int32_t wall_first_x;
+    uint32_t wall_along_extent;
+    uint32_t wall_vertical_extent;
+    uint32_t wall_span_valid;
+    int32_t wall_vertical_origin;
+    uint32_t wall_vertical_seeded;
 };
 
 struct hwr_gl_camera {

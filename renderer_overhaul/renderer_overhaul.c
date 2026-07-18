@@ -896,6 +896,15 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                     }
                 }
                 if (step == 4) {
+                    size_t nz_gl = 0;
+                    size_t nz_tex = 0;
+                    size_t i;
+                    for (i = 0; i < plane; i++) {
+                        nz_gl += gl[i] != 0;
+                        nz_tex += gltex[i] != 0;
+                    }
+                    fprintf(stderr, "[renderer_overhaul] compare cycle %u gl_nz=%zu tex_nz=%zu\n",
+                            g_compare_counter, nz_gl, nz_tex);
                     hwr_dump_compare_set(soft, gl, gltex, render_width,
                                          render_height, g_compare_counter);
                     hwr_dump_pgm("cmap", g_world.luts.colormap, 256, 32);

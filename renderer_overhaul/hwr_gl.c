@@ -572,6 +572,10 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=6) in uvec4 a_light_material;\n"
     "layout(location=7) in uint a_wall_shade_endpoint;\n"
     "layout(location=8) in uvec4 a_flat_span;\n"
+    "layout(location=9) in uvec4 a_wall_source;\n"
+    "layout(location=10) in uvec4 a_wall_rows;\n"
+    "layout(location=11) in uvec4 a_wall_span;\n"
+    "layout(location=12) in uvec2 a_wall_vertical;\n"
     "uniform ivec2 u_view_offset;\n"
     "uniform int u_eye_z;\n"
     "uniform vec2 u_basis;\n"
@@ -590,6 +594,10 @@ static const char g_geometry_vertex_shader[] =
     "flat out uvec4 v_pan_scale_flags;\n"
     "flat out uvec4 v_light_material;\n"
     "flat out uvec4 v_flat_span;\n"
+    "flat out uvec4 v_wall_source;\n"
+    "flat out uvec4 v_wall_rows;\n"
+    "flat out uvec4 v_wall_span;\n"
+    "flat out uvec2 v_wall_vertical;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
     "void main() {\n"
@@ -610,6 +618,9 @@ static const char g_geometry_vertex_shader[] =
     "  v_offset=a_offset; v_dims=a_dims; v_aux=a_aux;\n"
     "  v_pan_scale_flags=a_pan_scale_flags; v_light_material=a_light_material;\n"
     "  v_flat_span=a_flat_span;\n"
+    "  v_wall_source=a_wall_source; v_wall_rows=a_wall_rows;\n"
+    "  v_wall_span=a_wall_span;\n"
+    "  v_wall_vertical=a_wall_vertical;\n"
     "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
     "}\n";
 
@@ -646,8 +657,31 @@ static const char g_geometry_fragment_shader[] =
     "flat in uvec4 v_pan_scale_flags;\n"
     "flat in uvec4 v_light_material;\n"
     "flat in uvec4 v_flat_span;\n"
+    "flat in uvec4 v_wall_source;\n"
+    "flat in uvec4 v_wall_rows;\n"
+    "flat in uvec4 v_wall_span;\n"
+    "flat in uvec2 v_wall_vertical;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
     "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
+    "int signed16(uint v) { int n=int(v & 65535u); return n>=32768 ? n-65536 : n; }\n"
+    "uint wall_quotient(int column) {\n"
+    "  uint numerator=v_wall_source.x, denominator=v_wall_source.y;\n"
+    "  uint numerator_step=v_wall_source.z; int denominator_step=int(v_wall_source.w);\n"
+    "  if (column>0 && (numerator_step==0u || uint(column)<=(0xffffffffu-numerator)/numerator_step)) {\n"
+    "    numerator+=numerator_step*uint(column);\n"
+    "    denominator+=uint(denominator_step*column);\n"
+    "  } else {\n"
+    "    for (int i=0;i<column;i++) {\n"
+    "      uint old=numerator; numerator+=numerator_step;\n"
+    "      if (numerator<old) {\n"
+    "        denominator_step>>=1; numerator_step>>=1; denominator>>=1;\n"
+    "        numerator=(numerator>>1)|0x80000000u;\n"
+    "      }\n"
+    "      denominator+=uint(denominator_step);\n"
+    "    }\n"
+    "  }\n"
+    "  return denominator!=0u ? numerator/denominator : 0u;\n"
+    "}\n"
     "uint sample_texel() {\n"
     "  uint flags=v_light_material.y;\n"
     "  if ((flags & 4u)!=0u) return v_light_material.z;\n"
@@ -683,23 +717,38 @@ static const char g_geometry_fragment_shader[] =
     "    ix=int((accum_u >> 16) & uint(w-1));\n"
     "    iy=int((accum_v >> 16) & uint(h-1));\n"
     "  } else {\n"
-    /* Wall columns likewise consume S before advancing the column
-     * accumulator. The pan remains after integer S truncation and before
-     * the engine's unsigned coordinate halving. */
-    /* The engine's column accumulator is integral and never negative; the
-     * half-derivative correction can cross S=0 at a wall's first screen
-     * column, so clamp back onto the engine-reachable range. */
-    "    float wall_s=max(v_wall.x-0.5*dFdx(v_wall.x),0.0);\n"
-    "    int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
+    /* Wall texture coordinates come from the original integer column
+     * accumulators. The staged state is consumed before each advance. */
+    "    if (v_wall_span.w==0u) {\n"
+    "      float wall_s=max(v_wall.x-0.5*dFdx(v_wall.x),0.0);\n"
+    "      int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
+    "      if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
+    "      iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base;\n"
+    "      float wall_v=max(v_wall.y-0.5*dFdy(v_wall.y),0.0);\n"
+    "      int vertical=(((int(floor(wall_v)) & 65535) >> 1)+int(v_pan_scale_flags.y)) & 65535;\n"
+    "      ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical;\n"
+    "      return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
+    "    }\n"
+    "    int column=int(gl_FragCoord.x)-int(v_wall_span.x);\n"
+    "    uint mapped_s=wall_quotient(column);\n"
+    "    int base=int((mapped_s+v_pan_scale_flags.x*2u) & 65535u) >> 1;\n"
     "    if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
     /* Non-power-of-two wall classes stage 0xffff: the AND is an identity,
      * so their 16-bit coordinate is deliberately not texture-wrapped. */
     "    iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base;\n"
-    /* Like S, the vertical mapper fetches before advancing its fixed-point
-     * accumulator. v_wall.y is the CPU-selected stored-extent or texture-fit
-     * coordinate, including flag-0x20 scaling where that class uses it. */
-    "    float wall_v=max(v_wall.y-0.5*dFdy(v_wall.y),0.0);\n"
-    "    int vertical=(((int(floor(wall_v)) & 65535) >> 1)+int(v_pan_scale_flags.y)) & 65535;\n"
+    "    uint top_accum=v_wall_rows.x+v_wall_rows.z*uint(column);\n"
+    "    uint bottom_accum=v_wall_rows.y+v_wall_rows.w*uint(column);\n"
+    "    int top=signed16(top_accum>>16), bottom=signed16(bottom_accum>>16);\n"
+    "    int row=int(gl_FragCoord.y), count=max(bottom-top+1,1);\n"
+    "    uint vertical_step=(v_wall_span.z<<16)/uint(2*count-1);\n"
+    "    uint vertical_seed=0u;\n"
+    "    if (v_wall_vertical.y!=0u) {\n"
+    "      int seed=int(vertical_step)*(top-u_center_i.y)-int(v_wall_vertical.x);\n"
+    "      if (seed>0) vertical_seed=uint(seed);\n"
+    "    }\n"
+    "    int row_offset=clamp(row-top,0,count-1);\n"
+    "    int vertical=int((vertical_seed+vertical_step*uint(row_offset))>>16);\n"
+    "    vertical=(vertical+int(v_pan_scale_flags.y)) & 65535;\n"
     "    ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical;\n"
     "  }\n"
     "  return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
@@ -1170,6 +1219,18 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(8);
     g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
+    g_gl.enable_vertex_attrib_array(9);
+    g_gl.vertex_attrib_i_pointer(9, 4, GL_UNSIGNED_INT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_source_numerator));
+    g_gl.enable_vertex_attrib_array(10);
+    g_gl.vertex_attrib_i_pointer(10, 4, GL_UNSIGNED_INT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_top_accum));
+    g_gl.enable_vertex_attrib_array(11);
+    g_gl.vertex_attrib_i_pointer(11, 4, GL_UNSIGNED_INT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_first_x));
+    g_gl.enable_vertex_attrib_array(12);
+    g_gl.vertex_attrib_i_pointer(12, 2, GL_UNSIGNED_INT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_vertical_origin));
     g_gl.gen_vertex_arrays(1, &g_resolve_vao);
 
     g_gl.use_program(g_geometry_program);

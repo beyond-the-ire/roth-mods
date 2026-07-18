@@ -1257,6 +1257,225 @@ static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
     *guard_step = *guard / (uint32_t)range;
 }
 
+struct hwr_wall_span_state {
+    uint32_t numerator;
+    uint32_t denominator;
+    uint32_t numerator_step;
+    int32_t denominator_step;
+    uint32_t top_accum;
+    uint32_t bottom_accum;
+    int32_t top_step;
+    int32_t bottom_step;
+    int32_t first_x;
+    uint32_t along_extent;
+    uint32_t vertical_extent;
+    uint32_t valid;
+    int32_t vertical_origin;
+    uint32_t vertical_seeded;
+};
+
+static int32_t hwr_shift_right_6(int32_t value)
+{
+    if (value >= 0)
+        return value >> 6;
+    return -(int32_t)(((uint32_t)(-value) + 63u) >> 6);
+}
+
+static int hwr_project_fixed(int32_t value, int32_t scale,
+                             int32_t depth, int32_t center)
+{
+    int64_t projected = (int64_t)value * scale / depth + center;
+    if (projected < -0x3ffe)
+        return -0x3ffe;
+    if (projected > 0x3ffe)
+        return 0x3ffe;
+    return (int)projected;
+}
+
+static void hwr_wall_view_point(const struct hwr_gl_camera *camera,
+                                int16_t x, int16_t y,
+                                int32_t *view_x, int32_t *depth)
+{
+    int32_t dx = (int16_t)((uint16_t)x + (uint16_t)camera->view_offset_x);
+    int32_t dy = (int16_t)((uint16_t)y + (uint16_t)camera->view_offset_y);
+    *view_x = hwr_shift_right_6(dx * camera->yaw_sin +
+                               dy * camera->yaw_cos);
+    *depth = hwr_shift_right_6(dy * camera->yaw_sin -
+                              dx * camera->yaw_cos);
+}
+
+static int32_t hwr_wall_row_step(int left, int right, int divisor)
+{
+    int16_t difference;
+    int32_t numerator;
+    if (divisor == 0)
+        return 0;
+    difference = (int16_t)(right - left);
+    numerator = (int32_t)((uint32_t)(uint16_t)difference << 16);
+    return numerator / divisor;
+}
+
+static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
+                                const struct hwr_mesh_surface *surface,
+                                const struct hwr_gl_camera *camera,
+                                uint32_t viewport_width,
+                                uint16_t texture_width,
+                                uint16_t texture_height,
+                                struct hwr_wall_span_state *state)
+{
+    const struct hwr_mesh_vertex *vertices =
+        &mesh->vertices[surface->first_vertex];
+    const struct hwr_mesh_vertex *end_a = NULL;
+    const struct hwr_mesh_vertex *end_b = NULL;
+    int16_t bottom_a = INT16_MAX, top_a = INT16_MIN;
+    int16_t bottom_b = INT16_MAX, top_b = INT16_MIN;
+    int32_t view_a, view_b, depth_a_q8, depth_b_q8;
+    int depth_a, depth_b;
+    int xl, xr, row_top_a, row_top_b, row_bottom_a, row_bottom_b;
+    int original_top_a, original_bottom_a;
+    int segment_columns, left_clip, right_clip, columns;
+    uint32_t reciprocal_a, reciprocal_b;
+    uint32_t dividend = 2u << camera->shade_level;
+    uint64_t product;
+    int fit_texture;
+    int wrap_along;
+    int wrap_vertical;
+    size_t i;
+
+    memset(state, 0, sizeof *state);
+    if (viewport_width == 0 || surface->vertex_count == 0)
+        return;
+    for (i = 0; i < surface->vertex_count; i++) {
+        const struct hwr_mesh_vertex *vertex = &vertices[i];
+        if ((vertex->reserved & HWR_WALL_CORNER_END_B) != 0) {
+            if (end_b == NULL) end_b = vertex;
+            if (vertex->z < bottom_b) bottom_b = vertex->z;
+            if (vertex->z > top_b) top_b = vertex->z;
+        } else {
+            if (end_a == NULL) end_a = vertex;
+            if (vertex->z < bottom_a) bottom_a = vertex->z;
+            if (vertex->z > top_a) top_a = vertex->z;
+        }
+    }
+    if (end_a == NULL || end_b == NULL)
+        return;
+
+    fit_texture = (surface->mapping_flags & 4u) != 0 &&
+                  texture_width != 0 && texture_height != 0;
+    wrap_along = texture_height != 0 &&
+        (texture_height & (uint16_t)(texture_height - 1u)) == 0;
+    wrap_vertical = texture_width != 0 &&
+        (texture_width & (uint16_t)(texture_width - 1u)) == 0;
+    if (fit_texture) {
+        unsigned scale_u = wrap_along ? surface->scale & 0x0fu : 0u;
+        unsigned scale_v = wrap_vertical ? surface->scale >> 4 : 0u;
+        state->along_extent = (uint16_t)(2u * texture_height *
+            (scale_u != 0 ? scale_u + 1u : 1u));
+        state->vertical_extent = (uint16_t)(2u * texture_width *
+            (scale_v != 0 ? scale_v + 1u : 1u));
+    } else {
+        state->along_extent = surface->extent;
+        state->vertical_extent = (uint16_t)(top_a - bottom_a);
+        if ((surface->mapping_flags & 0x20u) != 0) {
+            state->along_extent = (uint16_t)(state->along_extent * 2u);
+            state->vertical_extent = (uint16_t)(state->vertical_extent * 2u);
+        }
+    }
+
+    hwr_wall_view_point(camera, end_a->x, end_a->y, &view_a, &depth_a_q8);
+    hwr_wall_view_point(camera, end_b->x, end_b->y, &view_b, &depth_b_q8);
+    if (depth_a_q8 < 0x1000 || depth_b_q8 < 0x1000)
+        return;
+    depth_a = depth_a_q8 >> 8;
+    depth_b = depth_b_q8 >> 8;
+    if (depth_a == 0 || depth_b == 0)
+        return;
+    xl = hwr_project_fixed(view_a, camera->focal_x,
+                           depth_a_q8, camera->center_x);
+    xr = hwr_project_fixed(view_b, camera->focal_x,
+                           depth_b_q8, camera->center_x);
+    if (xl >= xr)
+        return;
+    row_top_a = hwr_project_fixed((camera->eye_z - top_a) * 256,
+                                  camera->focal_y, depth_a_q8,
+                                  camera->horizon);
+    row_top_b = hwr_project_fixed((camera->eye_z - top_b) * 256,
+                                  camera->focal_y, depth_b_q8,
+                                  camera->horizon);
+    row_bottom_a = hwr_project_fixed((camera->eye_z - bottom_a) * 256,
+                                     camera->focal_y, depth_a_q8,
+                                     camera->horizon);
+    row_bottom_b = hwr_project_fixed((camera->eye_z - bottom_b) * 256,
+                                     camera->focal_y, depth_b_q8,
+                                     camera->horizon);
+    state->vertical_seeded =
+        row_bottom_a - camera->horizon >= 0 &&
+        row_top_a - camera->horizon < 0;
+    if (fit_texture) {
+        unsigned wall_height = top_a > bottom_a
+            ? (unsigned)(top_a - bottom_a) : (unsigned)(top_b - bottom_b);
+        uint64_t origin;
+        if (wall_height == 0)
+            return;
+        origin = (uint64_t)(top_a - camera->eye_z) * 32768u *
+                 state->vertical_extent / wall_height;
+        state->vertical_origin = -(int32_t)origin;
+    } else {
+        int vertical_scale = (surface->mapping_flags & 0x20u) != 0 ? 2 : 1;
+        state->vertical_origin =
+            (camera->eye_z - top_a) * vertical_scale * 32768;
+    }
+
+    segment_columns = xr - xl + 1;
+    left_clip = xl < 0 ? -xl : 0;
+    right_clip = xr >= (int)viewport_width
+        ? xr - ((int)viewport_width - 1) : 0;
+    columns = segment_columns - left_clip - right_clip;
+    if (columns <= 0)
+        return;
+    state->first_x = xl + left_clip;
+
+    reciprocal_a = (dividend << 16) / (uint32_t)depth_a;
+    reciprocal_b = (dividend << 16) / (uint32_t)depth_b;
+    state->denominator_step =
+        (int16_t)(uint16_t)(reciprocal_b - reciprocal_a);
+    state->denominator = (uint16_t)reciprocal_a * (uint32_t)segment_columns;
+    state->numerator_step = (uint16_t)reciprocal_b * state->along_extent;
+    if (left_clip != 0) {
+        state->denominator +=
+            (uint32_t)(state->denominator_step * left_clip);
+        product = (uint64_t)state->numerator_step * (uint32_t)left_clip;
+        while ((product >> 32) != 0) {
+            product >>= 1;
+            state->denominator_step >>= 1;
+            state->numerator_step >>= 1;
+            state->denominator >>= 1;
+        }
+        state->numerator = (uint32_t)product;
+    }
+
+    original_top_a = row_top_a;
+    original_bottom_a = row_bottom_a;
+    if (left_clip != 0) {
+        row_bottom_a -= (row_bottom_a - row_bottom_b) *
+                        left_clip / segment_columns;
+        row_top_a -= (row_top_a - row_top_b) *
+                     left_clip / segment_columns;
+    }
+    if (right_clip != 0) {
+        row_bottom_b -= (row_bottom_b - original_bottom_a) *
+                        right_clip / segment_columns;
+        row_top_b -= (row_top_b - original_top_a) *
+                     right_clip / segment_columns;
+    }
+    state->top_step = hwr_wall_row_step(row_top_a, row_top_b, columns - 1);
+    state->bottom_step = hwr_wall_row_step(row_bottom_a, row_bottom_b,
+                                           columns - 1);
+    state->top_accum = ((uint32_t)(uint16_t)row_top_a << 16) | 0x7fffu;
+    state->bottom_accum = ((uint32_t)(uint16_t)row_bottom_a << 16) | 0x7fffu;
+    state->valid = 1;
+}
+
 static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                                  const struct hwr_mesh_surface *surface,
                                  const struct hwr_gl_camera *camera,
@@ -1271,6 +1490,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     uint32_t flat_guard = 0;
     uint32_t flat_guard_step = 0;
     int32_t flat_guard_origin_y = camera->horizon;
+    struct hwr_wall_span_state wall_span = {0};
     size_t i;
     if (logical < 0x1600u) {
         texture_width = scene->textures[logical].width;
@@ -1298,6 +1518,9 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         hwr_flat_span_state(&scene->mesh, surface, camera, height,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
+    else
+        hwr_wall_span_state(&scene->mesh, surface, camera, width,
+                            texture_width, texture_height, &wall_span);
     for (i = 0; i < surface->vertex_count; i++) {
         const struct hwr_mesh_vertex *source =
             &scene->mesh.vertices[surface->first_vertex + i];
@@ -1375,6 +1598,20 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         target->flat_guard_step = flat_guard_step;
         target->flat_guard_origin_y = flat_guard_origin_y;
         target->flat_mapping_flags = surface->mapping_flags;
+        target->wall_source_numerator = wall_span.numerator;
+        target->wall_source_denominator = wall_span.denominator;
+        target->wall_source_step = wall_span.numerator_step;
+        target->wall_denominator_step = wall_span.denominator_step;
+        target->wall_top_accum = wall_span.top_accum;
+        target->wall_bottom_accum = wall_span.bottom_accum;
+        target->wall_top_step = wall_span.top_step;
+        target->wall_bottom_step = wall_span.bottom_step;
+        target->wall_first_x = wall_span.first_x;
+        target->wall_along_extent = wall_span.along_extent;
+        target->wall_vertical_extent = wall_span.vertical_extent;
+        target->wall_span_valid = wall_span.valid;
+        target->wall_vertical_origin = wall_span.vertical_origin;
+        target->wall_vertical_seeded = wall_span.vertical_seeded;
     }
 }
 
