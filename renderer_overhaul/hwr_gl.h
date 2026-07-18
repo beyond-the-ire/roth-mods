@@ -42,6 +42,11 @@ struct hwr_gl_vertex {
     /* The original wall driver selects masked or linear sampling separately
      * for the along-wall and vertical texture axes. */
     uint8_t wall_wrap_flags;
+    /* Per-flat affine span state after the original scanline-range setup. */
+    uint32_t flat_guard;
+    uint32_t flat_guard_step;
+    int32_t flat_guard_origin_y;
+    uint32_t flat_mapping_flags;
 };
 
 struct hwr_gl_camera {

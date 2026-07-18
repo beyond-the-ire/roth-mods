@@ -515,6 +515,7 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
 {
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *vertices;
+    uint8_t mapping_flags = 0;
     size_t count = triangle_count * 3u;
     size_t i;
     if (id >= 0 && (uint16_t)id == world->world_span_colorkey)
@@ -526,7 +527,11 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     surface->aux = aux;
     surface->scale = scale;
     surface->flags = HWR_SURFACE_FLAT | (face_down ? HWR_SURFACE_FACE_DOWN : 0);
-    hwr_finish_material(mesh, surface, sector, id, 0, 0);
+    if (kind == HWR_SURFACE_CEILING)
+        mapping_flags = (uint8_t)((sector->flat_orientation & 0x0cu) >> 1);
+    else if (kind == HWR_SURFACE_FLOOR)
+        mapping_flags = (uint8_t)((sector->flat_orientation & 0x03u) << 1);
+    hwr_finish_material(mesh, surface, sector, id, mapping_flags, 0);
     vertices = mesh->vertices + mesh->vertex_count;
     for (i = 0; i < triangle_count; i++) {
         uint16_t order[3];
@@ -1170,6 +1175,88 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
         (uint8_t)((uint8_t)projected << (3 - level)));
 }
 
+static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
+                              const struct hwr_gl_camera *camera,
+                              uint32_t height)
+{
+    int32_t dx = (int16_t)((uint16_t)vertex->x +
+                           (uint16_t)camera->view_offset_x);
+    int32_t dy = (int16_t)((uint16_t)vertex->y +
+                           (uint16_t)camera->view_offset_y);
+    int32_t depth = (dy * camera->yaw_sin - dx * camera->yaw_cos) >> 6;
+    int64_t projected;
+    int y;
+    if (depth < 0x1000)
+        depth = 0x1000;
+    projected = (int64_t)(camera->eye_z - vertex->z) *
+                ((int64_t)camera->focal_y << 8);
+    y = (int)(projected / depth) + camera->horizon;
+    if (y < 0)
+        return 0;
+    if (height != 0 && y >= (int)height)
+        return (int)height - 1;
+    return y;
+}
+
+static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
+                                const struct hwr_mesh_surface *surface,
+                                const struct hwr_gl_camera *camera,
+                                uint32_t height, uint32_t *guard,
+                                uint32_t *guard_step, int32_t *origin_y)
+{
+    int min_y = INT32_MAX;
+    int max_y = INT32_MIN;
+    int range;
+    uint32_t height_delta;
+    uint32_t shift = 4u - surface->scale;
+    uint32_t perspective_scale;
+    uint32_t product;
+    uint32_t product_high;
+    uint32_t product_low;
+    uint32_t dividend_high;
+    uint64_t dividend;
+    size_t i;
+
+    for (i = 0; i < surface->vertex_count; i++) {
+        int y = hwr_flat_project_y(
+            &mesh->vertices[surface->first_vertex + i], camera, height);
+        if (y < min_y)
+            min_y = y;
+        if (y > max_y)
+            max_y = y;
+    }
+    if (min_y == INT32_MAX) {
+        *guard = 0;
+        *guard_step = 0;
+        *origin_y = camera->horizon;
+        return;
+    }
+    if (max_y > camera->horizon) {
+        range = max_y - camera->horizon;
+        *origin_y = max_y;
+    } else {
+        range = camera->horizon - min_y;
+        *origin_y = min_y;
+    }
+    height_delta = (uint32_t)abs((int)camera->eye_z -
+        (int)mesh->vertices[surface->first_vertex].z);
+    if (range <= 0 || height_delta == 0 || camera->focal_y == 0) {
+        *guard = 0;
+        *guard_step = 0;
+        return;
+    }
+    perspective_scale = (0x2000u * camera->focal_x / camera->focal_y) >> shift;
+    product = perspective_scale * (uint32_t)range;
+    product_high = product >> 16;
+    product_low = product & 0xffffu;
+    dividend_high = (int16_t)product_high < (int32_t)height_delta
+        ? product_high : (height_delta - 1u) & 0xffffu;
+    dividend = ((uint64_t)dividend_high << 32) |
+               ((uint64_t)product_low << 16);
+    *guard = (uint32_t)(dividend / height_delta) * 2u;
+    *guard_step = *guard / (uint32_t)range;
+}
+
 static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                                  const struct hwr_mesh_surface *surface,
                                  const struct hwr_gl_camera *camera,
@@ -1181,6 +1268,9 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     uint16_t texture_height = 0;
     uint8_t flags = 0;
     uint8_t direct_index = (uint8_t)surface->texture_id;
+    uint32_t flat_guard = 0;
+    uint32_t flat_guard_step = 0;
+    int32_t flat_guard_origin_y = camera->horizon;
     size_t i;
     if (logical < 0x1600u) {
         texture_width = scene->textures[logical].width;
@@ -1204,6 +1294,10 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         flags |= HWR_GL_MATERIAL_HFLIP;
     if ((surface->flags & HWR_SURFACE_TRANSLUCENT) != 0)
         flags |= HWR_GL_MATERIAL_TRANSLUCENT;
+    if ((surface->flags & HWR_SURFACE_FLAT) != 0)
+        hwr_flat_span_state(&scene->mesh, surface, camera, height,
+                            &flat_guard, &flat_guard_step,
+                            &flat_guard_origin_y);
     for (i = 0; i < surface->vertex_count; i++) {
         const struct hwr_mesh_vertex *source =
             &scene->mesh.vertices[surface->first_vertex + i];
@@ -1277,6 +1371,10 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         target->light = surface->light;
         target->material_flags = flags;
         target->direct_index = direct_index;
+        target->flat_guard = flat_guard;
+        target->flat_guard_step = flat_guard_step;
+        target->flat_guard_origin_y = flat_guard_origin_y;
+        target->flat_mapping_flags = surface->mapping_flags;
     }
 }
 

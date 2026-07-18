@@ -79,6 +79,7 @@ static void hwr_parse_sector(struct hwr_sector *sector)
     sector->ceiling_pan = hwr_u16(sector->raw + 0x10);
     sector->floor_pan = hwr_u16(sector->raw + 0x12);
     sector->sentinel = hwr_i16(sector->raw + 0x14);
+    sector->flat_orientation = sector->raw[0x17];
     sector->slab_offset = hwr_u16(sector->raw + 0x18);
 }
 

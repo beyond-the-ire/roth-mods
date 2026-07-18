@@ -878,24 +878,31 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                 uint8_t *soft = buffer;
                 uint8_t *gl = buffer + plane;
                 uint8_t *gltex = buffer + plane * 2u;
-                int ok;
+                int step = 0;
                 g_compare_buffer = buffer;
-                ok = hwr_copy_soft_indices(api, &viewport, soft) &&
-                     hwr_gl_read_scene_indices(gl, render_width, render_height);
-                hwr_gl_set_debug_vis(2);
-                ok = ok &&
-                     hwr_scene_render(&g_scene, &g_world, api, render_width,
-                                      render_height) != NULL &&
-                     hwr_gl_read_scene_indices(gltex, render_width, render_height);
-                hwr_gl_set_debug_vis(0);
-                if (ok) {
+                if (hwr_copy_soft_indices(api, &viewport, soft)) {
+                    step = 1;
+                    if (hwr_gl_read_scene_indices(gl, render_width, render_height)) {
+                        step = 2;
+                        hwr_gl_set_debug_vis(2);
+                        if (hwr_scene_render(&g_scene, &g_world, api,
+                                             render_width, render_height) != NULL) {
+                            step = 3;
+                            if (hwr_gl_read_scene_indices(gltex, render_width,
+                                                          render_height))
+                                step = 4;
+                        }
+                        hwr_gl_set_debug_vis(0);
+                    }
+                }
+                if (step == 4) {
                     hwr_dump_compare_set(soft, gl, gltex, render_width,
                                          render_height, g_compare_counter);
                     hwr_dump_pgm("cmap", g_world.luts.colormap, 256, 32);
                     hwr_dump_pgm("tint", g_world.luts.tint, 256, 32);
-                } else if (g_debug_enabled) {
-                    fprintf(stderr, "[renderer_overhaul] compare cycle %u incomplete\n",
-                            g_compare_counter);
+                } else {
+                    fprintf(stderr, "[renderer_overhaul] compare cycle %u stalled at step %d\n",
+                            g_compare_counter, step);
                 }
             }
         }

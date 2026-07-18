@@ -571,9 +571,11 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=5) in uvec4 a_pan_scale_flags;\n"
     "layout(location=6) in uvec4 a_light_material;\n"
     "layout(location=7) in uint a_wall_shade_endpoint;\n"
+    "layout(location=8) in uvec4 a_flat_span;\n"
     "uniform ivec2 u_view_offset;\n"
     "uniform int u_eye_z;\n"
     "uniform vec2 u_basis;\n"
+    "uniform ivec2 u_basis_fixed;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
     "uniform ivec2 u_shade_origin;\n"
@@ -587,6 +589,7 @@ static const char g_geometry_vertex_shader[] =
     "flat out uint v_aux;\n"
     "flat out uvec4 v_pan_scale_flags;\n"
     "flat out uvec4 v_light_material;\n"
+    "flat out uvec4 v_flat_span;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
     "void main() {\n"
@@ -606,6 +609,7 @@ static const char g_geometry_vertex_shader[] =
     "  v_world=vec3(a_pos); v_depth_fixed=depth; v_wall=a_wall;\n"
     "  v_offset=a_offset; v_dims=a_dims; v_aux=a_aux;\n"
     "  v_pan_scale_flags=a_pan_scale_flags; v_light_material=a_light_material;\n"
+    "  v_flat_span=a_flat_span;\n"
     "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
     "}\n";
 
@@ -622,6 +626,11 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_tint_shade_level;\n"
     "uniform int u_light_bias;\n"
     "uniform int u_glow_phase;\n"
+    "uniform ivec2 u_view_offset;\n"
+    "uniform int u_eye_z;\n"
+    "uniform ivec2 u_basis_fixed;\n"
+    "uniform ivec2 u_focal_i;\n"
+    "uniform ivec2 u_center_i;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
     "uniform ivec2 u_shade_origin;\n"
@@ -636,28 +645,43 @@ static const char g_geometry_fragment_shader[] =
     "flat in uint v_aux;\n"
     "flat in uvec4 v_pan_scale_flags;\n"
     "flat in uvec4 v_light_material;\n"
+    "flat in uvec4 v_flat_span;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
+    "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
     "uint sample_texel() {\n"
     "  uint flags=v_light_material.y;\n"
     "  if ((flags & 4u)!=0u) return v_light_material.z;\n"
     "  if ((flags & 2u)!=0u) return v_light_material.z;\n"
     "  int w=int(v_dims.x), h=int(v_dims.y); int ix,iy;\n"
     "  if ((flags & 8u)!=0u) {\n"
-    "    float divisor=float(1u << v_pan_scale_flags.z);\n"
-    /* The scaled-sprite driver treats a 256x256 source as its byte-degenerate
-     * dimension class.  That path doubles both the map-coordinate and pan
-     * seeds before the same fixed-point extraction. */
-    "    float dimension_scale=(w==256 && h==256) ? 2.0 : 1.0;\n"
-    /* The span fillers fetch the accumulator before adding its per-pixel
-     * step. Move the center-sampled interpolation back to that lattice. */
-    "    vec2 world_sample=v_world.xy-0.5*dFdx(v_world.xy);\n"
-    "    vec2 mapped=(world_sample/divisor+vec2(float(v_aux & 255u),float(v_aux >> 8))*0.5)*dimension_scale;\n"
-    /* The engine's flat h-flip negates the X fixed-point accumulator before
-     * integer extraction.  Negating after floor(), or mirroring Y, changes
-     * every integral boundary. */
-    "    if ((flags & 32u)!=0u) mapped.x=-mapped.x;\n"
-    "    ix=int(floor(mapped.x)) & (w-1);\n"
-    "    iy=int(floor(mapped.y)) & (h-1);\n"
+    "    int scale=int(v_pan_scale_flags.z);\n"
+    "    int row=int(gl_FragCoord.y), column=int(gl_FragCoord.x);\n"
+    "    int height_delta=abs(u_eye_z-int(v_world.z));\n"
+    "    int remaining=abs(row-u_center_i.y);\n"
+    "    uint dividend=uint(height_delta << (4-scale))*uint(u_focal_i.y);\n"
+    "    uint perspective=remaining>1 ? dividend/uint(remaining) : dividend;\n"
+    "    uint guard_distance=uint(abs(row-int(v_flat_span.z)));\n"
+    "    uint guard=v_flat_span.x-v_flat_span.y*guard_distance;\n"
+    "    int guard_hi=max(int(guard >> 16),2);\n"
+    "    int step_u=(-(u_basis_fixed.x << 12))/guard_hi;\n"
+    "    int step_v=(u_basis_fixed.y << 12)/guard_hi;\n"
+    "    int screen_rel=column-u_center_i.x;\n"
+    "    uint accum_u=uint(imul_shift2(int(perspective),u_basis_fixed.y));\n"
+    "    uint accum_v=uint(imul_shift2(int(perspective),u_basis_fixed.x));\n"
+    "    accum_u+=(uint(step_u)&0xffffffu)*uint(screen_rel);\n"
+    "    accum_v+=(uint(step_v)&0xffffffu)*uint(screen_rel);\n"
+    "    accum_u+=uint(u_view_offset.x & 65535) << uint(16-scale);\n"
+    "    accum_v-=uint(u_view_offset.y & 65535) << uint(16-scale);\n"
+    "    accum_u+=uint(v_aux & 255u) << 15u;\n"
+    "    accum_v+=uint(v_aux >> 8) << 15u;\n"
+    /* A 256x256 source is the byte-degenerate dimension class.  Its mapper
+     * consumes the same accumulator at twice the ordinary coordinate rate. */
+    "    if (w==256 && h==256) { accum_u*=2u; accum_v*=2u; }\n"
+    "    uint flat_flags=v_flat_span.w;\n"
+    "    if ((flat_flags & 2u)!=0u) accum_u=0u-accum_u;\n"
+    "    if ((flat_flags & 4u)!=0u) accum_v=0u-accum_v;\n"
+    "    ix=int((accum_u >> 16) & uint(w-1));\n"
+    "    iy=int((accum_v >> 16) & uint(h-1));\n"
     "  } else {\n"
     /* Wall columns likewise consume S before advancing the column
      * accumulator. The pan remains after integer S truncation and before
@@ -1143,6 +1167,9 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(7);
     g_gl.vertex_attrib_i_pointer(7, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint));
+    g_gl.enable_vertex_attrib_array(8);
+    g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
     g_gl.gen_vertex_arrays(1, &g_resolve_vao);
 
     g_gl.use_program(g_geometry_program);
@@ -1400,10 +1427,16 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_uniform_2f(g_geometry_program, "u_basis",
                    (GLfloat)camera->yaw_sin / 16384.0f,
                    (GLfloat)camera->yaw_cos / 16384.0f);
+    hwr_uniform_2i(g_geometry_program, "u_basis_fixed",
+                   camera->yaw_sin, camera->yaw_cos);
     hwr_uniform_2f(g_geometry_program, "u_focal",
                    (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
+    hwr_uniform_2i(g_geometry_program, "u_focal_i",
+                   camera->focal_x, camera->focal_y);
     hwr_uniform_2f(g_geometry_program, "u_center",
                    (GLfloat)camera->center_x, (GLfloat)camera->horizon);
+    hwr_uniform_2i(g_geometry_program, "u_center_i",
+                   camera->center_x, camera->horizon);
     hwr_uniform_2i(g_geometry_program, "u_shade_origin",
                    camera->shade_origin_x, camera->shade_origin_y);
     hwr_uniform_1i(g_geometry_program, "u_flat_edge_bias", camera->flat_edge_bias);
@@ -1471,6 +1504,8 @@ void hwr_gl_set_debug_vis(int mode)
 
 int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height)
 {
+    size_t plane = (size_t)width * height;
+    size_t i;
     if (!g_initialized || g_index_fbo == 0 || out == NULL ||
         width != g_fbo_width || height != g_fbo_height ||
         !hwr_platform_make_current())
@@ -1479,6 +1514,18 @@ int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height)
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
                      GL_RED_INTEGER, GL_UNSIGNED_BYTE, out);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, 0);
+    if (hwr_gl_drain_errors() != 0)
+        return 0;
+    for (i = 0; i < plane; i++) {
+        if (out[i] != 0)
+            return 1;
+    }
+    /* Some driver paths return an empty ReadPixels result for the integer
+     * attachment; fetch the texture object directly as the fallback. */
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+    g_gl.get_tex_image(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, out);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
     return hwr_gl_drain_errors() == 0;
 }
 
