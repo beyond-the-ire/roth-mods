@@ -1201,14 +1201,15 @@ static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
 static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
                                 const struct hwr_mesh_surface *surface,
                                 const struct hwr_gl_camera *camera,
-                                uint32_t height, uint32_t *guard,
+                                uint32_t height, int wide_class,
+                                uint32_t *guard,
                                 uint32_t *guard_step, int32_t *origin_y)
 {
     int min_y = INT32_MAX;
     int max_y = INT32_MIN;
     int range;
     uint32_t height_delta;
-    uint32_t shift = 4u - surface->scale;
+    uint32_t shift = 4u - surface->scale + (wide_class ? 1u : 0u);
     uint32_t perspective_scale;
     uint32_t product;
     uint32_t product_high;
@@ -1516,6 +1517,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         flags |= HWR_GL_MATERIAL_TRANSLUCENT;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         hwr_flat_span_state(&scene->mesh, surface, camera, height,
+                            texture_width == 256u && texture_height == 256u,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
     else
