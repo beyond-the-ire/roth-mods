@@ -102,6 +102,7 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                         const uint8_t glow[0x200],
                         const uint8_t blend[0x10000]);
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
+                                    size_t sky_vertices,
                                     size_t opaque_vertices,
                                     size_t translucent_vertices,
                                     const struct hwr_gl_camera *camera,

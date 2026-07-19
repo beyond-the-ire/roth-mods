@@ -27,7 +27,13 @@ enum hwr_surface_flags {
     HWR_SURFACE_SKY          = 1u << 2,
     HWR_SURFACE_FLAT         = 1u << 3,
     HWR_SURFACE_FACE_DOWN    = 1u << 4,
-    HWR_SURFACE_TRANSLUCENT  = 1u << 5
+    HWR_SURFACE_TRANSLUCENT  = 1u << 5,
+    /* A screen-space sky quad emitted directly above a sky wall's top edge. It
+     * carries HWR_GL_MATERIAL_SKY so the geometry fragment shader samples the
+     * parallax skybox. Sky caps are streamed into their own range and drawn in
+     * a depth-off background pass before opaque geometry, which then overwrites
+     * the sky where a nearer surface projects, matching the engine. */
+    HWR_SURFACE_SKY_CAP      = 1u << 6
 };
 
 enum hwr_wall_corner_role {

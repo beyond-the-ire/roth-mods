@@ -264,6 +264,43 @@ static uint16_t hwr_wall_length(int16_t ax, int16_t ay,
     return (uint16_t)low;
 }
 
+/* Emits the sky "cap" for a wall whose top edge borders the sky: a vertical
+ * quad standing on the wall's top edge (endpoints a/b at top_a/top_b) and
+ * rising to just under the top of the coordinate space, so it projects above
+ * the top of the view from any camera.  The cap shares the wall's world x/y, so
+ * its projection covers exactly the screen column band above the wall's top
+ * edge; drawn in the depth-off sky background pass, the SKY-material fragment
+ * branch fills that band with the screen-space skybox, and later opaque
+ * geometry paints over it.  Nothing else about the wall changes. */
+static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
+                            const struct hwr_vertex *a,
+                            const struct hwr_vertex *b,
+                            int16_t top_a, int16_t top_b)
+{
+    struct hwr_mesh_surface *surface;
+    struct hwr_mesh_vertex *v;
+    int raised_a = (int)top_a + 30000;
+    int raised_b = (int)top_b + 30000;
+    int16_t cap_za = (int16_t)(raised_a > INT16_MAX ? INT16_MAX : raised_a);
+    int16_t cap_zb = (int16_t)(raised_b > INT16_MAX ? INT16_MAX : raised_b);
+    if (cap_za <= top_a && cap_zb <= top_b)
+        return 0;   /* the wall top already sits at the coordinate ceiling */
+    surface = hwr_add_surface(mesh, HWR_SURFACE_SOLID_MIDDLE, 6u);
+    if (surface == NULL)
+        return -1;
+    surface->texture_id = -1;
+    surface->flags = HWR_SURFACE_SKY_CAP;
+    v = mesh->vertices + mesh->vertex_count;
+    hwr_set_vertex(&v[0], a->world_x, a->world_y, top_a, 0.0f, 0.0f);
+    hwr_set_vertex(&v[1], b->world_x, b->world_y, top_b, 0.0f, 0.0f);
+    hwr_set_vertex(&v[2], b->world_x, b->world_y, cap_zb, 0.0f, 0.0f);
+    hwr_set_vertex(&v[3], a->world_x, a->world_y, top_a, 0.0f, 0.0f);
+    hwr_set_vertex(&v[4], b->world_x, b->world_y, cap_zb, 0.0f, 0.0f);
+    hwr_set_vertex(&v[5], a->world_x, a->world_y, cap_za, 0.0f, 0.0f);
+    mesh->vertex_count += 6u;
+    return 0;
+}
+
 static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *world,
                          const struct hwr_wall *wall, const struct hwr_sector *sector,
                          enum hwr_surface_kind kind, int16_t id,
@@ -404,6 +441,17 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
         }
     }
     mesh->vertex_count += triangle_count * 3u;
+    /* Sky walls (EDGE_MAP, bit 0x40) get a screen-space skybox cap standing on
+     * their top edge.  Every EDGE_MAP face is capped; the caps are drawn in a
+     * depth-off background pass before opaque geometry, which then overwrites
+     * the sky wherever a nearer surface projects, so the engine's rule "write
+     * sky everywhere a sky-wall projects it, then let geometry paint over it"
+     * holds without any single face over-covering the view. */
+    if ((mapping_flags & 0x40u) != 0 &&
+        hwr_emit_sky_cap(mesh, a, b, top_a, top_b) != 0) {
+        free(cuts);
+        return -1;
+    }
     free(cuts);
     return 0;
 }
@@ -1692,6 +1740,22 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     int32_t flat_guard_origin_y = camera->horizon;
     struct hwr_wall_span_state wall_span = {0};
     size_t i;
+    /* Sky caps carry only a position; the SKY-material fragment branch derives
+     * every texel from gl_FragCoord and the sky uniforms, so skip all texture,
+     * wall-span, and flat-span staging for them. */
+    if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
+        for (i = 0; i < surface->vertex_count; i++) {
+            const struct hwr_mesh_vertex *source =
+                &scene->mesh.vertices[surface->first_vertex + i];
+            struct hwr_gl_vertex *target = &destination[i];
+            memset(target, 0, sizeof *target);
+            target->x = source->x;
+            target->y = source->y;
+            target->z = source->z;
+            target->material_flags = HWR_GL_MATERIAL_SKY;
+        }
+        return;
+    }
     if (logical < 0x1600u) {
         texture_width = scene->textures[logical].width;
         texture_height = scene->textures[logical].height;
@@ -1817,21 +1881,29 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
 static int hwr_prepare_stream(struct hwr_scene *scene,
                               const struct hwr_gl_camera *camera,
                               uint32_t width, uint32_t height,
-                              size_t *opaque_count, size_t *translucent_count)
+                              size_t *sky_count, size_t *opaque_count,
+                              size_t *translucent_count)
 {
     size_t *translucent_order;
     float *depths;
     size_t visible_vertices = 0;
+    size_t sky_vertices = 0;
     size_t translucent_surfaces = 0;
     size_t i;
-    size_t opaque_cursor = 0;
+    size_t sky_cursor = 0;
+    size_t opaque_cursor;
     size_t translucent_cursor;
+    /* The stream packs three back-to-back ranges: [sky][opaque][translucent].
+     * Sky caps come first so they can be drawn as a depth-off background pass;
+     * everything else keeps its opaque-vs-translucent classification. */
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
         surface->flags &= (uint8_t)~HWR_SURFACE_TRANSLUCENT;
         if (!hwr_surface_visible(scene, surface, camera))
             continue;
-        if (hwr_surface_translucent(scene, surface)) {
+        if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
+            sky_vertices += surface->vertex_count;
+        } else if (hwr_surface_translucent(scene, surface)) {
             surface->flags |= HWR_SURFACE_TRANSLUCENT;
             translucent_surfaces++;
         }
@@ -1855,11 +1927,16 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         return hwr_scene_fail(scene, "out of memory sorting translucent surfaces");
     }
     translucent_surfaces = 0;
+    opaque_cursor = sky_vertices;
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
         if (!hwr_surface_visible(scene, surface, camera))
             continue;
-        if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
+        if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
+            hwr_copy_gpu_surface(scene, surface, camera, width, height,
+                                 scene->stream_vertices + sky_cursor);
+            sky_cursor += surface->vertex_count;
+        } else if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
             hwr_copy_gpu_surface(scene, surface, camera, width, height,
                                  scene->stream_vertices + opaque_cursor);
             opaque_cursor += surface->vertex_count;
@@ -1886,7 +1963,8 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     }
     free(translucent_order);
     free(depths);
-    *opaque_count = opaque_cursor;
+    *sky_count = sky_cursor;
+    *opaque_count = opaque_cursor - sky_vertices;
     *translucent_count = translucent_cursor - opaque_cursor;
     return 0;
 }
@@ -1921,6 +1999,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
 {
     struct hwr_gl_camera camera;
     uint8_t palette[1024];
+    size_t sky_count;
     size_t opaque_count;
     size_t translucent_count;
     if (scene == NULL || !scene->valid || !scene->uploaded ||
@@ -1941,9 +2020,9 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     camera.sky_double_scanline = api->game_ram->u8(VA_G_DOUBLE_SCANLINE) != 0;
     camera.sky_valid = scene->sky_valid;
     if (hwr_prepare_stream(scene, &camera, width, height,
-                           &opaque_count, &translucent_count) != 0)
+                           &sky_count, &opaque_count, &translucent_count) != 0)
         return NULL;
     hwr_build_palette(world, palette);
-    return hwr_gl_scene_render(scene->stream_vertices, opaque_count,
+    return hwr_gl_scene_render(scene->stream_vertices, sky_count, opaque_count,
                                translucent_count, &camera, palette, width, height);
 }

@@ -649,6 +649,16 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
     "uniform int u_blend_pass;\n"
+    /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
+     * the retired full-screen prepass did; these carry the same inputs. */
+    "uniform int u_sky_valid;\n"
+    "uniform int u_sky_texture_offset;\n"
+    "uniform int u_sky_source_offset;\n"
+    "uniform int u_sky_projection_offset;\n"
+    "uniform int u_sky_texture_height;\n"
+    "uniform int u_sky_start_row;\n"
+    "uniform int u_sky_yaw;\n"
+    "uniform int u_sky_double_scanline;\n"
     "in vec3 v_world;\n"
     "in float v_depth_fixed;\n"
     "in vec2 v_wall;\n"
@@ -691,6 +701,7 @@ static const char g_geometry_fragment_shader[] =
     "  if ((flags & 8u)!=0u) {\n"
     "    int scale=int(v_pan_scale_flags.z);\n"
     "    bool wide_class=w==256 && h==256;\n"
+    "    bool wide_u=(w==256), wide_v=(h==256);\n"
     "    int dimension_shift=wide_class ? 1 : 0;\n"
     "    int row=int(gl_FragCoord.y), column=int(gl_FragCoord.x);\n"
     "    int height_delta=abs(u_eye_z-int(v_world.z));\n"
@@ -728,6 +739,45 @@ static const char g_geometry_fragment_shader[] =
     "    if ((flat_flags & 4u)!=0u) accum_v=0u-accum_v;\n"
     "    ix=int((accum_u >> 16) & uint(w-1));\n"
     "    iy=int((accum_v >> 16) & uint(h-1));\n"
+    /* Flats follow one world-plane mapping (the map format's floor UV rule),
+     * applied PER AXIS keyed on that axis's own dimension (the engine's flat
+     * driver has no 256/square branch: U wraps at width, V at height, and the
+     * only dim-dependent input is the extent dim<<6 — see renderer.c 12914-18
+     * / 3703-12).  With base = 2^scale world units, an axis whose dimension is
+     * 256 covers base/2 world units per texel and lands its pan byte at full
+     * weight; every other axis covers base per texel with the pan byte at HALF
+     * weight.  So a 256x128 flat uses U=base/2 (width 256) and V=base
+     * (height 128) — both a square 256 and a 128 flat are special cases of the
+     * same rule.  The u axis is world-x negated plus pan_x; the v axis is
+     * world-y minus pan_y (both axes SUBTRACT pan_y).  The software renderer
+     * evaluates that plane at the span's INTEGER row/column — not at the
+     * fragment's pixel-center world position, which sits half a pixel away
+     * (several texels of drift at flat depths) — so reconstruct the world
+     * point from row/column + camera instead of sampling v_world.  Beyond ~3
+     * texels per pixel the original's integer span walk aliases differently
+     * than any exact evaluation; keep the accumulator result there for the
+     * no-256-axis case (a 256-axis is precise enough to evaluate everywhere). */
+    "    bool pow2_dims=(w & (w-1))==0 && (h & (h-1))==0;\n"
+    "    if (pow2_dims && w<=256 && h<=256) {\n"
+    "      float fdepth=float(u_eye_z-int(floor(v_world.z+0.5)))*u_focal.y/float(row-u_center_i.y);\n"
+    "      float w2t_u=wide_u ? float(1 << scale)*0.5 : float(1 << scale);\n"
+    "      float w2t_v=wide_v ? float(1 << scale)*0.5 : float(1 << scale);\n"
+    "      float pan_mul_u=wide_u ? 1.0 : 0.5;\n"
+    "      float pan_mul_v=wide_v ? 1.0 : 0.5;\n"
+    "      if (wide_u || wide_v || fdepth < 3.0*u_focal.x*w2t_u) {\n"
+    "        float fvx=float(screen_rel)*fdepth/u_focal.x;\n"
+    "        float fsin=float(u_basis_fixed.x)*(1.0/16384.0);\n"
+    "        float fcos=float(u_basis_fixed.y)*(1.0/16384.0);\n"
+    "        float wxf=fsin*fvx-fcos*fdepth-float(u_view_offset.x);\n"
+    "        float wyf=fcos*fvx+fsin*fdepth-float(u_view_offset.y);\n"
+    "        float uu=-wxf/w2t_u+float(v_aux & 255u)*pan_mul_u;\n"
+    "        float vv= wyf/w2t_v-float(v_aux >> 8)*pan_mul_v;\n"
+    "        if ((flat_flags & 2u)!=0u) uu=-uu;\n"
+    "        if ((flat_flags & 4u)!=0u) vv=-vv;\n"
+    "        ix=int(floor(uu)) & (w-1);\n"
+    "        iy=int(floor(vv)) & (h-1);\n"
+    "      }\n"
+    "    }\n"
     "  } else {\n"
     /* Wall texture coordinates come from the original integer column
      * accumulators. The staged state is consumed before each advance. */
@@ -819,7 +869,24 @@ static const char g_geometry_fragment_shader[] =
     "}\n"
     "uniform int u_debug_vis;\n"
     "void main() {\n"
-    "  uint texel=sample_texel(); uint material=v_light_material.y;\n"
+    "  uint material=v_light_material.y;\n"
+    /* Sky-cap fragment: fill the column with the screen-space skybox texel and
+     * stop.  The math is a verbatim port of the retired sky prepass shader; the
+     * cap geometry is what limits it to the region above each sky wall and lets
+     * the depth test occlude the geometry behind the wall. */
+    "  if ((material & 4u)!=0u) {\n"
+    "    if (u_sky_valid==0) discard;\n"
+    "    int sx=int(gl_FragCoord.x), sy=int(gl_FragCoord.y);\n"
+    "    int scolumn=int(texelFetch(u_texels,u_sky_projection_offset+sx).r);\n"
+    "    scolumn=(scolumn-(u_sky_yaw << 1)) & 255;\n"
+    "    int srow=u_sky_start_row+(u_sky_double_scanline!=0 ? (sy >> 1) : sy);\n"
+    "    srow=clamp(srow,0,u_sky_texture_height-1);\n"
+    "    uint stexel=texelFetch(u_texels,\n"
+    "        u_sky_texture_offset+u_sky_source_offset+srow*256+scolumn).r;\n"
+    "    out_index=u_debug_vis==1 ? 255u : stexel;\n"
+    "    return;\n"
+    "  }\n"
+    "  uint texel=sample_texel();\n"
     "  if ((material & 1u)!=0u && texel==0u) discard;\n"
     /* Mode 2: the raw pre-colormap texel byte, for offline texel-vs-shade
      * mismatch attribution. */
@@ -1473,13 +1540,14 @@ static void hwr_gl_scene_self_test(int first_run)
 }
 
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
+                                    size_t sky_vertices,
                                     size_t opaque_vertices,
                                     size_t translucent_vertices,
                                     const struct hwr_gl_camera *camera,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height)
 {
-    size_t total = opaque_vertices + translucent_vertices;
+    size_t total = sky_vertices + opaque_vertices + translucent_vertices;
     const GLuint clear_index[4] = { 0x7fu, 0, 0, 0 };
     GLint blend_location;
     if (!g_initialized || !g_scene_uploaded || vertices == NULL || camera == NULL ||
@@ -1513,33 +1581,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         const char *vis = getenv("HWR_SHADE_VIS");
         g_debug_vis = vis != NULL && vis[0] == '1' ? 1 : 0;
     }
-    if (camera->sky_valid && camera->sky_texture_height != 0 &&
-        width <= 0x288u) {
-        /* The software wall driver establishes the parallax image as the
-         * destination behind sky boundaries. Drawing it before depth-tested
-         * geometry gives masked walls and open portals the same destination. */
-        g_gl.disable(GL_DEPTH_TEST);
-        g_gl.use_program(g_sky_program);
-        hwr_set_sampler(g_sky_program, "u_texels", 0);
-        hwr_uniform_1i(g_sky_program, "u_texture_offset",
-                       (GLint)camera->sky_texture_offset);
-        hwr_uniform_1i(g_sky_program, "u_source_offset",
-                       camera->sky_source_offset);
-        hwr_uniform_1i(g_sky_program, "u_projection_offset",
-                       (GLint)camera->sky_projection_offset);
-        hwr_uniform_1i(g_sky_program, "u_texture_height",
-                       camera->sky_texture_height);
-        hwr_uniform_1i(g_sky_program, "u_start_row", camera->sky_start_row);
-        hwr_uniform_1i(g_sky_program, "u_yaw", camera->sky_yaw);
-        hwr_uniform_1i(g_sky_program, "u_double_scanline",
-                       camera->sky_double_scanline);
-        hwr_uniform_1i(g_sky_program, "u_debug_vis", g_debug_vis);
-        g_gl.bind_vertex_array(g_resolve_vao);
-        g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
-    }
-    /* The sky prepass leaves the fullscreen-triangle VAO bound; restore the
-     * scene VAO so the geometry pass draws the actual world, not a stray
-     * triangle over the sky. */
+    /* Sky is no longer a full-screen backdrop.  The per-wall sky caps emitted in
+     * hwr_scene.c (SKY-material branch of the geometry fragment shader) are drawn
+     * first as a depth-off background pass, then opaque geometry overwrites the
+     * sky wherever a nearer surface projects -- reproducing the engine's rule of
+     * writing sky everywhere a sky-wall projects it and letting geometry paint
+     * over it. */
     g_gl.bind_vertex_array(g_scene_vao);
     g_gl.enable(GL_DEPTH_TEST);
     g_gl.depth_func(GL_LESS);
@@ -1581,6 +1628,27 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
     hwr_uniform_1i(g_geometry_program, "u_glow_phase", camera->glow_phase);
     {
+        /* Feed the sky-cap fragment branch the same inputs the retired
+         * full-screen prepass used, gated on the identical draw condition
+         * (valid sky texture and a viewport the projection table covers) so the
+         * caps sample the skybox only when the backdrop previously would have. */
+        int sky_active = (camera->sky_valid && camera->sky_texture_height != 0 &&
+                          width <= 0x288u) ? 1 : 0;
+        hwr_uniform_1i(g_geometry_program, "u_sky_valid", sky_active);
+        hwr_uniform_1i(g_geometry_program, "u_sky_texture_offset",
+                       (GLint)camera->sky_texture_offset);
+        hwr_uniform_1i(g_geometry_program, "u_sky_source_offset",
+                       camera->sky_source_offset);
+        hwr_uniform_1i(g_geometry_program, "u_sky_projection_offset",
+                       (GLint)camera->sky_projection_offset);
+        hwr_uniform_1i(g_geometry_program, "u_sky_texture_height",
+                       camera->sky_texture_height);
+        hwr_uniform_1i(g_geometry_program, "u_sky_start_row", camera->sky_start_row);
+        hwr_uniform_1i(g_geometry_program, "u_sky_yaw", camera->sky_yaw);
+        hwr_uniform_1i(g_geometry_program, "u_sky_double_scanline",
+                       camera->sky_double_scanline);
+    }
+    {
         GLint scale_location = g_gl.get_uniform_location(g_geometry_program, "u_depth_scale");
         if (scale_location >= 0)
             g_gl.uniform_1f(scale_location, camera->shade_depth_scale > 0.0f
@@ -1589,8 +1657,18 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     blend_location = g_gl.get_uniform_location(g_geometry_program, "u_blend_pass");
     if (blend_location >= 0)
         g_gl.uniform_1i(blend_location, 0);
+    /* Sky background candidate: colour only, no depth interaction. */
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.depth_mask(GL_FALSE);
+    if (sky_vertices != 0)
+        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)sky_vertices);
+    /* Opaque geometry overwrites the sky wherever it projects. */
+    g_gl.enable(GL_DEPTH_TEST);
+    g_gl.depth_func(GL_LESS);
+    g_gl.depth_mask(GL_TRUE);
     if (opaque_vertices != 0)
-        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)opaque_vertices);
+        g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
+                         (GLsizei)opaque_vertices);
     if (translucent_vertices != 0) {
         g_gl.active_texture(GL_TEXTURE5);
         g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
@@ -1599,7 +1677,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         g_gl.depth_mask(GL_FALSE);
         if (blend_location >= 0)
             g_gl.uniform_1i(blend_location, 1);
-        g_gl.draw_arrays(GL_TRIANGLES, (GLint)opaque_vertices,
+        g_gl.draw_arrays(GL_TRIANGLES,
+                         (GLint)(sky_vertices + opaque_vertices),
                          (GLsizei)translucent_vertices);
         g_gl.depth_mask(GL_TRUE);
     }
