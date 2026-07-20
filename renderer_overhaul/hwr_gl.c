@@ -916,6 +916,12 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_debug_vis;\n"
     "void main() {\n"
     "  uint material=v_light_material.y;\n"
+    /* Surface-identity probes must reveal the OPAQUE winner behind a
+     * translucent surface, not the translucent surface itself.  The
+     * translucent pass writes colour with depth-write off, so under any probe
+     * mode (2 and up) drop translucent fragments and let the recorded index
+     * stay whatever opaque geometry owns the pixel. */
+    "  if (u_debug_vis>=2 && (material & 16u)!=0u) discard;\n"
     /* Sky-cap fragment: fill the column with the screen-space skybox texel and
      * stop.  The math is a verbatim port of the retired sky prepass shader; the
      * cap geometry is what limits it to the region above each sky wall and lets
