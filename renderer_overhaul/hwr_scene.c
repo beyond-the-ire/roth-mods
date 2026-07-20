@@ -1271,6 +1271,18 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                 return hwr_scene_fail(scene, "out of memory packing sky projection table");
             }
             scene->sky_valid = 1;
+            /* The skybox can itself be an animated block, and the game plays it
+             * like any other. It reads its pixels from the same store, so
+             * recording it here lets the ordinary frame swap animate it. */
+            if (entry != NULL &&
+                entry->resource_class == HWR_DAS_CLASS_ANIMATED &&
+                hwr_scene_register_animation(scene, entry,
+                                             scene->sky_texture_offset) != 0) {
+                hwr_das_release_decoded(owner, entry_id);
+                free(bytes);
+                return hwr_scene_fail(scene, "out of memory recording sky animation %u",
+                                      world->sky_fat_index);
+            }
             if (debug)
                 fprintf(stderr, "[renderer_overhaul] sky texture %u: 256x%u, row bias %u, source offset %u\n",
                         world->sky_fat_index, sky_height, scene->sky_row_bias,
