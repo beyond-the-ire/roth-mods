@@ -275,7 +275,8 @@ static uint16_t hwr_wall_length(int16_t ax, int16_t ay,
 static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
                             const struct hwr_vertex *a,
                             const struct hwr_vertex *b,
-                            int16_t top_a, int16_t top_b, int occluder)
+                            int16_t top_a, int16_t top_b, int occluder,
+                            int full_height)
 {
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *v;
@@ -283,7 +284,7 @@ static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
     int raised_b = (int)top_b + 30000;
     int16_t cap_za = (int16_t)(raised_a > INT16_MAX ? INT16_MAX : raised_a);
     int16_t cap_zb = (int16_t)(raised_b > INT16_MAX ? INT16_MAX : raised_b);
-    if (cap_za <= top_a && cap_zb <= top_b)
+    if (!full_height && cap_za <= top_a && cap_zb <= top_b)
         return 0;   /* the wall top already sits at the coordinate ceiling */
     surface = hwr_add_surface(mesh, HWR_SURFACE_SOLID_MIDDLE, 6u);
     if (surface == NULL)
@@ -291,13 +292,20 @@ static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
     surface->texture_id = -1;
     surface->flags = (uint8_t)(HWR_SURFACE_SKY_CAP |
                                (occluder ? HWR_SURFACE_SKY_OCCLUDER : 0u));
+    surface->aux = full_height ? 1u : 0u;
     v = mesh->vertices + mesh->vertex_count;
-    hwr_set_vertex(&v[0], a->world_x, a->world_y, top_a, 0.0f, 0.0f);
-    hwr_set_vertex(&v[1], b->world_x, b->world_y, top_b, 0.0f, 0.0f);
-    hwr_set_vertex(&v[2], b->world_x, b->world_y, cap_zb, 0.0f, 0.0f);
-    hwr_set_vertex(&v[3], a->world_x, a->world_y, top_a, 0.0f, 0.0f);
-    hwr_set_vertex(&v[4], b->world_x, b->world_y, cap_zb, 0.0f, 0.0f);
-    hwr_set_vertex(&v[5], a->world_x, a->world_y, cap_za, 0.0f, 0.0f);
+    hwr_set_vertex(&v[0], a->world_x, a->world_y,
+                   full_height ? INT16_MIN : top_a, 0.0f, 0.0f);
+    hwr_set_vertex(&v[1], b->world_x, b->world_y,
+                   full_height ? INT16_MIN : top_b, 0.0f, 0.0f);
+    hwr_set_vertex(&v[2], b->world_x, b->world_y,
+                   full_height ? INT16_MAX : cap_zb, 0.0f, 0.0f);
+    hwr_set_vertex(&v[3], a->world_x, a->world_y,
+                   full_height ? INT16_MIN : top_a, 0.0f, 0.0f);
+    hwr_set_vertex(&v[4], b->world_x, b->world_y,
+                   full_height ? INT16_MAX : cap_zb, 0.0f, 0.0f);
+    hwr_set_vertex(&v[5], a->world_x, a->world_y,
+                   full_height ? INT16_MAX : cap_za, 0.0f, 0.0f);
     mesh->vertex_count += 6u;
     return 0;
 }
@@ -464,7 +472,7 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
                 &world->sectors[wall->neighbor_sector_index];
             cap_occluder = nb->ceiling_z >= sector->ceiling_z;
         }
-        if (hwr_emit_sky_cap(mesh, a, b, top_a, top_b, cap_occluder) != 0) {
+        if (hwr_emit_sky_cap(mesh, a, b, top_a, top_b, cap_occluder, 0) != 0) {
             free(cuts);
             return -1;
         }
@@ -758,6 +766,16 @@ static int hwr_emit_portal_slab(struct hwr_scene_mesh *mesh,
                          wall->mapping_flags);
 }
 
+/* True when any surface added at or after `first` is a sky cap. */
+static int hwr_sky_capped_since(const struct hwr_scene_mesh *mesh, size_t first)
+{
+    size_t i;
+    for (i = first; i < mesh->surface_count; i++)
+        if ((mesh->surfaces[i].flags & HWR_SURFACE_SKY_CAP) != 0)
+            return 1;
+    return 0;
+}
+
 int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                          const struct hwr_world *world, int debug)
 {
@@ -773,6 +791,7 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
             goto failed;
         for (j = 0; j < sector->wall_count; j++) {
             const struct hwr_wall *wall = &world->walls[sector->first_wall + j];
+            size_t surfaces_before = mesh->surface_count;
             if (wall->neighbor_sector_index == SIZE_MAX) {
                 if (hwr_emit_wall(mesh, world, wall, sector,
                                   HWR_SURFACE_SOLID_MIDDLE,
@@ -840,6 +859,42 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                 } else if (hwr_emit_portal_slab(mesh, world, wall, sector, neighbor) != 0) {
                     goto failed;
                 }
+                /* A sky opening: an EDGE_MAP portal whose middle texture is the
+                 * span colorkey.  The engine never draws such a face's body (the
+                 * face dispatcher rejects the colorkey id), so the face renders
+                 * only its edge spans, and the EDGE_MAP fill runs from the view
+                 * top down to the opening's floor boundary -- the whole opening
+                 * is skybox and everything beyond it is hidden.  When the face
+                 * sits entirely below the view the engine's dedicated path fills
+                 * the full viewport instead; a cap standing on the opening
+                 * bottom projects to the same region in both cases.  The cap
+                 * occludes so geometry beyond the opening is dropped, and the
+                 * wall's own bands survive it through the occlusion pass's
+                 * polygon offset. */
+                if ((wall->mapping_flags & 0x40u) != 0 &&
+                    (uint16_t)wall->middle_id == world->world_span_colorkey) {
+                    const struct hwr_vertex *a =
+                        &world->vertices[wall->vertex_a_index];
+                    const struct hwr_vertex *b =
+                        &world->vertices[wall->vertex_b_index];
+                    int16_t base = sector->floor_z > neighbor->floor_z
+                                 ? sector->floor_z : neighbor->floor_z;
+                    if (hwr_emit_sky_cap(mesh, a, b, base, base, 1, 0) != 0)
+                        goto failed;
+                }
+            }
+            /* When the face produces no visible band, the engine's dedicated
+             * EDGE_MAP path fills every row in the clipped viewport, not merely
+             * the rows above the sector ceiling.  Mark this synthetic cap as a
+             * full-height wall-plane curtain; the vertex shader pins its two Z
+             * edges to the viewport edges while retaining the wall's X/depth. */
+            if ((wall->mapping_flags & 0x40u) != 0 &&
+                !hwr_sky_capped_since(mesh, surfaces_before)) {
+                const struct hwr_vertex *a = &world->vertices[wall->vertex_a_index];
+                const struct hwr_vertex *b = &world->vertices[wall->vertex_b_index];
+                if (hwr_emit_sky_cap(mesh, a, b, sector->ceiling_z,
+                                     sector->ceiling_z, 1, 1) != 0)
+                    goto failed;
             }
         }
     }
@@ -1985,7 +2040,9 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             target->z = source->z;
             target->material_flags = (uint8_t)(HWR_GL_MATERIAL_SKY |
                 ((surface->flags & HWR_SURFACE_SKY_OCCLUDER) != 0
-                     ? HWR_GL_MATERIAL_SKY_OCCLUDER : 0u));
+                     ? HWR_GL_MATERIAL_SKY_OCCLUDER : 0u) |
+                (surface->aux != 0
+                     ? HWR_GL_MATERIAL_SKY_FULL_HEIGHT : 0u));
         }
         return;
     }

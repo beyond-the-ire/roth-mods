@@ -627,6 +627,11 @@ static const char g_geometry_vertex_shader[] =
     "(2.0*u_center.x/u_viewport.x-1.0)*depth;\n"
     "  float clip_y=(2.0*u_focal.y/u_viewport.y)*zr+"
     "(2.0*u_center.y/u_viewport.y-1.0)*depth;\n"
+    /* The engine's degenerate EDGE_MAP path emits a viewport-height column.
+     * Pin the synthetic curtain to both clip-space Y edges while preserving
+     * the projected wall X and depth used by the selective occlusion pass. */
+    "  if ((a_light_material.y & 128u)!=0u)"
+    " clip_y=a_pos.z==32767 ? -depth : depth;\n"
     "  const float n=16.0, f=20000.0;\n"
     "  float clip_z=((f+n)/(f-n))*depth-(2.0*f*n/(f-n));\n"
     "  gl_Position=vec4(clip_x,clip_y,clip_z,depth);\n"
