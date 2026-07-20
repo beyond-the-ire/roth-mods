@@ -9,6 +9,12 @@
 #define HWR_DAS_MAX_DIMENSION 4096u
 #define HWR_DAS_MAX_ENTRIES 0x1600u
 
+/* A delta-compressed animation stores its first frame uncompressed at
+ * BASE_IMAGE_OFFSET, in the ordinary texture layout, so its pixels begin after
+ * the usual six-byte texture header. The delta streams that follow it start
+ * immediately after those pixels. */
+#define HWR_DAS_ANIM_BASE_HEADER 6u
+
 static uint16_t hwr_read_u16(const uint8_t *bytes)
 {
     return (uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
@@ -171,6 +177,52 @@ static int hwr_das_decode_animation(struct hwr_das_archive *archive,
     }
     entry->width = entry->frames[0].width;
     entry->height = entry->frames[0].height;
+    return 0;
+}
+
+/* Decodes the uncompressed first frame of a delta-compressed animation. The
+ * remaining frames are deltas against it and are not decoded yet, so the
+ * surface renders as the animation's opening still rather than as a fill. */
+static int hwr_das_decode_base_frame(struct hwr_das_archive *archive,
+                                     struct hwr_das_entry *entry)
+{
+    const uint8_t *block;
+    size_t base;
+    size_t pixel_count;
+    uint16_t width;
+    uint16_t height;
+
+    base = hwr_read_u16(entry->raw_payload + 0x0au);
+    if (base == 0 || base > entry->raw_payload_size ||
+        entry->raw_payload_size - base < HWR_DAS_ANIM_BASE_HEADER)
+        return hwr_das_fail(archive, "animation base image is out of range");
+    block = entry->raw_payload + base;
+    width = hwr_read_u16(block + 2);
+    height = hwr_read_u16(block + 4);
+    if (width == 0 || height == 0 || width > HWR_DAS_MAX_DIMENSION ||
+        height > HWR_DAS_MAX_DIMENSION)
+        return hwr_das_fail(archive, "animation base image dimensions are invalid");
+    pixel_count = (size_t)width * height;
+    if (pixel_count >
+        entry->raw_payload_size - base - HWR_DAS_ANIM_BASE_HEADER)
+        return hwr_das_fail(archive, "animation base image is truncated");
+
+    entry->frames = (struct hwr_das_frame *)calloc(1, sizeof *entry->frames);
+    if (entry->frames == NULL)
+        return hwr_das_fail(archive, "out of memory allocating the base frame");
+    entry->frames[0].pixels = (uint8_t *)malloc(pixel_count);
+    if (entry->frames[0].pixels == NULL) {
+        free(entry->frames);
+        entry->frames = NULL;
+        return hwr_das_fail(archive, "out of memory decoding the base frame");
+    }
+    memcpy(entry->frames[0].pixels, block + HWR_DAS_ANIM_BASE_HEADER,
+           pixel_count);
+    entry->frames[0].width = width;
+    entry->frames[0].height = height;
+    entry->frame_count = 1;
+    entry->width = width;
+    entry->height = height;
     return 0;
 }
 
@@ -357,11 +409,16 @@ int hwr_das_decode(struct hwr_das_archive *archive, size_t id)
         return 0;
     }
     entry->payload_flags = hwr_read_u16(entry->raw_payload);
-    if ((entry->payload_flags & 0x100u) != 0 && entry->raw_payload_size >= 0x0eu &&
-        hwr_read_u16(entry->raw_payload + 0x0c) == 0xfffeu) {
+    /* An odd block type marks a compressed animation. The two compression
+     * schemes are told apart by NUM_DELTA_FRAMES: the sentinel means the frames
+     * are run-length encoded behind sub-image headers, any other value counts
+     * the delta frames that follow an uncompressed base image. */
+    if ((entry->payload_flags & 0x100u) != 0 && entry->raw_payload_size >= 0x0eu) {
         int result;
         entry->resource_class = HWR_DAS_CLASS_ANIMATED;
-        result = hwr_das_decode_animation(archive, entry);
+        result = hwr_read_u16(entry->raw_payload + 0x0c) == 0xfffeu
+               ? hwr_das_decode_animation(archive, entry)
+               : hwr_das_decode_base_frame(archive, entry);
         entry->decode_failed = result != 0;
         return result;
     }
