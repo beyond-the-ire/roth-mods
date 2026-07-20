@@ -703,10 +703,23 @@ static int hwr_build_sector_flats(struct hwr_scene_mesh *mesh,
                             sector->ceiling_flat_id,
                             sector->sentinel == -3 ? 0 : sector->ceiling_pan,
                             (uint8_t)((sector->flags >> 2) & 3u), 1);
-    result |= hwr_emit_flat(mesh, world, sector, sector_index, points, triangles,
-                            count - 2u, HWR_SURFACE_FLOOR, sector->floor_z,
-                            sector->floor_flat_id, sector->floor_pan,
-                            (uint8_t)((sector->flags >> 4) & 3u), 0);
+    /* A slab is a full-footprint block sharing the sector's wall loop, so its
+     * top surface covers exactly the same triangles as the base floor.  When
+     * that top sits FLUSH with the floor, it fully hides a sentinel base floor
+     * (a negative flat id, drawn as a solid colour); the engine treats such a
+     * floor as absent and paints the slab top as the walkable surface.  Emitting
+     * the base floor anyway leaves two coplanar flats that z-fight, and the solid
+     * colour wins across one triangulation triangle -- a stray wedge below a
+     * doorway.  Skip it and let the slab top stand in for the floor.  Only the
+     * exactly-flush case qualifies: a slab hovering above the floor is a
+     * suspended platform, and the base floor beneath it still shows. */
+    if (sector->floor_flat_id >= 0 || sector->slab_index == SIZE_MAX ||
+        world->slabs[sector->slab_index].upper_z != sector->floor_z)
+        result |= hwr_emit_flat(mesh, world, sector, sector_index, points,
+                                triangles, count - 2u, HWR_SURFACE_FLOOR,
+                                sector->floor_z, sector->floor_flat_id,
+                                sector->floor_pan,
+                                (uint8_t)((sector->flags >> 4) & 3u), 0);
     if (sector->slab_index != SIZE_MAX) {
         const struct hwr_slab *slab = &world->slabs[sector->slab_index];
         result |= hwr_emit_flat(mesh, world, sector, sector_index, points, triangles,
