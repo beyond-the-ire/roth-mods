@@ -375,11 +375,30 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     return 0;
 }
 
+/* Texture panning is not something the renderer computes. Each pannable
+ * surface carries a pan byte pair in the map-geometry buffer, and the map's
+ * effect system advances that pair in place on the game tick; the engine
+ * simply re-reads it every time it emits the surface. Flowing water and
+ * drifting platform textures therefore only move if the pan bytes are re-read
+ * along with the other mutable geometry. HWR_SCROLL=0 leaves every surface at
+ * the pan it carried when the map was loaded. */
+static int hwr_scroll_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SCROLL");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
 {
     size_t i;
+    int scroll;
     if (world == NULL || !world->valid || api == NULL || api->game_ram == NULL)
         return -1;
+    scroll = hwr_scroll_enabled();
     /* A map change replaces the sections; a stale snapshot must fail closed
      * instead of reading through a dangling pointer. */
     if (hwr_stored_pointer(api, VA_G_MAP_GEOMETRY_BUFFER) != world->sector_section ||
@@ -395,6 +414,12 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
         sector->flags = sector->raw[0x0a];
         sector->light = sector->raw[0x0b];
         sector->texture_map_override = (int8_t)sector->raw[0x0c];
+        if (scroll) {
+            /* Ceiling pan pair at +0x10, floor pan pair at +0x12. */
+            memcpy(sector->raw + 0x10, record + 0x10, 4);
+            sector->ceiling_pan = hwr_u16(sector->raw + 0x10);
+            sector->floor_pan = hwr_u16(sector->raw + 0x12);
+        }
     }
     for (i = 0; i < world->slab_count; i++) {
         struct hwr_slab *slab = &world->slabs[i];
@@ -403,6 +428,25 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
         memcpy(slab->raw + 8, record + 8, 2);
         slab->lower_z = hwr_i16(slab->raw + 2);
         slab->upper_z = hwr_i16(slab->raw + 8);
+        if (scroll) {
+            /* Lower-pair pan at +0x04, upper-pair pan at +0x0a. */
+            memcpy(slab->raw + 4, record + 4, 2);
+            memcpy(slab->raw + 0x0a, record + 0x0a, 2);
+            slab->lower_aux = hwr_u16(slab->raw + 4);
+            slab->upper_aux = hwr_u16(slab->raw + 0x0a);
+        }
+    }
+    if (scroll) {
+        for (i = 0; i < world->wall_count; i++) {
+            struct hwr_wall *wall = &world->walls[i];
+            const uint8_t *record = world->sector_section + wall->mapping_offset;
+            /* A face's pan pair sits at +0x0a of its mapping record. Several
+             * walls may share one mapping record, which simply re-reads the
+             * same pair. */
+            memcpy(wall->mapping_raw + 0x0a, record + 0x0a, 2);
+            wall->pan_u = wall->mapping_raw[0x0a];
+            wall->pan_v = wall->mapping_raw[0x0b];
+        }
     }
     for (i = 0; i < world->vertex_count; i++) {
         struct hwr_vertex *vertex = &world->vertices[i];
