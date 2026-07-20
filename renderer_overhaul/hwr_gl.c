@@ -924,6 +924,14 @@ static const char g_geometry_fragment_shader[] =
     /* Mode 2: the raw pre-colormap texel byte, for offline texel-vs-shade
      * mismatch attribution. */
     "  if (u_debug_vis==2) { out_index=texel & 255u; return; }\n"
+    /* Modes 4 and 5 report which surface won a pixel: the low and high bytes
+     * of its texture's byte offset in the store, which identifies the texture
+     * uniquely. Mode 6 reports the material bits, which give the surface kind.
+     * Capturing 4 and 5 together names the surface behind any pixel. */
+    "  if (u_debug_vis==4) { out_index=v_offset & 255u; return; }\n"
+    "  if (u_debug_vis==5) { out_index=(v_offset >> 8) & 255u; return; }\n"
+    "  if (u_debug_vis==6) { out_index=material & 255u; return; }\n"
+    "  if (u_debug_vis==7) { out_index=v_dims.x & 255u; return; }\n"
     "  uint mapped; uint face_flags=v_pan_scale_flags.w;\n"
     "  if ((material & 4u)!=0u) mapped=texel;\n"
     "  else if ((face_flags & 64u)!=0u && (u_glow_phase & 73)!=0)"
@@ -1702,7 +1710,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_bind_scene_textures();
     if (g_debug_vis < 0) {
         const char *vis = getenv("HWR_SHADE_VIS");
-        g_debug_vis = vis != NULL && vis[0] == '1' ? 1 : 0;
+        g_debug_vis = vis != NULL && vis[0] >= '0' && vis[0] <= '9'
+                    ? vis[0] - '0' : 0;
     }
     if (g_sky_occlude < 0) {
         /* On by default: an EDGE_MAP face is meant to hide what stands behind

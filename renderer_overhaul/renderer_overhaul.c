@@ -926,7 +926,16 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                     step = 1;
                     if (hwr_gl_read_scene_indices(gl, render_width, render_height)) {
                         step = 2;
-                        hwr_gl_set_debug_vis(2);
+                        /* The third plane normally carries raw texels; a
+                         * numeric HWR_SHADE_VIS instead captures that probe,
+                         * so surface identity can be read without a palette
+                         * round trip. */
+                        {
+                            const char *probe = getenv("HWR_SHADE_VIS");
+                            int probe_mode = probe != NULL && probe[0] > '0' &&
+                                             probe[0] <= '9' ? probe[0] - '0' : 2;
+                            hwr_gl_set_debug_vis(probe_mode);
+                        }
                         if (hwr_scene_render(&g_scene, &g_world, api,
                                              render_width, render_height) != NULL) {
                             step = 3;

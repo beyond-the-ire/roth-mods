@@ -1294,6 +1294,21 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         if (entry != NULL)
             hwr_das_release_decoded(owner, entry_id);
     }
+    if (debug) {
+        /* Offset-to-texture map, so a captured surface-identity frame can be
+         * read back to the texture that produced each pixel. */
+        size_t t;
+        for (t = 0; t < 0x1600u; t++) {
+            if (scene->textures[t].width == 0 && scene->textures[t].height == 0)
+                continue;
+            fprintf(stderr, "[renderer_overhaul] texmap id=%u offset=%u %ux%u qflags=0x%04x%s\n",
+                    (unsigned)t, (unsigned)scene->textures[t].offset,
+                    (unsigned)scene->textures[t].width,
+                    (unsigned)scene->textures[t].height,
+                    (unsigned)scene->textures[t].qflags,
+                    scene->textures[t].direct ? " direct" : "");
+        }
+    }
     if (debug)
         fprintf(stderr, "[renderer_overhaul] scene stats: surfaces=%u quads=%u textures plain=%u grouped=%u animated=%u (playing %u) fill=%u fallbacks=%u\n",
                 (unsigned)scene->mesh.surface_count,
