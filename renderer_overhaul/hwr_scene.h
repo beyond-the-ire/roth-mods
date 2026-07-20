@@ -89,6 +89,40 @@ struct hwr_scene_mesh {
     char error[192];
 };
 
+enum hwr_animation_kind {
+    /* Frames stored as a base image plus a chain of difference streams. The
+     * block carries its own step rate and advances as the world is drawn. */
+    HWR_ANIMATION_DELTA = 0,
+    /* Frames stored as independent run-length encoded sub-images, selected
+     * outright from the global animation clock. */
+    HWR_ANIMATION_SUBIMAGE
+};
+
+/* One animated texture's playback state. The renderer runs its own clocks off
+ * the engine's global timers rather than reading the engine's per-block
+ * animation state, so a texture keeps time whether or not the engine drew a
+ * surface that uses it. */
+struct hwr_scene_animation {
+    /* frame_count images of frame_bytes each, packed back to back. */
+    uint8_t *frames;
+    uint32_t frame_bytes;
+    /* Where this texture's pixels sit in the uploaded texture store. */
+    uint32_t offset;
+    uint16_t frame_count;
+    uint16_t frame_index;
+    uint16_t uploaded_index;
+    /* Sub-image: clock ticks each frame is held for. */
+    uint16_t divisor;
+    /* Delta: the render tick this texture was last stepped on, so a texture
+     * used by many surfaces still advances only once per frame. */
+    uint16_t last_tick;
+    /* Delta: the block's step-rate byte and its running frame-time countdown. */
+    uint8_t rate;
+    uint8_t timer;
+    uint8_t kind;
+    uint8_t started;
+};
+
 struct hwr_camera {
     int16_t view_offset_x;
     int16_t view_offset_y;
@@ -118,6 +152,8 @@ struct hwr_scene {
     } textures[0x1600];
     struct hwr_gl_vertex *stream_vertices;
     size_t stream_capacity;
+    struct hwr_scene_animation *animations;
+    size_t animation_count;
     uint32_t sky_texture_offset;
     uint32_t sky_projection_offset;
     uint16_t sky_source_offset;

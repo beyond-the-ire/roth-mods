@@ -103,6 +103,11 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                         const uint8_t tint[0x2000],
                         const uint8_t glow[0x200],
                         const uint8_t blend[0x10000]);
+/* Rewrites a run of the uploaded texture store in place, for textures whose
+ * pixels change over time. Returns 0 when the store is not ready to be
+ * rewritten yet, in which case the caller should try again next frame. */
+int hwr_gl_scene_update_texels(uint32_t offset, const uint8_t *bytes,
+                               uint32_t size);
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,

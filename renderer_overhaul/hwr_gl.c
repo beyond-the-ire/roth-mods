@@ -107,6 +107,7 @@ struct hwr_gl_functions {
     PFNGLDELETEBUFFERSPROC delete_buffers;
     PFNGLBINDBUFFERPROC bind_buffer;
     PFNGLBUFFERDATAPROC buffer_data;
+    PFNGLBUFFERSUBDATAPROC buffer_sub_data;
     PFNGLTEXBUFFERPROC tex_buffer;
     PFNGLCREATESHADERPROC create_shader;
     PFNGLSHADERSOURCEPROC shader_source;
@@ -522,6 +523,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(delete_buffers, PFNGLDELETEBUFFERSPROC, "glDeleteBuffers");
     HWR_LOAD_GL(bind_buffer, PFNGLBINDBUFFERPROC, "glBindBuffer");
     HWR_LOAD_GL(buffer_data, PFNGLBUFFERDATAPROC, "glBufferData");
+    HWR_LOAD_GL(buffer_sub_data, PFNGLBUFFERSUBDATAPROC, "glBufferSubData");
     HWR_LOAD_GL(tex_buffer, PFNGLTEXBUFFERPROC, "glTexBuffer");
     HWR_LOAD_GL(create_shader, PFNGLCREATESHADERPROC, "glCreateShader");
     HWR_LOAD_GL(shader_source, PFNGLSHADERSOURCEPROC, "glShaderSource");
@@ -1401,6 +1403,35 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     }
 
     g_scene_uploaded = 1;
+    return 1;
+}
+
+int hwr_gl_scene_update_texels(uint32_t offset, const uint8_t *bytes,
+                               uint32_t size)
+{
+    if (!g_initialized || !g_scene_uploaded || g_texture_buffer == 0 ||
+        bytes == NULL || size == 0 || offset > g_verify_store_size ||
+        size > (uint32_t)(g_verify_store_size - offset) ||
+        !hwr_platform_make_current())
+        return 0;
+    /* The one-shot store self-test hashes the bytes exactly as they were
+     * uploaded, so it has to read the store back before anything starts
+     * rewriting parts of it. Callers retry on the next frame. */
+    if (g_verify_pending)
+        return 0;
+    g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
+    g_gl.buffer_sub_data(GL_TEXTURE_BUFFER, (GLintptr)offset,
+                         (GLsizeiptr)size, bytes);
+    /* Keep the recurring texel probes describing what the store now holds,
+     * so they still catch a store that has genuinely gone bad. */
+    if (g_verify_probe_offset >= 0 &&
+        (uint32_t)g_verify_probe_offset >= offset &&
+        (uint32_t)g_verify_probe_offset - offset < size)
+        g_verify_probe_texel = bytes[(uint32_t)g_verify_probe_offset - offset];
+    if (offset == 0)
+        g_verify_first_texel = bytes[0];
+    if ((size_t)offset + size == g_verify_store_size)
+        g_verify_last_texel = bytes[size - 1u];
     return 1;
 }
 

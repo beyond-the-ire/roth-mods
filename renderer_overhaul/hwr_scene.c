@@ -31,7 +31,7 @@ struct hwr_point {
 struct hwr_scene_texture_stats {
     size_t plain;
     size_t grouped;
-    size_t animated_frame0;
+    size_t animated;
     size_t fill;
     size_t fallbacks;
 };
@@ -852,12 +852,23 @@ failed:
     return -1;
 }
 
+static void hwr_scene_animations_clear(struct hwr_scene *scene)
+{
+    size_t i;
+    for (i = 0; i < scene->animation_count; i++)
+        free(scene->animations[i].frames);
+    free(scene->animations);
+    scene->animations = NULL;
+    scene->animation_count = 0;
+}
+
 void hwr_scene_clear(struct hwr_scene *scene)
 {
     if (scene == NULL)
         return;
     hwr_gl_scene_clear();
     hwr_scene_mesh_clear(&scene->mesh);
+    hwr_scene_animations_clear(scene);
     free(scene->stream_vertices);
     memset(scene, 0, sizeof *scene);
 }
@@ -987,6 +998,83 @@ static size_t hwr_scene_quad_count(const struct hwr_scene_mesh *mesh)
     return quads;
 }
 
+/* Fields of an animated block that the playback clocks read. Offsets are into
+ * the payload as the archive stores it; the engine addresses the same fields
+ * ten bytes further along, past the runtime header it prefixes in memory. */
+#define HWR_ANIM_FIELD_SUBIMAGE_DIVISOR 0x0au
+#define HWR_ANIM_FIELD_DELTA_COUNT      0x0cu
+#define HWR_ANIM_FIELD_DELTA_RATE       0x11u
+#define HWR_ANIM_SUBIMAGE_SENTINEL      0xfffeu
+#define HWR_ANIM_HEADER_SIZE            0x1au
+
+/* Records an animated texture so its pixels can be swapped as it plays. The
+ * frames are copied out because the archive releases its decoded copy as soon
+ * as the texture store is packed. Animations whose frames do not all share one
+ * size are left on their first frame: the store gives each texture a fixed
+ * slot, and a differently sized frame would not fit it. */
+static int hwr_scene_register_animation(struct hwr_scene *scene,
+                                        const struct hwr_das_entry *entry,
+                                        uint32_t offset)
+{
+    struct hwr_scene_animation *animations;
+    struct hwr_scene_animation *animation;
+    size_t frame_bytes;
+    size_t i;
+    if (entry->frames == NULL || entry->frame_count < 2u ||
+        entry->frame_count > UINT16_MAX || entry->raw_payload == NULL ||
+        entry->raw_payload_size < HWR_ANIM_HEADER_SIZE)
+        return 0;
+    frame_bytes = (size_t)entry->frames[0].width * entry->frames[0].height;
+    if (frame_bytes == 0)
+        return 0;
+    for (i = 0; i < entry->frame_count; i++) {
+        if (entry->frames[i].pixels == NULL ||
+            entry->frames[i].width != entry->frames[0].width ||
+            entry->frames[i].height != entry->frames[0].height)
+            return 0;
+    }
+    if (frame_bytes > SIZE_MAX / entry->frame_count)
+        return -1;
+    animations = (struct hwr_scene_animation *)realloc(
+        scene->animations,
+        (scene->animation_count + 1u) * sizeof *animations);
+    if (animations == NULL)
+        return -1;
+    scene->animations = animations;
+    animation = &animations[scene->animation_count];
+    memset(animation, 0, sizeof *animation);
+    animation->frames = (uint8_t *)malloc(frame_bytes * entry->frame_count);
+    if (animation->frames == NULL)
+        return -1;
+    for (i = 0; i < entry->frame_count; i++)
+        memcpy(animation->frames + i * frame_bytes, entry->frames[i].pixels,
+               frame_bytes);
+    animation->frame_bytes = (uint32_t)frame_bytes;
+    animation->offset = offset;
+    animation->frame_count = (uint16_t)entry->frame_count;
+    if (hwr_scene_read_u16(entry->raw_payload + HWR_ANIM_FIELD_DELTA_COUNT) ==
+        HWR_ANIM_SUBIMAGE_SENTINEL) {
+        animation->kind = HWR_ANIMATION_SUBIMAGE;
+        animation->divisor = hwr_scene_read_u16(entry->raw_payload +
+                                                HWR_ANIM_FIELD_SUBIMAGE_DIVISOR);
+    } else {
+        animation->kind = HWR_ANIMATION_DELTA;
+        animation->rate = entry->raw_payload[HWR_ANIM_FIELD_DELTA_RATE];
+    }
+    scene->animation_count++;
+    return 0;
+}
+
+static size_t hwr_scene_animation_bytes(const struct hwr_scene *scene)
+{
+    size_t bytes = 0;
+    size_t i;
+    for (i = 0; i < scene->animation_count; i++)
+        bytes += (size_t)scene->animations[i].frame_bytes *
+                 scene->animations[i].frame_count;
+    return bytes;
+}
+
 static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                                            const struct hwr_world *world,
                                            struct hwr_das_archive *map_archive,
@@ -1073,8 +1161,16 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                 stats.plain++;
             else if (resolved_class == HWR_DAS_CLASS_GROUPED)
                 stats.grouped++;
-            else if (resolved_class == HWR_DAS_CLASS_ANIMATED)
-                stats.animated_frame0++;
+            else if (resolved_class == HWR_DAS_CLASS_ANIMATED) {
+                stats.animated++;
+                if (hwr_scene_register_animation(scene, entry,
+                                                 scene->textures[logical].offset) != 0) {
+                    hwr_das_release_decoded(owner, entry_id);
+                    free(bytes);
+                    return hwr_scene_fail(scene, "out of memory recording animation %u",
+                                          logical);
+                }
+            }
         } else if (hwr_texture_is_door_placeholder(map_archive, shared_archive,
                                                    logical, entry)) {
             scene->textures[logical].skip = 1;
@@ -1187,12 +1283,16 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
             hwr_das_release_decoded(owner, entry_id);
     }
     if (debug)
-        fprintf(stderr, "[renderer_overhaul] scene stats: surfaces=%u quads=%u textures plain=%u grouped=%u anim-frame0=%u fill=%u fallbacks=%u\n",
+        fprintf(stderr, "[renderer_overhaul] scene stats: surfaces=%u quads=%u textures plain=%u grouped=%u animated=%u (playing %u) fill=%u fallbacks=%u\n",
                 (unsigned)scene->mesh.surface_count,
                 (unsigned)hwr_scene_quad_count(&scene->mesh),
                 (unsigned)stats.plain, (unsigned)stats.grouped,
-                (unsigned)stats.animated_frame0, (unsigned)stats.fill,
-                (unsigned)stats.fallbacks);
+                (unsigned)stats.animated, (unsigned)scene->animation_count,
+                (unsigned)stats.fill, (unsigned)stats.fallbacks);
+    if (debug)
+        fprintf(stderr, "[renderer_overhaul] animation frames retained: %u bytes across %u textures\n",
+                (unsigned)hwr_scene_animation_bytes(scene),
+                (unsigned)scene->animation_count);
     if (!hwr_gl_scene_upload(bytes, size, world->luts.colormap, world->luts.tint,
                              world->luts.glow, world->luts.blend)) {
         free(bytes);
@@ -1238,6 +1338,13 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
 #define VA_G_SKY_START_ROW       0x909f6u
 #define VA_G_SKY_YAW             0x909f8u
 #define VA_G_DOUBLE_SCANLINE     0x8a310u
+/* The two animation clocks. The render tick counts rendered frames; the frame
+ * time scale is how many timer ticks the last frame took, clamped; the
+ * animation clock is the raw timer tick copied once per frame. All three stop
+ * advancing whenever the game's own time does, so animations pause with it. */
+#define VA_G_RENDER_TICK         0x90c0au
+#define VA_G_FRAME_TIME_SCALE    0x85324u
+#define VA_G_ANIM_CLOCK          0x8532au
 
 static void hwr_read_camera(struct hwr_gl_camera *camera,
                             const struct hwr_world *world,
@@ -2011,6 +2118,99 @@ static void hwr_build_palette(const struct hwr_world *world, uint8_t rgba[1024])
     }
 }
 
+/* Steps a delta animation's countdown, byte for byte as the engine steps it.
+ * The timer is loaded with the block's rate byte and has the frame time scale
+ * taken off it once per rendered frame; the subtraction borrows exactly when a
+ * frame is due, which is what the low threshold detects, and adding the rate
+ * back leaves the borrowed remainder in place so the animation keeps its phase
+ * rather than drifting. An overshoot larger than one whole step is dropped
+ * instead of caught up, so however long the game stalls the animation still
+ * moves only one frame. A rate byte of 0xff steps on every frame. */
+static void hwr_animation_step_delta(struct hwr_scene_animation *animation,
+                                     uint16_t tick, uint8_t scale)
+{
+    uint8_t step;
+    if (!animation->started) {
+        /* A block starts with no frame chosen: the first frame it is drawn on
+         * shows frame zero and only arms the timer. */
+        animation->started = 1;
+        animation->frame_index = 0;
+        animation->timer = animation->rate;
+        animation->last_tick = tick;
+        return;
+    }
+    if (animation->last_tick == tick)
+        return;
+    animation->last_tick = tick;
+    if (animation->rate != 0xffu) {
+        animation->timer = (uint8_t)(animation->timer - scale);
+        if (animation->timer < 0x10u)
+            return;
+        step = (uint8_t)((animation->rate & 0x1fu) + 1u);
+        animation->timer = (uint8_t)(animation->timer + step);
+        if ((animation->timer & 0x80u) != 0)
+            animation->timer = 0;
+    }
+    animation->frame_index++;
+    if (animation->frame_index >= animation->frame_count)
+        animation->frame_index = 0;
+}
+
+/* Sub-image animations keep no state: the frame is a plain function of the
+ * global animation clock and the ticks each frame is held for. The count they
+ * cycle through is the one the block's frame chain actually yields, not the
+ * larger number its first header claims -- the game corrects that claim in
+ * place when it loads the block, and selects frames with the corrected value,
+ * so a block's final sub-image is never reached. */
+static uint16_t hwr_animation_subimage_frame(const struct hwr_scene_animation *animation,
+                                             uint16_t clock)
+{
+    if (animation->divisor == 0 || animation->frame_count == 0)
+        return 0;
+    return (uint16_t)((((uint32_t)clock & 0x7fffu) / animation->divisor) %
+                      animation->frame_count);
+}
+
+/* Advances every animated texture in the scene and pushes the frames that
+ * changed into their slots in the texture store. Playback is keyed by texture
+ * rather than by surface, so a texture on a hundred walls still steps once,
+ * and one the engine culled still keeps time. */
+static void hwr_scene_animate(struct hwr_scene *scene,
+                              const struct roth_api_v1 *api)
+{
+    static int enabled = -1;
+    uint16_t tick;
+    uint16_t clock;
+    uint8_t scale;
+    size_t i;
+    if (enabled < 0) {
+        /* On by default. HWR_ANIMATE=0 holds every animated texture on the
+         * frame the scene was built with. */
+        const char *setting = getenv("HWR_ANIMATE");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    if (!enabled || scene->animation_count == 0)
+        return;
+    tick = api->game_ram->u16(VA_G_RENDER_TICK);
+    clock = api->game_ram->u16(VA_G_ANIM_CLOCK);
+    scale = (uint8_t)api->game_ram->u32(VA_G_FRAME_TIME_SCALE);
+    for (i = 0; i < scene->animation_count; i++) {
+        struct hwr_scene_animation *animation = &scene->animations[i];
+        if (animation->kind == HWR_ANIMATION_SUBIMAGE)
+            animation->frame_index = hwr_animation_subimage_frame(animation, clock);
+        else
+            hwr_animation_step_delta(animation, tick, scale);
+        if (animation->frame_index == animation->uploaded_index)
+            continue;
+        if (hwr_gl_scene_update_texels(animation->offset,
+                                       animation->frames +
+                                       (size_t)animation->frame_index *
+                                       animation->frame_bytes,
+                                       animation->frame_bytes))
+            animation->uploaded_index = animation->frame_index;
+    }
+}
+
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
                                  const struct roth_api_v1 *api,
@@ -2028,6 +2228,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         hwr_scene_fail(scene, "%s", scene->mesh.error);
         return NULL;
     }
+    hwr_scene_animate(scene, api);
     hwr_read_camera(&camera, world, api);
     camera.sky_texture_offset = scene->sky_texture_offset;
     camera.sky_projection_offset = scene->sky_projection_offset;
