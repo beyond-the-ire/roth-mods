@@ -849,7 +849,11 @@ static const char g_geometry_fragment_shader[] =
     "    uint vertical_seed=0u;\n"
     "    if (v_wall_vertical.y!=0u) {\n"
     "      int seed=int(vertical_step)*(top-u_center_i.y)-int(v_wall_vertical.x);\n"
-    "      if (seed>0) vertical_seed=uint(seed);\n"
+    /* The engine stores the seed as a sub-texel phase in the low 16 bits with
+     * its integer part clamped to <=15; a larger whole-texel seed never
+     * survives.  Mirror that so a tall wall's first row samples the same texel. */
+    "      if (seed>0) { uint us=uint(seed); uint hi=us>>16u; if (hi>15u) hi=15u;"
+    " vertical_seed=(hi<<16u)|(us & 0xffffu); }\n"
     "    }\n"
     "    int row_offset=clamp(row-top,0,count-1);\n"
     "    int vertical=int((vertical_seed+vertical_step*uint(row_offset))>>16);\n"
