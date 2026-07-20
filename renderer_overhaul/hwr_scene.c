@@ -1403,6 +1403,66 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->shade_depth_scale = hwr_settings_get()->shade_depth_scale;
 }
 
+/* Every wall surface is a DIRECTED face: it is emitted from one sector, with
+ * its endpoints in that sector's wall-ring order.  The engine keeps a directed
+ * face only when its endpoints project across the screen from A to B, and drops
+ * it otherwise, so a wall seen from behind contributes nothing.  The mesh holds
+ * both sectors' faces for a shared wall, and it holds a facade (a portal upper
+ * or lower) that only the emitting sector should see, so without this test the
+ * renderer paints surfaces the engine never draws -- most visibly a facade
+ * painted over the open sky that should show through a portal.
+ *
+ * Projected A-left-of-B is, for endpoints in front of the eye, the sign of the
+ * view-space cross product, and the cross product is unchanged by rotation, so
+ * only the eye TRANSLATION is needed here.  Clipping an endpoint to the near
+ * plane slides it along the same wall line, which scales the cross product by a
+ * non-negative factor, so the untruncated endpoints answer for the clipped ones
+ * too.  Faces whose endpoints are both behind the eye are dropped by the
+ * frustum and need no test.
+ *
+ * Note the sign: the accepted face is the one with a NEGATIVE cross product.
+ * Were it inverted, every wall of the room the camera stands in would vanish
+ * and only the back sides of distant geometry would remain.
+ */
+static int hwr_wall_faces_camera(const struct hwr_scene_mesh *mesh,
+                                 const struct hwr_mesh_surface *surface,
+                                 const struct hwr_gl_camera *camera)
+{
+    const struct hwr_mesh_vertex *vertices = &mesh->vertices[surface->first_vertex];
+    const struct hwr_mesh_vertex *end_a = NULL;
+    const struct hwr_mesh_vertex *end_b = NULL;
+    int32_t ax, ay, bx, by;
+    size_t i;
+    for (i = 0; i < surface->vertex_count; i++) {
+        if ((vertices[i].reserved & HWR_WALL_CORNER_END_B) != 0) {
+            if (end_b == NULL)
+                end_b = &vertices[i];
+        } else if (end_a == NULL) {
+            end_a = &vertices[i];
+        }
+    }
+    if (end_a == NULL || end_b == NULL)
+        return 0;
+    ax = (int16_t)((uint16_t)end_a->x + (uint16_t)camera->view_offset_x);
+    ay = (int16_t)((uint16_t)end_a->y + (uint16_t)camera->view_offset_y);
+    bx = (int16_t)((uint16_t)end_b->x + (uint16_t)camera->view_offset_x);
+    by = (int16_t)((uint16_t)end_b->y + (uint16_t)camera->view_offset_y);
+    return (int64_t)ax * by - (int64_t)ay * bx < 0;
+}
+
+/* HWR_FACE_CULL=0 narrows the directed-face test back to portal middles, the
+ * one class that is emitted from both sides of the same wall.  It is an A/B
+ * switch for the test, not a correctness option. */
+static int hwr_face_cull_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_FACE_CULL");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 static int hwr_surface_visible(const struct hwr_scene *scene,
                                const struct hwr_mesh_surface *surface,
                                const struct hwr_gl_camera *camera)
@@ -1414,37 +1474,12 @@ static int hwr_surface_visible(const struct hwr_scene *scene,
         scene->textures[(uint16_t)surface->texture_id].skip)
         return 0;
     if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
-        if (surface->kind == HWR_SURFACE_PORTAL_MIDDLE) {
-            const struct hwr_mesh_vertex *vertices =
-                &mesh->vertices[surface->first_vertex];
-            const struct hwr_mesh_vertex *end_a = NULL;
-            const struct hwr_mesh_vertex *end_b = NULL;
-            int32_t ax, ay, bx, by;
-            size_t i;
-            for (i = 0; i < surface->vertex_count; i++) {
-                if ((vertices[i].reserved & HWR_WALL_CORNER_END_B) != 0) {
-                    if (end_b == NULL)
-                        end_b = &vertices[i];
-                } else if (end_a == NULL) {
-                    end_a = &vertices[i];
-                }
-            }
-            if (end_a == NULL || end_b == NULL)
-                return 0;
-            ax = (int16_t)((uint16_t)end_a->x +
-                           (uint16_t)camera->view_offset_x);
-            ay = (int16_t)((uint16_t)end_a->y +
-                           (uint16_t)camera->view_offset_y);
-            bx = (int16_t)((uint16_t)end_b->x +
-                           (uint16_t)camera->view_offset_x);
-            by = (int16_t)((uint16_t)end_b->y +
-                           (uint16_t)camera->view_offset_y);
-            /* Portal middles have a record on each side. The engine submits
-             * only the directed face whose projected endpoints run left to
-             * right; submitting both lets the back-side mapping win a depth
-             * tie and mirrors its along-wall texture coordinate. */
-            return (int64_t)ax * by - (int64_t)ay * bx < 0;
-        }
+        /* A sky cap carries no endpoint roles and already rejects the engine's
+         * back side inside the sky pass, so it is not tested here. */
+        if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0)
+            return 1;
+        if (surface->kind == HWR_SURFACE_PORTAL_MIDDLE || hwr_face_cull_enabled())
+            return hwr_wall_faces_camera(mesh, surface, camera);
         return 1;
     }
     z = mesh->vertices[surface->first_vertex].z;
