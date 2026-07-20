@@ -15,6 +15,18 @@
  * immediately after those pixels. */
 #define HWR_DAS_ANIM_BASE_HEADER 6u
 
+/* Offsets stored inside an animated block are relative to the block as the game
+ * holds it in memory, where a ten-byte runtime header precedes the bytes that
+ * come from the file. Subtracting that bias turns a stored offset into an index
+ * into the payload as read. */
+#define HWR_DAS_BLOCK_BIAS 0x0au
+
+/* Where each animation kind keeps its frame directory: sub-image animations
+ * chain their frame headers from the first, delta animations index their
+ * streams through a table of block offsets. */
+#define HWR_DAS_ANIM_TABLE 0x10u
+#define HWR_DAS_DELTA_TABLE 0x12u
+
 static uint16_t hwr_read_u16(const uint8_t *bytes)
 {
     return (uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
@@ -57,9 +69,14 @@ static void hwr_das_free_entry(struct hwr_das_entry *entry)
     memset(entry, 0, sizeof *entry);
 }
 
-static int hwr_das_decode_frame(struct hwr_das_archive *archive,
-                                const uint8_t *payload, size_t payload_size,
-                                size_t header_offset, struct hwr_das_frame *frame)
+/* Decodes one sub-image frame. Every frame covers the whole buffer: the game
+ * clears the margin around the frame's dirty rectangle, the gap that follows
+ * each decoded row, and the trailing remainder, so a zeroed buffer plus the
+ * decoded rows reproduces it byte for byte. Zero doubles as the transparent
+ * key, which is why the cleared margin is what punches the sprite's hole. */
+static int hwr_das_decode_rle_frame(struct hwr_das_archive *archive,
+                                    const uint8_t *payload, size_t payload_size,
+                                    size_t header_offset, struct hwr_das_frame *frame)
 {
     const uint8_t *header;
     uint32_t pixel_count;
@@ -93,6 +110,8 @@ static int hwr_das_decode_frame(struct hwr_das_archive *archive,
         return hwr_das_fail(archive, "out of memory decoding animation frame");
     frame->width = width;
     frame->height = height;
+    /* A single-row or single-column frame is a marker rather than an image: the
+     * game skips its stream and leaves the buffer blank. */
     if (rows == 1 || span == 1)
         return 0;
     if (left > width || span > width - left || top > height || rows > height - top)
@@ -101,8 +120,11 @@ static int hwr_das_decode_frame(struct hwr_das_archive *archive,
     source = header_offset + 0x18u;
     destination = (size_t)top * width + left;
     for (row = 0; row < rows; row++) {
-        uint16_t written = 0;
-        while (written < span) {
+        /* A run may spill past the end of its row, which simply carries the
+         * write cursor into the next one, so the row counts down rather than
+         * capping each run. */
+        int32_t remaining = (int32_t)span;
+        while (remaining > 0) {
             uint8_t opcode;
             uint16_t count;
             uint8_t value;
@@ -118,60 +140,79 @@ static int hwr_das_decode_frame(struct hwr_das_archive *archive,
                     return hwr_das_fail(archive, "animation RLE run is truncated");
                 value = payload[source++];
             }
-            if (count > span - written)
-                return hwr_das_fail(archive, "animation RLE run exceeds its row span");
-            memset(frame->pixels + destination + written, value, count);
-            written = (uint16_t)(written + count);
+            if ((size_t)count > pixel_count - destination)
+                return hwr_das_fail(archive, "animation RLE run overruns its frame");
+            memset(frame->pixels + destination, value, count);
+            destination += count;
+            remaining -= (int32_t)count;
         }
-        destination += width;
+        /* The gap back to the next row's left edge stays blank; the last row has
+         * no gap because the trailing margin covers the rest. */
+        if (row + 1 < rows) {
+            destination += (size_t)width - span;
+            if (destination > pixel_count)
+                return hwr_das_fail(archive, "animation frame rows overrun its buffer");
+        }
     }
     return 0;
 }
 
-static int hwr_das_decode_animation(struct hwr_das_archive *archive,
-                                    struct hwr_das_entry *entry)
+/* Recovers the number of frames a sub-image animation really holds. The count in
+ * the first header is only a claim; the game walks the chain and adopts the
+ * number of hops it could take while every header repeated that claim and the
+ * next header stayed inside the block, minus the sixteen bytes it keeps in
+ * reserve. Blocks routinely claim one frame more than that walk accepts, so the
+ * trailing frame is one the game itself never reaches. */
+static size_t hwr_das_repair_frame_count(const uint8_t *payload,
+                                         size_t payload_size, uint16_t claimed)
 {
-    size_t frame_offset = 0x10u;
-    size_t valid_count = 0;
-    uint16_t expected_count;
+    size_t offset = HWR_DAS_ANIM_TABLE;
+    size_t limit = payload_size - 0x10u;
+    size_t count = 0;
+    while (count < (size_t)claimed) {
+        int32_t advance;
+        if (offset > payload_size || payload_size - offset < 0x10u)
+            break;
+        if (hwr_read_u16(payload + offset + 8) != claimed)
+            break;
+        advance = (int32_t)hwr_read_u32(payload + offset + 0x0c);
+        if (advance < 1)
+            break;
+        offset += (uint32_t)advance;
+        if (offset > limit)
+            break;
+        count++;
+    }
+    return count;
+}
+
+static int hwr_das_decode_rle_animation(struct hwr_das_archive *archive,
+                                        struct hwr_das_entry *entry)
+{
+    size_t frame_offset = HWR_DAS_ANIM_TABLE;
+    size_t frame_count;
+    uint16_t claimed_count;
     size_t i;
 
-    if (entry->raw_payload_size < frame_offset + 0x10u)
+    if (entry->raw_payload_size < HWR_DAS_ANIM_TABLE + 0x18u)
         return hwr_das_fail(archive, "animation table is truncated");
-    expected_count = hwr_read_u16(entry->raw_payload + frame_offset + 8);
-    if (expected_count == 0)
+    claimed_count = hwr_read_u16(entry->raw_payload + frame_offset + 8);
+    if (claimed_count == 0)
         return hwr_das_fail(archive, "animation has no frames");
+    frame_count = hwr_das_repair_frame_count(entry->raw_payload,
+                                             entry->raw_payload_size, claimed_count);
+    if (frame_count == 0)
+        return hwr_das_fail(archive, "animation frame chain is unusable");
 
-    while (valid_count < expected_count) {
-        const uint8_t *header;
-        uint32_t advance;
-        if (frame_offset > entry->raw_payload_size ||
-            entry->raw_payload_size - frame_offset < 0x10u)
-            break;
-        header = entry->raw_payload + frame_offset;
-        if (hwr_read_u16(header + 8) != expected_count)
-            break;
-        advance = hwr_read_u32(header + 0x0c);
-        if (advance < 1u)
-            break;
-        if (advance > entry->raw_payload_size - frame_offset)
-            break;
-        valid_count++;
-        frame_offset += advance;
-    }
-    if (valid_count == 0)
-        return hwr_das_fail(archive, "animation frame-count repair found no frames");
-
-    entry->frames = (struct hwr_das_frame *)calloc(valid_count, sizeof *entry->frames);
+    entry->frames = (struct hwr_das_frame *)calloc(frame_count, sizeof *entry->frames);
     if (entry->frames == NULL)
         return hwr_das_fail(archive, "out of memory allocating animation frames");
-    entry->frame_count = valid_count;
-    frame_offset = 0x10u;
-    for (i = 0; i < valid_count; i++) {
+    entry->frame_count = frame_count;
+    for (i = 0; i < frame_count; i++) {
         uint32_t advance = hwr_read_u32(entry->raw_payload + frame_offset + 0x0c);
-        if (hwr_das_decode_frame(archive, entry->raw_payload,
-                                 entry->raw_payload_size, frame_offset,
-                                 &entry->frames[i]) != 0)
+        if (hwr_das_decode_rle_frame(archive, entry->raw_payload,
+                                     entry->raw_payload_size, frame_offset,
+                                     &entry->frames[i]) != 0)
             return -1;
         frame_offset += advance;
     }
@@ -180,17 +221,106 @@ static int hwr_das_decode_animation(struct hwr_das_archive *archive,
     return 0;
 }
 
-/* Decodes the uncompressed first frame of a delta-compressed animation. The
- * remaining frames are deltas against it and are not decoded yet, so the
- * surface renders as the animation's opening still rather than as a fill. */
-static int hwr_das_decode_base_frame(struct hwr_das_archive *archive,
-                                     struct hwr_das_entry *entry)
+/* Replays one delta stream over a frame buffer. The stream is a sequence of
+ * runs, literal blocks and skips; a skip leaves the bytes it passes over as the
+ * previous frame left them, which is what makes the encoding a delta. Control
+ * byte 0x80 introduces a sixteen-bit word whose high byte selects the operation
+ * and also terminates the stream. */
+static int hwr_das_apply_delta_stream(struct hwr_das_archive *archive,
+                                      const uint8_t *payload, size_t payload_size,
+                                      size_t source, uint8_t *pixels,
+                                      size_t pixel_count)
+{
+    size_t destination = 0;
+    for (;;) {
+        uint8_t control;
+        uint16_t count;
+        uint8_t value;
+        if (source >= payload_size)
+            return hwr_das_fail(archive, "delta stream is truncated");
+        control = payload[source++];
+        if (control == 0x00u) {                        /* run of one byte */
+            if (payload_size - source < 2u)
+                return hwr_das_fail(archive, "delta run is truncated");
+            count = payload[source];
+            value = payload[source + 1];
+            source += 2u;
+        } else if (control < 0x80u) {                  /* literal block */
+            count = control;
+            if ((size_t)count > payload_size - source ||
+                (size_t)count > pixel_count - destination)
+                return hwr_das_fail(archive, "delta literal overruns the frame");
+            memcpy(pixels + destination, payload + source, count);
+            destination += count;
+            source += count;
+            continue;
+        } else if (control != 0x80u) {                 /* skip */
+            count = (uint16_t)(control - 0x80u);
+            if ((size_t)count > pixel_count - destination)
+                return hwr_das_fail(archive, "delta skip leaves the frame");
+            destination += count;
+            continue;
+        } else {                                       /* wide operation */
+            uint8_t low;
+            uint8_t high;
+            if (payload_size - source < 2u)
+                return hwr_das_fail(archive, "delta stream ends mid-word");
+            low = payload[source];
+            high = payload[source + 1];
+            source += 2u;
+            if (high == 0x00u)
+                return 0;
+            if (high < 0x80u) {                        /* wide skip */
+                count = (uint16_t)(low | ((uint16_t)high << 8));
+                if ((size_t)count > pixel_count - destination)
+                    return hwr_das_fail(archive, "delta skip leaves the frame");
+                destination += count;
+                continue;
+            }
+            /* The operation lives in the top two bits, so the remaining six
+             * carry the high half of the length either way. */
+            count = (uint16_t)(low | ((uint16_t)(high & 0x3fu) << 8));
+            if (high < 0xc0u) {                        /* wide literal block */
+                if ((size_t)count > payload_size - source ||
+                    (size_t)count > pixel_count - destination)
+                    return hwr_das_fail(archive, "delta literal overruns the frame");
+                memcpy(pixels + destination, payload + source, count);
+                destination += count;
+                source += count;
+                continue;
+            }
+            if (source >= payload_size)               /* wide run */
+                return hwr_das_fail(archive, "delta run is truncated");
+            value = payload[source++];
+        }
+        if ((size_t)count > pixel_count - destination)
+            return hwr_das_fail(archive, "delta run overruns the frame");
+        memset(pixels + destination, value, count);
+        destination += count;
+    }
+}
+
+/* Decodes a delta-compressed animation. Its first frame is stored whole in the
+ * ordinary texture layout; each later frame is the one before it with a delta
+ * stream applied. The last stream returns the buffer to the first frame, so the
+ * table holds one stream per frame and the final one is not a frame of its own.
+ * A table slot of zero means the frame is unchanged from its predecessor. */
+static int hwr_das_decode_delta_animation(struct hwr_das_archive *archive,
+                                          struct hwr_das_entry *entry)
 {
     const uint8_t *block;
     size_t base;
     size_t pixel_count;
+    size_t frame_count;
+    size_t i;
     uint16_t width;
     uint16_t height;
+
+    frame_count = hwr_read_u16(entry->raw_payload + 0x0cu);
+    if (frame_count == 0)
+        return hwr_das_fail(archive, "animation has no frames");
+    if (HWR_DAS_DELTA_TABLE + 4u * frame_count > entry->raw_payload_size)
+        return hwr_das_fail(archive, "animation delta table is out of range");
 
     base = hwr_read_u16(entry->raw_payload + 0x0au);
     if (base == 0 || base > entry->raw_payload_size ||
@@ -207,20 +337,37 @@ static int hwr_das_decode_base_frame(struct hwr_das_archive *archive,
         entry->raw_payload_size - base - HWR_DAS_ANIM_BASE_HEADER)
         return hwr_das_fail(archive, "animation base image is truncated");
 
-    entry->frames = (struct hwr_das_frame *)calloc(1, sizeof *entry->frames);
+    entry->frames = (struct hwr_das_frame *)calloc(frame_count, sizeof *entry->frames);
     if (entry->frames == NULL)
-        return hwr_das_fail(archive, "out of memory allocating the base frame");
-    entry->frames[0].pixels = (uint8_t *)malloc(pixel_count);
-    if (entry->frames[0].pixels == NULL) {
-        free(entry->frames);
-        entry->frames = NULL;
-        return hwr_das_fail(archive, "out of memory decoding the base frame");
+        return hwr_das_fail(archive, "out of memory allocating animation frames");
+    entry->frame_count = frame_count;
+    for (i = 0; i < frame_count; i++) {
+        entry->frames[i].pixels = (uint8_t *)malloc(pixel_count);
+        if (entry->frames[i].pixels == NULL)
+            return hwr_das_fail(archive, "out of memory decoding an animation frame");
+        entry->frames[i].width = width;
+        entry->frames[i].height = height;
+        if (i == 0) {
+            memcpy(entry->frames[0].pixels, block + HWR_DAS_ANIM_BASE_HEADER,
+                   pixel_count);
+            continue;
+        }
+        memcpy(entry->frames[i].pixels, entry->frames[i - 1].pixels, pixel_count);
+        {
+            uint32_t stream = hwr_read_u32(entry->raw_payload +
+                                           HWR_DAS_DELTA_TABLE + 4u * (i - 1u));
+            if (stream == 0)
+                continue;
+            if (stream < HWR_DAS_BLOCK_BIAS ||
+                stream - HWR_DAS_BLOCK_BIAS >= entry->raw_payload_size)
+                return hwr_das_fail(archive, "animation delta stream is out of range");
+            if (hwr_das_apply_delta_stream(archive, entry->raw_payload,
+                                           entry->raw_payload_size,
+                                           stream - HWR_DAS_BLOCK_BIAS,
+                                           entry->frames[i].pixels, pixel_count) != 0)
+                return -1;
+        }
     }
-    memcpy(entry->frames[0].pixels, block + HWR_DAS_ANIM_BASE_HEADER,
-           pixel_count);
-    entry->frames[0].width = width;
-    entry->frames[0].height = height;
-    entry->frame_count = 1;
     entry->width = width;
     entry->height = height;
     return 0;
@@ -417,8 +564,8 @@ int hwr_das_decode(struct hwr_das_archive *archive, size_t id)
         int result;
         entry->resource_class = HWR_DAS_CLASS_ANIMATED;
         result = hwr_read_u16(entry->raw_payload + 0x0c) == 0xfffeu
-               ? hwr_das_decode_animation(archive, entry)
-               : hwr_das_decode_base_frame(archive, entry);
+               ? hwr_das_decode_rle_animation(archive, entry)
+               : hwr_das_decode_delta_animation(archive, entry);
         entry->decode_failed = result != 0;
         return result;
     }
