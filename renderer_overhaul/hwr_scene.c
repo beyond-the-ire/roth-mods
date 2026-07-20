@@ -275,7 +275,7 @@ static uint16_t hwr_wall_length(int16_t ax, int16_t ay,
 static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
                             const struct hwr_vertex *a,
                             const struct hwr_vertex *b,
-                            int16_t top_a, int16_t top_b)
+                            int16_t top_a, int16_t top_b, int occluder)
 {
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *v;
@@ -289,7 +289,8 @@ static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
     if (surface == NULL)
         return -1;
     surface->texture_id = -1;
-    surface->flags = HWR_SURFACE_SKY_CAP;
+    surface->flags = (uint8_t)(HWR_SURFACE_SKY_CAP |
+                               (occluder ? HWR_SURFACE_SKY_OCCLUDER : 0u));
     v = mesh->vertices + mesh->vertex_count;
     hwr_set_vertex(&v[0], a->world_x, a->world_y, top_a, 0.0f, 0.0f);
     hwr_set_vertex(&v[1], b->world_x, b->world_y, top_b, 0.0f, 0.0f);
@@ -447,10 +448,26 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
      * the sky wherever a nearer surface projects, so the engine's rule "write
      * sky everywhere a sky-wall projects it, then let geometry paint over it"
      * holds without any single face over-covering the view. */
-    if ((mapping_flags & 0x40u) != 0 &&
-        hwr_emit_sky_cap(mesh, a, b, top_a, top_b) != 0) {
-        free(cuts);
-        return -1;
+    if ((mapping_flags & 0x40u) != 0) {
+        /* A cap may OCCLUDE only when nothing of this wall is drawn above it,
+         * i.e. it stands on the wall's true sky boundary.  Parts reaching our
+         * ceiling always qualify.  A lower step qualifies only when no upper is
+         * emitted (neighbour ceiling at or above ours), because then the
+         * opening runs to the ceiling and the step's cap is the sky boundary;
+         * if a facade sits above the step instead, occluding with that cap
+         * would hide both the facade and whatever is seen through the opening. */
+        int cap_occluder = (top_a == sector->ceiling_z &&
+                            top_b == sector->ceiling_z);
+        if (!cap_occluder && kind == HWR_SURFACE_PORTAL_LOWER &&
+            wall->neighbor_sector_index != SIZE_MAX) {
+            const struct hwr_sector *nb =
+                &world->sectors[wall->neighbor_sector_index];
+            cap_occluder = nb->ceiling_z >= sector->ceiling_z;
+        }
+        if (hwr_emit_sky_cap(mesh, a, b, top_a, top_b, cap_occluder) != 0) {
+            free(cuts);
+            return -1;
+        }
     }
     free(cuts);
     return 0;
@@ -1752,7 +1769,9 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             target->x = source->x;
             target->y = source->y;
             target->z = source->z;
-            target->material_flags = HWR_GL_MATERIAL_SKY;
+            target->material_flags = (uint8_t)(HWR_GL_MATERIAL_SKY |
+                ((surface->flags & HWR_SURFACE_SKY_OCCLUDER) != 0
+                     ? HWR_GL_MATERIAL_SKY_OCCLUDER : 0u));
         }
         return;
     }

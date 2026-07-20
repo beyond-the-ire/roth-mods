@@ -71,6 +71,7 @@ typedef void (APIENTRY *hwr_gl_draw_arrays_fn)(GLenum, GLint, GLsizei);
 typedef void (APIENTRY *hwr_gl_capability_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_depth_func_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_depth_mask_fn)(GLboolean);
+typedef void (APIENTRY *hwr_gl_polygon_offset_fn)(GLfloat, GLfloat);
 typedef void (APIENTRY *hwr_gl_copy_tex_sub_image_2d_fn)(GLenum, GLint, GLint,
                                                          GLint, GLint, GLint,
                                                          GLsizei, GLsizei);
@@ -137,6 +138,7 @@ struct hwr_gl_functions {
     hwr_gl_capability_fn disable;
     hwr_gl_depth_func_fn depth_func;
     hwr_gl_depth_mask_fn depth_mask;
+    hwr_gl_polygon_offset_fn polygon_offset;
     PFNGLCLEARBUFFERUIVPROC clear_buffer_uiv;
     hwr_gl_copy_tex_sub_image_2d_fn copy_tex_sub_image_2d;
     hwr_gl_pixel_store_i_fn pixel_store_i;
@@ -183,6 +185,7 @@ static int g_verify_pending;
 static int g_verify_last_status = -1;
 static unsigned g_render_count;
 static int g_debug_vis = -1;   /* HWR_SHADE_VIS=1: render the shade-row map */
+static int g_sky_occlude = -1; /* HWR_SKY_OCCLUDE=0 disables the sky occlusion pass */
 static uint32_t g_fbo_width;
 static uint32_t g_fbo_height;
 static uint32_t *g_pixels;
@@ -550,6 +553,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(disable, hwr_gl_capability_fn, "glDisable");
     HWR_LOAD_GL(depth_func, hwr_gl_depth_func_fn, "glDepthFunc");
     HWR_LOAD_GL(depth_mask, hwr_gl_depth_mask_fn, "glDepthMask");
+    HWR_LOAD_GL(polygon_offset, hwr_gl_polygon_offset_fn, "glPolygonOffset");
     HWR_LOAD_GL(clear_buffer_uiv, PFNGLCLEARBUFFERUIVPROC, "glClearBufferuiv");
     HWR_LOAD_GL(copy_tex_sub_image_2d, hwr_gl_copy_tex_sub_image_2d_fn, "glCopyTexSubImage2D");
     HWR_LOAD_GL(pixel_store_i, hwr_gl_pixel_store_i_fn, "glPixelStorei");
@@ -659,6 +663,10 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_sky_start_row;\n"
     "uniform int u_sky_yaw;\n"
     "uniform int u_sky_double_scanline;\n"
+    /* The colour pass accepts both directed sides, as before.  The optional
+     * occlusion pass discards the rejected directed side before its EDGE_MAP
+     * sky can consume column extent. */
+    "uniform int u_sky_occlusion_pass;\n"
     "in vec3 v_world;\n"
     "in float v_depth_fixed;\n"
     "in vec2 v_wall;\n"
@@ -875,6 +883,15 @@ static const char g_geometry_fragment_shader[] =
      * cap geometry is what limits it to the region above each sky wall and lets
      * the depth test occlude the geometry behind the wall. */
     "  if ((material & 4u)!=0u) {\n"
+    /* Engine-visible directed walls project vertex A left of B.  Because the
+     * shader intentionally uses the engine's downward-positive screen Y, the
+     * resulting cap winding is clockwise in GL window coordinates; therefore
+     * GL's nominal front face is the side the engine rejects. */
+    "    if (u_sky_occlusion_pass!=0 && gl_FrontFacing) discard;\n"
+    /* Only a cap standing on its wall's TOPMOST edge may occlude.  A cap above
+     * a lower part (a sill under an arched opening) sits below that opening, so
+     * letting it write depth would hide the geometry seen through the arch. */
+    "    if (u_sky_occlusion_pass!=0 && (material & 64u)==0u) discard;\n"
     "    if (u_sky_valid==0) discard;\n"
     "    int sx=int(gl_FragCoord.x), sy=int(gl_FragCoord.y);\n"
     "    int scolumn=int(texelFetch(u_texels,u_sky_projection_offset+sx).r);\n"
@@ -1581,6 +1598,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         const char *vis = getenv("HWR_SHADE_VIS");
         g_debug_vis = vis != NULL && vis[0] == '1' ? 1 : 0;
     }
+    if (g_sky_occlude < 0) {
+        /* On by default: an EDGE_MAP face is meant to hide what stands behind
+         * it.  HWR_SKY_OCCLUDE=0 restores the older non-occluding sky. */
+        const char *occlude = getenv("HWR_SKY_OCCLUDE");
+        g_sky_occlude = occlude != NULL && occlude[0] == '0' ? 0 : 1;
+    }
     /* Sky is no longer a full-screen backdrop.  The per-wall sky caps emitted in
      * hwr_scene.c (SKY-material branch of the geometry fragment shader) are drawn
      * first as a depth-off background pass, then opaque geometry overwrites the
@@ -1647,6 +1670,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         hwr_uniform_1i(g_geometry_program, "u_sky_yaw", camera->sky_yaw);
         hwr_uniform_1i(g_geometry_program, "u_sky_double_scanline",
                        camera->sky_double_scanline);
+        hwr_uniform_1i(g_geometry_program, "u_sky_occlusion_pass", 0);
     }
     {
         GLint scale_location = g_gl.get_uniform_location(g_geometry_program, "u_depth_scale");
@@ -1657,12 +1681,40 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     blend_location = g_gl.get_uniform_location(g_geometry_program, "u_blend_pass");
     if (blend_location >= 0)
         g_gl.uniform_1i(blend_location, 0);
-    /* Sky background candidate: colour only, no depth interaction. */
+    /* Sky background candidate: colour only, no depth interaction.  Every cap
+     * contributes colour here; the occlusion pass below is the selective one. */
     g_gl.disable(GL_DEPTH_TEST);
     g_gl.depth_mask(GL_FALSE);
     if (sky_vertices != 0)
         g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)sky_vertices);
-    /* Opaque geometry overwrites the sky wherever it projects. */
+    /* The engine visits directed wall faces and rejects the back side before
+     * EDGE_MAP sky consumes the remaining vertical column extent.  Our mesh
+     * contains both sides of every portal, so making every cap depth-writing
+     * lets the reverse cap on a low portal step blanket the view.  Repeat the
+     * same cap range as an order-independent GPU depth pass, but have the
+     * fragment shader discard the engine-rejected directed side.  The cap's x/y
+     * is the wall's x/y, hence it writes exactly that wall's depth. */
+    if (sky_vertices != 0 && g_sky_occlude) {
+        g_gl.enable(GL_DEPTH_TEST);
+        g_gl.depth_func(GL_LESS);
+        g_gl.depth_mask(GL_TRUE);
+        /* Push the sky occluder a hair farther than the wall it stands on.  A
+         * cap shares its wall's x/y, so any of that SAME wall's geometry above
+         * the cap base (a facade above an arched opening) projects at an
+         * IDENTICAL depth; unbiased, GL_LESS rejects that coplanar facade and
+         * the colour-pass sky bleeds through it.  With the bias the cap occludes
+         * only geometry strictly BEHIND the wall, which is what an EDGE_MAP face
+         * should hide. */
+        g_gl.enable(GL_POLYGON_OFFSET_FILL);
+        g_gl.polygon_offset(1.0f, 1.0f);
+        hwr_uniform_1i(g_geometry_program, "u_sky_occlusion_pass", 1);
+        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)sky_vertices);
+        hwr_uniform_1i(g_geometry_program, "u_sky_occlusion_pass", 0);
+        g_gl.polygon_offset(0.0f, 0.0f);
+        g_gl.disable(GL_POLYGON_OFFSET_FILL);
+    }
+    /* Opaque geometry overwrites the colour-only sky and wins against a
+     * farther sky occluder wherever it projects. */
     g_gl.enable(GL_DEPTH_TEST);
     g_gl.depth_func(GL_LESS);
     g_gl.depth_mask(GL_TRUE);

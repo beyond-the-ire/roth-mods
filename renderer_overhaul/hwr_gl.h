@@ -11,7 +11,9 @@ enum hwr_gl_material_flags {
     HWR_GL_MATERIAL_SKY         = 1u << 2,
     HWR_GL_MATERIAL_FLAT        = 1u << 3,
     HWR_GL_MATERIAL_TRANSLUCENT = 1u << 4,
-    HWR_GL_MATERIAL_HFLIP       = 1u << 5
+    HWR_GL_MATERIAL_HFLIP       = 1u << 5,
+    /* A sky cap that may occlude: it stands on its wall's topmost edge. */
+    HWR_GL_MATERIAL_SKY_OCCLUDER = 1u << 6
 };
 
 enum hwr_gl_wall_wrap_flags {

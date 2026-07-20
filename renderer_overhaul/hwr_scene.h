@@ -33,7 +33,13 @@ enum hwr_surface_flags {
      * parallax skybox. Sky caps are streamed into their own range and drawn in
      * a depth-off background pass before opaque geometry, which then overwrites
      * the sky where a nearer surface projects, matching the engine. */
-    HWR_SURFACE_SKY_CAP      = 1u << 6
+    HWR_SURFACE_SKY_CAP      = 1u << 6,
+    /* Set on a sky cap standing on the wall's TOPMOST edge — the one place sky
+     * genuinely begins. Only these may act as depth occluders: a cap emitted
+     * above a lower part (a sill beneath an arched opening) has its base below
+     * that opening, so occluding with it would hide what is seen through the
+     * opening. Colour coverage still uses every cap. */
+    HWR_SURFACE_SKY_OCCLUDER = 1u << 7
 };
 
 enum hwr_wall_corner_role {
