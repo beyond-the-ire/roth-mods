@@ -116,6 +116,11 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height);
 void hwr_gl_scene_clear(void);
+/* Hands over the pixels the palette-index target should start from instead of a
+ * flat clear, in the same orientation as a scene readback. The next scene render
+ * of matching dimensions consumes them, once. Returns 0 on failure, in which
+ * case the flat clear stands. */
+int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t height);
 void hwr_gl_shutdown(void);
 const char *hwr_gl_last_error(void);
 unsigned hwr_gl_drain_errors(void);

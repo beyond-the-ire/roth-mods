@@ -5,6 +5,7 @@
 #include "roth_sdk.h"
 
 #include "hwr_gl.h"
+#include "hwr_backdrop.h"
 #include "hwr_das.h"
 #include "hwr_settings.h"
 #include "hwr_scene.h"
@@ -56,7 +57,7 @@ static const struct roth_api_v1 *g_api;
  * plugin, so every submit/withdraw must use one consistent token or the channel reports a foreign
  * owner. The world pass owns the channel, so its api pointer is the canonical identity. */
 static const struct roth_api_v1 *g_channel_api;
-static struct hwr_render_settings g_render_settings = { 1, 0xff8800u, 0, 0 };
+static struct hwr_render_settings g_render_settings = { 1, 0x000000u, 0, 0 };
 static struct hwr_settings g_window_settings;
 static uint32_t g_window_pending;
 static uint32_t g_wrap_serial;
@@ -105,6 +106,10 @@ static struct hwr_world g_world;
 static struct hwr_das_archive g_map_archive;
 static struct hwr_das_archive g_shared_archive;
 static struct hwr_scene g_scene;
+static struct hwr_backdrop g_backdrop;
+/* Raised when the backdrop still owes the index target its starting pixels. */
+static int g_backdrop_seed_pending;
+static int g_backdrop_error_logged;
 
 static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation);
 
@@ -475,11 +480,15 @@ static int hwr_regular_file_exists(const char *path)
     return 1;
 }
 
-static int hwr_find_archive_path(const char *root, const char *name,
-                                 char *path, size_t capacity)
+/* Game content sits in fixed subdirectories of the game root, but the case of
+ * both the directory entries and the names the engine asks for varies between
+ * installs, so an exact join is tried first and the directory is scanned
+ * case-insensitively when that misses. */
+static int hwr_find_game_file(const char *root, const char *subdirectory,
+                              const char *name, char *path, size_t capacity)
 {
     char directory[2600];
-    if (hwr_path_join(directory, sizeof directory, root, "M") != 0 ||
+    if (hwr_path_join(directory, sizeof directory, root, subdirectory) != 0 ||
         hwr_path_join(path, capacity, directory, name) != 0)
         return -1;
     if (hwr_regular_file_exists(path))
@@ -521,6 +530,12 @@ static int hwr_find_archive_path(const char *root, const char *name,
     }
 #endif
     return -1;
+}
+
+static int hwr_find_archive_path(const char *root, const char *name,
+                                 char *path, size_t capacity)
+{
+    return hwr_find_game_file(root, "M", name, path, capacity);
 }
 
 static void hwr_gl_settings_apply(uint32_t mask,
@@ -687,6 +702,31 @@ static int hwr_fill_sentinel(const struct roth_api_v1 *api,
     return 1;
 }
 
+/* Hands the index target the slice of the backdrop the viewport sits on, so the
+ * first world frame is drawn over that art instead of over a flat colour. The
+ * engine scales the image across the whole screen, so the slice depends on where
+ * the viewport falls within it. */
+static void hwr_submit_backdrop_seed(const struct roth_api_v1 *api,
+                                     const struct hwr_viewport *viewport)
+{
+    uint32_t screen_width = api->game_ram->u32(VA_G_SCREEN_PITCH);
+    uint32_t screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
+    size_t plane = (size_t)viewport->width * viewport->height;
+    uint8_t *indices;
+
+    g_backdrop_seed_pending = 0;
+    if (!g_backdrop.valid || screen_width == 0 || screen_height == 0)
+        return;
+    indices = (uint8_t *)malloc(plane);
+    if (indices == NULL)
+        return;
+    if (hwr_backdrop_view_indices(&g_backdrop, screen_width, screen_height,
+                                  (uint32_t)viewport->x, (uint32_t)viewport->y,
+                                  viewport->width, viewport->height, indices) == 0)
+        hwr_gl_set_index_seed(indices, viewport->width, viewport->height);
+    free(indices);
+}
+
 static void hwr_check_present_caps(const struct roth_api_v1 *api)
 {
     struct roth_present_caps_v1 caps;
@@ -792,6 +832,8 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_withdraw_if_owned(api);
         return;
     }
+    if (g_backdrop_seed_pending)
+        hwr_submit_backdrop_seed(api, &viewport);
     world_was_valid = g_world.valid;
     if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
         hwr_world_refresh_lut_state(&g_world, api) == 0) {
@@ -1104,6 +1146,7 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     hwr_map_data_clear();
     g_scene_rebuild_pending = 1;
     g_scene_error_logged = 0;
+    g_backdrop_seed_pending = 0;
     failure[0] = 0;
     if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
         hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
@@ -1125,6 +1168,27 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
                  shared_name);
         goto failed;
     }
+    /* The backdrop is optional decoration: a missing or unreadable file costs
+     * only the seed, so it never fails the map load. */
+    if (hwr_backdrop_enabled() && !g_backdrop.valid) {
+        char backdrop_path[2600];
+        if (hwr_find_game_file(root, "DATA", "BACKDROP.RAW", backdrop_path,
+                               sizeof backdrop_path) != 0) {
+            if (!g_backdrop_error_logged) {
+                fprintf(stderr, "[renderer_overhaul] backdrop not found under '%s/DATA'; void starts blank\n",
+                        root);
+                g_backdrop_error_logged = 1;
+            }
+        } else if (hwr_backdrop_load(&g_backdrop, backdrop_path) != 0) {
+            if (!g_backdrop_error_logged) {
+                fprintf(stderr, "[renderer_overhaul] backdrop unusable: %s; void starts blank\n",
+                        hwr_backdrop_error(&g_backdrop));
+                g_backdrop_error_logged = 1;
+            }
+        }
+    }
+    g_backdrop_seed_pending = g_backdrop.valid;
+
     if (hwr_das_open(&g_map_archive, map_path) != 0) {
         snprintf(failure, sizeof failure, "map DAS: %.220s", hwr_das_error(&g_map_archive));
         goto failed;

@@ -19,7 +19,9 @@ void hwr_settings_init_defaults(void)
 {
     memset(&g_settings, 0, sizeof g_settings);
     g_settings.enabled = 1;
-    g_settings.solid_color = 0xff8800u;
+    /* Shown only while the world is not renderable, such as during a map
+     * change. Black is unobtrusive there; a marker colour reads as a flash. */
+    g_settings.solid_color = 0x000000u;
     g_settings.window_mode = HWR_WINDOW_DEFAULT;
     g_settings.present_mode = HWR_PRESENT_FIFO;
     g_settings.pitch_mode = HWR_PITCH_HORIZON_SHIFT;

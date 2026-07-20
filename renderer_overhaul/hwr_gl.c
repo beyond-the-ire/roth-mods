@@ -153,6 +153,15 @@ static struct hwr_gl_functions g_gl;
 static GLuint g_fbo;
 static GLuint g_color_buffer;
 static GLuint g_index_fbo;
+static int g_void_persist = -1;
+/* Set whenever the index target is (re)created, so it starts from a
+ * defined state before any frame is allowed to persist into it. */
+static int g_index_target_dirty = 1;
+/* Pixels waiting to be laid into the index target in place of the flat clear,
+ * and the size they were built for. */
+static uint8_t *g_index_seed;
+static uint32_t g_index_seed_width;
+static uint32_t g_index_seed_height;
 static GLuint g_index_texture;
 static GLuint g_index_copy_texture;
 static GLuint g_depth_buffer;
@@ -1138,6 +1147,7 @@ static int hwr_create_framebuffer(uint32_t width, uint32_t height)
         return 0;
     }
 
+    g_index_target_dirty = 1;
     g_gl.gen_framebuffers(1, &g_index_fbo);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.gen_textures(1, &g_index_texture);
@@ -1592,6 +1602,46 @@ static void hwr_gl_scene_self_test(int first_run)
     g_verify_last_status = status;
 }
 
+int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t height)
+{
+    size_t plane = (size_t)width * height;
+    uint8_t *copy;
+
+    if (indices == NULL || width == 0 || height == 0 ||
+        plane / width != height || plane > (size_t)INT32_MAX)
+        return 0;
+    copy = (uint8_t *)malloc(plane);
+    if (copy == NULL)
+        return 0;
+    memcpy(copy, indices, plane);
+    free(g_index_seed);
+    g_index_seed = copy;
+    g_index_seed_width = width;
+    g_index_seed_height = height;
+    /* The target is only rewritten on a dirty frame, so ask for one. */
+    g_index_target_dirty = 1;
+    return 1;
+}
+
+/* Lays a pending seed of the right size into the index target and drops it, so
+ * later frames persist into those pixels rather than replacing them. */
+static int hwr_consume_index_seed(uint32_t width, uint32_t height)
+{
+    if (g_index_seed == NULL || g_index_texture == 0 ||
+        g_index_seed_width != width || g_index_seed_height != height)
+        return 0;
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+    g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height,
+                          GL_RED_INTEGER, GL_UNSIGNED_BYTE, g_index_seed);
+    free(g_index_seed);
+    g_index_seed = NULL;
+    g_index_seed_width = 0;
+    g_index_seed_height = 0;
+    return 1;
+}
+
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
@@ -1601,7 +1651,9 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     uint32_t width, uint32_t height)
 {
     size_t total = sky_vertices + opaque_vertices + translucent_vertices;
-    const GLuint clear_index[4] = { 0x7fu, 0, 0, 0 };
+    /* Only ever seen on the first frame after the target is created or
+     * resized, so it should be unobtrusive rather than a marker colour. */
+    const GLuint clear_index[4] = { 0u, 0, 0, 0 };
     GLint blend_location;
     if (!g_initialized || !g_scene_uploaded || vertices == NULL || camera == NULL ||
         palette_rgba == NULL || total > (size_t)INT32_MAX ||
@@ -1627,7 +1679,25 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                      vertices, GL_STREAM_DRAW);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
-    g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
+    /* The original never wipes the view before drawing it, so a column no
+     * surface covers keeps whatever the previous frame left in that pixel.
+     * This shows up where a see-through surface has nothing but void behind
+     * it: the blend reads those stale pixels as its background. Wiping to a
+     * constant here would lighten that result, so the target is cleared only
+     * when it is first created or resized. HWR_VOID_PERSIST=0 restores the
+     * per-frame wipe. */
+    if (g_void_persist < 0) {
+        const char *persist = getenv("HWR_VOID_PERSIST");
+        g_void_persist = persist != NULL && persist[0] == '0' ? 0 : 1;
+    }
+    if (!g_void_persist || g_index_target_dirty) {
+        /* At a map load the engine's framebuffer holds the backdrop image, so
+         * void starts as that art rather than as a flat colour; the seed carries
+         * the part of it the viewport covers. */
+        if (!hwr_consume_index_seed(width, height))
+            g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
+        g_index_target_dirty = 0;
+    }
     g_gl.clear(GL_DEPTH_BUFFER_BIT);
     hwr_bind_scene_textures();
     if (g_debug_vis < 0) {
@@ -1851,6 +1921,10 @@ void hwr_gl_shutdown(void)
     free(g_pixels);
     g_pixels = NULL;
     g_pixels_bytes = 0;
+    free(g_index_seed);
+    g_index_seed = NULL;
+    g_index_seed_width = 0;
+    g_index_seed_height = 0;
     g_initialized = 0;
     memset(&g_gl, 0, sizeof g_gl);
 }
