@@ -660,6 +660,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform usampler2D u_blend;\n"
     "uniform usampler2D u_dst;\n"
     "uniform usampler2D u_stale;\n"
+    "int dbg_ix=0, dbg_iy=0;\n"
     "uniform int u_shade_level;\n"
     "uniform int u_tint_shade_level;\n"
     "uniform int u_light_bias;\n"
@@ -820,22 +821,26 @@ static const char g_geometry_fragment_shader[] =
     "      float wall_s=max(v_wall.x-0.5*dFdx(v_wall.x),0.0);\n"
     "      int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
     "      if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
-    "      iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base;\n"
+    "      iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base % h;\n"
     "      float wall_v=max(v_wall.y-0.5*dFdy(v_wall.y),0.0);\n"
     "      int vertical=(int(floor(wall_v)) & 65535) >> 1;\n"
     "      if ((v_flat_span.w & 128u)!=0u)\n"
     "        vertical=(vertical+w-int(v_wall_span.z >> 1)-int(v_pan_scale_flags.y)) & 65535;\n"
     "      else vertical=(vertical+int(v_pan_scale_flags.y)) & 65535;\n"
-    "      ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical;\n"
+    "      ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical % w;\n"
+    "      dbg_ix=ix; dbg_iy=iy;\n"
     "      return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "    }\n"
     "    int column=int(gl_FragCoord.x)-int(v_wall_span.x);\n"
     "    uint mapped_s=wall_quotient(column);\n"
     "    int base=int((mapped_s+v_pan_scale_flags.x*2u) & 65535u) >> 1;\n"
     "    if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
-    /* Non-power-of-two wall classes stage 0xffff: the AND is an identity,
-     * so their 16-bit coordinate is deliberately not texture-wrapped. */
-    "    iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base;\n"
+    /* Non-power-of-two wall classes stage 0xffff as their accumulator mask,
+     * an identity: the engine tiles them at the span level instead, so the
+     * coordinate wraps modulo the real dimension.  In range the modulo is a
+     * no-op; past the edge it starts the next tile rather than spilling into
+     * the bytes of the adjacent stored row. */
+    "    iy=(v_light_material.w & 1u)!=0u ? base & (h-1) : base % h;\n"
     "    uint top_accum=v_wall_rows.x+v_wall_rows.z*uint(column);\n"
     "    uint bottom_accum=v_wall_rows.y+v_wall_rows.w*uint(column);\n"
     "    int top=signed16(top_accum>>16), bottom=signed16(bottom_accum>>16);\n"
@@ -851,8 +856,10 @@ static const char g_geometry_fragment_shader[] =
     "    if ((v_flat_span.w & 128u)!=0u)\n"
     "      vertical=(vertical+w-int(v_wall_span.z >> 1)-int(v_pan_scale_flags.y)) & 65535;\n"
     "    else vertical=(vertical+int(v_pan_scale_flags.y)) & 65535;\n"
-    "    ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical;\n"
+    "    ix=(v_light_material.w & 2u)!=0u ? vertical & (w-1) : vertical % w;\n"
+    "    dbg_iy=1000+iy;\n"
     "  }\n"
+    "  dbg_ix=ix; if (dbg_iy<1000) dbg_iy=iy;\n"
     "  return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "}\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
@@ -943,6 +950,8 @@ static const char g_geometry_fragment_shader[] =
     "  if (u_debug_vis==5) { out_index=(v_offset >> 8) & 255u; return; }\n"
     "  if (u_debug_vis==6) { out_index=material & 255u; return; }\n"
     "  if (u_debug_vis==7) { out_index=v_dims.x & 255u; return; }\n"
+    "  if (u_debug_vis==8) { out_index=uint(dbg_ix) & 255u; return; }\n"
+    "  if (u_debug_vis==9) { out_index=uint(dbg_iy) & 255u; return; }\n"
     /* A one-sided wall with a block-transparent texture: the engine's masked
      * writer skips index-0 texels, and no traversal ever paints behind a
      * one-sided wall, so the skipped pixel keeps what the PREVIOUS frame left
