@@ -1693,6 +1693,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
                                     size_t translucent_vertices,
+                                    const uint32_t *translucent_runs,
+                                    size_t translucent_run_count,
                                     const struct hwr_gl_camera *camera,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height)
@@ -1884,16 +1886,34 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
                          (GLsizei)opaque_vertices);
     if (translucent_vertices != 0) {
-        g_gl.active_texture(GL_TEXTURE5);
-        g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
-        g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                                   (GLsizei)width, (GLsizei)height);
+        /* Translucent surfaces arrive depth-sorted back to front, and each
+         * blends against what is already on screen -- INCLUDING the
+         * translucent surfaces drawn before it, the way the engine's painter
+         * order stacks two shimmering doorways.  Refreshing the destination
+         * snapshot before every surface is what makes that stacking real; a
+         * single snapshot would make every surface blend against the opaque
+         * background alone. */
+        size_t run;
+        GLint first = (GLint)(sky_vertices + opaque_vertices);
         g_gl.depth_mask(GL_FALSE);
         if (blend_location >= 0)
             g_gl.uniform_1i(blend_location, 1);
-        g_gl.draw_arrays(GL_TRIANGLES,
-                         (GLint)(sky_vertices + opaque_vertices),
-                         (GLsizei)translucent_vertices);
+        g_gl.active_texture(GL_TEXTURE5);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
+        if (translucent_runs == NULL || translucent_run_count == 0) {
+            g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                       (GLsizei)width, (GLsizei)height);
+            g_gl.draw_arrays(GL_TRIANGLES, first,
+                             (GLsizei)translucent_vertices);
+        } else {
+            for (run = 0; run < translucent_run_count; run++) {
+                g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                           (GLsizei)width, (GLsizei)height);
+                g_gl.draw_arrays(GL_TRIANGLES, first,
+                                 (GLsizei)translucent_runs[run]);
+                first += (GLint)translucent_runs[run];
+            }
+        }
         g_gl.depth_mask(GL_TRUE);
     }
 

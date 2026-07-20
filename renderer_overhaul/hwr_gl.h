@@ -119,6 +119,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
                                     size_t translucent_vertices,
+                                    const uint32_t *translucent_runs,
+                                    size_t translucent_run_count,
                                     const struct hwr_gl_camera *camera,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height);

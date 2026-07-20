@@ -152,6 +152,10 @@ struct hwr_scene {
     } textures[0x1600];
     struct hwr_gl_vertex *stream_vertices;
     size_t stream_capacity;
+    /* Vertex counts of the depth-sorted translucent surfaces, in draw order,
+     * so the renderer can refresh its destination snapshot between them. */
+    uint32_t *translucent_runs;
+    size_t translucent_run_capacity;
     struct hwr_scene_animation *animations;
     size_t animation_count;
     uint32_t sky_texture_offset;

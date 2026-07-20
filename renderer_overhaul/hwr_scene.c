@@ -906,6 +906,7 @@ void hwr_scene_clear(struct hwr_scene *scene)
     hwr_scene_mesh_clear(&scene->mesh);
     hwr_scene_animations_clear(scene);
     free(scene->stream_vertices);
+    free(scene->translucent_runs);
     memset(scene, 0, sizeof *scene);
 }
 
@@ -2188,7 +2189,8 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                               const struct hwr_gl_camera *camera,
                               uint32_t width, uint32_t height,
                               size_t *sky_count, size_t *opaque_count,
-                              size_t *translucent_count)
+                              size_t *translucent_count,
+                              size_t *translucent_run_count)
 {
     size_t *translucent_order;
     float *depths;
@@ -2259,14 +2261,28 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
             translucent_surfaces++;
         }
     }
+    if (translucent_surfaces > scene->translucent_run_capacity) {
+        uint32_t *runs = (uint32_t *)realloc(
+            scene->translucent_runs,
+            translucent_surfaces * sizeof *runs);
+        if (runs == NULL) {
+            free(translucent_order);
+            free(depths);
+            return hwr_scene_fail(scene, "out of memory recording translucent runs");
+        }
+        scene->translucent_runs = runs;
+        scene->translucent_run_capacity = translucent_surfaces;
+    }
     translucent_cursor = opaque_cursor;
     for (i = 0; i < translucent_surfaces; i++) {
         const struct hwr_mesh_surface *surface =
             &scene->mesh.surfaces[translucent_order[i]];
         hwr_copy_gpu_surface(scene, surface, camera, width, height,
                              scene->stream_vertices + translucent_cursor);
+        scene->translucent_runs[i] = (uint32_t)surface->vertex_count;
         translucent_cursor += surface->vertex_count;
     }
+    *translucent_run_count = translucent_surfaces;
     free(translucent_order);
     free(depths);
     *sky_count = sky_cursor;
@@ -2401,6 +2417,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     size_t sky_count;
     size_t opaque_count;
     size_t translucent_count;
+    size_t translucent_run_count;
     if (scene == NULL || !scene->valid || !scene->uploaded ||
         world == NULL || !world->valid || api == NULL || api->game_ram == NULL)
         return NULL;
@@ -2420,9 +2437,12 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     camera.sky_double_scanline = api->game_ram->u8(VA_G_DOUBLE_SCANLINE) != 0;
     camera.sky_valid = scene->sky_valid;
     if (hwr_prepare_stream(scene, &camera, width, height,
-                           &sky_count, &opaque_count, &translucent_count) != 0)
+                           &sky_count, &opaque_count, &translucent_count,
+                           &translucent_run_count) != 0)
         return NULL;
     hwr_build_palette(world, palette);
     return hwr_gl_scene_render(scene->stream_vertices, sky_count, opaque_count,
-                               translucent_count, &camera, palette, width, height);
+                               translucent_count, scene->translucent_runs,
+                               translucent_run_count, &camera, palette,
+                               width, height);
 }
