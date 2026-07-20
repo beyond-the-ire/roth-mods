@@ -1450,6 +1450,24 @@ static int hwr_surface_translucent(struct hwr_scene *scene,
     return (qflags & 0x400u) != 0 && (qflags & 0x200u) == 0;
 }
 
+/* A textured surface's DAS block carries a transparency bit that the span
+ * driver loads into its texture-mode selector as it resolves the block.  For
+ * flats that one bit does two jobs: it selects the masking span writer, so
+ * palette index 0 punches a hole, and it suppresses the density boost an
+ * opaque square-256 flat gets.  Both consequences are derived from this. */
+static int hwr_flat_transparent(const struct hwr_scene *scene,
+                                const struct hwr_mesh_surface *surface)
+{
+    uint16_t logical;
+    if ((surface->flags & HWR_SURFACE_FLAT) == 0 ||
+        (surface->flags & HWR_SURFACE_DIRECT) != 0)
+        return 0;
+    logical = (uint16_t)surface->texture_id;
+    if (logical >= 0x1600u)
+        return 0;
+    return (scene->textures[logical].qflags & 0x400u) != 0;
+}
+
 static float hwr_surface_depth(const struct hwr_mesh_surface *surface,
                                const struct hwr_scene_mesh *mesh,
                                const struct hwr_gl_camera *camera)
@@ -1580,7 +1598,7 @@ static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
 static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
                                 const struct hwr_mesh_surface *surface,
                                 const struct hwr_gl_camera *camera,
-                                uint32_t height, int wide_class,
+                                uint32_t height, int density_boost,
                                 uint32_t *guard,
                                 uint32_t *guard_step, int32_t *origin_y)
 {
@@ -1588,7 +1606,9 @@ static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
     int max_y = INT32_MIN;
     int range;
     uint32_t height_delta;
-    uint32_t shift = 4u - surface->scale + (wide_class ? 1u : 0u);
+    /* The extra step of perspective shift belongs to the opaque square-256
+     * class only; a transparent flat of the same dimensions keeps the base. */
+    uint32_t shift = 4u - surface->scale + (density_boost ? 1u : 0u);
     uint32_t perspective_scale;
     uint32_t product;
     uint32_t product_high;
@@ -1874,6 +1894,8 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     uint32_t flat_guard = 0;
     uint32_t flat_guard_step = 0;
     int32_t flat_guard_origin_y = camera->horizon;
+    int flat_transparent = 0;
+    int flat_square256 = 0;
     struct hwr_wall_span_state wall_span = {0};
     size_t i;
     /* Sky caps carry only a position; the SKY-material fragment branch derives
@@ -1898,7 +1920,16 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         texture_width = scene->textures[logical].width;
         texture_height = scene->textures[logical].height;
     }
-    if ((surface->flags & HWR_SURFACE_MASKED) != 0)
+    if ((surface->flags & HWR_SURFACE_FLAT) != 0) {
+        /* The flat driver's density class is joint over both dimensions: a
+         * texture qualifies only when it is square and its side is a whole
+         * multiple of 256, never on one axis alone. */
+        flat_square256 = texture_width != 0 &&
+                         texture_width == texture_height &&
+                         (texture_width & 0xffu) == 0;
+        flat_transparent = hwr_flat_transparent(scene, surface);
+    }
+    if ((surface->flags & HWR_SURFACE_MASKED) != 0 || flat_transparent)
         flags |= HWR_GL_MATERIAL_MASKED;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         flags |= HWR_GL_MATERIAL_FLAT;
@@ -1915,7 +1946,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         flags |= HWR_GL_MATERIAL_TRANSLUCENT;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         hwr_flat_span_state(&scene->mesh, surface, camera, height,
-                            texture_width == 256u && texture_height == 256u,
+                            flat_square256 && !flat_transparent,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
     else

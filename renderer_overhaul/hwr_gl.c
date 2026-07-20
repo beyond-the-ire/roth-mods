@@ -710,9 +710,18 @@ static const char g_geometry_fragment_shader[] =
     "  int w=int(v_dims.x), h=int(v_dims.y); int ix,iy;\n"
     "  if ((flags & 8u)!=0u) {\n"
     "    int scale=int(v_pan_scale_flags.z);\n"
-    "    bool wide_class=w==256 && h==256;\n"
-    "    bool wide_u=(w==256), wide_v=(h==256);\n"
-    "    int dimension_shift=wide_class ? 1 : 0;\n"
+    /* The flat driver's density class is JOINT over both dimensions — a
+     * texture qualifies only when it is square and its side is a whole
+     * multiple of 256 — and the DAS transparency bit splits that class in
+     * two.  An opaque square-256 flat gets the density boost (half the world
+     * units per texel, and one extra step of perspective shift); a
+     * transparent one keeps the base density and the base shift.  The pan
+     * byte lands at full weight for the whole class either way, so the pan
+     * and world/perspective shifts are separate terms. */
+    "    bool square256=w!=0 && w==h && (w & 255)==0;\n"
+    "    bool transparent=(flags & 1u)!=0u;\n"
+    "    int dimension_shift=(square256 && !transparent) ? 1 : 0;\n"
+    "    int pan_shift=square256 ? 1 : 0;\n"
     "    int row=int(gl_FragCoord.y), column=int(gl_FragCoord.x);\n"
     "    int height_delta=abs(u_eye_z-int(v_world.z));\n"
     "    int remaining=int(v_flat_span.z)>u_center_i.y ? row-u_center_i.y : u_center_i.y-row;\n"
@@ -742,46 +751,42 @@ static const char g_geometry_fragment_shader[] =
     "    accum_v+=(uint(step_v)&0xffffffu)*uint(screen_rel);\n"
     "    accum_u+=uint(u_view_offset.x & 65535) << uint(16-scale+dimension_shift);\n"
     "    accum_v-=uint(u_view_offset.y & 65535) << uint(16-scale+dimension_shift);\n"
-    "    accum_u+=uint(v_aux & 255u) << uint(15+dimension_shift);\n"
-    "    if (wide_class) accum_v-=uint(v_aux >> 8) << uint(15+dimension_shift);\n"
-    "    else accum_v+=uint(v_aux >> 8) << uint(15+dimension_shift);\n"
+    "    accum_u+=uint(v_aux & 255u) << uint(15+pan_shift);\n"
+    "    if (square256) accum_v-=uint(v_aux >> 8) << uint(15+pan_shift);\n"
+    "    else accum_v+=uint(v_aux >> 8) << uint(15+pan_shift);\n"
     "    if ((flat_flags & 2u)!=0u) accum_u=0u-accum_u;\n"
     "    if ((flat_flags & 4u)!=0u) accum_v=0u-accum_v;\n"
     "    ix=int((accum_u >> 16) & uint(w-1));\n"
     "    iy=int((accum_v >> 16) & uint(h-1));\n"
     /* Flats follow one world-plane mapping (the map format's floor UV rule),
-     * applied PER AXIS keyed on that axis's own dimension (the engine's flat
-     * driver has no 256/square branch: U wraps at width, V at height, and the
-     * only dim-dependent input is the extent dim<<6 — see renderer.c 12914-18
-     * / 3703-12).  With base = 2^scale world units, an axis whose dimension is
-     * 256 covers base/2 world units per texel and lands its pan byte at full
-     * weight; every other axis covers base per texel with the pan byte at HALF
-     * weight.  So a 256x128 flat uses U=base/2 (width 256) and V=base
-     * (height 128) — both a square 256 and a 128 flat are special cases of the
-     * same rule.  The u axis is world-x negated plus pan_x; the v axis is
-     * world-y minus pan_y (both axes SUBTRACT pan_y).  The software renderer
-     * evaluates that plane at the span's INTEGER row/column — not at the
-     * fragment's pixel-center world position, which sits half a pixel away
+     * applied to both axes with the SAME density: the flat driver's branch is
+     * on the joint square-256 class and the transparency bit, never on one
+     * axis alone.  With base = 2^scale world units, a flat covers base world
+     * units per texel, halved only for the opaque square-256 case; the pan
+     * byte lands at full weight for the whole square-256 class and at HALF
+     * weight otherwise.  The u axis is world-x negated plus pan_x; the v axis
+     * is world-y minus pan_y (both axes SUBTRACT pan_y).  The software
+     * renderer evaluates that plane at the span's INTEGER row/column — not at
+     * the fragment's pixel-center world position, which sits half a pixel away
      * (several texels of drift at flat depths) — so reconstruct the world
      * point from row/column + camera instead of sampling v_world.  Beyond ~3
      * texels per pixel the original's integer span walk aliases differently
      * than any exact evaluation; keep the accumulator result there for the
-     * no-256-axis case (a 256-axis is precise enough to evaluate everywhere). */
+     * non-square-256 case (the square-256 class is precise enough to evaluate
+     * everywhere). */
     "    bool pow2_dims=(w & (w-1))==0 && (h & (h-1))==0;\n"
     "    if (pow2_dims && w<=256 && h<=256) {\n"
     "      float fdepth=float(u_eye_z-int(floor(v_world.z+0.5)))*u_focal.y/float(row-u_center_i.y);\n"
-    "      float w2t_u=wide_u ? float(1 << scale)*0.5 : float(1 << scale);\n"
-    "      float w2t_v=wide_v ? float(1 << scale)*0.5 : float(1 << scale);\n"
-    "      float pan_mul_u=wide_u ? 1.0 : 0.5;\n"
-    "      float pan_mul_v=wide_v ? 1.0 : 0.5;\n"
-    "      if (wide_u || wide_v || fdepth < 3.0*u_focal.x*w2t_u) {\n"
+    "      float w2t=float(1 << scale)/float(1 << dimension_shift);\n"
+    "      float pan_mul=0.5*float(1 << pan_shift);\n"
+    "      if (square256 || fdepth < 3.0*u_focal.x*w2t) {\n"
     "        float fvx=float(screen_rel)*fdepth/u_focal.x;\n"
     "        float fsin=float(u_basis_fixed.x)*(1.0/16384.0);\n"
     "        float fcos=float(u_basis_fixed.y)*(1.0/16384.0);\n"
     "        float wxf=fsin*fvx-fcos*fdepth-float(u_view_offset.x);\n"
     "        float wyf=fcos*fvx+fsin*fdepth-float(u_view_offset.y);\n"
-    "        float uu=-wxf/w2t_u+float(v_aux & 255u)*pan_mul_u;\n"
-    "        float vv= wyf/w2t_v-float(v_aux >> 8)*pan_mul_v;\n"
+    "        float uu=-wxf/w2t+float(v_aux & 255u)*pan_mul;\n"
+    "        float vv= wyf/w2t-float(v_aux >> 8)*pan_mul;\n"
     "        if ((flat_flags & 2u)!=0u) uu=-uu;\n"
     "        if ((flat_flags & 4u)!=0u) vv=-vv;\n"
     "        ix=int(floor(uu)) & (w-1);\n"
