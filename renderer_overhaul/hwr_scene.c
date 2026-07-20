@@ -766,16 +766,6 @@ static int hwr_emit_portal_slab(struct hwr_scene_mesh *mesh,
                          wall->mapping_flags);
 }
 
-/* True when any surface added at or after `first` is a sky cap. */
-static int hwr_sky_capped_since(const struct hwr_scene_mesh *mesh, size_t first)
-{
-    size_t i;
-    for (i = first; i < mesh->surface_count; i++)
-        if ((mesh->surfaces[i].flags & HWR_SURFACE_SKY_CAP) != 0)
-            return 1;
-    return 0;
-}
-
 int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                          const struct hwr_world *world, int debug)
 {
@@ -791,7 +781,6 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
             goto failed;
         for (j = 0; j < sector->wall_count; j++) {
             const struct hwr_wall *wall = &world->walls[sector->first_wall + j];
-            size_t surfaces_before = mesh->surface_count;
             if (wall->neighbor_sector_index == SIZE_MAX) {
                 if (hwr_emit_wall(mesh, world, wall, sector,
                                   HWR_SURFACE_SOLID_MIDDLE,
@@ -859,41 +848,33 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                 } else if (hwr_emit_portal_slab(mesh, world, wall, sector, neighbor) != 0) {
                     goto failed;
                 }
-                /* A sky opening: an EDGE_MAP portal whose middle texture is the
-                 * span colorkey.  The engine never draws such a face's body (the
-                 * face dispatcher rejects the colorkey id), so the face renders
-                 * only its edge spans, and the EDGE_MAP fill runs from the view
-                 * top down to the opening's floor boundary -- the whole opening
-                 * is skybox and everything beyond it is hidden.  When the face
-                 * sits entirely below the view the engine's dedicated path fills
-                 * the full viewport instead; a cap standing on the opening
-                 * bottom projects to the same region in both cases.  The cap
-                 * occludes so geometry beyond the opening is dropped, and the
-                 * wall's own bands survive it through the occlusion pass's
-                 * polygon offset. */
-                if ((wall->mapping_flags & 0x40u) != 0 &&
-                    (uint16_t)wall->middle_id == world->world_span_colorkey) {
-                    const struct hwr_vertex *a =
-                        &world->vertices[wall->vertex_a_index];
-                    const struct hwr_vertex *b =
-                        &world->vertices[wall->vertex_b_index];
-                    int16_t base = sector->floor_z > neighbor->floor_z
-                                 ? sector->floor_z : neighbor->floor_z;
-                    if (hwr_emit_sky_cap(mesh, a, b, base, base, 1, 0) != 0)
-                        goto failed;
-                }
             }
-            /* When the face produces no visible band, the engine's dedicated
-             * EDGE_MAP path fills every row in the clipped viewport, not merely
-             * the rows above the sector ceiling.  Mark this synthetic cap as a
-             * full-height wall-plane curtain; the vertex shader pins its two Z
-             * edges to the viewport edges while retaining the wall's X/depth. */
+            /* A sky opening: an EDGE_MAP face whose middle texture is the span
+             * colorkey.  The engine never draws such a face's body (the face
+             * dispatcher rejects the colorkey id), so the face renders only its
+             * edge spans, and the EDGE_MAP fill runs from the view top down to
+             * the face's floor boundary -- the whole face is skybox and
+             * everything beyond it is hidden.  When the face sits entirely
+             * below the view the engine's dedicated path fills the full
+             * viewport instead; a cap standing on the floor boundary projects
+             * to the same region in both cases.  The cap occludes so geometry
+             * beyond the face is dropped, and the wall's own bands survive it
+             * through the occlusion pass's polygon offset.  The colorkey
+             * middle is the load-bearing condition: an EDGE_MAP face with a
+             * real middle texture draws normally, and skying it over would
+             * blanket walls the engine shows. */
             if ((wall->mapping_flags & 0x40u) != 0 &&
-                !hwr_sky_capped_since(mesh, surfaces_before)) {
+                (uint16_t)wall->middle_id == world->world_span_colorkey) {
                 const struct hwr_vertex *a = &world->vertices[wall->vertex_a_index];
                 const struct hwr_vertex *b = &world->vertices[wall->vertex_b_index];
-                if (hwr_emit_sky_cap(mesh, a, b, sector->ceiling_z,
-                                     sector->ceiling_z, 1, 1) != 0)
+                int16_t base = sector->floor_z;
+                if (wall->neighbor_sector_index != SIZE_MAX) {
+                    const struct hwr_sector *nb =
+                        &world->sectors[wall->neighbor_sector_index];
+                    if (nb->floor_z > base)
+                        base = nb->floor_z;
+                }
+                if (hwr_emit_sky_cap(mesh, a, b, base, base, 1, 0) != 0)
                     goto failed;
             }
         }
