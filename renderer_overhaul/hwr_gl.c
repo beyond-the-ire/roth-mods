@@ -164,6 +164,11 @@ static uint32_t g_index_seed_width;
 static uint32_t g_index_seed_height;
 static GLuint g_index_texture;
 static GLuint g_index_copy_texture;
+/* Snapshot of the index target as the frame STARTS (the persisted previous
+ * frame), for surfaces whose engine counterpart reads pixels nothing repaints
+ * this frame.  g_index_copy_texture cannot serve: it is recopied mid-frame,
+ * after opaque geometry, for the translucent pass. */
+static GLuint g_stale_copy_texture;
 static GLuint g_depth_buffer;
 static GLuint g_texture_buffer;
 static GLuint g_texture_buffer_texture;
@@ -654,6 +659,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform usampler2D u_glow;\n"
     "uniform usampler2D u_blend;\n"
     "uniform usampler2D u_dst;\n"
+    "uniform usampler2D u_stale;\n"
     "uniform int u_shade_level;\n"
     "uniform int u_tint_shade_level;\n"
     "uniform int u_light_bias;\n"
@@ -937,6 +943,16 @@ static const char g_geometry_fragment_shader[] =
     "  if (u_debug_vis==5) { out_index=(v_offset >> 8) & 255u; return; }\n"
     "  if (u_debug_vis==6) { out_index=material & 255u; return; }\n"
     "  if (u_debug_vis==7) { out_index=v_dims.x & 255u; return; }\n"
+    /* A one-sided wall with a block-transparent texture: the engine's masked
+     * writer skips index-0 texels, and no traversal ever paints behind a
+     * one-sided wall, so the skipped pixel keeps what the PREVIOUS frame left
+     * there.  Copying that stale pixel -- rather than discarding -- both shows
+     * the engine's void smear and still occludes this frame's geometry behind
+     * the wall, which the engine never draws. */
+    "  if ((v_light_material.w & 4u)!=0u && texel==0u) {\n"
+    "    out_index=texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r;\n"
+    "    return;\n"
+    "  }\n"
     "  uint mapped; uint face_flags=v_pan_scale_flags.w;\n"
     "  if ((material & 4u)!=0u) mapped=texel;\n"
     "  else if ((face_flags & 64u)!=0u && (u_glow_phase & 73)!=0)"
@@ -952,6 +968,12 @@ static const char g_geometry_fragment_shader[] =
     "  if (u_blend_pass!=0 && (material & 16u)!=0u && (texel & 128u)!=0u) {\n"
     "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(dst)),0).r;\n"
+    "  }\n"
+    /* The stale wall's high-bit texels blend against the same previous-frame
+     * pixel its holes show, per the engine's masked writer. */
+    "  if ((v_light_material.w & 4u)!=0u && (texel & 128u)!=0u) {\n"
+    "    uint stale=texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r;\n"
+    "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(stale)),0).r;\n"
     "  }\n"
     "  out_index=mapped;\n"
     "}\n";
@@ -1116,6 +1138,7 @@ static void hwr_destroy_framebuffer(void)
 {
     hwr_delete_texture(&g_index_texture);
     hwr_delete_texture(&g_index_copy_texture);
+    hwr_delete_texture(&g_stale_copy_texture);
     if (g_depth_buffer != 0) {
         g_gl.delete_renderbuffers(1, &g_depth_buffer);
         g_depth_buffer = 0;
@@ -1186,6 +1209,14 @@ static int hwr_create_framebuffer(uint32_t width, uint32_t height)
     }
     g_gl.gen_textures(1, &g_index_copy_texture);
     g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R8UI, (GLsizei)width,
+                      (GLsizei)height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
+    g_gl.gen_textures(1, &g_stale_copy_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
     g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1398,6 +1429,7 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     hwr_set_sampler(g_geometry_program, "u_glow", 3);
     hwr_set_sampler(g_geometry_program, "u_blend", 4);
     hwr_set_sampler(g_geometry_program, "u_dst", 5);
+    hwr_set_sampler(g_geometry_program, "u_stale", 6);
     g_gl.use_program(g_resolve_program);
     hwr_set_sampler(g_resolve_program, "u_index", 0);
     hwr_set_sampler(g_resolve_program, "u_palette", 1);
@@ -1465,16 +1497,17 @@ int hwr_gl_scene_update_texels(uint32_t offset, const uint8_t *bytes,
 
 static void hwr_bind_scene_textures(void)
 {
-    GLuint textures[6] = {
+    GLuint textures[7] = {
         g_texture_buffer_texture, g_colormap_texture, g_tint_texture,
-        g_glow_texture, g_blend_texture, g_index_copy_texture
+        g_glow_texture, g_blend_texture, g_index_copy_texture,
+        g_stale_copy_texture
     };
-    GLenum targets[6] = {
+    GLenum targets[7] = {
         GL_TEXTURE_BUFFER, GL_TEXTURE_2D, GL_TEXTURE_2D,
-        GL_TEXTURE_2D, GL_TEXTURE_2D, GL_TEXTURE_2D
+        GL_TEXTURE_2D, GL_TEXTURE_2D, GL_TEXTURE_2D, GL_TEXTURE_2D
     };
     unsigned i;
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < 7; i++) {
         g_gl.active_texture(GL_TEXTURE0 + i);
         g_gl.bind_texture(targets[i], textures[i]);
     }
@@ -1517,7 +1550,7 @@ static void hwr_uniform_2f(GLuint program, const char *name, GLfloat x, GLfloat 
 static void hwr_gl_scene_self_test(int first_run)
 {
     int store_ok = 0, colormap_ok = 0, probe_ok = 0, samplers_ok = 1;
-    GLint samplers[6] = { -1, -1, -1, -1, -1, -1 };
+    GLint samplers[7] = { -1, -1, -1, -1, -1, -1, -1 };
     uint8_t colormap_read[0x2000];
     uint8_t probe_read[4] = { 0, 0, 0, 0 };
     uint8_t expected_colormap = g_verify_colormap[16 * 256 + 128];
@@ -1577,11 +1610,12 @@ static void hwr_gl_scene_self_test(int first_run)
         /* The world pass depends on the geometry program's sampler uniforms
          * holding units 0..5; read the live values so a lost assignment is
          * visible in the report. */
-        static const char *const names[6] = {
-            "u_texels", "u_colormap", "u_tint", "u_glow", "u_blend", "u_dst"
+        static const char *const names[7] = {
+            "u_texels", "u_colormap", "u_tint", "u_glow", "u_blend", "u_dst",
+            "u_stale"
         };
         int i;
-        for (i = 0; i < 6; i++) {
+        for (i = 0; i < 7; i++) {
             GLint location = g_gl.get_uniform_location(g_geometry_program,
                                                        names[i]);
             samplers[i] = -1;
@@ -1598,7 +1632,7 @@ static void hwr_gl_scene_self_test(int first_run)
         pre_errors != 0 || post_errors != 0)
         fprintf(stderr,
                 "[renderer_overhaul] sampling self-test: store=%s colormap=%s "
-                "probe=%s samplers=%s [%d %d %d %d %d %d] (store mid %u/%u "
+                "probe=%s samplers=%s [%d %d %d %d %d %d %d] (store mid %u/%u "
                 "first %u/%u last %u/%u, colormap %u/%u, GL errors %u before "
                 "/ %u during)\n",
                 store_ok ? "ok" : "MISMATCH",
@@ -1606,7 +1640,7 @@ static void hwr_gl_scene_self_test(int first_run)
                 probe_ok ? "ok" : "MISMATCH",
                 samplers_ok ? "ok" : "WRONG",
                 samplers[0], samplers[1], samplers[2],
-                samplers[3], samplers[4], samplers[5],
+                samplers[3], samplers[4], samplers[5], samplers[6],
                 probe_read[0], g_verify_probe_texel,
                 probe_read[2], g_verify_first_texel,
                 probe_read[3], g_verify_last_texel,
@@ -1711,6 +1745,13 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
             g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
         g_index_target_dirty = 0;
     }
+    /* Snapshot the persisted target before anything draws: this is the
+     * "previous frame" that stale-masked walls show through their holes and
+     * blend their high-bit texels against. */
+    g_gl.active_texture(GL_TEXTURE6);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
+    g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                               (GLsizei)width, (GLsizei)height);
     g_gl.clear(GL_DEPTH_BUFFER_BIT);
     hwr_bind_scene_textures();
     if (g_debug_vis < 0) {
@@ -1745,6 +1786,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_set_sampler(g_geometry_program, "u_glow", 3);
     hwr_set_sampler(g_geometry_program, "u_blend", 4);
     hwr_set_sampler(g_geometry_program, "u_dst", 5);
+    hwr_set_sampler(g_geometry_program, "u_stale", 6);
     hwr_uniform_1i(g_geometry_program, "u_debug_vis", g_debug_vis);
     hwr_uniform_2i(g_geometry_program, "u_view_offset",
                    camera->view_offset_x, camera->view_offset_y);

@@ -1541,6 +1541,18 @@ static int hwr_flat_blend_enabled(void)
     return enabled;
 }
 
+/* HWR_WALL_STALE=0 restores the previous fully-opaque rendering of one-sided
+ * walls whose texture carries the block transparency bit. */
+static int hwr_wall_stale_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_WALL_STALE");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 static int hwr_surface_translucent(struct hwr_scene *scene,
                                    struct hwr_mesh_surface *surface)
 {
@@ -2005,6 +2017,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     int32_t flat_guard_origin_y = camera->horizon;
     int flat_transparent = 0;
     int flat_square256 = 0;
+    int wall_stale = 0;
     struct hwr_wall_span_state wall_span = {0};
     size_t i;
     /* Sky caps carry only a position; the SKY-material fragment branch derives
@@ -2039,6 +2052,16 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                          texture_width == texture_height &&
                          (texture_width & 0xffu) == 0;
         flat_transparent = hwr_flat_transparent(scene, surface);
+    } else if (surface->kind == HWR_SURFACE_SOLID_MIDDLE &&
+               (surface->flags & (HWR_SURFACE_MASKED | HWR_SURFACE_DIRECT)) == 0 &&
+               logical < 0x1600u && !scene->textures[logical].direct &&
+               (scene->textures[logical].qflags & 0x400u) != 0 &&
+               hwr_wall_stale_enabled()) {
+        /* The span driver keys its masked writer on the texture's own
+         * transparency bit for every surface kind, with no face-flag gate.  On
+         * a one-sided wall nothing behind is ever traversed, so its holes and
+         * high-bit blends read the untouched -- previous-frame -- pixels. */
+        wall_stale = 1;
     }
     if ((surface->flags & HWR_SURFACE_MASKED) != 0 || flat_transparent)
         flags |= HWR_GL_MATERIAL_MASKED;
@@ -2121,6 +2144,8 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                 target->wall_wrap_flags |= HWR_GL_WALL_WRAP_ALONG;
             if (wrap_vertical)
                 target->wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
+            if (wall_stale)
+                target->wall_wrap_flags |= HWR_GL_WALL_STALE_MASK;
         } else {
             target->wall_s = source->wall_s;
             target->wall_top = source->wall_top;

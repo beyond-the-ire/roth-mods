@@ -20,7 +20,12 @@ enum hwr_gl_material_flags {
 
 enum hwr_gl_wall_wrap_flags {
     HWR_GL_WALL_WRAP_ALONG    = 1u << 0,
-    HWR_GL_WALL_WRAP_VERTICAL = 1u << 1
+    HWR_GL_WALL_WRAP_VERTICAL = 1u << 1,
+    /* A one-sided wall whose texture carries the block transparency bit.  The
+     * engine's masked span writer leaves index-0 texels untouched and blends
+     * high-bit texels with the destination pixel; behind a one-sided wall that
+     * destination is never repainted, so both read as the previous frame. */
+    HWR_GL_WALL_STALE_MASK    = 1u << 2
 };
 
 struct hwr_gl_vertex {
