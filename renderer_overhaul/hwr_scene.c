@@ -1437,17 +1437,40 @@ static int hwr_surface_visible(const struct hwr_scene *scene,
         ? camera->eye_z < z : camera->eye_z > z;
 }
 
+static int hwr_flat_transparent(const struct hwr_scene *scene,
+                                const struct hwr_mesh_surface *surface);
+
+/* A transparent flat blends through the same table as a transparent wall, so
+ * it belongs in the same pass; its transparency is carried by the texture
+ * rather than by a surface flag, hence the separate test.  HWR_FLAT_BLEND=0
+ * keeps such flats in the opaque pass, where they punch holes but do not
+ * blend. */
+static int hwr_flat_blend_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_FLAT_BLEND");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 static int hwr_surface_translucent(struct hwr_scene *scene,
                                    struct hwr_mesh_surface *surface)
 {
     uint16_t logical;
     uint16_t qflags;
+    if (hwr_flat_blend_enabled() && hwr_flat_transparent(scene, surface))
+        return 1;
     if ((surface->flags & (HWR_SURFACE_DIRECT | HWR_SURFACE_MASKED)) !=
         HWR_SURFACE_MASKED)
         return 0;
     logical = (uint16_t)surface->texture_id;
     qflags = logical < 0x1600u ? scene->textures[logical].qflags : 0;
-    return (qflags & 0x400u) != 0 && (qflags & 0x200u) == 0;
+    /* The transparency bit alone decides this.  The block's other high bit is
+     * only ever consulted when this one is clear, so a surface carrying both
+     * still blends. */
+    return (qflags & 0x400u) != 0;
 }
 
 /* A textured surface's DAS block carries a transparency bit that the span
@@ -1942,7 +1965,8 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     if (((surface->mapping_flags & 2u) != 0) !=
         (logical < 0x1600u && scene->textures[logical].flip_toggle != 0))
         flags |= HWR_GL_MATERIAL_HFLIP;
-    if ((surface->flags & HWR_SURFACE_TRANSLUCENT) != 0)
+    if ((surface->flags & HWR_SURFACE_TRANSLUCENT) != 0 ||
+        (flat_transparent && hwr_flat_blend_enabled()))
         flags |= HWR_GL_MATERIAL_TRANSLUCENT;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         hwr_flat_span_state(&scene->mesh, surface, camera, height,
