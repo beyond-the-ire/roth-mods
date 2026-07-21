@@ -1643,6 +1643,18 @@ static float hwr_surface_depth(const struct hwr_mesh_surface *surface,
     return s * y - c * x;
 }
 
+/* Mirrors the shader's HWR_SHADE_FULLBRIGHT gate for the CPU tinted-wall
+ * endpoint word: read once, default ON. */
+static int hwr_shade_fullbright_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SHADE_FULLBRIGHT");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
                                        const struct hwr_mesh_vertex *vertex,
                                        int16_t bottom_z,
@@ -1708,6 +1720,10 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
+    /* FULLBRIGHT (FIX 1): an effective-light-0 face draws through the engine's
+     * unshaded mapper (colormap row 0), so the endpoint word is row 0. */
+    if (hwr_shade_fullbright_enabled() && light == 0)
+        return 0x0000u;
     axv = light == 0 ? 0 : (int)light - 128;
     bias = 8 + axv;
     clip_scale = light == 0 ? 32 : 32 - ((axv + 4 > 0 ? axv + 4 : 0) >> 2);

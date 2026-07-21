@@ -675,6 +675,10 @@ static const char g_geometry_fragment_shader[] =
     "uniform ivec2 u_shade_origin;\n"
     "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
+    "uniform int u_shade_fullbright;\n"
+    "uniform int u_shade_flatclip;\n"
+    "uniform int u_shade_tintwall;\n"
+    "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
      * the retired full-screen prepass did; these carry the same inputs. */
@@ -867,10 +871,22 @@ static const char g_geometry_fragment_shader[] =
     "  return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "}\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
-    "int shade_row(int selected_level, bool tinted) {\n"
-    "  int level=selected_level; int shr=5+level;\n"
+    /* Effective face light mirrors the engine's sector byte plus the weapon
+     * flash, and the flash is added only when the authored byte is nonzero. */
+    "int effective_light() {\n"
     "  int authored=int(v_light_material.x); int light=authored;\n"
     "  if (authored!=0) light=(light+u_light_bias) & 255;\n"
+    "  return light;\n"
+    "}\n"
+    "int shade_row(int selected_level, bool tinted) {\n"
+    "  int level=selected_level; int shr=5+level;\n"
+    "  int light=effective_light();\n"
+    /* FULLBRIGHT (FIX 1): a face whose effective light resolves to 0 -- authored
+     * 0, or the flashed sum wrapping to 0 -- is drawn by the engine's UNSHADED
+     * mapper: colormap row 0, at every distance and for every surface class,
+     * because the column dispatcher takes that branch before any wall/flat/tint
+     * shade math.  Row 0 is the fullbright colormap row. */
+    "  if (u_shade_fullbright!=0 && light==0) return 0;\n"
     "  int axv=light==0 ? 0 : light-128;\n"
     "  int bias=8+axv;\n"
     "  int scale=light==0 ? 32 : 32-(max(axv+4,0) >> 2);\n"
@@ -889,12 +905,32 @@ static const char g_geometry_fragment_shader[] =
     "      r=((r+32768) & 65535)-32768;\n"
     "      return r<=0 ? 1 : min(r,31);\n"
     "    }\n"
+    /* FLATCLIP (FIX 2): the engine's untinted-flat row is min(r, clip_scale, 31)
+     * with r<=0 -> row 0, so a dim sector's floor tops out at its clip scale
+     * exactly like the wall path below; clip_scale 0 pins the plane to row 0. */
     "    r=(depth >> shr)-bias;\n"
-    "    return clamp(((r+32768) & 65535)-32768,0,31);\n"
+    "    r=((r+32768) & 65535)-32768;\n"
+    "    return u_shade_flatclip!=0 ? clamp(r,0,min(scale,31)) : clamp(r,0,31);\n"
     "  }\n"
-    /* Tinted walls carry per-corner shade words interpolated across columns,
-     * matching the column rasterizer's endpoint stepping. */
-    "  if (tinted) return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
+    /* TINTWALL (FIX 3): a tinted wall's row is the engine's per-corner wd_project
+     * shade, evaluated PER PIXEL here.  The mod's wall surfaces are not split
+     * into the engine's short portal-clipped segments, so interpolating two
+     * corner words across a whole wall underestimates the Chebyshev candle
+     * radial toward the screen edges (the +16-row over-lightness).  The radial
+     * and depth reuse the tinted-flat structure; the wall subtracts the candle
+     * bias AND wd_project's own bias (wdbias, 8 at shade level 0). */
+    "  if (tinted) {\n"
+    "    if (u_shade_tintwall!=0) {\n"
+    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
+    "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
+    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
+    "      r=(edge_depth >> shr)-bias-u_wd_bias;\n"
+    "      r=((r+32768) & 65535)-32768;\n"
+    "      return r<=0 ? 1 : min(r,31);\n"
+    "    }\n"
+    "    return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
+    "  }\n"
     "  int dividend=2 << level;\n"
     /* The wall span divisors are the 16-bit vertex depth words, already in
      * world units, so the column ratio reduces to depth/(16*dividend). */
@@ -906,6 +942,9 @@ static const char g_geometry_fragment_shader[] =
      * endpoint accumulator is not available here, so use the same depth word;
      * integer reciprocal boundaries are the remaining exceptional columns. */
     "int dithered_row(int row, int selected_level, bool tinted) {\n"
+    /* FULLBRIGHT (FIX 1): an effective-light-0 face is fullbright at every
+     * distance, so the depth checker must not darken its row 0. */
+    "  if (u_shade_fullbright!=0 && effective_light()==0) return row;\n"
     "  if (tinted || (v_light_material.y & 8u)!=0u) return row;\n"
     "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
     "  int depth=(transformed >> 8) & 65535;\n"
@@ -1708,6 +1747,38 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
     return 1;
 }
 
+/* Shade-parity kill switches, each read once and defaulting ON.  They gate the
+ * three fragment-shader corrections against their pre-fix behaviour:
+ *   HWR_SHADE_FULLBRIGHT=0  restores depth shading on effective-light-0 faces
+ *   HWR_SHADE_FLATCLIP=0    restores the plain 0..31 clamp on untinted flats
+ *   HWR_SHADE_TINTWALL=0    restores the interpolated per-corner tinted-wall row */
+static int hwr_env_default_on(const char *name)
+{
+    const char *v = getenv(name);
+    return (v != NULL && v[0] == '0') ? 0 : 1;
+}
+
+static int hwr_shade_fullbright_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_FULLBRIGHT");
+    return e;
+}
+
+static int hwr_shade_flatclip_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_FLATCLIP");
+    return e;
+}
+
+static int hwr_shade_tintwall_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_TINTWALL");
+    return e;
+}
+
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
@@ -1832,6 +1903,16 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
+    hwr_uniform_1i(g_geometry_program, "u_shade_fullbright",
+                   hwr_shade_fullbright_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_flatclip",
+                   hwr_shade_flatclip_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_tintwall",
+                   hwr_shade_tintwall_enabled());
+    /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
+     * scaled down with the shade level the same way its shift is. */
+    hwr_uniform_1i(g_geometry_program, "u_wd_bias",
+                   8 >> camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_glow_phase", camera->glow_phase);
     {
         /* Feed the sky-cap fragment branch the same inputs the retired
