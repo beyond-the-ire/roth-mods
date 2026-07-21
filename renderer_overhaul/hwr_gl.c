@@ -593,6 +593,7 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=6) in uvec4 a_light_material;\n"
     "layout(location=7) in uint a_wall_shade_endpoint;\n"
     "layout(location=13) in uint a_wall_tint_adjust;\n"
+    "layout(location=14) in uint a_flat_taint;\n"
     "layout(location=8) in uvec4 a_flat_span;\n"
     "layout(location=9) in uvec4 a_wall_source;\n"
     "layout(location=10) in uvec4 a_wall_rows;\n"
@@ -622,6 +623,7 @@ static const char g_geometry_vertex_shader[] =
     "flat out uvec2 v_wall_vertical;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
     "flat out uint v_wall_tint_adjust;\n"
+    "flat out uint v_flat_taint;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
     "void main() {\n"
     "  int dx=wrap16(a_pos.x+u_view_offset.x);\n"
@@ -651,6 +653,7 @@ static const char g_geometry_vertex_shader[] =
     "  v_wall_vertical=a_wall_vertical;\n"
     "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
     "  v_wall_tint_adjust=a_wall_tint_adjust;\n"
+    "  v_flat_taint=a_flat_taint;\n"
     "}\n";
 
 static const char g_geometry_fragment_shader[] =
@@ -683,6 +686,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_shade_tintwall;\n"
     "uniform int u_shade_tintclip;\n"
     "uniform int u_shade_flatvert;\n"
+    "uniform int u_shade_wallclip;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
@@ -714,6 +718,7 @@ static const char g_geometry_fragment_shader[] =
     "flat in uvec2 v_wall_vertical;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
     "flat in uint v_wall_tint_adjust;\n"
+    "flat in uint v_flat_taint;\n"
     "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
     "int signed16(uint v) { int n=int(v & 65535u); return n>=32768 ? n-65536 : n; }\n"
     "uint wall_quotient(int column) {\n"
@@ -905,8 +910,15 @@ static const char g_geometry_fragment_shader[] =
      * polygon vertices and interpolates it linearly in screen space.  When on,
      * read the CPU-computed per-vertex row carried by the noperspective wall
      * endpoint varying (stored for flats in the wall high-byte format) and
-     * truncate it per fragment; flats clamp to 0..31. */
-    "      if (u_shade_flatvert!=0)"
+     * truncate it per fragment; flats clamp to 0..31.
+     * DEFECT-1 fix: a triangle straddling the near plane has a vertex whose
+     * hwr_flat_shade_endpoint projection is garbage (clamped near the shade
+     * origin -> a spurious BRIGHT row that interpolates across the triangle).
+     * The engine never samples a row there (it near-clips the polygon first), so
+     * when v_flat_taint marks such a triangle, fall through to the per-pixel
+     * radial below -- engine-faithful for the surviving fragments and glitch-
+     * free. */
+    "      if (u_shade_flatvert!=0 && v_flat_taint==0u)"
     " return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     /* OFF path: the pre-FLATVERT per-pixel radial.  The edge term measures from
      * the jittered shade origin (the light position); the jitter is the
@@ -945,7 +957,14 @@ static const char g_geometry_fragment_shader[] =
     "      int adj=u_shade_tintclip!=0 ? int(v_wall_tint_adjust) : 0;\n"
     "      r=(edge_depth >> shr)-(bias-adj)-u_wd_bias;\n"
     "      r=((r+32768) & 65535)-32768;\n"
-    "      return r<=0 ? 1 : min(r,31);\n"
+    /* WALLCLIP (FIX 5): wd_project (renderer.c:4338) clamps a wall row at the
+     * sector's clip_scale ceiling BEFORE the 31 clamp, so a dim sector's darkest
+     * wall tops out below 31 and stays dimly visible instead of crushing to near-
+     * black.  The interpolated corner-word fallback below already carries it (the
+     * CPU hwr_wall_endpoint_word applies clip_scale); the per-pixel path was
+     * missing it.  clip_scale==scale here (both 32-(max(light-124,0)>>2)). */
+    "      int cap=u_shade_wallclip!=0 ? min(scale,31) : 31;\n"
+    "      return r<=0 ? 1 : min(r,cap);\n"
     "    }\n"
     "    return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  }\n"
@@ -1484,6 +1503,9 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(13);
     g_gl.vertex_attrib_i_pointer(13, 1, GL_UNSIGNED_BYTE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_tint_adjust));
+    g_gl.enable_vertex_attrib_array(14);
+    g_gl.vertex_attrib_i_pointer(14, 1, GL_UNSIGNED_BYTE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, flat_taint));
     g_gl.enable_vertex_attrib_array(8);
     g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
@@ -1775,7 +1797,10 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
  *   HWR_SHADE_TINTWALL=0    restores the interpolated per-corner tinted-wall row
  *   HWR_SHADE_FLATVERT=0    restores the per-pixel radial on tinted flats (the
  *                           default ON path is the engine's per-vertex,
- *                           screen-linearly interpolated flat shade) */
+ *                           screen-linearly interpolated flat shade, with a
+ *                           per-pixel-radial fallback for clipped-corner triangles)
+ *   HWR_SHADE_WALLCLIP=0    restores the 0..31 tinted-wall clamp WITHOUT the
+ *                           engine's per-sector clip_scale ceiling (wd_project) */
 static int hwr_env_default_on(const char *name)
 {
     const char *v = getenv(name);
@@ -1814,6 +1839,13 @@ static int hwr_shade_flatvert_enabled(void)
 {
     static int e = -1;
     if (e < 0) e = hwr_env_default_on("HWR_SHADE_FLATVERT");
+    return e;
+}
+
+static int hwr_shade_wallclip_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_WALLCLIP");
     return e;
 }
 
@@ -1951,6 +1983,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    hwr_shade_tintclip_enabled());
     hwr_uniform_1i(g_geometry_program, "u_shade_flatvert",
                    hwr_shade_flatvert_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_wallclip",
+                   hwr_shade_wallclip_enabled());
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
      * scaled down with the shade level the same way its shift is. */
     hwr_uniform_1i(g_geometry_program, "u_wd_bias",

@@ -1785,25 +1785,34 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
 }
 
 /* Per-FACE port of the engine wall driver's flags&0x40 depth-bias adjust
- * (renderer.c:4823-4846, VA 0x36c64).  The engine darkens a tinted wall by up to
- * 16 shade rows when the drawn span's two vertical edges sit at DIFFERENT view
- * depths (a receding wall); a face-on span whose edges share a depth gets none.
+ * (renderer.c:4823-4846, VA 0x36c64).  The engine darkens a tinted wall by
+ * effective_bias = bias - adjust, where adjust = ((ax + r12) << 4) / ax.
  *
- * Live tracing (ROTH_SHADELOG) on the study corridor pinned the engine's
- * per-segment inputs: the block's `ax` (span record +0x26) is the wall's
- * mapping-record extent word, and its `r12` (reoffset +0x12) traces as exactly 0
- * for a receding span (edges differ) and exactly -extent for a face-on span
- * (edges equal), so the extent cancels and the resulting row is 0 or 16.  Only
- * near-plane-straddling slivers produce the intermediate 5/6 rows, evaluated
- * here via the same integer path (the per-face approximation's accepted
- * residual).  The two edge depths are the endpoint view depths BEFORE the 16.0
- * near clamp, matching the engine's unclamped divA/divB words. */
+ * Correlated ROTH_SHADELOG tracing (the flags&0x40 read at 0x36c64 paired by
+ * screen column with the r12 WRITER at 0x2b029/0x29068) pinned the true
+ * semantics on the slot-2 pose:
+ *   - ax  (reoffset +0x8) = the mapping-record extent word (record +0x26), the
+ *     wall segment's world-space length.  This mod's surface->extent is the same
+ *     field (hwr_world.c: wall->extent = hwr_i16(mapping_raw)).
+ *   - r12 (reoffset +0x12) = FS16(edge+9) - FS16(edge+0x1d) = f9[thisEdge] -
+ *     f9[nextEdge], where f9 is the per-vertex accumulated VIEW-SPACE HORIZONTAL
+ *     coordinate.  So r12 = -(view_x[A] - view_x[B]) up to sign = -|dview_x|, the
+ *     negated projected horizontal extent of the wall.
+ * Hence adj = 16*(extent - |dview_x|)/extent: a face-on wall's whole length is
+ * horizontal (|dview_x| == extent -> adj 0), an edge-on receding wall projects to
+ * zero width (|dview_x| == 0 -> adj 16), and every pose between is CONTINUOUS.
+ * The prior heuristic keyed adj on int16 depth-word equality (bx==dx), a
+ * knife-edge that mislabels a near-face-on wall as fully receding (spurious 16-
+ * row darkening); this computes the engine's actual continuous quantity.
+ * Verified: the exact f9 diff reproduces the engine's adj 28/28 on the traced
+ * segments.  The two edge depths bx/dx are still needed for the engine's
+ * near-plane extent rescale below (unclamped divA/divB words). */
 static int hwr_wall_tint_clip_adjust(const struct hwr_mesh_surface *surface,
                                      const struct hwr_scene_mesh *mesh,
                                      const struct hwr_gl_camera *camera)
 {
     const struct hwr_mesh_vertex *verts;
-    double sine, cosine, da, db;
+    double sine, cosine, da, db, vxa, vxb, dview;
     int have_a = 0, have_b = 0;
     int16_t ax, bx, dx, r12;
     int adjust = 0, proceed = 1;
@@ -1819,26 +1828,37 @@ static int hwr_wall_tint_clip_adjust(const struct hwr_mesh_surface *surface,
     verts = mesh->vertices + surface->first_vertex;
     sine = (double)camera->yaw_sin / 16384.0;
     cosine = (double)camera->yaw_cos / 16384.0;
-    da = db = 0.0;
+    da = db = vxa = vxb = 0.0;
     for (i = 0; i < surface->vertex_count; i++) {
         int vx = (int16_t)((uint16_t)verts[i].x + (uint16_t)camera->view_offset_x);
         int vy = (int16_t)((uint16_t)verts[i].y + (uint16_t)camera->view_offset_y);
-        double d = sine * (double)vy - cosine * (double)vx;
-        if ((verts[i].reserved & HWR_WALL_CORNER_END_B) != 0) { db = d; have_b = 1; }
-        else { da = d; have_a = 1; }
+        double d = sine * (double)vy - cosine * (double)vx;   /* view depth  */
+        double h = sine * (double)vx + cosine * (double)vy;   /* view_x (f9) */
+        if ((verts[i].reserved & HWR_WALL_CORNER_END_B) != 0) {
+            db = d; vxb = h; have_b = 1;
+        } else {
+            da = d; vxa = h; have_a = 1;
+        }
     }
     if (!have_a || !have_b)
         return 0;
 
-    /* Quantise to the engine's 16-bit signed depth-word domain (divA>>8 /
-     * divB>>8); a receding wall's endpoints differ, a face-on wall's do not. */
+    /* Quantise the depths to the engine's 16-bit signed depth-word domain
+     * (divA>>8 / divB>>8); used only by the near-plane extent rescale. */
     da = da > 32767.0 ? 32767.0 : (da < -32768.0 ? -32768.0 : da);
     db = db > 32767.0 ? 32767.0 : (db < -32768.0 ? -32768.0 : db);
     dx = (int16_t)(int)da;   /* edge-A depth (g_wall_proj_y3 + 0x18) */
     bx = (int16_t)(int)db;   /* edge-B depth (g_wall_proj_y3 + 0x10) */
 
     ax = (int16_t)(uint16_t)surface->extent;   /* record +0x26 = mapping extent */
-    r12 = (bx == dx) ? (int16_t)(-ax) : (int16_t)0;
+
+    /* r12 = -|view_x[A] - view_x[B]|, the engine's f9 difference.  For every real
+     * face |dview_x| <= extent, so s = ax + r12 stays in [0, extent] and adj in
+     * [0,16]; the final clamp guards the degenerate near-plane residual. */
+    dview = vxa - vxb;
+    if (dview < 0.0) dview = -dview;
+    if (dview > 32767.0) dview = 32767.0;
+    r12 = (int16_t)(-(int)(dview + 0.5));
 
     if ((int16_t)(dx | bx) < 0) {              /* segment touches/straddles near plane */
         int16_t bp = (int16_t)(dx - bx); if (bp < 0) bp = (int16_t)(-bp);
@@ -1883,6 +1903,52 @@ static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
     if (height != 0 && y >= (int)height)
         return (int)height - 1;
     return y;
+}
+
+/* DEFECT-1 fix: report whether a tinted flat's triangle (three consecutive mesh
+ * vertices at tri_base) has any corner the engine would CLIP away before shading.
+ * The engine evaluates the flat candle row only at the vertices of the near- AND
+ * frustum-CLIPPED projected polygon (rasterize_floorceil_polygon receives clipped
+ * geometry); the mod triangulates the FULL, unclipped sector loop.  A corner that
+ * the engine clips -- behind the near plane, or off the left/right/top/bottom of
+ * the viewport -- projects to a screen position that does NOT lie on the visible
+ * interior, so hwr_flat_shade_endpoint's row there (and the flickering shade
+ * origin's radial to it) does not describe any drawn fragment.  Interpolating
+ * that off-window row linearly across the visible interior is exactly the
+ * +20..+29 bright-patch tail (the jittering shade origin makes an off-window
+ * corner intermittently read row 0 -> a bright wedge that GL bleeds inward).
+ * Because the staging buffer is pre-sized per triangle (CPU-clipping the polygon
+ * would change the vertex count), the mod instead flags any triangle with a
+ * clipped corner so the shader falls back to the per-pixel candle radial (the OFF
+ * path) for its surviving fragments -- which IS evaluated on the visible fragment
+ * and so is clip-faithful and glitch-free.  Fully-visible triangles keep the
+ * engine's per-vertex screen-linear evaluation.  The near threshold is the 16.0
+ * view-depth clamp shared by hwr_vertex_view_depth / hwr_flat_project_y (and the
+ * GL near plane n=16 in the vertex shader). */
+static int hwr_flat_triangle_needs_radial(const struct hwr_scene_mesh *mesh,
+                                          const struct hwr_mesh_surface *surface,
+                                          const struct hwr_gl_camera *camera,
+                                          uint32_t width, uint32_t height,
+                                          size_t tri_base)
+{
+    size_t k;
+    for (k = 0; k < 3u && tri_base + k < surface->vertex_count; k++) {
+        const struct hwr_mesh_vertex *v =
+            &mesh->vertices[surface->first_vertex + tri_base + k];
+        double view_x;
+        double depth = hwr_vertex_view_depth(v, camera, &view_x);
+        int sx, sy;
+        if (depth < 16.0)
+            return 1;                         /* behind the near plane */
+        sx = (int)(view_x * (double)camera->focal_x / depth) + (int)camera->center_x;
+        if (width != 0 && (sx < 0 || sx >= (int)width))
+            return 1;                         /* off the left/right frustum */
+        sy = (int)(((double)camera->eye_z - (double)v->z) *
+                   (double)camera->focal_y / depth) + (int)camera->horizon;
+        if (height != 0 && (sy < 0 || sy >= (int)height))
+            return 1;                         /* off the top/bottom frustum */
+    }
+    return 0;
 }
 
 /* Per-FLAT-VERTEX candle shade row.  The engine draws a corridor floor/ceiling
@@ -2405,6 +2471,13 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                     surface, source, camera, width, height);
                 target->wall_shade_endpoint =
                     (uint16_t)((uint16_t)(uint8_t)flat_row << 8);
+                /* Flag every vertex of a clipped-corner triangle so the shader
+                 * drops this unfaithful per-vertex row for the per-pixel radial
+                 * (mesh vertices come in per-triangle triples). */
+                if (hwr_flat_triangle_needs_radial(
+                        &scene->mesh, surface, camera, width, height,
+                        (i / 3u) * 3u))
+                    target->flat_taint = 1u;
             }
         }
         if (logical < 0x1600u) {

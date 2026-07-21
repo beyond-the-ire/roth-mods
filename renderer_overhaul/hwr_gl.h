@@ -55,6 +55,10 @@ struct hwr_gl_vertex {
      * flags&0x40 wall-driver block subtracts from the candle bias. Zero for
      * non-wall geometry. */
     uint8_t wall_tint_adjust;
+    /* Set on all three vertices of a tinted flat triangle that straddles the near
+     * plane, so the shader falls back to the per-pixel candle radial rather than
+     * interpolating a garbage near-clamped vertex row. Zero otherwise. */
+    uint8_t flat_taint;
     /* Per-flat affine span state after the original scanline-range setup. */
     uint32_t flat_guard;
     uint32_t flat_guard_step;
