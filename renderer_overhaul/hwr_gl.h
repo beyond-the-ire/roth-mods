@@ -51,6 +51,10 @@ struct hwr_gl_vertex {
     /* The original wall driver selects masked or linear sampling separately
      * for the along-wall and vertical texture axes. */
     uint8_t wall_wrap_flags;
+    /* Per-face tinted-wall depth-bias adjust (0..16): shade rows the engine's
+     * flags&0x40 wall-driver block subtracts from the candle bias. Zero for
+     * non-wall geometry. */
+    uint8_t wall_tint_adjust;
     /* Per-flat affine span state after the original scanline-range setup. */
     uint32_t flat_guard;
     uint32_t flat_guard_step;

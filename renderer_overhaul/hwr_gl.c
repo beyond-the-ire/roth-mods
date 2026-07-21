@@ -592,6 +592,7 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=5) in uvec4 a_pan_scale_flags;\n"
     "layout(location=6) in uvec4 a_light_material;\n"
     "layout(location=7) in uint a_wall_shade_endpoint;\n"
+    "layout(location=13) in uint a_wall_tint_adjust;\n"
     "layout(location=8) in uvec4 a_flat_span;\n"
     "layout(location=9) in uvec4 a_wall_source;\n"
     "layout(location=10) in uvec4 a_wall_rows;\n"
@@ -620,6 +621,7 @@ static const char g_geometry_vertex_shader[] =
     "flat out uvec4 v_wall_span;\n"
     "flat out uvec2 v_wall_vertical;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
+    "flat out uint v_wall_tint_adjust;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
     "void main() {\n"
     "  int dx=wrap16(a_pos.x+u_view_offset.x);\n"
@@ -648,6 +650,7 @@ static const char g_geometry_vertex_shader[] =
     "  v_wall_span=a_wall_span;\n"
     "  v_wall_vertical=a_wall_vertical;\n"
     "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
+    "  v_wall_tint_adjust=a_wall_tint_adjust;\n"
     "}\n";
 
 static const char g_geometry_fragment_shader[] =
@@ -678,6 +681,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_shade_fullbright;\n"
     "uniform int u_shade_flatclip;\n"
     "uniform int u_shade_tintwall;\n"
+    "uniform int u_shade_tintclip;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
@@ -708,6 +712,7 @@ static const char g_geometry_fragment_shader[] =
     "flat in uvec4 v_wall_span;\n"
     "flat in uvec2 v_wall_vertical;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
+    "flat in uint v_wall_tint_adjust;\n"
     "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
     "int signed16(uint v) { int n=int(v & 65535u); return n>=32768 ? n-65536 : n; }\n"
     "uint wall_quotient(int column) {\n"
@@ -925,7 +930,11 @@ static const char g_geometry_fragment_shader[] =
     "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
     "      int edge_depth=(depth+max(px,py)) & 65535;\n"
-    "      r=(edge_depth >> shr)-bias-u_wd_bias;\n"
+    /* TINTCLIP (FIX 4): the engine's flags&0x40 wall block darkens the tinted
+     * bias by a per-face amount (effective_bias = bias - adjust) so receding
+     * walls drop up to 16 rows the interpolated corner word missed. */
+    "      int adj=u_shade_tintclip!=0 ? int(v_wall_tint_adjust) : 0;\n"
+    "      r=(edge_depth >> shr)-(bias-adj)-u_wd_bias;\n"
     "      r=((r+32768) & 65535)-32768;\n"
     "      return r<=0 ? 1 : min(r,31);\n"
     "    }\n"
@@ -1463,6 +1472,9 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(7);
     g_gl.vertex_attrib_i_pointer(7, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint));
+    g_gl.enable_vertex_attrib_array(13);
+    g_gl.vertex_attrib_i_pointer(13, 1, GL_UNSIGNED_BYTE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_tint_adjust));
     g_gl.enable_vertex_attrib_array(8);
     g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
@@ -1779,6 +1791,13 @@ static int hwr_shade_tintwall_enabled(void)
     return e;
 }
 
+static int hwr_shade_tintclip_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_TINTCLIP");
+    return e;
+}
+
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
@@ -1909,6 +1928,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    hwr_shade_flatclip_enabled());
     hwr_uniform_1i(g_geometry_program, "u_shade_tintwall",
                    hwr_shade_tintwall_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_tintclip",
+                   hwr_shade_tintclip_enabled());
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
      * scaled down with the shade level the same way its shift is. */
     hwr_uniform_1i(g_geometry_program, "u_wd_bias",

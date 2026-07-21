@@ -1657,11 +1657,24 @@ static int hwr_shade_fullbright_enabled(void)
     return enabled;
 }
 
+/* Mirrors the shader's HWR_SHADE_TINTCLIP gate for the CPU tinted-wall endpoint
+ * word: read once, default ON. */
+static int hwr_shade_tintclip_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SHADE_TINTCLIP");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
                                        const struct hwr_mesh_vertex *vertex,
                                        int16_t bottom_z,
                                        const struct hwr_gl_camera *camera,
-                                       uint32_t width, uint32_t height)
+                                       uint32_t width, uint32_t height,
+                                       int tint_clip_adjust)
 {
     int dx = (int16_t)((uint16_t)vertex->x + (uint16_t)camera->view_offset_x);
     int dy = (int16_t)((uint16_t)vertex->y + (uint16_t)camera->view_offset_y);
@@ -1728,6 +1741,10 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
         return 0x0000u;
     axv = light == 0 ? 0 : (int)light - 128;
     bias = 8 + axv;
+    /* The engine wall driver's flags&0x40 block darkens the tinted-wall bias by
+     * a per-face amount (effective_bias = bias - adjust); fold it in so the CPU
+     * fallback row matches the per-pixel shader. */
+    bias -= tint_clip_adjust;
     clip_scale = light == 0 ? 32 : 32 - ((axv + 4 > 0 ? axv + 4 : 0) >> 2);
     shade = (int)(projected >> (5 + level));
     shade = (int16_t)(shade - bias);
@@ -1740,6 +1757,84 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
         return 0x1fffu;
     return (uint16_t)(((uint16_t)(uint8_t)shade << 8) |
         (uint8_t)((uint8_t)projected << (3 - level)));
+}
+
+/* Per-FACE port of the engine wall driver's flags&0x40 depth-bias adjust
+ * (renderer.c:4823-4846, VA 0x36c64).  The engine darkens a tinted wall by up to
+ * 16 shade rows when the drawn span's two vertical edges sit at DIFFERENT view
+ * depths (a receding wall); a face-on span whose edges share a depth gets none.
+ *
+ * Live tracing (ROTH_SHADELOG) on the study corridor pinned the engine's
+ * per-segment inputs: the block's `ax` (span record +0x26) is the wall's
+ * mapping-record extent word, and its `r12` (reoffset +0x12) traces as exactly 0
+ * for a receding span (edges differ) and exactly -extent for a face-on span
+ * (edges equal), so the extent cancels and the resulting row is 0 or 16.  Only
+ * near-plane-straddling slivers produce the intermediate 5/6 rows, evaluated
+ * here via the same integer path (the per-face approximation's accepted
+ * residual).  The two edge depths are the endpoint view depths BEFORE the 16.0
+ * near clamp, matching the engine's unclamped divA/divB words. */
+static int hwr_wall_tint_clip_adjust(const struct hwr_mesh_surface *surface,
+                                     const struct hwr_scene_mesh *mesh,
+                                     const struct hwr_gl_camera *camera)
+{
+    const struct hwr_mesh_vertex *verts;
+    double sine, cosine, da, db;
+    int have_a = 0, have_b = 0;
+    int16_t ax, bx, dx, r12;
+    int adjust = 0, proceed = 1;
+    size_t i;
+
+    if (!hwr_shade_tintclip_enabled())
+        return 0;
+    /* texflags bit 0x10 set -> the composed fill-mode word never receives 0x40,
+     * so the engine's wall driver skips this block for the surface. */
+    if ((surface->mapping_flags & 0x10u) != 0)
+        return 0;
+
+    verts = mesh->vertices + surface->first_vertex;
+    sine = (double)camera->yaw_sin / 16384.0;
+    cosine = (double)camera->yaw_cos / 16384.0;
+    da = db = 0.0;
+    for (i = 0; i < surface->vertex_count; i++) {
+        int vx = (int16_t)((uint16_t)verts[i].x + (uint16_t)camera->view_offset_x);
+        int vy = (int16_t)((uint16_t)verts[i].y + (uint16_t)camera->view_offset_y);
+        double d = sine * (double)vy - cosine * (double)vx;
+        if ((verts[i].reserved & HWR_WALL_CORNER_END_B) != 0) { db = d; have_b = 1; }
+        else { da = d; have_a = 1; }
+    }
+    if (!have_a || !have_b)
+        return 0;
+
+    /* Quantise to the engine's 16-bit signed depth-word domain (divA>>8 /
+     * divB>>8); a receding wall's endpoints differ, a face-on wall's do not. */
+    da = da > 32767.0 ? 32767.0 : (da < -32768.0 ? -32768.0 : da);
+    db = db > 32767.0 ? 32767.0 : (db < -32768.0 ? -32768.0 : db);
+    dx = (int16_t)(int)da;   /* edge-A depth (g_wall_proj_y3 + 0x18) */
+    bx = (int16_t)(int)db;   /* edge-B depth (g_wall_proj_y3 + 0x10) */
+
+    ax = (int16_t)(uint16_t)surface->extent;   /* record +0x26 = mapping extent */
+    r12 = (bx == dx) ? (int16_t)(-ax) : (int16_t)0;
+
+    if ((int16_t)(dx | bx) < 0) {              /* segment touches/straddles near plane */
+        int16_t bp = (int16_t)(dx - bx); if (bp < 0) bp = (int16_t)(-bp);
+        int16_t base = (bx < 0) ? bx : dx;
+        int16_t t = (int16_t)((int16_t)(base - 0x10) + bp);
+        if (t <= 0 || bp == 0) proceed = 0;
+        else ax = (int16_t)(((int32_t)ax * (int32_t)t) / (int32_t)bp);
+    }
+    if (proceed) {
+        uint16_t cxv = (uint16_t)ax;
+        if (ax != 0) {
+            int16_t s = (int16_t)(ax + r12);
+            if (s > 0) {
+                uint16_t e16 = (uint16_t)((uint16_t)s << 4);
+                adjust = (int)(uint16_t)(e16 / cxv);
+            }
+        }
+    }
+    if (adjust < 0) adjust = 0;
+    if (adjust > 31) adjust = 31;
+    return adjust;
 }
 
 static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
@@ -2067,6 +2162,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     int flat_transparent = 0;
     int flat_square256 = 0;
     int wall_stale = 0;
+    int wall_tint_adjust = 0;
     struct hwr_wall_span_state wall_span = {0};
     size_t i;
     /* Sky caps carry only a position; the SKY-material fragment branch derives
@@ -2133,9 +2229,12 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                             flat_square256 && !flat_transparent,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
-    else
+    else {
         hwr_wall_span_state(&scene->mesh, surface, camera, width,
                             texture_width, texture_height, &wall_span);
+        wall_tint_adjust =
+            hwr_wall_tint_clip_adjust(surface, &scene->mesh, camera);
+    }
     for (i = 0; i < surface->vertex_count; i++) {
         const struct hwr_mesh_vertex *source =
             &scene->mesh.vertices[surface->first_vertex + i];
@@ -2170,7 +2269,9 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                 }
             }
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
-                surface, source, bottom_z, camera, width, height);
+                surface, source, bottom_z, camera, width, height,
+                wall_tint_adjust);
+            target->wall_tint_adjust = (uint8_t)wall_tint_adjust;
             if (fit_texture) {
                 target->wall_s = end_b
                     ? (float)wall_span.along_extent : 0.0f;
