@@ -1969,7 +1969,7 @@ static int hwr_flat_triangle_needs_radial(const struct hwr_scene_mesh *mesh,
  * vertex's plane height) and the clamps are the FLAT clamps -- row<=0 -> 0
  * (BRIGHT; the flat driver floors at 0, unlike the wall's floor of 1) and
  * row>=0x1f -> 31, with no per-face clip scale. */
-static int hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
+static uint16_t hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
                                     const struct hwr_mesh_vertex *vertex,
                                     const struct hwr_gl_camera *camera,
                                     uint32_t width, uint32_t height)
@@ -2016,7 +2016,15 @@ static int hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
     shade = (int16_t)(shade - (int16_t)camera->flat_edge_bias);
     if (shade <= 0)
         return 0;
-    return shade < 31 ? shade : 31;
+    if (shade >= 31)
+        return (uint16_t)(31u << 8);
+    /* Compose the engine's 8-bit sub-row fraction the same way the wall corner
+     * word does: the pre-shift low bits of (depth+radial) shifted << (3-level).
+     * The shader floors the screen-linearly interpolated word (row<<8)|frac per
+     * fragment, so a candle band boundary walks its sub-pixel height across the
+     * flat instead of snapping to whole shade rows. */
+    return (uint16_t)(((uint16_t)(uint8_t)shade << 8) |
+        (uint8_t)((uint8_t)projected << (3 - level)));
 }
 
 static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
@@ -2430,6 +2438,14 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height,
                 wall_tint_adjust);
+            /* Companion TOP-edge corner word: the same wd_project shade taken at
+             * the wall's TOP screen row (screen_y from top_z) instead of the
+             * bottom.  Both corners of a side share the vertex's x/y, so every
+             * vertex of that side carries the identical top/bottom pair; the
+             * shader interpolates them bilinearly for the sub-row candle DDA. */
+            target->wall_shade_endpoint_top = hwr_wall_endpoint_word(
+                surface, source, top_z, camera, width, height,
+                wall_tint_adjust);
             target->wall_tint_adjust = (uint8_t)wall_tint_adjust;
             if (fit_texture) {
                 target->wall_s = end_b
@@ -2460,17 +2476,18 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             target->wall_top = source->wall_top;
             target->pan_u = surface->pan_u;
             target->pan_v = surface->pan_v;
-            /* Tinted flats carry the engine's per-vertex candle shade row so the
+            /* Tinted flats carry the engine's per-vertex candle shade word so the
              * shader can interpolate it screen-linearly (noperspective) instead
              * of evaluating a per-pixel radial.  It reuses the wall endpoint
-             * varying (unused by flats) in the wall's high-byte format, so the
-             * shader's `>> 8` extraction is uniform across both surface kinds.
-             * Untinted flats keep 0 here and take the FLATCLIP depth path. */
+             * varying (unused by flats) in the wall's (row<<8)|frac format, which
+             * the shader floors per fragment for sub-row precision (see
+             * HWR_SHADE_SUBROW).  Untinted flats keep 0 here and take the
+             * FLATCLIP depth path. */
             if ((surface->sector_flags & 2u) != 0) {
-                int flat_row = hwr_flat_shade_endpoint(
+                /* Fraction-bearing per-vertex candle word (row<<8)|frac; the
+                 * shader floors it per fragment for sub-row precision. */
+                target->wall_shade_endpoint = hwr_flat_shade_endpoint(
                     surface, source, camera, width, height);
-                target->wall_shade_endpoint =
-                    (uint16_t)((uint16_t)(uint8_t)flat_row << 8);
                 /* Flag every vertex of a clipped-corner triangle so the shader
                  * drops this unfaithful per-vertex row for the per-pixel radial
                  * (mesh vertices come in per-triangle triples). */

@@ -33,8 +33,15 @@ struct hwr_gl_vertex {
     int16_t y;
     int16_t z;
     /* Packed wall endpoint: shade row in the high byte and interpolation
-     * fraction in the low byte. It is zero for non-wall geometry. */
+     * fraction in the low byte.  For a wall this is the BOTTOM-edge corner word
+     * (screen row at the column's bottom); for a tinted flat it is the
+     * per-vertex candle shade word.  Zero for non-shaded geometry. */
     uint16_t wall_shade_endpoint;
+    /* Companion TOP-edge corner word (row<<8)|frac for a wall.  The tinted-wall
+     * sub-row shade interpolates bilinearly between this and the bottom-edge
+     * word down each column (see the fragment shader's HWR_SHADE_SUBROW path).
+     * Zero for flats and non-shaded geometry. */
+    uint16_t wall_shade_endpoint_top;
     float wall_s;
     float wall_top;
     uint32_t texture_offset;

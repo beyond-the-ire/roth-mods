@@ -592,6 +592,7 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=5) in uvec4 a_pan_scale_flags;\n"
     "layout(location=6) in uvec4 a_light_material;\n"
     "layout(location=7) in uint a_wall_shade_endpoint;\n"
+    "layout(location=15) in uint a_wall_shade_top;\n"
     "layout(location=13) in uint a_wall_tint_adjust;\n"
     "layout(location=14) in uint a_flat_taint;\n"
     "layout(location=8) in uvec4 a_flat_span;\n"
@@ -622,6 +623,7 @@ static const char g_geometry_vertex_shader[] =
     "flat out uvec4 v_wall_span;\n"
     "flat out uvec2 v_wall_vertical;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
+    "noperspective out float v_wall_shade_top;\n"
     "flat out uint v_wall_tint_adjust;\n"
     "flat out uint v_flat_taint;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
@@ -652,6 +654,7 @@ static const char g_geometry_vertex_shader[] =
     "  v_wall_span=a_wall_span;\n"
     "  v_wall_vertical=a_wall_vertical;\n"
     "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
+    "  v_wall_shade_top=float(a_wall_shade_top);\n"
     "  v_wall_tint_adjust=a_wall_tint_adjust;\n"
     "  v_flat_taint=a_flat_taint;\n"
     "}\n";
@@ -687,6 +690,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_shade_tintclip;\n"
     "uniform int u_shade_flatvert;\n"
     "uniform int u_shade_wallclip;\n"
+    "uniform int u_shade_subrow;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
@@ -717,6 +721,7 @@ static const char g_geometry_fragment_shader[] =
     "flat in uvec4 v_wall_span;\n"
     "flat in uvec2 v_wall_vertical;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
+    "noperspective in float v_wall_shade_top;\n"
     "flat in uint v_wall_tint_adjust;\n"
     "flat in uint v_flat_taint;\n"
     "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
@@ -918,8 +923,14 @@ static const char g_geometry_fragment_shader[] =
      * when v_flat_taint marks such a triangle, fall through to the per-pixel
      * radial below -- engine-faithful for the surviving fragments and glitch-
      * free. */
+    /* SUBROW: the per-vertex word now carries the engine's 8-bit sub-row
+     * fraction in its low byte; floor the interpolated word per fragment so a
+     * band boundary lands at the engine's sub-pixel height instead of snapping
+     * to the whole row (OFF path keeps the old whole-row truncate). */
     "      if (u_shade_flatvert!=0 && v_flat_taint==0u)"
-    " return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
+    " return u_shade_subrow!=0"
+    " ? clamp(int(floor(v_wall_shade_endpoint/256.0)),0,31)"
+    " : clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     /* OFF path: the pre-FLATVERT per-pixel radial.  The edge term measures from
      * the jittered shade origin (the light position); the jitter is the
      * flicker. */
@@ -946,6 +957,28 @@ static const char g_geometry_fragment_shader[] =
      * and depth reuse the tinted-flat structure; the wall subtracts the candle
      * bias AND wd_project's own bias (wdbias, 8 at shade level 0). */
     "  if (tinted) {\n"
+    /* SUBROW (default): reproduce wd_project's per-corner shade words and the
+     * engine's column DDA.  v_wall_shade_top / v_wall_shade_endpoint are the
+     * TOP / BOTTOM edge words (row<<8)|frac, each carried linear-in-X (both
+     * endpoints of a side hold the same word, and the wall's left/right screen
+     * edges are vertical columns, so the noperspective interpolation is exactly
+     * the engine's top-edge and bottom-edge lerps with no triangle-diagonal
+     * seam).  Down the column, mix the two words by the fraction of the way from
+     * the wall's projected top row to its bottom row (the same per-column top/
+     * bottom accumulators the texel path uses), then floor the interpolated word
+     * -- WITH its fraction -- to the shade row.  That is the engine's
+     * seed24 + k*q >> 16 DDA in floating point: row = floor(V/256). */
+    "    if (u_shade_subrow!=0 && v_wall_span.w!=0u) {\n"
+    "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
+    "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
+    "      uint ba=v_wall_rows.y+v_wall_rows.w*uint(scol);\n"
+    "      float stop=float(signed16(ta>>16u));\n"
+    "      float sbot=float(signed16(ba>>16u));\n"
+    "      float cnt=sbot-stop+1.0;\n"
+    "      float t=cnt>0.5 ? clamp((floor(gl_FragCoord.y)-stop)/cnt,0.0,1.0) : 0.0;\n"
+    "      float V=mix(v_wall_shade_top,v_wall_shade_endpoint,t);\n"
+    "      return clamp(int(floor(V/256.0)),0,31);\n"
+    "    }\n"
     "    if (u_shade_tintwall!=0) {\n"
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
@@ -1506,6 +1539,9 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(14);
     g_gl.vertex_attrib_i_pointer(14, 1, GL_UNSIGNED_BYTE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_taint));
+    g_gl.enable_vertex_attrib_array(15);
+    g_gl.vertex_attrib_i_pointer(15, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint_top));
     g_gl.enable_vertex_attrib_array(8);
     g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
@@ -1800,7 +1836,17 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
  *                           screen-linearly interpolated flat shade, with a
  *                           per-pixel-radial fallback for clipped-corner triangles)
  *   HWR_SHADE_WALLCLIP=0    restores the 0..31 tinted-wall clamp WITHOUT the
- *                           engine's per-sector clip_scale ceiling (wd_project) */
+ *                           engine's per-sector clip_scale ceiling (wd_project)
+ *   HWR_SHADE_SUBROW=0      restores the pre-sub-row candle shade: tinted walls
+ *                           fall back to the per-pixel TINTWALL radial and tinted
+ *                           flats truncate the per-vertex word to a whole row.
+ *                           Default ON reproduces the engine's sub-row precision
+ *                           -- the tinted wall bilinearly interpolates its TOP and
+ *                           BOTTOM wd_project corner words (row<<8)|frac down each
+ *                           column and floors WITH the fraction (the engine's
+ *                           column DDA), and the tinted flat floors the fraction-
+ *                           bearing per-vertex word -- so band boundaries walk the
+ *                           engine's ragged staircase instead of square rings. */
 static int hwr_env_default_on(const char *name)
 {
     const char *v = getenv(name);
@@ -1846,6 +1892,13 @@ static int hwr_shade_wallclip_enabled(void)
 {
     static int e = -1;
     if (e < 0) e = hwr_env_default_on("HWR_SHADE_WALLCLIP");
+    return e;
+}
+
+static int hwr_shade_subrow_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_SUBROW");
     return e;
 }
 
@@ -1985,6 +2038,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    hwr_shade_flatvert_enabled());
     hwr_uniform_1i(g_geometry_program, "u_shade_wallclip",
                    hwr_shade_wallclip_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_subrow",
+                   hwr_shade_subrow_enabled());
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
      * scaled down with the shade level the same way its shift is. */
     hwr_uniform_1i(g_geometry_program, "u_wd_bias",
