@@ -1528,11 +1528,11 @@ static int hwr_surface_visible(const struct hwr_scene *scene,
 {
     const struct hwr_scene_mesh *mesh = &scene->mesh;
     int16_t z;
-    /* Portal-reachable visibility gate. When the flood produced a valid set, a
-     * surface whose sector the camera could not reach through any portal
-     * opening is dropped -- including its sky caps -- so a sector stacked over
-     * or under the camera's own, but not reachable through the sight path, no
-     * longer bleeds through. Inert while pvs_valid is 0. */
+    /* Per-frame visibility gate. When the renderer's own drawn-sector set was
+     * read successfully, a surface whose sector that set did not draw is
+     * dropped -- including its sky caps -- so a sector stacked over or under the
+     * camera's own, but not on the sight path, no longer bleeds through. Inert
+     * while pvs_valid is 0. */
     if (scene->pvs_valid && surface->sector_index < scene->visible_count &&
         !scene->visible[surface->sector_index])
         return 0;
@@ -2496,9 +2496,9 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     camera.sky_yaw = api->game_ram->u16(VA_G_SKY_YAW);
     camera.sky_double_scanline = api->game_ram->u8(VA_G_DOUBLE_SCANLINE) != 0;
     camera.sky_valid = scene->sky_valid;
-    /* Portal-reachable visibility (HWR_PVS). When disabled or when the flood
-     * cannot seed, pvs_valid stays 0 and the per-surface gate is a no-op,
-     * leaving the frame identical to the plain stream-everything path. */
+    /* Per-frame visibility (HWR_PVS). When disabled or when the renderer's draw
+     * list cannot be read, pvs_valid stays 0 and the per-surface gate is a
+     * no-op, leaving the frame identical to the plain stream-everything path. */
     scene->pvs_valid = 0;
     if (hwr_pvs_enabled() &&
         hwr_scene_ensure_visible(scene, world->sector_count) == 0)
