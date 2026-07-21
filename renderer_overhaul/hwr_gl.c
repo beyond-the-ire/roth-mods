@@ -1894,7 +1894,16 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_bind_scene_textures();
     if (g_debug_vis < 0) {
         const char *vis = getenv("HWR_SHADE_VIS");
-        g_debug_vis = vis != NULL && vis[0] >= '0' && vis[0] <= '9'
+        /* HWR_SHADE_VIS drives the base render ONLY as the standalone shade-map
+         * feature.  Under HWR_COMPARE the base render is the final-output plane
+         * (plane 1) and must stay at debug_vis 0; the compare path sets the
+         * probe plane's vis explicitly per cycle (hwr_gl_set_debug_vis).  Without
+         * this guard the first compare cycle -- the only one a briefly-valid
+         * scene such as the main-menu backdrop ever emits -- captured the base
+         * render at the env-seeded vis, so plane 1 showed the shade-row map (the
+         * palette's coincidental yellow ramp) instead of the real world. */
+        g_debug_vis = (getenv("HWR_COMPARE") == NULL &&
+                       vis != NULL && vis[0] >= '0' && vis[0] <= '9')
                     ? vis[0] - '0' : 0;
     }
     if (g_sky_occlude < 0) {
