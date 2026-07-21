@@ -237,7 +237,7 @@ static void hwr_add_sector_cuts(const struct hwr_world *world,
 {
     hwr_add_wall_cut(cuts, count, sector->floor_z, bottom, top);
     hwr_add_wall_cut(cuts, count, sector->ceiling_z, bottom, top);
-    if (sector->slab_index != SIZE_MAX) {
+    if (sector->slab_index < world->slab_count) {
         const struct hwr_slab *slab = &world->slabs[sector->slab_index];
         hwr_add_wall_cut(cuts, count, slab->lower_z, bottom, top);
         hwr_add_wall_cut(cuts, count, slab->upper_z, bottom, top);
@@ -368,6 +368,8 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
             int touches_b = incident->vertex_a_index == wall->vertex_b_index ||
                             incident->vertex_b_index == wall->vertex_b_index;
             if (!touches_a && !touches_b)
+                continue;
+            if (incident->sector_index >= world->sector_count)
                 continue;
             incident_sector = &world->sectors[incident->sector_index];
             if (touches_a)
@@ -720,14 +722,14 @@ static int hwr_build_sector_flats(struct hwr_scene_mesh *mesh,
      * doorway.  Skip it and let the slab top stand in for the floor.  Only the
      * exactly-flush case qualifies: a slab hovering above the floor is a
      * suspended platform, and the base floor beneath it still shows. */
-    if (sector->floor_flat_id >= 0 || sector->slab_index == SIZE_MAX ||
+    if (sector->floor_flat_id >= 0 || sector->slab_index >= world->slab_count ||
         world->slabs[sector->slab_index].upper_z != sector->floor_z)
         result |= hwr_emit_flat(mesh, world, sector, sector_index, points,
                                 triangles, count - 2u, HWR_SURFACE_FLOOR,
                                 sector->floor_z, sector->floor_flat_id,
                                 sector->floor_pan,
                                 (uint8_t)((sector->flags >> 4) & 3u), 0);
-    if (sector->slab_index != SIZE_MAX) {
+    if (sector->slab_index < world->slab_count) {
         const struct hwr_slab *slab = &world->slabs[sector->slab_index];
         result |= hwr_emit_flat(mesh, world, sector, sector_index, points, triangles,
                                 count - 2u, HWR_SURFACE_SLAB_LOWER, slab->lower_z,
@@ -759,7 +761,7 @@ static int hwr_emit_portal_slab(struct hwr_scene_mesh *mesh,
     const struct hwr_slab *neighbor_slab;
     int16_t bottom;
     int16_t top;
-    if (neighbor->slab_index == SIZE_MAX)
+    if (neighbor->slab_index >= world->slab_count)
         return 0;
     neighbor_slab = &world->slabs[neighbor->slab_index];
     bottom = neighbor_slab->lower_z;
@@ -770,7 +772,7 @@ static int hwr_emit_portal_slab(struct hwr_scene_mesh *mesh,
         bottom = sector->floor_z;
     if (top > sector->ceiling_z)
         top = sector->ceiling_z;
-    if (sector->slab_index != SIZE_MAX) {
+    if (sector->slab_index < world->slab_count) {
         const struct hwr_slab *source_slab = &world->slabs[sector->slab_index];
         if (bottom < source_slab->upper_z && top > source_slab->lower_z) {
             if (bottom >= source_slab->lower_z)

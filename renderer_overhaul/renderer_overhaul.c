@@ -88,6 +88,14 @@ static int g_luts_recheck_pending;
 static int g_scene_error_logged;
 static int g_selfheal_retry;
 static uint32_t g_selfheal_tick;
+/* A map-load event only records a pending reload here; the geometry re-snapshot
+ * runs at the render-dispatch safe point (see hwr_render_world_view_pass), never
+ * inline from the event, so g_world's arrays can never be freed/reallocated
+ * while hwr_scene_build_mesh is walking them.  Several events before the next
+ * dispatch coalesce to the newest generation (an older staged map is superseded
+ * by the newest load). */
+static int g_map_reload_pending;
+static uint32_t g_map_reload_generation;
 /* Development aid: HWR_DUMP_FRAME=<path.ppm> periodically writes the submitted
  * world frame (atomically, via rename) for offline comparison against the
  * original renderer's output. */
@@ -832,6 +840,16 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_withdraw_if_owned(api);
         return;
     }
+    /* Safe point for a deferred map reload: nothing consumes g_world yet on this
+     * dispatch, and (single game thread) no other dispatch's mesh build is in
+     * flight, so re-snapshotting here cannot free geometry under
+     * hwr_scene_build_mesh.  It runs before the refresh/render below, so the
+     * first frame after a load still renders the new map -- or fails closed
+     * through the same invalid-snapshot path as an inline reload would have. */
+    if (g_map_reload_pending) {
+        g_map_reload_pending = 0;
+        hwr_reload_map_data(api, g_map_reload_generation);
+    }
     if (g_backdrop_seed_pending)
         hwr_submit_backdrop_seed(api, &viewport);
     world_was_valid = g_world.valid;
@@ -1239,8 +1257,15 @@ failed:
 static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
                                           const struct roth_map_event_v1 *event)
 {
+    /* Do NOT reload inline: this event is raised from the engine's per-frame
+     * int33 pump and can land while a world render (hwr_scene_build_mesh) is on
+     * the stack, so an inline hwr_world_snapshot would free and reallocate
+     * g_world's geometry under the running mesh builder -- a use-after-free.
+     * Withdraw the now-stale GL frame and defer the re-snapshot to the render
+     * dispatch's safe point, keeping only the newest generation. */
     hwr_withdraw_if_owned(api);
-    hwr_reload_map_data(api, event->generation);
+    g_map_reload_generation = event->generation;
+    g_map_reload_pending = 1;
 }
 
 static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
