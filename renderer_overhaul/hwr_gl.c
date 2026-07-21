@@ -682,6 +682,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_shade_flatclip;\n"
     "uniform int u_shade_tintwall;\n"
     "uniform int u_shade_tintclip;\n"
+    "uniform int u_shade_flatvert;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
@@ -900,8 +901,16 @@ static const char g_geometry_fragment_shader[] =
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; int r;\n"
     "  if (flat_surface) {\n"
     "    if (tinted) {\n"
-    /* The edge term measures from the jittered shade origin (the light
-     * position); the jitter is the flicker. */
+    /* FLATVERT: the engine evaluates the flat shade only at the projected
+     * polygon vertices and interpolates it linearly in screen space.  When on,
+     * read the CPU-computed per-vertex row carried by the noperspective wall
+     * endpoint varying (stored for flats in the wall high-byte format) and
+     * truncate it per fragment; flats clamp to 0..31. */
+    "      if (u_shade_flatvert!=0)"
+    " return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
+    /* OFF path: the pre-FLATVERT per-pixel radial.  The edge term measures from
+     * the jittered shade origin (the light position); the jitter is the
+     * flicker. */
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
@@ -1763,7 +1772,10 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
  * three fragment-shader corrections against their pre-fix behaviour:
  *   HWR_SHADE_FULLBRIGHT=0  restores depth shading on effective-light-0 faces
  *   HWR_SHADE_FLATCLIP=0    restores the plain 0..31 clamp on untinted flats
- *   HWR_SHADE_TINTWALL=0    restores the interpolated per-corner tinted-wall row */
+ *   HWR_SHADE_TINTWALL=0    restores the interpolated per-corner tinted-wall row
+ *   HWR_SHADE_FLATVERT=0    restores the per-pixel radial on tinted flats (the
+ *                           default ON path is the engine's per-vertex,
+ *                           screen-linearly interpolated flat shade) */
 static int hwr_env_default_on(const char *name)
 {
     const char *v = getenv(name);
@@ -1795,6 +1807,13 @@ static int hwr_shade_tintclip_enabled(void)
 {
     static int e = -1;
     if (e < 0) e = hwr_env_default_on("HWR_SHADE_TINTCLIP");
+    return e;
+}
+
+static int hwr_shade_flatvert_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_FLATVERT");
     return e;
 }
 
@@ -1930,6 +1949,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    hwr_shade_tintwall_enabled());
     hwr_uniform_1i(g_geometry_program, "u_shade_tintclip",
                    hwr_shade_tintclip_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_flatvert",
+                   hwr_shade_flatvert_enabled());
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
      * scaled down with the shade level the same way its shift is. */
     hwr_uniform_1i(g_geometry_program, "u_wd_bias",

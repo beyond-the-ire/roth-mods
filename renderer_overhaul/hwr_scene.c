@@ -1669,6 +1669,52 @@ static int hwr_shade_tintclip_enabled(void)
     return enabled;
 }
 
+/* Shared view-space depth for the candle shade law.  Returns the vertex's view
+ * depth (before the near clamp) and, via view_x_out, its view-space X.  The wall
+ * endpoint word and the per-flat-vertex shade row both derive their screen
+ * column and 16-bit depth word from these two dot products. */
+static double hwr_vertex_view_depth(const struct hwr_mesh_vertex *vertex,
+                                    const struct hwr_gl_camera *camera,
+                                    double *view_x_out)
+{
+    int dx = (int16_t)((uint16_t)vertex->x + (uint16_t)camera->view_offset_x);
+    int dy = (int16_t)((uint16_t)vertex->y + (uint16_t)camera->view_offset_y);
+    double sine = (double)camera->yaw_sin / 16384.0;
+    double cosine = (double)camera->yaw_cos / 16384.0;
+    if (view_x_out != NULL)
+        *view_x_out = sine * (double)dx + cosine * (double)dy;
+    return sine * (double)dy - cosine * (double)dx;
+}
+
+/* The candle radial edge term shared by walls and flats: the Chebyshev distance
+ * from the jittered shade origin (0x90990/0x90992, the flickering light
+ * position) to the projected point, in the engine's 16-bit shade domain, plus
+ * the view-depth word.  screen_x/screen_y are the projected, viewport-clamped
+ * pixel coordinates; depth is the clamped view-depth word. */
+static uint16_t hwr_shade_edge_term(int screen_x, int screen_y,
+                                    const struct hwr_gl_camera *camera,
+                                    int depth)
+{
+    uint16_t scale_x = camera->focal_x != 0
+        ? (uint16_t)(0x40000u / camera->focal_x) : 0;
+    uint16_t scale_y = camera->focal_y != 0
+        ? (uint16_t)(0x40000u / camera->focal_y) : 0;
+    int16_t delta;
+    uint16_t magnitude;
+    uint16_t distance_x;
+    uint16_t distance_y;
+    uint16_t projected;
+
+    delta = (int16_t)((uint16_t)screen_x - (uint16_t)camera->shade_origin_x);
+    magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
+    distance_x = (uint16_t)(((uint32_t)magnitude * scale_x) >> 8);
+    delta = (int16_t)((uint16_t)screen_y - (uint16_t)camera->shade_origin_y);
+    magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
+    distance_y = (uint16_t)(((uint32_t)magnitude * scale_y) >> 8);
+    projected = distance_y > distance_x ? distance_y : distance_x;
+    return (uint16_t)(projected + (uint16_t)depth);
+}
+
 static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
                                        const struct hwr_mesh_vertex *vertex,
                                        int16_t bottom_z,
@@ -1676,21 +1722,11 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
                                        uint32_t width, uint32_t height,
                                        int tint_clip_adjust)
 {
-    int dx = (int16_t)((uint16_t)vertex->x + (uint16_t)camera->view_offset_x);
-    int dy = (int16_t)((uint16_t)vertex->y + (uint16_t)camera->view_offset_y);
-    double sine = (double)camera->yaw_sin / 16384.0;
-    double cosine = (double)camera->yaw_cos / 16384.0;
-    double view_x = sine * (double)dx + cosine * (double)dy;
-    double depth_f = sine * (double)dy - cosine * (double)dx;
+    double view_x;
+    double depth_f = hwr_vertex_view_depth(vertex, camera, &view_x);
     int depth;
     int screen_x;
     int screen_y;
-    int16_t delta;
-    uint16_t magnitude;
-    uint16_t scale_x;
-    uint16_t scale_y;
-    uint16_t distance_x;
-    uint16_t distance_y;
     uint16_t projected;
     uint8_t light = surface->light;
     int axv;
@@ -1720,18 +1756,7 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
             screen_x = (int)width - 1;
     }
 
-    scale_x = camera->focal_x != 0
-        ? (uint16_t)(0x40000u / camera->focal_x) : 0;
-    scale_y = camera->focal_y != 0
-        ? (uint16_t)(0x40000u / camera->focal_y) : 0;
-    delta = (int16_t)((uint16_t)screen_x - (uint16_t)camera->shade_origin_x);
-    magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
-    distance_x = (uint16_t)(((uint32_t)magnitude * scale_x) >> 8);
-    delta = (int16_t)((uint16_t)screen_y - (uint16_t)camera->shade_origin_y);
-    magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
-    distance_y = (uint16_t)(((uint32_t)magnitude * scale_y) >> 8);
-    projected = distance_y > distance_x ? distance_y : distance_x;
-    projected = (uint16_t)(projected + (uint16_t)depth);
+    projected = hwr_shade_edge_term(screen_x, screen_y, camera, depth);
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
@@ -1858,6 +1883,74 @@ static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
     if (height != 0 && y >= (int)height)
         return (int)height - 1;
     return y;
+}
+
+/* Per-FLAT-VERTEX candle shade row.  The engine draws a corridor floor/ceiling
+ * through draw_scaled_sprite_spans (0x39610): rasterize_floorceil_polygon
+ * (0x3b1c1) evaluates the shade at each PROJECTED polygon vertex via
+ * project_floorceil_edge_texcoord (0x3b724), and sprite_span_setup (0x39bd2)
+ * interpolates that row LINEARLY down the polygon edges and across each span --
+ * screen-space bilinear, NOT per pixel and NOT perspective-correct.  This
+ * mirrors that per-vertex evaluation for the mod's flat mesh corners; the GPU
+ * carries the returned row as a noperspective (screen-linear) varying and
+ * truncates it per fragment.  The two-lobe pool the engine shows arises because
+ * it samples only at sector-corner vertices (none on the corridor's bright
+ * centreline) and interpolates -- reproducing that structure is the point.
+ *
+ * The law is the same edge/depth structure as the wall endpoint word: the screen
+ * column and the 16-bit view-depth word come from the shared projection, but the
+ * screen row is the flat plane's own projection (hwr_flat_project_y, on the
+ * vertex's plane height) and the clamps are the FLAT clamps -- row<=0 -> 0
+ * (BRIGHT; the flat driver floors at 0, unlike the wall's floor of 1) and
+ * row>=0x1f -> 31, with no per-face clip scale. */
+static int hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
+                                    const struct hwr_mesh_vertex *vertex,
+                                    const struct hwr_gl_camera *camera,
+                                    uint32_t width, uint32_t height)
+{
+    double view_x;
+    double depth_f = hwr_vertex_view_depth(vertex, camera, &view_x);
+    int depth;
+    int screen_x;
+    int screen_y = hwr_flat_project_y(vertex, camera, height);
+    uint16_t projected;
+    uint8_t light = surface->light;
+    int axv;
+    int bias;
+    int level = camera->tint_shade_level;
+    int shade;
+
+    if (depth_f < 16.0)
+        depth_f = 16.0;
+    depth = (int)(depth_f * (camera->shade_depth_scale > 0.0f
+                          ? camera->shade_depth_scale : 1.0f));
+    if (depth < 16)
+        depth = 16;
+    screen_x = (int)(view_x * (double)camera->focal_x / depth_f) +
+               camera->center_x;
+    if (width != 0) {
+        if (screen_x < 0)
+            screen_x = 0;
+        else if (screen_x >= (int)width)
+            screen_x = (int)width - 1;
+    }
+
+    projected = hwr_shade_edge_term(screen_x, screen_y, camera, depth);
+
+    if (light != 0)
+        light = (uint8_t)(light + camera->global_light_bias);
+    /* FULLBRIGHT: an effective-light-0 face draws through the engine's unshaded
+     * mapper (row 0), matching the shader's top-of-shade_row gate. */
+    if (hwr_shade_fullbright_enabled() && light == 0)
+        return 0;
+    axv = light == 0 ? 0 : (int)light - 128;
+    bias = 8 + axv;
+    shade = (int)(projected >> (5 + level));
+    shade = (int16_t)(shade - bias);
+    shade = (int16_t)(shade - (int16_t)camera->flat_edge_bias);
+    if (shade <= 0)
+        return 0;
+    return shade < 31 ? shade : 31;
 }
 
 static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
@@ -2301,6 +2394,18 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
             target->wall_top = source->wall_top;
             target->pan_u = surface->pan_u;
             target->pan_v = surface->pan_v;
+            /* Tinted flats carry the engine's per-vertex candle shade row so the
+             * shader can interpolate it screen-linearly (noperspective) instead
+             * of evaluating a per-pixel radial.  It reuses the wall endpoint
+             * varying (unused by flats) in the wall's high-byte format, so the
+             * shader's `>> 8` extraction is uniform across both surface kinds.
+             * Untinted flats keep 0 here and take the FLATCLIP depth path. */
+            if ((surface->sector_flags & 2u) != 0) {
+                int flat_row = hwr_flat_shade_endpoint(
+                    surface, source, camera, width, height);
+                target->wall_shade_endpoint =
+                    (uint16_t)((uint16_t)(uint8_t)flat_row << 8);
+            }
         }
         if (logical < 0x1600u) {
             target->texture_offset = scene->textures[logical].offset;
