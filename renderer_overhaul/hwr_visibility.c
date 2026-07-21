@@ -42,13 +42,16 @@ struct hwr_pvs_ctx {
     long budget;
 };
 
-/* HWR_PVS: on unless explicitly set to 0. */
+/* HWR_PVS=1 enables the portal flood. Off by default: the angular windows
+ * still over-cull in motion (whole sectors can drop out until the camera
+ * crosses a boundary), so the flood stays opt-in until it reproduces the
+ * engine's own sector walk. */
 int hwr_pvs_enabled(void)
 {
     static int state = -1;
     if (state < 0) {
         const char *setting = getenv("HWR_PVS");
-        state = setting != NULL && setting[0] == '0' ? 0 : 1;
+        state = setting != NULL && setting[0] == '1' ? 1 : 0;
     }
     return state;
 }
