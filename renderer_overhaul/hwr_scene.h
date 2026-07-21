@@ -164,6 +164,13 @@ struct hwr_scene {
     uint16_t sky_texture_height;
     uint8_t sky_row_bias;
     uint8_t sky_valid;
+    /* Portal-reachable visibility (HWR_PVS). visible[sector] is 1 when the
+     * camera's flood reached that sector; visible_count is the allocated length
+     * and pvs_valid gates the cull (0 = every surface passes, the plain
+     * stream-everything behaviour). */
+    uint8_t *visible;
+    size_t visible_count;
+    int pvs_valid;
     int uploaded;
     int valid;
     int fallback_logged;

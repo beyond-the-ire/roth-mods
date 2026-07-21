@@ -1,8 +1,9 @@
 ROTH_SDK ?= ../../ROTH.C/sdk
 
 SOURCES := renderer_overhaul.c hwr_settings.c hwr_gl.c hwr_world.c hwr_das.c hwr_scene.c \
-           hwr_backdrop.c
+           hwr_backdrop.c hwr_visibility.c
 HEADERS := hwr_settings.h hwr_gl.h hwr_world.h hwr_das.h hwr_scene.h hwr_backdrop.h \
+           hwr_visibility.h \
            $(ROTH_SDK)/include/roth_sdk.h \
            $(ROTH_SDK)/include/roth_sdk_overrides.h
 

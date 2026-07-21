@@ -4,6 +4,8 @@
 
 #include "hwr_gl.h"
 
+#include "hwr_visibility.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -276,7 +278,7 @@ static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
                             const struct hwr_vertex *a,
                             const struct hwr_vertex *b,
                             int16_t top_a, int16_t top_b, int occluder,
-                            int full_height)
+                            int full_height, size_t sector_index)
 {
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *v;
@@ -290,6 +292,10 @@ static int hwr_emit_sky_cap(struct hwr_scene_mesh *mesh,
     if (surface == NULL)
         return -1;
     surface->texture_id = -1;
+    /* A cap belongs to the sector whose wall bears the sky flag, so the
+     * visibility gate drops it with that sector -- the engine only fills sky
+     * from the faces it actually visits. */
+    surface->sector_index = sector_index;
     surface->flags = (uint8_t)(HWR_SURFACE_SKY_CAP |
                                (occluder ? HWR_SURFACE_SKY_OCCLUDER : 0u));
     surface->aux = full_height ? 1u : 0u;
@@ -472,7 +478,8 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
                 &world->sectors[wall->neighbor_sector_index];
             cap_occluder = nb->ceiling_z >= sector->ceiling_z;
         }
-        if (hwr_emit_sky_cap(mesh, a, b, top_a, top_b, cap_occluder, 0) != 0) {
+        if (hwr_emit_sky_cap(mesh, a, b, top_a, top_b, cap_occluder, 0,
+                             wall->sector_index) != 0) {
             free(cuts);
             return -1;
         }
@@ -887,7 +894,8 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                     if (nb->floor_z > base)
                         base = nb->floor_z;
                 }
-                if (hwr_emit_sky_cap(mesh, a, b, base, base, 1, 0) != 0)
+                if (hwr_emit_sky_cap(mesh, a, b, base, base, 1, 0,
+                                     wall->sector_index) != 0)
                     goto failed;
             }
         }
@@ -920,6 +928,7 @@ void hwr_scene_clear(struct hwr_scene *scene)
     hwr_scene_animations_clear(scene);
     free(scene->stream_vertices);
     free(scene->translucent_runs);
+    free(scene->visible);
     memset(scene, 0, sizeof *scene);
 }
 
@@ -1519,6 +1528,14 @@ static int hwr_surface_visible(const struct hwr_scene *scene,
 {
     const struct hwr_scene_mesh *mesh = &scene->mesh;
     int16_t z;
+    /* Portal-reachable visibility gate. When the flood produced a valid set, a
+     * surface whose sector the camera could not reach through any portal
+     * opening is dropped -- including its sky caps -- so a sector stacked over
+     * or under the camera's own, but not reachable through the sight path, no
+     * longer bleeds through. Inert while pvs_valid is 0. */
+    if (scene->pvs_valid && surface->sector_index < scene->visible_count &&
+        !scene->visible[surface->sector_index])
+        return 0;
     if (surface->texture_id >= 0 &&
         (uint16_t)surface->texture_id < 0x1600u &&
         scene->textures[(uint16_t)surface->texture_id].skip)
@@ -2420,6 +2437,36 @@ static void hwr_scene_animate(struct hwr_scene *scene,
     }
 }
 
+/* Grows the per-sector visibility bitset to hold sector_count bytes. */
+static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count)
+{
+    if (sector_count == 0)
+        return -1;
+    if (scene->visible_count < sector_count) {
+        uint8_t *buffer = (uint8_t *)realloc(scene->visible, sector_count);
+        if (buffer == NULL)
+            return -1;
+        scene->visible = buffer;
+        scene->visible_count = sector_count;
+    }
+    return 0;
+}
+
+/* Reports the cull ratio once per mesh build under HWR_PVS_LOG=1. */
+static void hwr_scene_log_visibility(const struct hwr_scene *scene,
+                                     const struct hwr_world *world)
+{
+    size_t visible_sectors = 0;
+    size_t i;
+    if (!scene->pvs_valid || getenv("HWR_PVS_LOG") == NULL)
+        return;
+    for (i = 0; i < world->sector_count; i++)
+        visible_sectors += scene->visible[i] != 0 ? 1u : 0u;
+    fprintf(stderr,
+            "[renderer_overhaul] portal-reachable visibility: %u/%u sectors\n",
+            (unsigned)visible_sectors, (unsigned)world->sector_count);
+}
+
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
                                  const struct roth_api_v1 *api,
@@ -2449,6 +2496,14 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     camera.sky_yaw = api->game_ram->u16(VA_G_SKY_YAW);
     camera.sky_double_scanline = api->game_ram->u8(VA_G_DOUBLE_SCANLINE) != 0;
     camera.sky_valid = scene->sky_valid;
+    /* Portal-reachable visibility (HWR_PVS). When disabled or when the flood
+     * cannot seed, pvs_valid stays 0 and the per-surface gate is a no-op,
+     * leaving the frame identical to the plain stream-everything path. */
+    scene->pvs_valid = 0;
+    if (hwr_pvs_enabled() &&
+        hwr_scene_ensure_visible(scene, world->sector_count) == 0)
+        scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
+    hwr_scene_log_visibility(scene, world);
     if (hwr_prepare_stream(scene, &camera, width, height,
                            &sky_count, &opaque_count, &translucent_count,
                            &translucent_run_count) != 0)
