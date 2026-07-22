@@ -44,8 +44,7 @@ struct hwr_gl_vertex {
     uint16_t wall_shade_endpoint;
     /* Companion TOP-edge corner word (row<<8)|frac for a wall.  The tinted-wall
      * sub-row shade interpolates bilinearly between this and the bottom-edge
-     * word down each column (see the fragment shader's HWR_SHADE_SUBROW path).
-     * Zero for flats and non-shaded geometry. */
+     * word down each column.  Zero for flats and non-shaded geometry. */
     uint16_t wall_shade_endpoint_top;
     float wall_s;
     float wall_top;

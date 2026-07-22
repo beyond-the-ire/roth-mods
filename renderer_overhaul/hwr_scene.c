@@ -1645,30 +1645,6 @@ static float hwr_surface_depth(const struct hwr_mesh_surface *surface,
     return s * y - c * x;
 }
 
-/* Mirrors the shader's HWR_SHADE_FULLBRIGHT gate for the CPU tinted-wall
- * endpoint word: read once, default ON. */
-static int hwr_shade_fullbright_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *setting = getenv("HWR_SHADE_FULLBRIGHT");
-        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return enabled;
-}
-
-/* Mirrors the shader's HWR_SHADE_TINTCLIP gate for the CPU tinted-wall endpoint
- * word: read once, default ON. */
-static int hwr_shade_tintclip_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *setting = getenv("HWR_SHADE_TINTCLIP");
-        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return enabled;
-}
-
 /* DEFECT B gate (HWR_SHADE_WALLSEG).  When ON, a receding tinted wall is emitted
  * as several along-SCREEN sub-quads, each carrying its own pair of wd_project
  * corner words, so the shader's screen-linear corner-word ramp re-anchors the
@@ -1690,23 +1666,6 @@ static int hwr_shade_wallseg_enabled(void)
     if (enabled < 0) {
         const char *setting = getenv("HWR_SHADE_WALLSEG");
         enabled = setting != NULL && setting[0] == '1' ? 1 : 0;
-    }
-    return enabled;
-}
-
-/* SOLID-FILL gate (HWR_SHADE_SOLIDFILL), default ON.  Mirrors the engine's
- * all-corners-saturated wall fast path (renderer.c:5018, VA 0x371f3): when every
- * wd_project corner word of a wall column-block saturates (== 0x1fff, the
- * counter==4 test), the engine skips per-texel shading and solid-fills the block
- * with the map fill index.  When ON, the mod flags such (sub-)quads SOLID_FILL so
- * the shader outputs the fill index directly, matching the engine's featureless
- * far-dark instead of leaving faint row-31 texture structure. */
-static int hwr_shade_solidfill_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *setting = getenv("HWR_SHADE_SOLIDFILL");
-        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
     }
     return enabled;
 }
@@ -1802,9 +1761,9 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
-    /* FULLBRIGHT (FIX 1): an effective-light-0 face draws through the engine's
-     * unshaded mapper (colormap row 0), so the endpoint word is row 0. */
-    if (hwr_shade_fullbright_enabled() && light == 0)
+    /* An effective-light-0 face draws through the engine's unshaded mapper
+     * (colormap row 0), so the endpoint word is row 0. */
+    if (light == 0)
         return 0x0000u;
     axv = light == 0 ? 0 : (int)light - 128;
     bias = 8 + axv;
@@ -1860,8 +1819,6 @@ static int hwr_wall_tint_clip_adjust(const struct hwr_mesh_surface *surface,
     int adjust = 0, proceed = 1;
     size_t i;
 
-    if (!hwr_shade_tintclip_enabled())
-        return 0;
     /* texflags bit 0x10 set -> the composed fill-mode word never receives 0x40,
      * so the engine's wall driver skips this block for the surface. */
     if ((surface->mapping_flags & 0x10u) != 0)
@@ -2047,9 +2004,9 @@ static uint16_t hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
-    /* FULLBRIGHT: an effective-light-0 face draws through the engine's unshaded
-     * mapper (row 0), matching the shader's top-of-shade_row gate. */
-    if (hwr_shade_fullbright_enabled() && light == 0)
+    /* An effective-light-0 face draws through the engine's unshaded mapper
+     * (row 0), matching the shader's top-of-shade_row gate. */
+    if (light == 0)
         return 0;
     axv = light == 0 ? 0 : (int)light - 128;
     bias = 8 + axv;
@@ -2667,8 +2624,7 @@ static size_t hwr_surface_reserve(const struct hwr_mesh_surface *surface)
      * most a quad -> 2 output triangles = 6 vertices; over HWR_WALLSEG_MAX slabs
      * that is 2*HWR_WALLSEG_MAX per input vertex.  Reserve that so the staging
      * pass can never overrun the buffer. */
-    if ((surface->sector_flags & 2u) != 0 &&
-        (hwr_shade_wallseg_enabled() || hwr_shade_solidfill_enabled()))
+    if ((surface->sector_flags & 2u) != 0)
         return surface->vertex_count * (size_t)(2 * HWR_WALLSEG_MAX);
     return surface->vertex_count;
 }
@@ -2767,17 +2723,15 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
         wall_tint_adjust =
             hwr_wall_tint_clip_adjust(surface, &scene->mesh, camera);
     }
-    /* DEFECT B / SOLID-FILL: a receding tinted wall is emitted as several along-
-     * length sub-quads, each carrying its own wd_project corner words, so the
-     * shader's screen-linear ramp re-anchors piecewise.  SOLID-FILL subdivides
-     * here (default ON) only a face that STRADDLES the saturation boundary --
-     * some corners at 0x1fff and some not -- so its far sub-quads can solid-fill
-     * while the near ones stay texel-shaded; a face with no saturation stays
-     * single-ramp and byte-exact. */
+    /* Solid-fill: a receding tinted wall is emitted as several along-length
+     * sub-quads, each carrying its own wd_project corner words, so the shader's
+     * screen-linear ramp re-anchors piecewise.  This subdivides only a face that
+     * STRADDLES the saturation boundary -- some corners at 0x1fff and some not --
+     * so its far sub-quads can solid-fill while the near ones stay texel-shaded;
+     * a face with no saturation stays single-ramp and byte-exact. */
     if ((surface->flags & HWR_SURFACE_FLAT) == 0 &&
         (surface->sector_flags & 2u) != 0 && wall_span.valid &&
-        (hwr_shade_wallseg_enabled() ||
-         (hwr_shade_solidfill_enabled() && fill_ok)) &&
+        (hwr_shade_wallseg_enabled() || fill_ok) &&
         !hwr_wall_uses_image_fit(surface, texture_width, texture_height)) {
         const struct hwr_mesh_vertex *verts =
             &scene->mesh.vertices[surface->first_vertex];
@@ -2806,7 +2760,7 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
          * the saturation boundary (0 < saturated < 4), the exact receding faces
          * whose far end the engine solid-fills segment by segment. */
         int want_seg = hwr_shade_wallseg_enabled();
-        if (!want_seg && hwr_shade_solidfill_enabled() && fill_ok &&
+        if (!want_seg && fill_ok &&
             va != NULL && vb != NULL) {
             int sat =
                 (hwr_wall_endpoint_word(surface, va, bottom_a, camera,
@@ -2881,7 +2835,7 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                 wall_tint_adjust, half_pixel, (double)xl, (double)xr,
                 va->x, va->y, vb->x, vb->y,
                 bottom_a, top_a, bottom_b, top_b, sa, sb,
-                hwr_shade_solidfill_enabled() && fill_ok,
+                fill_ok,
                 &tmpl, destination);
         }
     }
@@ -2963,9 +2917,8 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
              * shader can interpolate it screen-linearly (noperspective) instead
              * of evaluating a per-pixel radial.  It reuses the wall endpoint
              * varying (unused by flats) in the wall's (row<<8)|frac format, which
-             * the shader floors per fragment for sub-row precision (see
-             * HWR_SHADE_SUBROW).  Untinted flats keep 0 here and take the
-             * FLATCLIP depth path. */
+             * the shader floors per fragment for sub-row precision.  Untinted
+             * flats keep 0 here and take the clamped depth path. */
             if ((surface->sector_flags & 2u) != 0) {
                 /* Fraction-bearing per-vertex candle word (row<<8)|frac; the
                  * shader floors it per fragment for sub-row precision. */
@@ -3016,7 +2969,7 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
      * that merely straddles the boundary took the subdivided path above and is
      * filled per sub-quad there; a partially saturated face left here keeps its
      * texel shading, matching the engine (only counter==4 fills). */
-    if (hwr_shade_solidfill_enabled() && fill_ok &&
+    if (fill_ok &&
         (surface->flags & HWR_SURFACE_FLAT) == 0 &&
         (surface->sector_flags & 2u) != 0) {
         int all_sat = 1;

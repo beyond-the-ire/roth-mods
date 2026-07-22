@@ -684,14 +684,7 @@ static const char g_geometry_fragment_shader[] =
     "uniform ivec2 u_shade_origin;\n"
     "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
-    "uniform int u_shade_fullbright;\n"
-    "uniform int u_shade_flatclip;\n"
-    "uniform int u_shade_tintwall;\n"
-    "uniform int u_shade_tintclip;\n"
     "uniform int u_shade_flatvert;\n"
-    "uniform int u_shade_wallclip;\n"
-    "uniform int u_shade_subrow;\n"
-    "uniform int u_shade_solidfill;\n"
     "uniform int u_fill_index;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
@@ -899,12 +892,12 @@ static const char g_geometry_fragment_shader[] =
     "int shade_row(int selected_level, bool tinted) {\n"
     "  int level=selected_level; int shr=5+level;\n"
     "  int light=effective_light();\n"
-    /* FULLBRIGHT (FIX 1): a face whose effective light resolves to 0 -- authored
-     * 0, or the flashed sum wrapping to 0 -- is drawn by the engine's UNSHADED
-     * mapper: colormap row 0, at every distance and for every surface class,
-     * because the column dispatcher takes that branch before any wall/flat/tint
-     * shade math.  Row 0 is the fullbright colormap row. */
-    "  if (u_shade_fullbright!=0 && light==0) return 0;\n"
+    /* A face whose effective light resolves to 0 -- authored 0, or the flashed
+     * sum wrapping to 0 -- is drawn by the engine's UNSHADED mapper: colormap
+     * row 0, at every distance and for every surface class, because the column
+     * dispatcher takes that branch before any wall/flat/tint shade math.  Row 0
+     * is the fullbright colormap row. */
+    "  if (light==0) return 0;\n"
     "  int axv=light==0 ? 0 : light-128;\n"
     "  int bias=8+axv;\n"
     "  int scale=light==0 ? 32 : 32-(max(axv+4,0) >> 2);\n"
@@ -925,14 +918,11 @@ static const char g_geometry_fragment_shader[] =
      * when v_flat_taint marks such a triangle, fall through to the per-pixel
      * radial below -- engine-faithful for the surviving fragments and glitch-
      * free. */
-    /* SUBROW: the per-vertex word now carries the engine's 8-bit sub-row
-     * fraction in its low byte; floor the interpolated word per fragment so a
-     * band boundary lands at the engine's sub-pixel height instead of snapping
-     * to the whole row (OFF path keeps the old whole-row truncate). */
+    /* The per-vertex word carries the engine's 8-bit sub-row fraction in its low
+     * byte; floor the interpolated word per fragment so a band boundary lands at
+     * the engine's sub-pixel height instead of snapping to the whole row. */
     "      if (u_shade_flatvert!=0 && v_flat_taint==0u)"
-    " return u_shade_subrow!=0"
-    " ? clamp(int(floor(v_wall_shade_endpoint/256.0)),0,31)"
-    " : clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
+    " return clamp(int(floor(v_wall_shade_endpoint/256.0)),0,31);\n"
     /* OFF path: the pre-FLATVERT per-pixel radial.  The edge term measures from
      * the jittered shade origin (the light position); the jitter is the
      * flicker. */
@@ -944,33 +934,35 @@ static const char g_geometry_fragment_shader[] =
     "      r=((r+32768) & 65535)-32768;\n"
     "      return r<=0 ? 1 : min(r,31);\n"
     "    }\n"
-    /* FLATCLIP (FIX 2): the engine's untinted-flat row is min(r, clip_scale, 31)
-     * with r<=0 -> row 0, so a dim sector's floor tops out at its clip scale
-     * exactly like the wall path below; clip_scale 0 pins the plane to row 0. */
+    /* The engine's untinted-flat row is min(r, clip_scale, 31) with r<=0 -> row
+     * 0, so a dim sector's floor tops out at its clip scale exactly like the wall
+     * path below; clip_scale 0 pins the plane to row 0. */
     "    r=(depth >> shr)-bias;\n"
     "    r=((r+32768) & 65535)-32768;\n"
-    "    return u_shade_flatclip!=0 ? clamp(r,0,min(scale,31)) : clamp(r,0,31);\n"
+    "    return clamp(r,0,min(scale,31));\n"
     "  }\n"
-    /* TINTWALL (FIX 3): a tinted wall's row is the engine's per-corner wd_project
-     * shade, evaluated PER PIXEL here.  The mod's wall surfaces are not split
-     * into the engine's short portal-clipped segments, so interpolating two
-     * corner words across a whole wall underestimates the Chebyshev candle
-     * radial toward the screen edges (the +16-row over-lightness).  The radial
-     * and depth reuse the tinted-flat structure; the wall subtracts the candle
-     * bias AND wd_project's own bias (wdbias, 8 at shade level 0). */
+    /* A tinted wall's row is the engine's per-corner wd_project shade.  Where the
+     * column DDA above cannot run (degenerate span) it is evaluated PER PIXEL
+     * here.  The mod's wall surfaces are not split into the engine's short
+     * portal-clipped segments, so interpolating two corner words across a whole
+     * wall underestimates the Chebyshev candle radial toward the screen edges
+     * (the +16-row over-lightness).  The radial and depth reuse the tinted-flat
+     * structure; the wall subtracts the candle bias AND wd_project's own bias
+     * (wdbias, 8 at shade level 0). */
     "  if (tinted) {\n"
-    /* SUBROW (default): reproduce wd_project's per-corner shade words and the
-     * engine's column DDA.  v_wall_shade_top / v_wall_shade_endpoint are the
-     * TOP / BOTTOM edge words (row<<8)|frac, each carried linear-in-X (both
-     * endpoints of a side hold the same word, and the wall's left/right screen
-     * edges are vertical columns, so the noperspective interpolation is exactly
-     * the engine's top-edge and bottom-edge lerps with no triangle-diagonal
-     * seam).  Down the column, mix the two words by the fraction of the way from
-     * the wall's projected top row to its bottom row (the same per-column top/
-     * bottom accumulators the texel path uses), then floor the interpolated word
-     * -- WITH its fraction -- to the shade row.  That is the engine's
-     * seed24 + k*q >> 16 DDA in floating point: row = floor(V/256). */
-    "    if (u_shade_subrow!=0 && v_wall_span.w!=0u) {\n"
+    /* Reproduce wd_project's per-corner shade words and the engine's column DDA.
+     * v_wall_shade_top / v_wall_shade_endpoint are the TOP / BOTTOM edge words
+     * (row<<8)|frac, each carried linear-in-X (both endpoints of a side hold the
+     * same word, and the wall's left/right screen edges are vertical columns, so
+     * the noperspective interpolation is exactly the engine's top-edge and
+     * bottom-edge lerps with no triangle-diagonal seam).  Down the column, mix
+     * the two words by the fraction of the way from the wall's projected top row
+     * to its bottom row (the same per-column top/bottom accumulators the texel
+     * path uses), then floor the interpolated word -- WITH its fraction -- to the
+     * shade row.  That is the engine's seed24 + k*q >> 16 DDA in floating point:
+     * row = floor(V/256).  A degenerate-span wall (no valid column DDA) falls to
+     * the per-pixel radial below. */
+    "    if (v_wall_span.w!=0u) {\n"
     "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
     "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
     "      uint ba=v_wall_rows.y+v_wall_rows.w*uint(scol);\n"
@@ -981,27 +973,24 @@ static const char g_geometry_fragment_shader[] =
     "      float V=mix(v_wall_shade_top,v_wall_shade_endpoint,t);\n"
     "      return clamp(int(floor(V/256.0)),0,31);\n"
     "    }\n"
-    "    if (u_shade_tintwall!=0) {\n"
+    "    {\n"
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
     "      int edge_depth=(depth+max(px,py)) & 65535;\n"
-    /* TINTCLIP (FIX 4): the engine's flags&0x40 wall block darkens the tinted
-     * bias by a per-face amount (effective_bias = bias - adjust) so receding
-     * walls drop up to 16 rows the interpolated corner word missed. */
-    "      int adj=u_shade_tintclip!=0 ? int(v_wall_tint_adjust) : 0;\n"
+    /* The engine's flags&0x40 wall block darkens the tinted bias by a per-face
+     * amount (effective_bias = bias - adjust) so receding walls drop up to 16
+     * rows the interpolated corner word missed. */
+    "      int adj=int(v_wall_tint_adjust);\n"
     "      r=(edge_depth >> shr)-(bias-adj)-u_wd_bias;\n"
     "      r=((r+32768) & 65535)-32768;\n"
-    /* WALLCLIP (FIX 5): wd_project (renderer.c:4338) clamps a wall row at the
-     * sector's clip_scale ceiling BEFORE the 31 clamp, so a dim sector's darkest
-     * wall tops out below 31 and stays dimly visible instead of crushing to near-
-     * black.  The interpolated corner-word fallback below already carries it (the
-     * CPU hwr_wall_endpoint_word applies clip_scale); the per-pixel path was
-     * missing it.  clip_scale==scale here (both 32-(max(light-124,0)>>2)). */
-    "      int cap=u_shade_wallclip!=0 ? min(scale,31) : 31;\n"
+    /* wd_project (renderer.c:4338) clamps a wall row at the sector's clip_scale
+     * ceiling BEFORE the 31 clamp, so a dim sector's darkest wall tops out below
+     * 31 and stays dimly visible instead of crushing to near-black.
+     * clip_scale==scale here (both 32-(max(light-124,0)>>2)). */
+    "      int cap=min(scale,31);\n"
     "      return r<=0 ? 1 : min(r,cap);\n"
     "    }\n"
-    "    return clamp(int(v_wall_shade_endpoint) >> 8,0,31);\n"
     "  }\n"
     "  int dividend=2 << level;\n"
     /* The wall span divisors are the 16-bit vertex depth words, already in
@@ -1014,9 +1003,9 @@ static const char g_geometry_fragment_shader[] =
      * endpoint accumulator is not available here, so use the same depth word;
      * integer reciprocal boundaries are the remaining exceptional columns. */
     "int dithered_row(int row, int selected_level, bool tinted) {\n"
-    /* FULLBRIGHT (FIX 1): an effective-light-0 face is fullbright at every
-     * distance, so the depth checker must not darken its row 0. */
-    "  if (u_shade_fullbright!=0 && effective_light()==0) return row;\n"
+    /* An effective-light-0 face is fullbright at every distance, so the depth
+     * checker must not darken its row 0. */
+    "  if (effective_light()==0) return row;\n"
     "  if (tinted || (v_light_material.y & 8u)!=0u) return row;\n"
     "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
     "  int depth=(transformed >> 8) & 65535;\n"
@@ -1058,12 +1047,12 @@ static const char g_geometry_fragment_shader[] =
     "    out_index=u_debug_vis==1 ? 255u : stexel;\n"
     "    return;\n"
     "  }\n"
-    /* SOLID-FILL: an all-corners-saturated tinted wall block (flagged on the
-     * wall-wrap attribute bit 3) skips texel sampling and shading entirely and
-     * outputs the map fill index, exactly like the engine's counter==4 fast path.
-     * Only in normal rendering -- every debug_vis mode falls through so texel,
-     * offset, material and shade-row attribution keep working on these walls. */
-    "  if (u_shade_solidfill!=0 && u_debug_vis==0 &&"
+    /* An all-corners-saturated tinted wall block (flagged on the wall-wrap
+     * attribute bit 3) skips texel sampling and shading entirely and outputs the
+     * map fill index, exactly like the engine's counter==4 fast path.  Only in
+     * normal rendering -- every debug_vis mode falls through so texel, offset,
+     * material and shade-row attribution keep working on these walls. */
+    "  if (u_debug_vis==0 &&"
     " (v_light_material.w & 8u)!=0u) {\n"
     "    out_index=uint(u_fill_index) & 255u;\n"
     "    return;\n"
@@ -1838,86 +1827,20 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
     return 1;
 }
 
-/* Shade-parity kill switches, each read once and defaulting ON.  They gate the
- * three fragment-shader corrections against their pre-fix behaviour:
- *   HWR_SHADE_FULLBRIGHT=0  restores depth shading on effective-light-0 faces
- *   HWR_SHADE_FLATCLIP=0    restores the plain 0..31 clamp on untinted flats
- *   HWR_SHADE_TINTWALL=0    restores the interpolated per-corner tinted-wall row
- *   HWR_SHADE_FLATVERT=0    restores the per-pixel radial on tinted flats (the
- *                           default ON path is the engine's per-vertex,
- *                           screen-linearly interpolated flat shade, with a
- *                           per-pixel-radial fallback for clipped-corner triangles)
- *   HWR_SHADE_WALLCLIP=0    restores the 0..31 tinted-wall clamp WITHOUT the
- *                           engine's per-sector clip_scale ceiling (wd_project)
- *   HWR_SHADE_SUBROW=0      restores the pre-sub-row candle shade: tinted walls
- *                           fall back to the per-pixel TINTWALL radial and tinted
- *                           flats truncate the per-vertex word to a whole row.
- *                           Default ON reproduces the engine's sub-row precision
- *                           -- the tinted wall bilinearly interpolates its TOP and
- *                           BOTTOM wd_project corner words (row<<8)|frac down each
- *                           column and floors WITH the fraction (the engine's
- *                           column DDA), and the tinted flat floors the fraction-
- *                           bearing per-vertex word -- so band boundaries walk the
- *                           engine's ragged staircase instead of square rings. */
+/* HWR_SHADE_FLATVERT (read once, default ON) selects how tinted flats are shaded.
+ * Default ON is the engine's per-vertex, screen-linearly interpolated flat shade,
+ * with a per-pixel-radial fallback for clipped-corner triangles; =0 restores the
+ * plain per-pixel radial on tinted flats. */
 static int hwr_env_default_on(const char *name)
 {
     const char *v = getenv(name);
     return (v != NULL && v[0] == '0') ? 0 : 1;
 }
 
-static int hwr_shade_fullbright_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_FULLBRIGHT");
-    return e;
-}
-
-static int hwr_shade_flatclip_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_FLATCLIP");
-    return e;
-}
-
-static int hwr_shade_tintwall_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_TINTWALL");
-    return e;
-}
-
-static int hwr_shade_tintclip_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_TINTCLIP");
-    return e;
-}
-
 static int hwr_shade_flatvert_enabled(void)
 {
     static int e = -1;
     if (e < 0) e = hwr_env_default_on("HWR_SHADE_FLATVERT");
-    return e;
-}
-
-static int hwr_shade_wallclip_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_WALLCLIP");
-    return e;
-}
-
-static int hwr_shade_subrow_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_SUBROW");
-    return e;
-}
-
-static int hwr_shade_solidfill_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_SOLIDFILL");
     return e;
 }
 
@@ -2045,22 +1968,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
-    hwr_uniform_1i(g_geometry_program, "u_shade_fullbright",
-                   hwr_shade_fullbright_enabled());
-    hwr_uniform_1i(g_geometry_program, "u_shade_flatclip",
-                   hwr_shade_flatclip_enabled());
-    hwr_uniform_1i(g_geometry_program, "u_shade_tintwall",
-                   hwr_shade_tintwall_enabled());
-    hwr_uniform_1i(g_geometry_program, "u_shade_tintclip",
-                   hwr_shade_tintclip_enabled());
     hwr_uniform_1i(g_geometry_program, "u_shade_flatvert",
                    hwr_shade_flatvert_enabled());
-    hwr_uniform_1i(g_geometry_program, "u_shade_wallclip",
-                   hwr_shade_wallclip_enabled());
-    hwr_uniform_1i(g_geometry_program, "u_shade_subrow",
-                   hwr_shade_subrow_enabled());
-    hwr_uniform_1i(g_geometry_program, "u_shade_solidfill",
-                   hwr_shade_solidfill_enabled());
     hwr_uniform_1i(g_geometry_program, "u_fill_index",
                    camera->solid_fill_index);
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
