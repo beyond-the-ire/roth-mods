@@ -1669,6 +1669,48 @@ static int hwr_shade_tintclip_enabled(void)
     return enabled;
 }
 
+/* DEFECT B gate (HWR_SHADE_WALLSEG).  When ON, a receding tinted wall is emitted
+ * as several along-SCREEN sub-quads, each carrying its own pair of wd_project
+ * corner words, so the shader's screen-linear corner-word ramp re-anchors the
+ * nonlinear (hyperbolic) depth+candle law piecewise.
+ *
+ * Default OFF.  This subdivision was implemented and stress-tested (world-t and
+ * screen-X splits, and a forced-max variant that subdivides EVERY tinted wall):
+ * none measurably reduced the far-wall darkness undershoot -- forcing seg=8 on
+ * ~22.5k walls held the hard-undershoot fraction at ~0.28%, identical to no
+ * subdivision within frame-jitter noise.  The residual "faint far door" is thus
+ * in the corner-WORD value (hwr_wall_endpoint_word vs the engine's per-column
+ * DDA at large depth) or in texel divergence, NOT in the ramp's granularity, so
+ * subdivision cannot fix it.  Defaulting OFF keeps tinted walls byte-identical to
+ * the accepted (~95% exact) baseline -- zero wall-regression risk -- while the
+ * machinery stays available: HWR_SHADE_WALLSEG=1 enables it. */
+static int hwr_shade_wallseg_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SHADE_WALLSEG");
+        enabled = setting != NULL && setting[0] == '1' ? 1 : 0;
+    }
+    return enabled;
+}
+
+/* SOLID-FILL gate (HWR_SHADE_SOLIDFILL), default ON.  Mirrors the engine's
+ * all-corners-saturated wall fast path (renderer.c:5018, VA 0x371f3): when every
+ * wd_project corner word of a wall column-block saturates (== 0x1fff, the
+ * counter==4 test), the engine skips per-texel shading and solid-fills the block
+ * with the map fill index.  When ON, the mod flags such (sub-)quads SOLID_FILL so
+ * the shader outputs the fill index directly, matching the engine's featureless
+ * far-dark instead of leaving faint row-31 texture structure. */
+static int hwr_shade_solidfill_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SHADE_SOLIDFILL");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 /* Shared view-space depth for the candle shade law.  Returns the vertex's view
  * depth (before the near clamp) and, via view_x_out, its view-space X.  The wall
  * endpoint word and the per-flat-vertex shade row both derive their screen
@@ -2312,7 +2354,326 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
     state->valid = 1;
 }
 
-static void hwr_copy_gpu_surface(struct hwr_scene *scene,
+/* ======================================================================
+ * DEFECT B / SOLID-FILL: per-frame along-wall subdivision so the candle
+ * shade is evaluated at the same anchor points the engine uses (per
+ * portal-segment column blocks), and the all-corners-saturated fast path.
+ * All arithmetic is in world-space doubles; every along-wall screen-column
+ * boundary is an affine function of world (x,y,z) within one triangle, so
+ * linear edge interpolation of the signed distance gives the exact crossing.
+ * ====================================================================== */
+
+/* A wall band-triangle clipped to a screen-column slab is at most a quad, so a
+ * small fixed polygon buffer is enough. */
+#define HWR_CLIP_MAX 12
+
+struct hwr_clip_pt {
+    double x;
+    double y;
+    double z;
+};
+
+/* Round to nearest int16 without pulling in libm (the mod links neither -lm nor
+ * any float runtime symbol). */
+static int16_t hwr_round_i16(double v)
+{
+    return (int16_t)(int)(v >= 0.0 ? v + 0.5 : v - 0.5);
+}
+
+/* View-space (view_x, depth) of a world point, matching hwr_vertex_view_depth
+ * but on doubles and WITHOUT the 16-bit coordinate wrap (a single triangle
+ * never spans a wrap boundary, so the wrap is the identity here). */
+static void hwr_view_project(double x, double y,
+                             const struct hwr_gl_camera *camera,
+                             double *view_x, double *depth)
+{
+    double sine = (double)camera->yaw_sin / 16384.0;
+    double cosine = (double)camera->yaw_cos / 16384.0;
+    double dx = x + (double)camera->view_offset_x;
+    double dy = y + (double)camera->view_offset_y;
+    *view_x = sine * dx + cosine * dy;
+    *depth = sine * dy - cosine * dx;
+}
+
+/* Sutherland-Hodgman clip of polygon `in` (n points) against one half-plane,
+ * given the pre-computed signed distance of every input point.  Keeps the
+ * dist>=0 side and inserts the exact edge crossings.  Output <= n+1 points. */
+static int hwr_clip_halfplane(const struct hwr_clip_pt *in, int n,
+                              const double *dist, struct hwr_clip_pt *out)
+{
+    int i, m = 0;
+    for (i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        int in_i = dist[i] >= 0.0;
+        int in_j = dist[j] >= 0.0;
+        if (in_i)
+            out[m++] = in[i];
+        if (in_i != in_j) {
+            double t = dist[i] / (dist[i] - dist[j]);
+            out[m].x = in[i].x + t * (in[j].x - in[i].x);
+            out[m].y = in[i].y + t * (in[j].y - in[i].y);
+            out[m].z = in[i].z + t * (in[j].z - in[i].z);
+            m++;
+        }
+    }
+    return m;
+}
+
+/* --- DEFECT B along-wall subdivision --- */
+#define HWR_WALLSEG_MAX 8      /* cap on along-screen sub-quads per wall */
+#define HWR_WALLSEG_PX 40      /* target screen span per sub-quad (px) */
+
+/* Along-wall parameter t in [0,1] (0 at end_a, 1 at end_b), affine in (x,y).
+ * Used only to interpolate the wall's top/bottom edge Z and the along texture
+ * coordinate at a sub-vertex; the SPLIT itself is done in screen-X. */
+static double hwr_wall_param(double x, double y, double ax, double ay,
+                             double dir_x, double dir_y, double inv_len2)
+{
+    return ((x - ax) * dir_x + (y - ay) * dir_y) * inv_len2;
+}
+
+/* depth * (screen_x - bound)  for upper==0, or depth * (bound - screen_x) for
+ * upper==1.  Affine in world (x,y) and, since a visible wall's depth is > 0
+ * throughout, sign-equal to the screen_x comparison -- so it is a valid clip
+ * half-plane for splitting the wall at a screen column. */
+static double hwr_wall_screenx_dist(double x, double y,
+                                    const struct hwr_gl_camera *camera,
+                                    double bound, int upper)
+{
+    double view_x, depth;
+    double sx_term, b_term;
+    hwr_view_project(x, y, camera, &view_x, &depth);
+    sx_term = view_x * (double)camera->focal_x;
+    b_term = (bound - (double)camera->center_x) * depth;
+    return upper ? (b_term - sx_term) : (sx_term - b_term);
+}
+
+/* Decide how many along-SCREEN sub-quads a tinted wall wants.  Splitting in
+ * screen-X (the space the noperspective corner-word varying interpolates in)
+ * puts equal-error anchors along the ramp, so the far, screen-compressed end
+ * where the hyperbolic depth law bends most gets its own anchors.  Only a
+ * receding wall with a meaningful screen span subdivides; a face-on or short
+ * wall keeps its single ramp (returns 1). */
+static int hwr_wall_segment_count(int xl, int xr, int depth_a, int depth_b)
+{
+    int span = xr - xl;
+    int lo = depth_a < depth_b ? depth_a : depth_b;
+    int hi = depth_a < depth_b ? depth_b : depth_a;
+    int n;
+    if (span < 2 * HWR_WALLSEG_PX || lo <= 0)
+        return 1;
+    /* A near-face-on wall (little depth variation) already interpolates almost
+     * linearly, so only subdivide when the far end is clearly deeper. */
+    if ((double)hi < 1.3 * (double)lo)
+        return 1;
+    n = (span + HWR_WALLSEG_PX / 2) / HWR_WALLSEG_PX;
+    if (n < 2)
+        n = 2;
+    if (n > HWR_WALLSEG_MAX)
+        n = HWR_WALLSEG_MAX;
+    return n;
+}
+
+/* SOLID-FILL exemption.  The engine reaches its counter==4 fast path only inside
+ * the corner-projection variant gated on g_world_alt_render_flags 0x8000, AND
+ * only when g_world_surface_draw_flags bit 0 is clear (the `& 1` gate,
+ * renderer.c:5018).  Two engine mechanisms take a face off that path, and this
+ * mirrors both:
+ *
+ *  1. GLOW / emissive faces.  The per-face shade prologue (renderer.c:9200)
+ *     SETS alt_render 0x8000 for a tinted face but CLEARS it again for a glow
+ *     face (edge flag 0x40 + the blend gate), so a glow face never enters the
+ *     fill variant -- it is drawn through the glow colormap at full emissive
+ *     brightness instead, which is why the studyshade stained-glass window is
+ *     bright in the engine and must never be solid-filled to the map's dark
+ *     fill index.  The mod carries the glow bit at sector granularity
+ *     (sector_flags 0x40, the same bit its fragment glow branch keys on), so
+ *     drop the fill for any glow-sector face.
+ *
+ *  2. MASKED transparent middles.  For a non-glow tinted face the `& 1` bit is
+ *     the per-part render-flags bit 0 (emit_world_span_record 0x2d130 copies it
+ *     into the span mode word; it is loaded per part from the ES record at
+ *     renderer.c:9026).  It is set on the masked span writers -- a one-sided
+ *     wall's masked middle (a window) or a two-sided wall's masked opening --
+ *     and clear on the opaque upper/lower/slab parts, so those always fill.  The
+ *     mod already carries that per-part distinction as HWR_SURFACE_MASKED (set
+ *     only for the masked middle).  The texture's 0x2000000 qflags bit OVERRIDES
+ *     it back onto the fill path (renderer.c:13285: `draw_flags &= ~1`), so a
+ *     masked middle whose texture carries it (a tiling transparent grate) still
+ *     fills; only a masked middle LACKING it stays exempt.  In the runtime block
+ *     the on-disk 16-bit payload flags land in the HIGH word of the 32-bit
+ *     qflags read (read_das_block_payload writes the payload to block+0xa), so
+ *     runtime 0x2000000 == the mod's staged qflags 0x200 -- the same field
+ *     hwr_surface_translucent reads at 0x400. */
+static int hwr_fill_face_allowed(const struct hwr_scene *scene,
+                                 const struct hwr_mesh_surface *surface)
+{
+    uint16_t logical;
+    if ((surface->sector_flags & 0x40u) != 0)
+        return 0;                                   /* glow face: never filled */
+    if ((surface->flags & HWR_SURFACE_MASKED) == 0)
+        return 1;                                   /* opaque part: always fills */
+    logical = (uint16_t)surface->texture_id;
+    if (logical < 0x1600u && (scene->textures[logical].qflags & 0x200u) != 0)
+        return 1;                                   /* 0x2000000 override: fills */
+    return 0;                                       /* masked, no override: exempt */
+}
+
+/* DEFECT B: emit a tinted wall as `segments` along-length sub-quads.  Each of
+ * the surface's band triangles is clipped to each along-slab [t_k,t_{k+1}] and
+ * fan-triangulated; every surviving vertex carries the TOP/BOTTOM wd_project
+ * corner words evaluated at ITS along-position, so the shader's screen-linear
+ * corner-word ramp becomes piecewise and tracks the hyperbolic law.  The whole-
+ * wall span/DDA state in `tmpl` is copied unchanged (the shader keys its texel
+ * and row DDAs on the absolute screen column), so texel mapping is untouched.
+ * Per slab, when every corner word saturates (== 0x1fff) and fill_solid is set,
+ * flag its vertices SOLID_FILL so the shader outputs the map fill index.
+ * Returns the emitted vertex count. */
+static size_t hwr_emit_wall_segmented(const struct hwr_scene_mesh *mesh,
+                                      const struct hwr_mesh_surface *surface,
+                                      const struct hwr_gl_camera *camera,
+                                      uint32_t width, uint32_t height,
+                                      int segments, int wall_tint_adjust,
+                                      int half_pixel, double xl, double xr,
+                                      double ax, double ay, double bx, double by,
+                                      int16_t bottom_a, int16_t top_a,
+                                      int16_t bottom_b, int16_t top_b,
+                                      float sa, float sb, int fill_solid,
+                                      const struct hwr_gl_vertex *tmpl,
+                                      struct hwr_gl_vertex *dst)
+{
+    double dir_x = bx - ax;
+    double dir_y = by - ay;
+    double len2 = dir_x * dir_x + dir_y * dir_y;
+    double inv_len2 = len2 > 0.0 ? 1.0 / len2 : 0.0;
+    double vscale = half_pixel ? 2.0 : 1.0;
+    size_t out = 0;
+    size_t base;
+    int seg;
+    if (inv_len2 == 0.0)
+        return 0;
+    for (base = 0; base + 3u <= surface->vertex_count; base += 3u) {
+        struct hwr_clip_pt tri[3];
+        int k;
+        for (k = 0; k < 3; k++) {
+            const struct hwr_mesh_vertex *v =
+                &mesh->vertices[surface->first_vertex + base + (size_t)k];
+            tri[k].x = v->x;
+            tri[k].y = v->y;
+            tri[k].z = v->z;
+        }
+        for (seg = 0; seg < segments; seg++) {
+            double x0 = xl + (xr - xl) * (double)seg / (double)segments;
+            double x1 = xl + (xr - xl) * (double)(seg + 1) / (double)segments;
+            struct hwr_clip_pt poly[HWR_CLIP_MAX];
+            struct hwr_clip_pt tmp2[HWR_CLIP_MAX];
+            double dist[HWR_CLIP_MAX];
+            int n = 3, c, m;
+            for (c = 0; c < 3; c++)
+                poly[c] = tri[c];
+            /* clip to screen_x >= x0 (skip on the first slab: xl already bounds
+             * the wall, and an exact-boundary re-clip could drop a seam column) */
+            if (seg > 0) {
+                for (c = 0; c < n; c++)
+                    dist[c] = hwr_wall_screenx_dist(poly[c].x, poly[c].y,
+                                                    camera, x0, 0);
+                m = hwr_clip_halfplane(poly, n, dist, tmp2);
+                if (m > HWR_CLIP_MAX)
+                    m = HWR_CLIP_MAX;
+                memcpy(poly, tmp2, (size_t)m * sizeof poly[0]);
+                n = m;
+                if (n < 3)
+                    continue;
+            }
+            /* clip to screen_x <= x1 (skip on the last slab: xr already bounds) */
+            if (seg + 1 < segments) {
+                for (c = 0; c < n; c++)
+                    dist[c] = hwr_wall_screenx_dist(poly[c].x, poly[c].y,
+                                                    camera, x1, 1);
+                m = hwr_clip_halfplane(poly, n, dist, tmp2);
+                if (m > HWR_CLIP_MAX)
+                    m = HWR_CLIP_MAX;
+                memcpy(poly, tmp2, (size_t)m * sizeof poly[0]);
+                n = m;
+                if (n < 3)
+                    continue;
+            }
+            /* Per-slab SOLID-FILL: the engine's counter==4 fast path fires per
+             * portal-clipped column block, so decide it per sub-quad here.  When
+             * every corner word this slab emits saturates (== 0x1fff), flag all
+             * of its vertices so the shader outputs the fill index directly. */
+            size_t seg_first = out;
+            int seg_all_sat = 1;
+            for (k = 1; k + 1 < n; k++) {
+                int corner[3];
+                int j;
+                corner[0] = 0;
+                corner[1] = k;
+                corner[2] = k + 1;
+                for (j = 0; j < 3; j++) {
+                    struct hwr_mesh_vertex mv;
+                    struct hwr_gl_vertex *o = &dst[out++];
+                    double t = hwr_wall_param(poly[corner[j]].x,
+                                              poly[corner[j]].y, ax, ay,
+                                              dir_x, dir_y, inv_len2);
+                    double bz = (double)bottom_a + ((double)bottom_b - bottom_a) * t;
+                    double tz = (double)top_a + ((double)top_b - top_a) * t;
+                    int16_t vz = hwr_round_i16(poly[corner[j]].z);
+                    mv.x = hwr_round_i16(poly[corner[j]].x);
+                    mv.y = hwr_round_i16(poly[corner[j]].y);
+                    mv.z = vz;
+                    mv.reserved = 0;
+                    mv.wall_s = 0.0f;
+                    mv.wall_top = 0.0f;
+                    *o = *tmpl;
+                    o->x = mv.x;
+                    o->y = mv.y;
+                    o->z = vz;
+                    o->wall_shade_endpoint = hwr_wall_endpoint_word(
+                        surface, &mv, hwr_round_i16(bz), camera, width, height,
+                        wall_tint_adjust);
+                    o->wall_shade_endpoint_top = hwr_wall_endpoint_word(
+                        surface, &mv, hwr_round_i16(tz), camera, width, height,
+                        wall_tint_adjust);
+                    if (o->wall_shade_endpoint != 0x1fffu ||
+                        o->wall_shade_endpoint_top != 0x1fffu)
+                        seg_all_sat = 0;
+                    o->wall_s = (float)((double)sa + ((double)sb - sa) * t) *
+                                (float)vscale;
+                    o->wall_top = (float)(tz - (double)vz) * (float)vscale;
+                }
+            }
+            if (fill_solid && seg_all_sat && out > seg_first) {
+                size_t f;
+                for (f = seg_first; f < out; f++)
+                    dst[f].wall_wrap_flags |= HWR_GL_WALL_SOLID_FILL;
+            }
+        }
+    }
+    return out;
+}
+
+/* Worst-case streamed vertex count for a surface, so hwr_prepare_stream can
+ * pre-size the stream buffer before the (possibly expanding) staging pass.  Only
+ * tinted walls expand (along-length sub-quads); flats and sky caps are 1:1. */
+static size_t hwr_surface_reserve(const struct hwr_mesh_surface *surface)
+{
+    if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0)
+        return surface->vertex_count;
+    if ((surface->flags & HWR_SURFACE_FLAT) != 0)
+        return surface->vertex_count;
+    /* Band-triangle vertices sit only at the two wall ends (t==0 or t==1), never
+     * strictly inside an along-slab, so a band triangle clipped to one slab is at
+     * most a quad -> 2 output triangles = 6 vertices; over HWR_WALLSEG_MAX slabs
+     * that is 2*HWR_WALLSEG_MAX per input vertex.  Reserve that so the staging
+     * pass can never overrun the buffer. */
+    if ((surface->sector_flags & 2u) != 0 &&
+        (hwr_shade_wallseg_enabled() || hwr_shade_solidfill_enabled()))
+        return surface->vertex_count * (size_t)(2 * HWR_WALLSEG_MAX);
+    return surface->vertex_count;
+}
+
+static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                                  const struct hwr_mesh_surface *surface,
                                  const struct hwr_gl_camera *camera,
                                  uint32_t width, uint32_t height,
@@ -2330,6 +2691,10 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
     int flat_square256 = 0;
     int wall_stale = 0;
     int wall_tint_adjust = 0;
+    /* SOLID-FILL is allowed unless this is a masked (transparent) part whose
+     * texture lacks the 0x2000000 override -- the engine's per-part `& 1`
+     * exemption; windows / stained glass are never filled however saturated. */
+    int fill_ok = hwr_fill_face_allowed(scene, surface);
     struct hwr_wall_span_state wall_span = {0};
     size_t i;
     /* Sky caps carry only a position; the SKY-material fragment branch derives
@@ -2350,7 +2715,7 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                 (surface->aux != 0
                      ? HWR_GL_MATERIAL_SKY_FULL_HEIGHT : 0u));
         }
-        return;
+        return surface->vertex_count;
     }
     if (logical < 0x1600u) {
         texture_width = scene->textures[logical].width;
@@ -2401,6 +2766,124 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
                             texture_width, texture_height, &wall_span);
         wall_tint_adjust =
             hwr_wall_tint_clip_adjust(surface, &scene->mesh, camera);
+    }
+    /* DEFECT B / SOLID-FILL: a receding tinted wall is emitted as several along-
+     * length sub-quads, each carrying its own wd_project corner words, so the
+     * shader's screen-linear ramp re-anchors piecewise.  SOLID-FILL subdivides
+     * here (default ON) only a face that STRADDLES the saturation boundary --
+     * some corners at 0x1fff and some not -- so its far sub-quads can solid-fill
+     * while the near ones stay texel-shaded; a face with no saturation stays
+     * single-ramp and byte-exact. */
+    if ((surface->flags & HWR_SURFACE_FLAT) == 0 &&
+        (surface->sector_flags & 2u) != 0 && wall_span.valid &&
+        (hwr_shade_wallseg_enabled() ||
+         (hwr_shade_solidfill_enabled() && fill_ok)) &&
+        !hwr_wall_uses_image_fit(surface, texture_width, texture_height)) {
+        const struct hwr_mesh_vertex *verts =
+            &scene->mesh.vertices[surface->first_vertex];
+        const struct hwr_mesh_vertex *va = NULL;
+        const struct hwr_mesh_vertex *vb = NULL;
+        int16_t bottom_a = INT16_MAX, top_a = INT16_MIN;
+        int16_t bottom_b = INT16_MAX, top_b = INT16_MIN;
+        float sa = 0.0f, sb = 0.0f;
+        int half_pixel = (surface->mapping_flags & HWR_TEX_HALF_PIXEL) != 0;
+        int32_t view_a, view_b, depth_a_q8, depth_b_q8;
+        int xl, xr, depth_a, depth_b, segments;
+        size_t j;
+        for (j = 0; j < surface->vertex_count; j++) {
+            if ((verts[j].reserved & HWR_WALL_CORNER_END_B) != 0) {
+                if (vb == NULL) { vb = &verts[j]; sb = verts[j].wall_s; }
+                if (verts[j].z < bottom_b) bottom_b = verts[j].z;
+                if (verts[j].z > top_b) top_b = verts[j].z;
+            } else {
+                if (va == NULL) { va = &verts[j]; sa = verts[j].wall_s; }
+                if (verts[j].z < bottom_a) bottom_a = verts[j].z;
+                if (verts[j].z > top_a) top_a = verts[j].z;
+            }
+        }
+        /* Decide whether to subdivide.  HWR_SHADE_WALLSEG forces it globally; the
+         * SOLID-FILL auto-trigger opts in only faces whose corner words straddle
+         * the saturation boundary (0 < saturated < 4), the exact receding faces
+         * whose far end the engine solid-fills segment by segment. */
+        int want_seg = hwr_shade_wallseg_enabled();
+        if (!want_seg && hwr_shade_solidfill_enabled() && fill_ok &&
+            va != NULL && vb != NULL) {
+            int sat =
+                (hwr_wall_endpoint_word(surface, va, bottom_a, camera,
+                     width, height, wall_tint_adjust) == 0x1fffu) +
+                (hwr_wall_endpoint_word(surface, va, top_a, camera,
+                     width, height, wall_tint_adjust) == 0x1fffu) +
+                (hwr_wall_endpoint_word(surface, vb, bottom_b, camera,
+                     width, height, wall_tint_adjust) == 0x1fffu) +
+                (hwr_wall_endpoint_word(surface, vb, top_b, camera,
+                     width, height, wall_tint_adjust) == 0x1fffu);
+            want_seg = (sat > 0 && sat < 4);
+        }
+        segments = 1;
+        if (want_seg && va != NULL && vb != NULL) {
+            hwr_wall_view_point(camera, va->x, va->y, &view_a, &depth_a_q8);
+            hwr_wall_view_point(camera, vb->x, vb->y, &view_b, &depth_b_q8);
+            if (depth_a_q8 >= 0x1000 && depth_b_q8 >= 0x1000) {
+                depth_a = depth_a_q8 >> 8;
+                depth_b = depth_b_q8 >> 8;
+                xl = hwr_project_fixed(view_a, camera->focal_x,
+                                       depth_a_q8, camera->center_x);
+                xr = hwr_project_fixed(view_b, camera->focal_x,
+                                       depth_b_q8, camera->center_x);
+                if (xl > xr) { int t = xl; xl = xr; xr = t; }
+                segments = hwr_wall_segment_count(xl, xr, depth_a, depth_b);
+            }
+        }
+        if (segments >= 2) {
+            struct hwr_gl_vertex tmpl;
+            memset(&tmpl, 0, sizeof tmpl);
+            if (logical < 0x1600u) {
+                tmpl.texture_offset = scene->textures[logical].offset;
+                tmpl.texture_width = texture_width;
+                tmpl.texture_height = texture_height;
+            }
+            tmpl.pan_u = (surface->mapping_flags & HWR_TEX_IMAGE_FIT) != 0
+                ? 0 : surface->pan_u;
+            tmpl.pan_v = (surface->mapping_flags & HWR_TEX_IMAGE_FIT) != 0
+                ? 0 : surface->pan_v;
+            tmpl.aux = surface->aux;
+            tmpl.scale = surface->scale;
+            tmpl.sector_flags = surface->sector_flags;
+            tmpl.light = surface->light;
+            tmpl.material_flags = flags;
+            tmpl.direct_index = direct_index;
+            tmpl.wall_tint_adjust = (uint8_t)wall_tint_adjust;
+            tmpl.flat_mapping_flags = surface->mapping_flags;
+            if (texture_height != 0 &&
+                (texture_height & (uint16_t)(texture_height - 1u)) == 0)
+                tmpl.wall_wrap_flags |= HWR_GL_WALL_WRAP_ALONG;
+            if (texture_width != 0 &&
+                (texture_width & (uint16_t)(texture_width - 1u)) == 0)
+                tmpl.wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
+            if (wall_stale)
+                tmpl.wall_wrap_flags |= HWR_GL_WALL_STALE_MASK;
+            tmpl.wall_source_numerator = wall_span.numerator;
+            tmpl.wall_source_denominator = wall_span.denominator;
+            tmpl.wall_source_step = wall_span.numerator_step;
+            tmpl.wall_denominator_step = wall_span.denominator_step;
+            tmpl.wall_top_accum = wall_span.top_accum;
+            tmpl.wall_bottom_accum = wall_span.bottom_accum;
+            tmpl.wall_top_step = wall_span.top_step;
+            tmpl.wall_bottom_step = wall_span.bottom_step;
+            tmpl.wall_first_x = wall_span.first_x;
+            tmpl.wall_along_extent = wall_span.along_extent;
+            tmpl.wall_vertical_extent = wall_span.vertical_extent;
+            tmpl.wall_span_valid = wall_span.valid;
+            tmpl.wall_vertical_origin = wall_span.vertical_origin;
+            tmpl.wall_vertical_seeded = wall_span.vertical_seeded;
+            return hwr_emit_wall_segmented(
+                &scene->mesh, surface, camera, width, height, segments,
+                wall_tint_adjust, half_pixel, (double)xl, (double)xr,
+                va->x, va->y, vb->x, vb->y,
+                bottom_a, top_a, bottom_b, top_b, sa, sb,
+                hwr_shade_solidfill_enabled() && fill_ok,
+                &tmpl, destination);
+        }
     }
     for (i = 0; i < surface->vertex_count; i++) {
         const struct hwr_mesh_vertex *source =
@@ -2527,6 +3010,28 @@ static void hwr_copy_gpu_surface(struct hwr_scene *scene,
         target->wall_vertical_origin = wall_span.vertical_origin;
         target->wall_vertical_seeded = wall_span.vertical_seeded;
     }
+    /* Whole-face SOLID-FILL: a tinted wall that reaches this single-ramp path
+     * (not subdivided) fills only when EVERY one of its corner words saturated
+     * (== 0x1fff), i.e. the engine's counter==4 across the whole face.  A face
+     * that merely straddles the boundary took the subdivided path above and is
+     * filled per sub-quad there; a partially saturated face left here keeps its
+     * texel shading, matching the engine (only counter==4 fills). */
+    if (hwr_shade_solidfill_enabled() && fill_ok &&
+        (surface->flags & HWR_SURFACE_FLAT) == 0 &&
+        (surface->sector_flags & 2u) != 0) {
+        int all_sat = 1;
+        for (i = 0; i < surface->vertex_count; i++) {
+            if (destination[i].wall_shade_endpoint != 0x1fffu ||
+                destination[i].wall_shade_endpoint_top != 0x1fffu) {
+                all_sat = 0;
+                break;
+            }
+        }
+        if (all_sat)
+            for (i = 0; i < surface->vertex_count; i++)
+                destination[i].wall_wrap_flags |= HWR_GL_WALL_SOLID_FILL;
+    }
+    return surface->vertex_count;
 }
 
 static int hwr_prepare_stream(struct hwr_scene *scene,
@@ -2559,7 +3064,9 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
             surface->flags |= HWR_SURFACE_TRANSLUCENT;
             translucent_surfaces++;
         }
-        visible_vertices += surface->vertex_count;
+        /* Reserve the worst-case expansion: a tinted wall is split into along-
+         * length sub-quads (<=2*HWR_WALLSEG_MAX); everything else is 1:1. */
+        visible_vertices += hwr_surface_reserve(surface);
     }
     if (visible_vertices > scene->stream_capacity) {
         struct hwr_gl_vertex *vertices = (struct hwr_gl_vertex *)realloc(
@@ -2585,13 +3092,11 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         if (!hwr_surface_visible(scene, surface, camera))
             continue;
         if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
-            hwr_copy_gpu_surface(scene, surface, camera, width, height,
-                                 scene->stream_vertices + sky_cursor);
-            sky_cursor += surface->vertex_count;
+            sky_cursor += hwr_copy_gpu_surface(scene, surface, camera, width,
+                                 height, scene->stream_vertices + sky_cursor);
         } else if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
-            hwr_copy_gpu_surface(scene, surface, camera, width, height,
-                                 scene->stream_vertices + opaque_cursor);
-            opaque_cursor += surface->vertex_count;
+            opaque_cursor += hwr_copy_gpu_surface(scene, surface, camera, width,
+                                 height, scene->stream_vertices + opaque_cursor);
         } else {
             size_t position = translucent_surfaces;
             float depth = hwr_surface_depth(surface, &scene->mesh, camera);
@@ -2621,10 +3126,10 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     for (i = 0; i < translucent_surfaces; i++) {
         const struct hwr_mesh_surface *surface =
             &scene->mesh.surfaces[translucent_order[i]];
-        hwr_copy_gpu_surface(scene, surface, camera, width, height,
-                             scene->stream_vertices + translucent_cursor);
-        scene->translucent_runs[i] = (uint32_t)surface->vertex_count;
-        translucent_cursor += surface->vertex_count;
+        size_t emitted = hwr_copy_gpu_surface(scene, surface, camera, width,
+                             height, scene->stream_vertices + translucent_cursor);
+        scene->translucent_runs[i] = (uint32_t)emitted;
+        translucent_cursor += emitted;
     }
     *translucent_run_count = translucent_surfaces;
     free(translucent_order);

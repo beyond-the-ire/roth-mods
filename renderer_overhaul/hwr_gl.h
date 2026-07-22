@@ -25,7 +25,12 @@ enum hwr_gl_wall_wrap_flags {
      * engine's masked span writer leaves index-0 texels untouched and blends
      * high-bit texels with the destination pixel; behind a one-sided wall that
      * destination is never repainted, so both read as the previous frame. */
-    HWR_GL_WALL_STALE_MASK    = 1u << 2
+    HWR_GL_WALL_STALE_MASK    = 1u << 2,
+    /* All four wd_project corner words of this (sub-)quad saturated the shade
+     * ramp (== 0x1fff).  The engine's counter==4 fast path skips per-texel
+     * shading and solid-fills the block with the map fill index; the shader
+     * outputs u_fill_index directly for these fragments. */
+    HWR_GL_WALL_SOLID_FILL    = 1u << 3
 };
 
 struct hwr_gl_vertex {
@@ -104,6 +109,9 @@ struct hwr_gl_camera {
     uint8_t tint_shade_level;
     uint8_t global_light_bias;
     uint8_t glow_phase;
+    /* Low byte of the map's g_das_palette_remap_prefix: the flat palette index a
+     * solid-filled (all-corners-saturated) tinted wall block outputs directly. */
+    uint8_t solid_fill_index;
     uint16_t flat_edge_bias;
     float shade_depth_scale;
     uint32_t sky_texture_offset;

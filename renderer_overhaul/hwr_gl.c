@@ -691,6 +691,8 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_shade_flatvert;\n"
     "uniform int u_shade_wallclip;\n"
     "uniform int u_shade_subrow;\n"
+    "uniform int u_shade_solidfill;\n"
+    "uniform int u_fill_index;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
@@ -1054,6 +1056,16 @@ static const char g_geometry_fragment_shader[] =
     "    uint stexel=texelFetch(u_texels,\n"
     "        u_sky_texture_offset+u_sky_source_offset+srow*256+scolumn).r;\n"
     "    out_index=u_debug_vis==1 ? 255u : stexel;\n"
+    "    return;\n"
+    "  }\n"
+    /* SOLID-FILL: an all-corners-saturated tinted wall block (flagged on the
+     * wall-wrap attribute bit 3) skips texel sampling and shading entirely and
+     * outputs the map fill index, exactly like the engine's counter==4 fast path.
+     * Only in normal rendering -- every debug_vis mode falls through so texel,
+     * offset, material and shade-row attribution keep working on these walls. */
+    "  if (u_shade_solidfill!=0 && u_debug_vis==0 &&"
+    " (v_light_material.w & 8u)!=0u) {\n"
+    "    out_index=uint(u_fill_index) & 255u;\n"
     "    return;\n"
     "  }\n"
     "  uint texel=sample_texel();\n"
@@ -1902,6 +1914,13 @@ static int hwr_shade_subrow_enabled(void)
     return e;
 }
 
+static int hwr_shade_solidfill_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = hwr_env_default_on("HWR_SHADE_SOLIDFILL");
+    return e;
+}
+
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
@@ -2040,6 +2059,10 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                    hwr_shade_wallclip_enabled());
     hwr_uniform_1i(g_geometry_program, "u_shade_subrow",
                    hwr_shade_subrow_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_shade_solidfill",
+                   hwr_shade_solidfill_enabled());
+    hwr_uniform_1i(g_geometry_program, "u_fill_index",
+                   camera->solid_fill_index);
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
      * scaled down with the shade level the same way its shift is. */
     hwr_uniform_1i(g_geometry_program, "u_wd_bias",

@@ -17,6 +17,7 @@
 #define VA_G_VERTEX_GEOMETRY_BASE  0x90aacu
 #define VA_G_SHADE_LEVEL           0x90c16u
 #define VA_G_TINT_SHADE_LEVEL      0x90c18u
+#define VA_G_DAS_FILL_INDEX        0x89f10u
 
 #define HWR_SECTION_EXTENT 0x10000u
 #define HWR_NO_INDEX UINT16_MAX
@@ -499,6 +500,7 @@ int hwr_world_refresh_lut_state(struct hwr_world *world,
     world->luts.damage_flash_level = api->game_ram->u8(VA_G_DAMAGE_FLASH_LEVEL);
     world->luts.shade_level = api->game_ram->u16(VA_G_SHADE_LEVEL);
     world->luts.tint_shade_level = api->game_ram->u16(VA_G_TINT_SHADE_LEVEL);
+    world->luts.fill_index = api->game_ram->u16(VA_G_DAS_FILL_INDEX);
     /* The palette buffer is populated late on some load paths (a quickload
      * can stage frames before it lands) and screen effects rewrite it, so it
      * is re-read every frame rather than trusted from the load snapshot. */

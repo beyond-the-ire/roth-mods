@@ -79,6 +79,10 @@ struct hwr_luts {
     uint8_t damage_flash_level;
     uint16_t shade_level;
     uint16_t tint_shade_level;
+    /* Per-map solid-fill colour word (g_das_palette_remap_prefix, loaded from the
+     * DAS file right after the palette). Its low byte is the flat palette index
+     * the engine's all-corners-saturated wall block solid-fills with. */
+    uint16_t fill_index;
     int valid;
 };
 
