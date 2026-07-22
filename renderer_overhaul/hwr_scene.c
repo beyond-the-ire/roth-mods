@@ -1645,31 +1645,6 @@ static float hwr_surface_depth(const struct hwr_mesh_surface *surface,
     return s * y - c * x;
 }
 
-/* DEFECT B gate (HWR_SHADE_WALLSEG).  When ON, a receding tinted wall is emitted
- * as several along-SCREEN sub-quads, each carrying its own pair of wd_project
- * corner words, so the shader's screen-linear corner-word ramp re-anchors the
- * nonlinear (hyperbolic) depth+candle law piecewise.
- *
- * Default OFF.  This subdivision was implemented and stress-tested (world-t and
- * screen-X splits, and a forced-max variant that subdivides EVERY tinted wall):
- * none measurably reduced the far-wall darkness undershoot -- forcing seg=8 on
- * ~22.5k walls held the hard-undershoot fraction at ~0.28%, identical to no
- * subdivision within frame-jitter noise.  The residual "faint far door" is thus
- * in the corner-WORD value (hwr_wall_endpoint_word vs the engine's per-column
- * DDA at large depth) or in texel divergence, NOT in the ramp's granularity, so
- * subdivision cannot fix it.  Defaulting OFF keeps tinted walls byte-identical to
- * the accepted (~95% exact) baseline -- zero wall-regression risk -- while the
- * machinery stays available: HWR_SHADE_WALLSEG=1 enables it. */
-static int hwr_shade_wallseg_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *setting = getenv("HWR_SHADE_WALLSEG");
-        enabled = setting != NULL && setting[0] == '1' ? 1 : 0;
-    }
-    return enabled;
-}
-
 /* Shared view-space depth for the candle shade law.  Returns the vertex's view
  * depth (before the near clamp) and, via view_x_out, its view-space X.  The wall
  * endpoint word and the per-flat-vertex shade row both derive their screen
@@ -2731,7 +2706,7 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
      * a face with no saturation stays single-ramp and byte-exact. */
     if ((surface->flags & HWR_SURFACE_FLAT) == 0 &&
         (surface->sector_flags & 2u) != 0 && wall_span.valid &&
-        (hwr_shade_wallseg_enabled() || fill_ok) &&
+        fill_ok &&
         !hwr_wall_uses_image_fit(surface, texture_width, texture_height)) {
         const struct hwr_mesh_vertex *verts =
             &scene->mesh.vertices[surface->first_vertex];
@@ -2755,12 +2730,12 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                 if (verts[j].z > top_a) top_a = verts[j].z;
             }
         }
-        /* Decide whether to subdivide.  HWR_SHADE_WALLSEG forces it globally; the
-         * SOLID-FILL auto-trigger opts in only faces whose corner words straddle
-         * the saturation boundary (0 < saturated < 4), the exact receding faces
-         * whose far end the engine solid-fills segment by segment. */
-        int want_seg = hwr_shade_wallseg_enabled();
-        if (!want_seg && fill_ok &&
+        /* Decide whether to subdivide.  The solid-fill auto-trigger opts in only
+         * faces whose corner words straddle the saturation boundary
+         * (0 < saturated < 4), the exact receding faces whose far end the engine
+         * solid-fills segment by segment. */
+        int want_seg = 0;
+        if (fill_ok &&
             va != NULL && vb != NULL) {
             int sat =
                 (hwr_wall_endpoint_word(surface, va, bottom_a, camera,

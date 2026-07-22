@@ -684,7 +684,6 @@ static const char g_geometry_fragment_shader[] =
     "uniform ivec2 u_shade_origin;\n"
     "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
-    "uniform int u_shade_flatvert;\n"
     "uniform int u_fill_index;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
@@ -906,26 +905,25 @@ static const char g_geometry_fragment_shader[] =
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; int r;\n"
     "  if (flat_surface) {\n"
     "    if (tinted) {\n"
-    /* FLATVERT: the engine evaluates the flat shade only at the projected
-     * polygon vertices and interpolates it linearly in screen space.  When on,
-     * read the CPU-computed per-vertex row carried by the noperspective wall
-     * endpoint varying (stored for flats in the wall high-byte format) and
-     * truncate it per fragment; flats clamp to 0..31.
-     * DEFECT-1 fix: a triangle straddling the near plane has a vertex whose
-     * hwr_flat_shade_endpoint projection is garbage (clamped near the shade
-     * origin -> a spurious BRIGHT row that interpolates across the triangle).
-     * The engine never samples a row there (it near-clips the polygon first), so
-     * when v_flat_taint marks such a triangle, fall through to the per-pixel
-     * radial below -- engine-faithful for the surviving fragments and glitch-
-     * free. */
-    /* The per-vertex word carries the engine's 8-bit sub-row fraction in its low
-     * byte; floor the interpolated word per fragment so a band boundary lands at
-     * the engine's sub-pixel height instead of snapping to the whole row. */
-    "      if (u_shade_flatvert!=0 && v_flat_taint==0u)"
+    /* The engine evaluates the flat shade only at the projected polygon vertices
+     * and interpolates it linearly in screen space: read the CPU-computed per-
+     * vertex row carried by the noperspective wall endpoint varying (stored for
+     * flats in the wall high-byte format) and truncate it per fragment; flats
+     * clamp to 0..31.  The per-vertex word carries the engine's 8-bit sub-row
+     * fraction in its low byte, so flooring the interpolated word per fragment
+     * lands a band boundary at the engine's sub-pixel height instead of snapping
+     * to the whole row.
+     * A triangle straddling the near plane has a vertex whose flat-shade
+     * projection is garbage (clamped near the shade origin -> a spurious BRIGHT
+     * row that interpolates across the triangle).  The engine never samples a row
+     * there (it near-clips the polygon first), so when v_flat_taint marks such a
+     * triangle, fall through to the per-pixel radial below -- engine-faithful for
+     * the surviving fragments and glitch-free. */
+    "      if (v_flat_taint==0u)"
     " return clamp(int(floor(v_wall_shade_endpoint/256.0)),0,31);\n"
-    /* OFF path: the pre-FLATVERT per-pixel radial.  The edge term measures from
-     * the jittered shade origin (the light position); the jitter is the
-     * flicker. */
+    /* The per-pixel radial for tainted (near-clipped-corner) triangles.  The edge
+     * term measures from the jittered shade origin (the light position); the
+     * jitter is the flicker. */
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
@@ -1827,23 +1825,6 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
     return 1;
 }
 
-/* HWR_SHADE_FLATVERT (read once, default ON) selects how tinted flats are shaded.
- * Default ON is the engine's per-vertex, screen-linearly interpolated flat shade,
- * with a per-pixel-radial fallback for clipped-corner triangles; =0 restores the
- * plain per-pixel radial on tinted flats. */
-static int hwr_env_default_on(const char *name)
-{
-    const char *v = getenv(name);
-    return (v != NULL && v[0] == '0') ? 0 : 1;
-}
-
-static int hwr_shade_flatvert_enabled(void)
-{
-    static int e = -1;
-    if (e < 0) e = hwr_env_default_on("HWR_SHADE_FLATVERT");
-    return e;
-}
-
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
@@ -1968,8 +1949,6 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
-    hwr_uniform_1i(g_geometry_program, "u_shade_flatvert",
-                   hwr_shade_flatvert_enabled());
     hwr_uniform_1i(g_geometry_program, "u_fill_index",
                    camera->solid_fill_index);
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
