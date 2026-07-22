@@ -129,7 +129,54 @@ void hwr_world_clear(struct hwr_world *world)
     free(world->slabs);
     free(world->sector_offset_to_index);
     free(world->vertex_offset_to_index);
+    free(world->vertex_wall_offsets);
+    free(world->vertex_wall_indices);
     memset(world, 0, sizeof *world);
+}
+
+/* Builds the vertex -> incident-wall CSR index from the parsed wall list. Runs
+ * once per snapshot; the mesh builder then finds the walls sharing an endpoint
+ * with O(1) lookups instead of a full per-emit scan.  Bucket fill proceeds in
+ * ascending wall index, so each vertex lists its walls in the same order the
+ * former linear scan visited them. */
+static int hwr_world_build_adjacency(struct hwr_world *world)
+{
+    size_t *offsets;
+    uint32_t *indices;
+    size_t *cursor;
+    size_t total;
+    size_t i;
+    size_t v;
+    if (world->vertex_count == 0)
+        return 0;
+    offsets = (size_t *)calloc(world->vertex_count + 1u, sizeof *offsets);
+    if (offsets == NULL)
+        return -1;
+    for (i = 0; i < world->wall_count; i++) {
+        offsets[world->walls[i].vertex_a_index + 1u]++;
+        offsets[world->walls[i].vertex_b_index + 1u]++;
+    }
+    for (v = 0; v < world->vertex_count; v++)
+        offsets[v + 1u] += offsets[v];
+    total = offsets[world->vertex_count];
+    indices = total != 0 ? (uint32_t *)malloc(total * sizeof *indices) : NULL;
+    cursor = (size_t *)malloc(world->vertex_count * sizeof *cursor);
+    if ((total != 0 && indices == NULL) || cursor == NULL) {
+        free(offsets);
+        free(indices);
+        free(cursor);
+        return -1;
+    }
+    for (v = 0; v < world->vertex_count; v++)
+        cursor[v] = offsets[v];
+    for (i = 0; i < world->wall_count; i++) {
+        indices[cursor[world->walls[i].vertex_a_index]++] = (uint32_t)i;
+        indices[cursor[world->walls[i].vertex_b_index]++] = (uint32_t)i;
+    }
+    free(cursor);
+    world->vertex_wall_offsets = offsets;
+    world->vertex_wall_indices = indices;
+    return 0;
 }
 
 int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
@@ -327,6 +374,10 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     }
     next.world_span_colorkey = api->game_ram->u16(VA_G_WORLD_SPAN_COLORKEY);
     next.sky_fat_index = api->game_ram->u16(VA_G_SKY_FAT_INDEX);
+    if (hwr_world_build_adjacency(&next) != 0) {
+        hwr_world_clear(&next);
+        return hwr_world_fail(world, "out of memory building wall adjacency index");
+    }
     next.valid = 1;
     /* Development aid: HWR_WORLD_DUMP=<path> writes the parsed geometry as
      * text (sectors, then walls with endpoint coordinates) for offline

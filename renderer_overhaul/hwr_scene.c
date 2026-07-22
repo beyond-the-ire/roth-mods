@@ -69,7 +69,32 @@ void hwr_scene_mesh_clear(struct hwr_scene_mesh *mesh)
         return;
     free(mesh->vertices);
     free(mesh->surfaces);
+    free(mesh->cut_scratch);
     memset(mesh, 0, sizeof *mesh);
+}
+
+/* Sizes the reusable wall-cut scratch to the current map. Each side (a/b) can
+ * accrue at most 8 cuts per incident wall (floor/ceiling of the incident sector
+ * plus its neighbour, each optionally carrying a slab), and every wall can be
+ * incident to an endpoint, so wall_count*8 per side bounds either list -- the
+ * same bound the former per-emit allocation used. */
+static int hwr_reserve_cut_scratch(struct hwr_scene_mesh *mesh, size_t wall_count)
+{
+    int16_t *scratch;
+    size_t needed;
+    if (wall_count == 0)
+        return 0;
+    if (wall_count > SIZE_MAX / (16u * sizeof *scratch))
+        return hwr_mesh_fail(mesh, "wall cut scratch overflow");
+    needed = wall_count * 16u;
+    if (needed <= mesh->cut_scratch_capacity)
+        return 0;
+    scratch = (int16_t *)realloc(mesh->cut_scratch, needed * sizeof *scratch);
+    if (scratch == NULL)
+        return hwr_mesh_fail(mesh, "out of memory reserving wall cut scratch");
+    mesh->cut_scratch = scratch;
+    mesh->cut_scratch_capacity = needed;
+    return 0;
 }
 
 static int hwr_reserve_vertices(struct hwr_scene_mesh *mesh, size_t extra)
@@ -244,6 +269,33 @@ static void hwr_add_sector_cuts(const struct hwr_world *world,
     }
 }
 
+/* Collects the wall-edge cuts contributed by every wall incident to one
+ * endpoint vertex, using the world's static adjacency index. This replaces the
+ * per-emit linear scan over all walls: the set of incident walls is fixed map
+ * topology, so it is precomputed once at snapshot time. Cuts are de-duplicated
+ * and later sorted, so the visitation order does not affect the result. */
+static void hwr_collect_endpoint_cuts(const struct hwr_world *world, size_t vertex,
+                                      int16_t *cuts, size_t *count,
+                                      int16_t bottom, int16_t top)
+{
+    size_t start = world->vertex_wall_offsets[vertex];
+    size_t end = world->vertex_wall_offsets[vertex + 1u];
+    size_t k;
+    for (k = start; k < end; k++) {
+        const struct hwr_wall *incident =
+            &world->walls[world->vertex_wall_indices[k]];
+        const struct hwr_sector *incident_sector;
+        if (incident->sector_index >= world->sector_count)
+            continue;
+        incident_sector = &world->sectors[incident->sector_index];
+        hwr_add_sector_cuts(world, incident_sector, cuts, count, bottom, top);
+        if (incident->neighbor_sector_index != SIZE_MAX)
+            hwr_add_sector_cuts(world,
+                                &world->sectors[incident->neighbor_sector_index],
+                                cuts, count, bottom, top);
+    }
+}
+
 static uint16_t hwr_wall_length(int16_t ax, int16_t ay,
                                 int16_t bx, int16_t by)
 {
@@ -326,7 +378,6 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     const struct hwr_vertex *b;
     struct hwr_mesh_surface *surface;
     struct hwr_mesh_vertex *v;
-    int16_t *cuts = NULL;
     int16_t *cuts_a = NULL;
     int16_t *cuts_b = NULL;
     size_t cut_count_a = 0;
@@ -348,64 +399,28 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     sa = HWR_WALL_U_REVERSED ? (float)extent : 0.0f;
     sb = HWR_WALL_U_REVERSED ? 0.0f : (float)extent;
     if (world->wall_count != 0) {
-        size_t capacity;
-        size_t i;
-        if (world->wall_count > SIZE_MAX / 8u)
-            return hwr_mesh_fail(mesh, "wall cut count overflow");
-        capacity = world->wall_count * 8u;
-        if (capacity > SIZE_MAX / (2u * sizeof *cuts))
-            return hwr_mesh_fail(mesh, "wall cut allocation overflow");
-        cuts = (int16_t *)malloc(capacity * 2u * sizeof *cuts);
-        if (cuts == NULL)
-            return hwr_mesh_fail(mesh, "out of memory splitting wall edges");
-        cuts_a = cuts;
-        cuts_b = cuts + capacity;
-        for (i = 0; i < world->wall_count; i++) {
-            const struct hwr_wall *incident = &world->walls[i];
-            const struct hwr_sector *incident_sector;
-            int touches_a = incident->vertex_a_index == wall->vertex_a_index ||
-                            incident->vertex_b_index == wall->vertex_a_index;
-            int touches_b = incident->vertex_a_index == wall->vertex_b_index ||
-                            incident->vertex_b_index == wall->vertex_b_index;
-            if (!touches_a && !touches_b)
-                continue;
-            if (incident->sector_index >= world->sector_count)
-                continue;
-            incident_sector = &world->sectors[incident->sector_index];
-            if (touches_a)
-                hwr_add_sector_cuts(world, incident_sector, cuts_a,
-                                    &cut_count_a, bottom_a, top_a);
-            if (touches_b)
-                hwr_add_sector_cuts(world, incident_sector, cuts_b,
-                                    &cut_count_b, bottom_b, top_b);
-            if (incident->neighbor_sector_index != SIZE_MAX) {
-                const struct hwr_sector *neighbor =
-                    &world->sectors[incident->neighbor_sector_index];
-                if (touches_a)
-                    hwr_add_sector_cuts(world, neighbor, cuts_a,
-                                        &cut_count_a, bottom_a, top_a);
-                if (touches_b)
-                    hwr_add_sector_cuts(world, neighbor, cuts_b,
-                                        &cut_count_b, bottom_b, top_b);
-            }
-        }
+        /* The two endpoint lists are backed by the halves of the mesh's reusable
+         * cut scratch (reserved once per build).  The walls incident to each
+         * endpoint come from the world's precomputed adjacency index, so no
+         * per-emit allocation or full-wall scan is needed. */
+        size_t half = world->wall_count * 8u;
+        cuts_a = mesh->cut_scratch;
+        cuts_b = mesh->cut_scratch + half;
+        hwr_collect_endpoint_cuts(world, wall->vertex_a_index, cuts_a,
+                                  &cut_count_a, bottom_a, top_a);
+        hwr_collect_endpoint_cuts(world, wall->vertex_b_index, cuts_b,
+                                  &cut_count_b, bottom_b, top_b);
         qsort(cuts_a, cut_count_a, sizeof *cuts_a, hwr_compare_heights);
         qsort(cuts_b, cut_count_b, sizeof *cuts_b, hwr_compare_heights);
     }
-    if (cut_count_a > SIZE_MAX - cut_count_b - 2u) {
-        free(cuts);
+    if (cut_count_a > SIZE_MAX - cut_count_b - 2u)
         return hwr_mesh_fail(mesh, "wall triangle count overflow");
-    }
     triangle_count = cut_count_a + cut_count_b + 2u;
-    if (triangle_count > SIZE_MAX / 3u) {
-        free(cuts);
+    if (triangle_count > SIZE_MAX / 3u)
         return hwr_mesh_fail(mesh, "wall vertex count overflow");
-    }
     surface = hwr_add_surface(mesh, kind, triangle_count * 3u);
-    if (surface == NULL) {
-        free(cuts);
+    if (surface == NULL)
         return -1;
-    }
     surface->sector_index = wall->sector_index;
     surface->extent = extent;
     surface->scale = wall->scale;
@@ -481,12 +496,9 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
             cap_occluder = nb->ceiling_z >= sector->ceiling_z;
         }
         if (hwr_emit_sky_cap(mesh, a, b, top_a, top_b, cap_occluder, 0,
-                             wall->sector_index) != 0) {
-            free(cuts);
+                             wall->sector_index) != 0)
             return -1;
-        }
     }
-    free(cuts);
     return 0;
 }
 
@@ -796,6 +808,8 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
         return -1;
     hwr_scene_mesh_clear(mesh);
     hwr_collect_texture_references(mesh, world);
+    if (hwr_reserve_cut_scratch(mesh, world->wall_count) != 0)
+        return -1;
     for (i = 0; i < world->sector_count; i++) {
         const struct hwr_sector *sector = &world->sectors[i];
         size_t j;

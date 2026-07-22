@@ -98,6 +98,13 @@ struct hwr_world {
     size_t vertex_count;
     size_t slab_count;
     size_t portal_count;
+    /* Static wall/vertex topology index (CSR): for vertex v, the walls incident
+     * to it are vertex_wall_indices[vertex_wall_offsets[v] .. offsets[v+1]).
+     * Built once per snapshot; it depends only on the map, not the camera, so
+     * the per-frame mesh build looks up a wall's endpoint neighbours instead of
+     * rescanning every wall.  Walls are listed in ascending index order. */
+    size_t *vertex_wall_offsets;
+    uint32_t *vertex_wall_indices;
     /* Map sections live in engine heap allocations outside the plugin accessor
      * window; the engine publishes their addresses in globals, and the plugin
      * shares the process address space, so they are read through these pointers. */

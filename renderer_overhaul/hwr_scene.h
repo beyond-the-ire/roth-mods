@@ -85,6 +85,11 @@ struct hwr_scene_mesh {
     uint8_t texture_refs[0x1600 / 8];
     size_t texture_ref_count;
     size_t skipped_flats;
+    /* Reused wall-edge cut scratch (cuts_a | cuts_b), sized once per build to
+     * hold the worst-case cut count for the current map instead of a fresh
+     * allocation per emitted wall. */
+    int16_t *cut_scratch;
+    size_t cut_scratch_capacity;
     int valid;
     char error[192];
 };
