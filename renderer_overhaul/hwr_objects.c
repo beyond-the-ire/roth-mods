@@ -167,6 +167,8 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
             item.backref = hwr_obj_u16(record + HWR_OBJ_OFF_BACKREF);
             if (record[HWR_OBJ_OFF_FLAGS9] & 2u)
                 item.flags |= HWR_OBJECT_FLAG_REFLECTION_SKIP;
+            if (record[HWR_OBJ_OFF_FLAGS7] & 1u)
+                item.flags |= HWR_OBJECT_FLAG_FLAT;         /* type-3 fixed-orientation */
             if (hwr_objects_push(objects, &item) != 0)
                 return hwr_objects_fail(objects, "out of memory enumerating objects");
         }

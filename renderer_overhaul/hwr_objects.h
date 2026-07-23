@@ -26,7 +26,12 @@ enum hwr_object_source {
 enum hwr_object_flags {
     /* Map record +9 bit1: skip this object during a reflection/secondary walk.
      * The primary pass ignores it; a mirror subview must honour it. */
-    HWR_OBJECT_FLAG_REFLECTION_SKIP = 1u << 0
+    HWR_OBJECT_FLAG_REFLECTION_SKIP = 1u << 0,
+    /* Map record +7 bit0: the engine's type-3 discriminator
+     * (renderer.c:8042). These faces render through the fixed-orientation
+     * (linear/wall) path, not the camera-facing billboard finalize -- a flat
+     * object whose world orientation is set by its authored facing. */
+    HWR_OBJECT_FLAG_FLAT = 1u << 1
 };
 
 struct hwr_object {

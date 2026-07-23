@@ -365,7 +365,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                         const struct roth_api_v1 *api)
 {
     uint16_t yaw;
-    double focal_x, focal_y;
+    double focal_x, focal_y, xscale, pscale, hscale, vscale;
     struct hwr_bb_trans *pending = NULL;
     size_t pending_count = 0, pending_capacity = 0;
     size_t i;
@@ -373,6 +373,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     int bb_log = getenv("HWR_BB_LOG") != NULL;
     static uint32_t frame_no;
     int log_frame, throttle;
+    size_t flat_seen = 0;
 
     if (bb == NULL)
         return 0;
@@ -394,8 +395,23 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     yaw = api->game_ram->u16(VA_G_SPRITE_VIEW_ANGLE);
     focal_x = (double)camera->focal_x;
     focal_y = (double)camera->focal_y;
-    if (focal_x <= 0.0 || focal_y <= 0.0)
+    /* The engine's type-1 billboard projects its horizontal extent with
+     * view_params_block+0xc and its vertical with g_perspective_scale, dividing
+     * by g_view_clip_plane -- a view depth carried in a x256 fixed point (near
+     * plane 0x1000 = 16 world units). The mod's world shader projects with
+     * camera focal_x/focal_y against a x1 world depth (s*dy - c*dx). Matching the
+     * engine's projected pixels therefore scales the pre-projection extent by
+     * (engine_focal / mod_focal) and DIVIDES by the 256 view-depth fixed point:
+     *   half_w_world = extent_h * Xscale / (focal_x * 256)
+     *   vext_world   = extent_v * Pscale / (focal_y * 256)
+     * (finalize_draw_list_entry renderer.c:7738-7768; proj64 :7284). Reading both
+     * focals keeps it exact regardless of the Xscale:focal ratios. */
+    xscale = (double)(int32_t)api->game_ram->u32(VA_G_VIEW_PARAMS_XSCALE);
+    pscale = (double)(int32_t)api->game_ram->u32(VA_G_PERSPECTIVE_SCALE);
+    if (focal_x <= 0.0 || focal_y <= 0.0 || xscale <= 0.0 || pscale <= 0.0)
         return 0;                                         /* no projection staged yet */
+    hscale = xscale / (focal_x * 256.0);
+    vscale = pscale / (focal_y * 256.0);
 
 
     for (i = 0; i < objects->count; i++) {
@@ -410,9 +426,11 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         double half_w, famod, vext_d, rx, ry;
         int32_t disp, vext, z_top, z_bottom;
         int16_t xl, yl, xr, yr;
-        int translucent, do_trace;
+        int translucent, do_trace, cl;
 
         bb->stat_enumerated++;
+        if (o->flags & HWR_OBJECT_FLAG_FLAT)
+            flat_seen++;
         do_trace = trace >= 2 && throttle && i < 260u;
 
         /* Per-visible-sector emission: an object whose owner sector the engine's
@@ -421,16 +439,18 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         if (pvs_valid && o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
             o->sector_index < visible_count && !visible[o->sector_index]) {
             if (do_trace)
-                fprintf(stderr, "[bb] o%zu id=%#06x sec=%u DROP pvs\n",
-                        i, o->graphic_id, o->sector_index);
+                fprintf(stderr, "[bb] o%zu id=%#06x sec=%u%s DROP pvs\n",
+                        i, o->graphic_id, o->sector_index,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             continue;
         }
 
         hwr_bb_view_point(camera, o->world_x, o->world_y, &view_x, &depth);
         if (depth < HWR_BB_NEAR_DEPTH) {
             if (do_trace)
-                fprintf(stderr, "[bb] o%zu id=%#06x depth=%d DROP near\n",
-                        i, o->graphic_id, depth);
+                fprintf(stderr, "[bb] o%zu id=%#06x depth=%d%s DROP near\n",
+                        i, o->graphic_id, depth,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             continue;                                     /* near-depth cull */
         }
         corr = (int32_t)(((int64_t)view_x << 6) / depth); /* per-sprite screen-angle */
@@ -441,8 +461,9 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             if (do_trace) {
                 uint16_t st = api->game_ram->u16(0x86d30u +
                     (uint32_t)(uint16_t)(o->graphic_id + 0x1000u) * 2u);
-                fprintf(stderr, "[bb] o%zu id=%#06x bref=%u status=%#06x DROP resolve\n",
-                        i, o->graphic_id, o->backref, st);
+                fprintf(stderr, "[bb] o%zu id=%#06x bref=%u status=%#06x%s DROP resolve\n",
+                        i, o->graphic_id, o->backref, st,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             }
             continue;
         }
@@ -454,23 +475,26 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         }
         if (hwr_sprites_frame(&lookup, &frame) != 0) {
             if (do_trace)
-                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x DROP frame\n",
-                        i, o->graphic_id, lookup.archive_id);
+                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x%s DROP frame\n",
+                        i, o->graphic_id, lookup.archive_id,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             continue;
         }
         if ((frame.flags & HWR_BB_MESH_FLAG) != 0) {
             bb->stat_skipped_mesh++;                      /* 3D-object mesh: later */
             if (do_trace)
-                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x SKIP mesh\n",
-                        i, o->graphic_id, lookup.archive_id);
+                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x%s SKIP mesh\n",
+                        i, o->graphic_id, lookup.archive_id,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             continue;
         }
 
         slot = hwr_bb_slot_of(bb, &lookup);
         if (slot == NULL || !slot->present) {
             if (do_trace)
-                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x DROP atlas-miss\n",
-                        i, o->graphic_id, lookup.archive_id);
+                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x%s DROP atlas-miss\n",
+                        i, o->graphic_id, lookup.archive_id,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             continue;
         }
         if (slot->klass == HWR_DAS_CLASS_ANIMATED) {
@@ -511,19 +535,28 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
          * scale), which project against a x256 view-depth the mod's world shader
          * does not share; deriving from wall texel density is depth-independent
          * and keeps the sprite consistent with the geometry around it. */
+        /* Pre-projection extents exactly as the engine stages them: horizontal
+         * half a_h = (frame.height*2) << cl (renderer.c:7720/7738); vertical
+         * ecxv = frame.width*2, block-modifier scaled (w980, :7723-7736). The
+         * modifier nibble sets cl {6,7,7+t} and the vertical scale {0.5,1,2^t}. */
         famod = 1.0;
+        cl = 7;
         if ((fa & 0x80u) != 0) {
             if ((fa & 0x6000u) != 0) {
                 int t = (int)(((uint32_t)(fa << 3) | (fa >> 13)) & 3u);
                 famod = (double)(1u << t);
+                cl = 7 + t;
             } else {
                 famod = 0.5;
+                cl = 6;
             }
         }
-        half_w = (double)th * famod;                  /* full width = 2*frame.height */
-        vext_d = 2.0 * (double)tw * famod;            /* full height = 2*frame.width */
+        half_w = (double)((uint32_t)((uint32_t)th * 2u) << cl) * hscale;
+        vext_d = 2.0 * (double)tw * famod * vscale;
         vext = (int32_t)(vext_d + 0.5);
-        disp = (int32_t)(2.0 * (double)(fa & 0xfu) + 0.5);  /* low-nibble displacement */
+        /* Low-nibble vertical displacement edxv = 2*(dl&0xf), same projected
+         * domain as the extent (renderer.c:7756-7758). */
+        disp = (int32_t)(2.0 * (double)(fa & 0xfu) * vscale + 0.5);
 
         /* Vertical anchor + displacement (finalize_draw_list_entry,
          * renderer.c:7754-7768). The engine's vertical anchor is
@@ -573,9 +606,11 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
 
         if (bb_log || (trace >= 2 && throttle))
             fprintf(stderr,
-                    "[bb] o%zu id=%#06x nid=%#06x %ux%u fa=%#06x fmod=%.2g half=%.0f vext=%d wxy=%d,%d..%d,%d z=%d..%d depth=%d mat=%#x EMIT%s\n",
+                    "[bb] o%zu id=%#06x nid=%#06x %ux%u fa=%#06x fmod=%.2g half=%.0f vext=%d wxy=%d,%d..%d,%d z=%d..%d depth=%d mat=%#x face=%u%s EMIT%s\n",
                     i, o->graphic_id, lookup.archive_id, tw, th, fa, famod,
                     half_w, vext, xl, yl, xr, yr, z_top, z_bottom, depth, material,
+                    o->facing,
+                    (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "",
                     translucent ? "(t)" : "");
 
         if (!translucent) {
@@ -649,10 +684,14 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     free(pending);
     if (log_frame)
         fprintf(stderr,
-                "[bb] frame %u: emit=%zu enum=%zu skip-mesh=%zu opaque-v=%zu trans-v=%zu runs=%zu | cam vox=%d voy=%d eyez=%d yaw=%u sin=%d cos=%d\n",
+                "[bb] frame %u: emit=%zu enum=%zu skip-mesh=%zu opaque-v=%zu trans-v=%zu runs=%zu | cam vox=%d voy=%d eyez=%d yaw=%u sin=%d cos=%d | Xsc=%.0f Psc=%.0f fx=%.0f fy=%.0f hsc=%.4f vsc=%.4f\n",
                 (unsigned)(frame_no - 1u), bb->stat_emitted, bb->stat_enumerated,
                 bb->stat_skipped_mesh, bb->opaque_count, bb->translucent_count,
                 bb->run_count, camera->view_offset_x, camera->view_offset_y,
-                camera->eye_z, yaw, camera->yaw_sin, camera->yaw_cos);
+                camera->eye_z, yaw, camera->yaw_sin, camera->yaw_cos,
+                xscale, pscale, focal_x, focal_y, hscale, vscale);
+    if (log_frame && flat_seen != 0)
+        fprintf(stderr, "[bb] frame %u: flat(type-3) enumerated=%zu\n",
+                (unsigned)(frame_no - 1u), flat_seen);
     return 0;
 }
