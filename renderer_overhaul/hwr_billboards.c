@@ -397,6 +397,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     if (focal_x <= 0.0 || focal_y <= 0.0)
         return 0;                                         /* no projection staged yet */
 
+
     for (i = 0; i < objects->count; i++) {
         const struct hwr_object *o = &objects->items[i];
         struct hwr_sprite_lookup lookup;
@@ -524,18 +525,25 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         vext = (int32_t)(vext_d + 0.5);
         disp = (int32_t)(2.0 * (double)(fa & 0xfu) + 0.5);  /* low-nibble displacement */
 
-        /* Vertical anchor from the modifier byte (renderer.c:7755-7770). World Z
-         * increases UPWARD here (the floor is at a smaller z than the eye -- the
-         * engine's floor-visible test is eye_z > floor_z), so the image TOP (the
-         * texture's v=0 head row, z_top) is the LARGER z and the feet the
-         * smaller. Bit 0x10 set = top (head) anchored at the object's Z; else
-         * (default) bottom (feet) at the object's Z with the head extending up.
-         * The low nibble raises the whole sprite. */
+        /* Vertical anchor + displacement (finalize_draw_list_entry,
+         * renderer.c:7754-7768). The engine's vertical anchor is
+         * eaxv = eye_z - objZ in screen-DOWN units, and the modifier byte's low
+         * nibble is a displacement edxv = 2*(dl&0xf) [+ the block's authored
+         * vertical bias, renderer.c:7758, not yet mirrored]:
+         *   default 0x8N (bit 0x10 clear): eaxv_final = eaxv + edxv  (7760)
+         *     -> feet (bottom edge) world z = objZ - edxv, head = feet + height.
+         *   0x9N (bit 0x10 set): eaxv_final = eaxv - edxv + height    (7759)
+         *     -> head (top edge)  world z = objZ + edxv, feet = head - height.
+         * World z increases UPWARD (floor-visible test is eye_z > floor_z), so
+         * z_top (the texture's v=0 head row) is the LARGER z. The displacement
+         * sign therefore DIFFERS between the two anchors -- 0x9N adds, 0x8N
+         * SUBTRACTS -- which is why wall items (0x9N) sat correctly while floor
+         * items (0x8N) sat too high under a single-sign +disp. */
         if ((fa & 0x10u) != 0) {
-            z_top = (int32_t)o->world_z + disp;
+            z_top = (int32_t)o->world_z + disp;      /* head at objZ + edxv */
             z_bottom = z_top - vext;
         } else {
-            z_bottom = (int32_t)o->world_z + disp;
+            z_bottom = (int32_t)o->world_z - disp;   /* feet at objZ - edxv */
             z_top = z_bottom + vext;
         }
 
