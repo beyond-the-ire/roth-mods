@@ -43,6 +43,9 @@
 #define HWR_PARTICLE_OFF_Y      0x0au
 #define HWR_PARTICLE_OFF_GFX    0x0cu
 #define HWR_PARTICLE_OFF_FACING 0x0eu
+/* The particle's appearance record starts at node+8 (its X), so the billboard
+ * shade seed (appearance +8, like a map record's +8) is node+0x10. */
+#define HWR_PARTICLE_OFF_SEED   0x10u
 #define HWR_PARTICLE_OFF_Z      0x12u
 #define HWR_PARTICLE_OFF_BUSY   0x30u
 
@@ -219,6 +222,7 @@ static int hwr_objects_walk_particles(struct hwr_objects *objects,
             item.world_z = (int16_t)api->game_ram->u16(off + HWR_PARTICLE_OFF_Z);
             item.graphic_id = api->game_ram->u16(off + HWR_PARTICLE_OFF_GFX);
             item.facing = api->game_ram->u8(off + HWR_PARTICLE_OFF_FACING);
+            item.seed = api->game_ram->u8(off + HWR_PARTICLE_OFF_SEED);
             if (hwr_objects_push(objects, &item) != 0)
                 return hwr_objects_fail(objects, "out of memory enumerating particles");
         }
