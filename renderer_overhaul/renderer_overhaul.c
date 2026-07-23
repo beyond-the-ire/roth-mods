@@ -10,6 +10,8 @@
 #include "hwr_settings.h"
 #include "hwr_scene.h"
 #include "hwr_world.h"
+#include "hwr_sprites.h"
+#include "hwr_objects.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -118,6 +120,17 @@ static struct hwr_backdrop g_backdrop;
 /* Raised when the backdrop still owes the index target its starting pixels. */
 static int g_backdrop_seed_pending;
 static int g_backdrop_error_logged;
+/* Object data layer: the per-frame billboard enumeration, the pre-decoded sprite
+ * census, and their controls. The layer produces no pixels yet; it stages the
+ * data the billboard emitter will consume. HWR_OBJECTS=0 disables it entirely. */
+static struct hwr_objects g_objects;
+static struct hwr_sprite_census g_sprite_census;
+static int g_objects_enabled = 1;
+static int g_object_stats_pending;
+/* Development aid: HWR_OBJ_DUMP=<path> periodically writes the enumerated object
+ * list (atomically, via rename) for offline inspection. */
+static char g_obj_dump_path[2600];
+static uint32_t g_obj_dump_counter;
 
 static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation);
 
@@ -430,6 +443,9 @@ static void hwr_data_settings_apply(uint32_t mask,
 
 static void hwr_map_data_clear(void)
 {
+    hwr_objects_clear(&g_objects);
+    hwr_objects_set_enabled(&g_objects, g_objects_enabled);
+    memset(&g_sprite_census, 0, sizeof g_sprite_census);
     hwr_world_clear(&g_world);
     hwr_das_close(&g_map_archive);
     hwr_das_close(&g_shared_archive);
@@ -758,6 +774,33 @@ static void hwr_check_present_caps(const struct roth_api_v1 *api)
     }
 }
 
+/* Rebuilds the per-frame billboard enumeration from live state, dumps it on a
+ * throttle when HWR_OBJ_DUMP is set, and emits the object-layer stats line once
+ * after each map load. Runs at the render-dispatch safe point, after the world
+ * refresh, so the objects and geometry are drawn from one consistent frame. */
+static void hwr_run_object_layer(const struct roth_api_v1 *api)
+{
+    if (!g_objects_enabled)
+        return;
+    if (hwr_objects_rebuild(&g_objects, &g_world, api) != 0) {
+        if (g_debug_enabled)
+            fprintf(stderr, "[renderer_overhaul] object enumeration unavailable: %s\n",
+                    g_objects.error);
+        return;
+    }
+    if (g_object_stats_pending && g_debug_enabled) {
+        fprintf(stderr,
+                "[renderer_overhaul] object layer: objects=%zu sprite-textures=%zu sprite-frames=%zu decode-fails=%zu\n",
+                g_objects.count,
+                g_sprite_census.plain + g_sprite_census.grouped + g_sprite_census.animated,
+                g_sprite_census.sprite_frames, g_sprite_census.failures);
+        g_object_stats_pending = 0;
+    }
+    if (g_obj_dump_path[0] != 0 && ((g_obj_dump_counter++) % 30u) == 0)
+        hwr_objects_dump(&g_objects, g_obj_dump_path, api, &g_map_archive,
+                         &g_shared_archive);
+}
+
 static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                                                    const struct roth_api_v1 *api,
                                                    uint32_t eax_record)
@@ -855,6 +898,10 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     world_was_valid = g_world.valid;
     if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
         hwr_world_refresh_lut_state(&g_world, api) == 0) {
+        /* Enumerate this frame's billboards from the just-refreshed live state.
+         * The layer stages data only; nothing consumes it in the render below
+         * yet, so it never affects the current output. */
+        hwr_run_object_layer(api);
         /* The engine finishes repointing its color tables after the load
          * event fires; the first staged frame is the earliest safe moment to
          * confirm the snapshot saw the final tables. */
@@ -1106,11 +1153,17 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
     {
         const char *dump = getenv("HWR_DUMP_FRAME");
         const char *compare = getenv("HWR_COMPARE");
+        const char *objects = getenv("HWR_OBJECTS");
+        const char *obj_dump = getenv("HWR_OBJ_DUMP");
         if (dump != NULL)
             snprintf(g_dump_path, sizeof g_dump_path, "%s", dump);
         if (compare != NULL)
             snprintf(g_compare_path, sizeof g_compare_path, "%s", compare);
+        g_objects_enabled = !(objects != NULL && objects[0] == '0');
+        if (obj_dump != NULL)
+            snprintf(g_obj_dump_path, sizeof g_obj_dump_path, "%s", obj_dump);
     }
+    hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     hwr_settings_init_defaults();
     if (hwr_settings_register_apply(hwr_render_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_data_settings_apply, NULL) != 0 ||
@@ -1233,6 +1286,16 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         snprintf(failure, sizeof failure, "color tables: %.216s", hwr_world_error(&g_world));
         goto failed;
     }
+    /* Pre-decode every sprite frame both archives hold: all of the shared sprite
+     * set, and the per-map archive's object-graphic tail (ids at and above the
+     * bias). The census feeds the object-layer stats line. Decoding is idempotent
+     * with the scene upload's own lazy decode. */
+    memset(&g_sprite_census, 0, sizeof g_sprite_census);
+    if (g_objects_enabled) {
+        hwr_sprites_predecode(&g_shared_archive, 0, &g_sprite_census);
+        hwr_sprites_predecode(&g_map_archive, HWR_SPRITE_ID_BIAS, &g_sprite_census);
+        g_object_stats_pending = 1;
+    }
     if (g_debug_enabled) {
         fprintf(stderr, "[renderer_overhaul] map data (gen=%u map=%s shared=%s)\n",
                 generation, map_name, shared_name);
@@ -1284,6 +1347,7 @@ static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
     hwr_withdraw_if_owned(api);
     hwr_map_data_clear();
+    hwr_objects_clear(&g_objects);
     hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();
     g_channel_api = NULL;
