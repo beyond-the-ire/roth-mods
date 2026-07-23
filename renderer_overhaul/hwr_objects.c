@@ -165,6 +165,8 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
             item.seed = record[HWR_OBJ_OFF_SEED];
             item.sector_index = (uint16_t)sector;
             item.backref = hwr_obj_u16(record + HWR_OBJ_OFF_BACKREF);
+            item.flags7 = record[HWR_OBJ_OFF_FLAGS7];
+            item.flags9 = record[HWR_OBJ_OFF_FLAGS9];
             if (record[HWR_OBJ_OFF_FLAGS9] & 2u)
                 item.flags |= HWR_OBJECT_FLAG_REFLECTION_SKIP;
             if (record[HWR_OBJ_OFF_FLAGS7] & 1u)
@@ -317,9 +319,10 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
             hwr_sprites_frame(&lookup, &frame) == 0)
             have_frame = 1;
         fprintf(file,
-                "%-10s x=%d y=%d z=%d facing=%u id=%#06x shade=%u flags=%#x",
+                "%-10s x=%d y=%d z=%d facing=%u id=%#06x shade=%u flags=%#x f7=%#04x f9=%#04x",
                 hwr_objects_source_name(o->source), o->world_x, o->world_y,
-                o->world_z, o->facing, o->graphic_id, o->shade, o->flags);
+                o->world_z, o->facing, o->graphic_id, o->shade, o->flags,
+                o->flags7, o->flags9);
         if (have_frame)
             fprintf(file, " frame=%u %ux%u fflags=%#x flip=%d\n",
                     lookup.frame_index, frame.width, frame.height, frame.flags,

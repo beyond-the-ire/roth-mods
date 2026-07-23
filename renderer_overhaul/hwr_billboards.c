@@ -7,6 +7,10 @@
 
 /* View angle the direction resolver quantizes against (g_sprite_view_angle). */
 #define VA_G_SPRITE_VIEW_ANGLE   0x909f8u
+/* The engine's sincos table (g_sincos_table, 512 int16 entries scaled +/-16384;
+ * table[k] = 16384*sin(2*pi*k/512), cos(k) = table[k + 0x80]). The rotated /
+ * fixed-orientation object path indexes it to orient a flat face by its facing. */
+#define VA_G_SINCOS_TABLE        0x72080u
 /* The engine's type-1 billboard projects its horizontal extent with this focal
  * (g_view_params_block+0xc) and its vertical extent with g_perspective_scale,
  * while the mod's world projection uses focal_x/focal_y. The size is matched by
@@ -71,10 +75,36 @@ void hwr_billboards_clear(struct hwr_billboards *bb)
         return;
     free(bb->map_dir);
     free(bb->shared_dir);
+    free(bb->children);
     free(bb->opaque);
     free(bb->translucent);
     free(bb->runs);
     memset(bb, 0, sizeof *bb);
+}
+
+/* Appends one packed grouped child to the shared child table, growing it
+ * geometrically. Returns the child's index, or (size_t)-1 on OOM. */
+static size_t hwr_bb_add_child(struct hwr_billboards *bb, uint32_t payload_offset,
+                               uint32_t atlas_offset, uint16_t width,
+                               uint16_t height, uint16_t flags)
+{
+    struct hwr_bb_child *c;
+    if (bb->child_count == bb->child_capacity) {
+        size_t next = bb->child_capacity != 0 ? bb->child_capacity * 2u : 64u;
+        struct hwr_bb_child *grown = (struct hwr_bb_child *)realloc(
+            bb->children, next * sizeof *grown);
+        if (grown == NULL)
+            return (size_t)-1;
+        bb->children = grown;
+        bb->child_capacity = next;
+    }
+    c = &bb->children[bb->child_count];
+    c->payload_offset = payload_offset;
+    c->atlas_offset = atlas_offset;
+    c->width = width;
+    c->height = height;
+    c->flags = flags;
+    return bb->child_count++;
 }
 
 static int hwr_bb_fail(struct hwr_billboards *bb, const char *message)
@@ -112,8 +142,41 @@ static int hwr_bb_append(uint8_t **bytes, size_t *size, size_t *capacity,
     return 0;
 }
 
+/* Packs one grouped child (pixels -> store, entry -> shared child table),
+ * deduplicated by payload offset within this slot's child range. Returns 0 on
+ * success (or a benign skip), -1 on OOM. */
+static int hwr_bb_pack_group_child(struct hwr_billboards *bb,
+                                   struct hwr_das_entry *entry,
+                                   uint16_t child_word, uint8_t **bytes,
+                                   size_t *size, size_t *capacity,
+                                   size_t child_first)
+{
+    size_t child_offset;
+    int flip = 0;
+    struct hwr_das_texture_view view;
+    size_t k;
+    if (hwr_das_group_child_offset(entry, child_word, &child_offset, &flip) != 0 ||
+        hwr_das_group_child_view(entry, child_offset, &view) != 0 ||
+        view.pixels == NULL || view.pixel_count == 0 ||
+        *size > UINT32_MAX - view.pixel_count)
+        return 0;                                          /* skip malformed child */
+    for (k = child_first; k < bb->child_count; k++)
+        if (bb->children[k].payload_offset == (uint32_t)child_offset)
+            return 0;                                      /* already packed (mirror pair) */
+    {
+        uint32_t atlas_offset = (uint32_t)*size;
+        if (hwr_bb_append(bytes, size, capacity, view.pixels, view.pixel_count) != 0)
+            return -1;
+        if (hwr_bb_add_child(bb, (uint32_t)child_offset, atlas_offset,
+                             view.width, view.height, view.flags) == (size_t)-1)
+            return -1;
+    }
+    return 0;
+}
+
 /* Packs one entry's frame(s) into the store and records its atlas slot. */
-static int hwr_bb_pack_entry(struct hwr_das_archive *archive, size_t id,
+static int hwr_bb_pack_entry(struct hwr_billboards *bb,
+                             struct hwr_das_archive *archive, size_t id,
                              struct hwr_bb_slot *slot,
                              uint8_t **bytes, size_t *size, size_t *capacity)
 {
@@ -173,27 +236,43 @@ static int hwr_bb_pack_entry(struct hwr_das_archive *archive, size_t id,
         return 0;
     }
     case HWR_DAS_CLASS_GROUPED: {
-        /* Keep the first directional child as a stand-in; the mesh renderer
-         * owns the full grouped/sub-image path. */
-        uint16_t child_word;
-        size_t child_offset;
-        int flip = 0;
-        struct hwr_das_texture_view view;
+        /* Pack EVERY directional child so the emitter can draw the resolved
+         * facing (a grouped statue is view-directional; keeping only the first
+         * child rendered every direction as direction 0 -- the "backside for
+         * front" defect). The selector at payload+6 (== engine block+0x10)
+         * selects directional (0x8000) coarse (8) / fine (0x2000 -> 16) child
+         * words at payload+8+ci; a non-directional grouped block keeps just the
+         * first child (part/actor selection is resolved elsewhere). The first
+         * child also stands in as base_offset for an unmatched resolve. */
+        uint16_t selector;
+        size_t child_first = bb->child_count;
+        uint32_t ci, ci_max;
         if (entry->raw_payload == NULL || entry->raw_payload_size < 10u)
             return 0;
-        child_word = (uint16_t)(entry->raw_payload[8] |
-                                ((uint16_t)entry->raw_payload[9] << 8));
-        if (hwr_das_group_child_offset(entry, child_word, &child_offset, &flip) != 0 ||
-            hwr_das_group_child_view(entry, child_offset, &view) != 0 ||
-            view.pixels == NULL || view.pixel_count == 0 ||
-            *size > UINT32_MAX - view.pixel_count)
-            return 0;
-        slot->base_offset = (uint32_t)*size;
-        if (hwr_bb_append(bytes, size, capacity, view.pixels, view.pixel_count) != 0)
-            return -1;
-        slot->width = view.width;
-        slot->height = view.height;
-        slot->flags = view.flags;
+        selector = (uint16_t)(entry->raw_payload[6] |
+                              ((uint16_t)entry->raw_payload[7] << 8));
+        ci_max = (selector & 0x8000u)
+               ? ((selector & 0x2000u) ? 30u : 14u)        /* fine 16-dir / coarse 8-dir */
+               : 0u;                                        /* non-directional: first child only */
+        for (ci = 0; ci <= ci_max; ci += 2u) {
+            size_t off = 8u + (size_t)ci;
+            uint16_t child_word;
+            if (off + 2u > entry->raw_payload_size)
+                continue;
+            child_word = (uint16_t)(entry->raw_payload[off] |
+                                    ((uint16_t)entry->raw_payload[off + 1u] << 8));
+            if (hwr_bb_pack_group_child(bb, entry, child_word, bytes, size,
+                                        capacity, child_first) != 0)
+                return -1;
+        }
+        if (bb->child_count == child_first)
+            return 0;                                       /* no valid child packed */
+        slot->child_first = (uint32_t)child_first;
+        slot->child_count = (uint16_t)(bb->child_count - child_first);
+        slot->base_offset = bb->children[child_first].atlas_offset;
+        slot->width = bb->children[child_first].width;
+        slot->height = bb->children[child_first].height;
+        slot->flags = bb->children[child_first].flags;
         slot->frame_count = 1;
         slot->klass = HWR_DAS_CLASS_GROUPED;
         slot->present = 1;
@@ -204,7 +283,8 @@ static int hwr_bb_pack_entry(struct hwr_das_archive *archive, size_t id,
     }
 }
 
-static int hwr_bb_pack_archive(struct hwr_das_archive *archive, size_t first_id,
+static int hwr_bb_pack_archive(struct hwr_billboards *bb,
+                               struct hwr_das_archive *archive, size_t first_id,
                                struct hwr_bb_slot **dir_out, size_t *dir_count_out,
                                uint8_t **bytes, size_t *size, size_t *capacity)
 {
@@ -219,7 +299,7 @@ static int hwr_bb_pack_archive(struct hwr_das_archive *archive, size_t first_id,
     if (dir == NULL)
         return -1;
     for (id = first_id; id < count; id++) {
-        if (hwr_bb_pack_entry(archive, id, &dir[id], bytes, size, capacity) != 0) {
+        if (hwr_bb_pack_entry(bb, archive, id, &dir[id], bytes, size, capacity) != 0) {
             free(dir);
             return -1;
         }
@@ -240,8 +320,12 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
         return -1;
     free(bb->map_dir);
     free(bb->shared_dir);
+    free(bb->children);
     bb->map_dir = NULL;
     bb->shared_dir = NULL;
+    bb->children = NULL;
+    bb->child_count = 0;
+    bb->child_capacity = 0;
     bb->map_dir_count = 0;
     bb->shared_dir_count = 0;
     bb->map_archive = map_archive;
@@ -251,11 +335,11 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
         return 0;                                         /* kill switch: no atlas */
     /* Map object graphics occupy the archive tail from the id bias; the shared
      * (ADEMO) archive holds the game-wide sprite set from its start. */
-    if (hwr_bb_pack_archive(map_archive, HWR_SPRITE_ID_BIAS,
+    if (hwr_bb_pack_archive(bb, map_archive, HWR_SPRITE_ID_BIAS,
                             &bb->map_dir, &bb->map_dir_count,
                             bytes, size, capacity) != 0)
         return hwr_bb_fail(bb, "out of memory packing map sprite atlas");
-    if (hwr_bb_pack_archive(shared_archive, 0,
+    if (hwr_bb_pack_archive(bb, shared_archive, 0,
                             &bb->shared_dir, &bb->shared_dir_count,
                             bytes, size, capacity) != 0)
         return hwr_bb_fail(bb, "out of memory packing shared sprite atlas");
@@ -285,6 +369,12 @@ static void hwr_bb_view_point(const struct hwr_gl_camera *camera,
     int32_t dp = dy * camera->yaw_sin - dx * camera->yaw_cos;
     *view_x = vx >= 0 ? vx >> 6 : -(int32_t)(((uint32_t)(-vx) + 63u) >> 6);
     *depth  = dp >= 0 ? dp >> 6 : -(int32_t)(((uint32_t)(-dp) + 63u) >> 6);
+}
+
+/* g_sincos_table lookup: returns 16384*sin(2*pi*k/512) as a signed value. */
+static int32_t hwr_bb_sincos(const struct roth_api_v1 *api, uint32_t k)
+{
+    return (int16_t)api->game_ram->u16(VA_G_SINCOS_TABLE + (k & 0x1ffu) * 2u);
 }
 
 static int hwr_bb_reserve_verts(struct hwr_gl_vertex **arr, size_t count,
@@ -501,12 +591,38 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             uint16_t index = lookup.frame_index < slot->frame_count
                            ? lookup.frame_index : 0;
             offset = slot->base_offset + (uint32_t)index * slot->frame_bytes;
+            tw = slot->width;
+            th = slot->height;
+            fa = slot->flags;
+        } else if (slot->klass == HWR_DAS_CLASS_GROUPED) {
+            /* Draw the resolved directional child, not the first-child stand-in. */
+            const struct hwr_bb_child *child = NULL;
+            uint16_t c;
+            for (c = 0; c < slot->child_count; c++) {
+                const struct hwr_bb_child *cand =
+                    &bb->children[slot->child_first + c];
+                if (cand->payload_offset == (uint32_t)lookup.child_offset) {
+                    child = cand;
+                    break;
+                }
+            }
+            if (child == NULL) {                          /* fallback: first child */
+                offset = slot->base_offset;
+                tw = slot->width;
+                th = slot->height;
+                fa = slot->flags;
+            } else {
+                offset = child->atlas_offset;
+                tw = child->width;
+                th = child->height;
+                fa = child->flags;
+            }
         } else {
             offset = slot->base_offset;
+            tw = slot->width;
+            th = slot->height;
+            fa = slot->flags;
         }
-        tw = slot->width;
-        th = slot->height;
-        fa = slot->flags;
         if (tw == 0 || th == 0)
             continue;
 
@@ -580,10 +696,27 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             z_top = z_bottom + vext;
         }
 
-        /* Camera-facing: the horizontal axis is the camera-right world vector
-         * (yaw_sin, yaw_cos)/16384, centred on the object. */
-        rx = half_w * (double)camera->yaw_sin / 16384.0;
-        ry = half_w * (double)camera->yaw_cos / 16384.0;
+        /* Horizontal axis. A camera-facing object spans the camera-right world
+         * vector (yaw_sin, yaw_cos)/16384. A FIXED-ORIENTATION face (map record
+         * +9 bit0x80 -> the engine's rotated projection, rwss_rotated_tail
+         * renderer.c:6093-6148) instead lies flat in the world, its horizontal
+         * axis set by the authored facing. The engine builds the rotated edges
+         * in VIEW space at angle 2*(facing+0x40) - yaw; undoing the camera
+         * rotation, the yaw and the +0x40 (90 deg) term cancel to a world axis at
+         * angle 2*facing + 0x80 -- independent of the camera, so the quad stays
+         * pinned to the wall as the view moves. The half-extent is the same as
+         * the billboard's (the engine's ext*|sincos| reaches the same 256*height
+         * magnitude), so only the direction differs. */
+        if ((o->flags9 & 0x80u) != 0) {
+            uint32_t phi = 2u * (uint32_t)o->facing + 0x80u;
+            double ax = (double)hwr_bb_sincos(api, phi);          /* sin(phi) */
+            double ay = (double)hwr_bb_sincos(api, phi + 0x80u);  /* cos(phi) */
+            rx = half_w * ax / 16384.0;
+            ry = half_w * ay / 16384.0;
+        } else {
+            rx = half_w * (double)camera->yaw_sin / 16384.0;
+            ry = half_w * (double)camera->yaw_cos / 16384.0;
+        }
         xl = hwr_bb_clamp_i16((int32_t)((double)o->world_x - rx));
         yl = hwr_bb_clamp_i16((int32_t)((double)o->world_y - ry));
         xr = hwr_bb_clamp_i16((int32_t)((double)o->world_x + rx));

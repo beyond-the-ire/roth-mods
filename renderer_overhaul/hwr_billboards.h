@@ -22,14 +22,30 @@
  * SKIPPED here and counted; that is a later change. Nothing here is cached across
  * frames except the immutable per-map sprite atlas built at map load. */
 
+/* One packed directional child of a grouped resource, keyed by its payload-
+ * relative byte offset (== the value hwr_das_group_child_offset yields, so the
+ * emitter can match the resolved child). */
+struct hwr_bb_child {
+    uint32_t payload_offset;
+    uint32_t atlas_offset;
+    uint16_t width;
+    uint16_t height;
+    uint16_t flags;
+};
+
 /* One packed sprite resource, addressed by (archive, entry id). Plain and
  * grouped resources hold a single image; animated resources hold frame_count
  * images packed back to back at base_offset, stride frame_bytes. A grouped
- * resource keeps the FIRST directional child as a stand-in (the mesh renderer
- * owns the full grouped/mesh sub-image path). */
+ * resource packs EVERY directional child into the store and records them in the
+ * billboards' shared child table [child_first, child_first+child_count); the
+ * emitter picks the child matching the resolved directional index, so a
+ * grouped statue shows the correct facing (base_offset stays the first child as
+ * a fallback when a resolved child is not among the packed set). */
 struct hwr_bb_slot {
     uint32_t base_offset;
     uint32_t frame_bytes;
+    uint32_t child_first;
+    uint16_t child_count;
     uint16_t width;
     uint16_t height;
     uint16_t flags;
@@ -45,6 +61,10 @@ struct hwr_billboards {
     size_t shared_dir_count;
     struct hwr_das_archive *map_archive;
     struct hwr_das_archive *shared_archive;
+    /* Shared table of packed grouped-children; slots index into it. */
+    struct hwr_bb_child *children;
+    size_t child_count;
+    size_t child_capacity;
     int built;
 
     /* Per-frame emit scratch. Opaque (raw) quads depth-test naturally; masked/

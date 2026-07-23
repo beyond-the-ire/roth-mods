@@ -27,10 +27,14 @@ enum hwr_object_flags {
     /* Map record +9 bit1: skip this object during a reflection/secondary walk.
      * The primary pass ignores it; a mirror subview must honour it. */
     HWR_OBJECT_FLAG_REFLECTION_SKIP = 1u << 0,
-    /* Map record +7 bit0: the engine's type-3 discriminator
-     * (renderer.c:8042). These faces render through the fixed-orientation
-     * (linear/wall) path, not the camera-facing billboard finalize -- a flat
-     * object whose world orientation is set by its authored facing. */
+    /* Map record +7 bit0: the engine's type-3 draw-entry discriminator
+     * (renderer.c:8042). Type-3 faces are mostly authored as 3D-object meshes
+     * (resolved block flag 0x8000) and are skipped with the mesh class; a
+     * non-mesh type-3 takes the linear (camera-facing) path unless it also
+     * carries +9 bit0x80. The FIXED-ORIENTATION (flat-on-wall) rendering is the
+     * engine's ROTATED path, keyed on record +9 bit0x80 (see flags9 and
+     * rwss_rotated_tail renderer.c:6093-6148) -- the emitter orients those by
+     * facing. This flag is retained as the type-3 marker for diagnostics. */
     HWR_OBJECT_FLAG_FLAT = 1u << 1
 };
 
@@ -48,6 +52,11 @@ struct hwr_object {
     uint8_t seed;
     uint8_t source;
     uint8_t flags;
+    /* Raw record flag bytes +7 and +9, kept so the emitter can read the type-3
+     * sub-discriminators (record +9 bit0x80 selects the engine's rotated /
+     * fixed-orientation projection for a flat face). */
+    uint8_t flags7;
+    uint8_t flags9;
     /* Owner sector index recorded during the per-sector enumeration, so the
      * emitter can gate a billboard on the engine's visible-sector set and
      * inherit that sector's shade/tint selection. HWR_OBJECT_NO_SECTOR when the
