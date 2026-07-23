@@ -898,9 +898,24 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
              * through the occlusion pass's polygon offset.  The colorkey
              * middle is the load-bearing condition: an EDGE_MAP face with a
              * real middle texture draws normally, and skying it over would
-             * blanket walls the engine shows. */
+             * blanket walls the engine shows.
+             *
+             * A solid direct-colour upper band is a lintel, and it disqualifies
+             * the opening: the face frames a see-through doorway (e.g. ANUBDOOR)
+             * whose top is capped by opaque geometry, not an aperture onto the
+             * sky.  The engine draws such a face's parallax sky only above its
+             * own top edge (the per-band cap above already emits that) and
+             * leaves the colorkey middle see-through, so the door behind shows;
+             * it never occludes with sky.  Emitting the full-height occluding
+             * cap here would blanket that doorway with sky (the ANUBIS door
+             * vanishing behind parallax sky), so a framed opening skips it.
+             * Genuine sky openings leave the upper band empty (ceilings level)
+             * or colorkey, so the sentinel/colorkey upper id keeps them skied. */
+            int framed_opening = (wall->upper_id & 0x8000u) != 0 &&
+                                 wall->upper_id != 0xFFFFu;
             if ((wall->mapping_flags & 0x40u) != 0 &&
-                (uint16_t)wall->middle_id == world->world_span_colorkey) {
+                (uint16_t)wall->middle_id == world->world_span_colorkey &&
+                !framed_opening) {
                 const struct hwr_vertex *a = &world->vertices[wall->vertex_a_index];
                 const struct hwr_vertex *b = &world->vertices[wall->vertex_b_index];
                 int16_t base = sector->floor_z;
