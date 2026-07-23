@@ -407,10 +407,16 @@ int hwr_sprites_frame(const struct hwr_sprite_lookup *lookup,
         frame->pixels = entry->raw_payload + 6u;
         return 0;
     case HWR_DAS_CLASS_ANIMATED: {
-        uint16_t index = lookup->frame_index < entry->frame_count
-                       ? lookup->frame_index : 0;
-        if (entry->frames == NULL || entry->frame_count == 0 ||
-            entry->frames[index].pixels == NULL)
+        /* Out-of-range clamps to the LAST frame, not frame 0: the engine stores
+         * the requested RLE index but clamps its decode to the final frame
+         * (das_assets.c:1503), so a dying actor requesting a frame past the end
+         * HOLDS the last death pose. Mapping to 0 flashed the alive frame. */
+        uint16_t index;
+        if (entry->frame_count == 0)
+            return -1;
+        index = lookup->frame_index < entry->frame_count
+              ? lookup->frame_index : (uint16_t)(entry->frame_count - 1u);
+        if (entry->frames == NULL || entry->frames[index].pixels == NULL)
             return -1;
         frame->width = entry->frames[index].width;
         frame->height = entry->frames[index].height;

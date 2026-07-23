@@ -2045,11 +2045,18 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
             g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
                              (GLsizei)opaque_main);
         if (flat_vertices != 0 && opaque_vertices >= flat_vertices) {
+            /* Depth TEST stays (a nearer wall still occludes the decal), but
+             * depth WRITES are off: the decal is a later painter overlay on its
+             * coplanar wall, not a new occluder, so it must not stamp its own
+             * (biased-nearer) depth and shadow a sprite that legitimately stands
+             * in front of the wall. */
             g_gl.enable(GL_POLYGON_OFFSET_FILL);
             g_gl.polygon_offset(-1.0f, -1.0f);
+            g_gl.depth_mask(GL_FALSE);
             g_gl.draw_arrays(GL_TRIANGLES,
                              (GLint)(sky_vertices + opaque_main),
                              (GLsizei)flat_vertices);
+            g_gl.depth_mask(GL_TRUE);
             g_gl.polygon_offset(0.0f, 0.0f);
             g_gl.disable(GL_POLYGON_OFFSET_FILL);
         }

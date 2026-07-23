@@ -515,9 +515,9 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         uint32_t offset;
         uint16_t tw, th, fa;
         uint8_t sector_light = 0, sector_flags = 0, seed, composed, material;
-        double half_w, famod, vext_d, rx, ry;
+        double half_w, famod, vext_d, rx, ry, cx, cy;
         int32_t disp, vext, z_top, z_bottom;
-        int16_t xl, yl, xr, yr;
+        int16_t xl, yl, xr, yr, origin_x, origin_y;
         int translucent, do_trace, cl;
 
         bb->stat_enumerated++;
@@ -580,6 +580,9 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                         (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
             continue;
         }
+        if ((frame.flags & 0x20u) != 0)
+            continue;                                     /* resolved block +0xa bit5 = DRAW NOTHING
+                                                           * (renderer.c:6292 hookblk) */
 
         slot = hwr_bb_slot_of(bb, &lookup);
         if (slot == NULL || !slot->present) {
@@ -590,8 +593,11 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             continue;
         }
         if (slot->klass == HWR_DAS_CLASS_ANIMATED) {
+            /* Clamp out-of-range to the LAST frame (death-pose hold), matching
+             * das_assets.c:1503 -- not frame 0, which flashed the alive sprite. */
             uint16_t index = lookup.frame_index < slot->frame_count
-                           ? lookup.frame_index : 0;
+                           ? lookup.frame_index
+                           : (uint16_t)(slot->frame_count ? slot->frame_count - 1u : 0u);
             offset = slot->base_offset + (uint32_t)index * slot->frame_bytes;
             tw = slot->width;
             th = slot->height;
@@ -657,6 +663,26 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
          * half a_h = (frame.height*2) << cl (renderer.c:7720/7738); vertical
          * ecxv = frame.width*2, block-modifier scaled (w980, :7723-7736). The
          * modifier nibble sets cl {6,7,7+t} and the vertical scale {0.5,1,2^t}. */
+        /* Signed DAS origin prefix (FAT flag 8; hwr_das.c:527). The engine loads
+         * the 4-byte prefix into the resolved block and applies it before the
+         * anchor branch: low word = a flip-aware HORIZONTAL origin added to the
+         * view X the quad centres on (renderer.c:5667-5669), high word = a
+         * VERTICAL origin folded into the displacement (renderer.c:7758). It is
+         * per-resolved-leaf; grouped children carry their own child data, not the
+         * entry prefix, and the grouped (statue) path already matches at origin 0,
+         * so the prefix is applied only to plain/animated leaves. */
+        origin_x = 0;
+        origin_y = 0;
+        if (lookup.klass == HWR_DAS_CLASS_PLAIN ||
+            lookup.klass == HWR_DAS_CLASS_ANIMATED) {
+            const struct hwr_das_entry *le =
+                &lookup.archive->entries[lookup.entry_id];
+            origin_x = (int16_t)(uint16_t)(le->size_prefix & 0xffffu);
+            origin_y = (int16_t)(uint16_t)(le->size_prefix >> 16);
+        }
+        if (lookup.flip)                            /* x-flip mirrors origin_x (renderer.c:5668) */
+            origin_x = (int16_t)(-origin_x);
+
         famod = 1.0;
         cl = 7;
         if ((fa & 0x80u) != 0) {
@@ -672,9 +698,15 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         half_w = (double)((uint32_t)((uint32_t)th * 2u) << cl) * hscale;
         vext_d = 2.0 * (double)tw * famod * vscale;
         vext = (int32_t)(vext_d + 0.5);
-        /* Low-nibble vertical displacement edxv = 2*(dl&0xf), same projected
-         * domain as the extent (renderer.c:7756-7758). */
-        disp = (int32_t)(2.0 * (double)(fa & 0xfu) * vscale + 0.5);
+        /* Low-nibble vertical displacement edxv = 2*(dl&0xf), plus the prefix's
+         * vertical origin -- but NOT on the rotated path, which omits it
+         * (renderer.c:7756-7758 vs 6129-6134). */
+        {
+            double disp_units = 2.0 * (double)(fa & 0xfu)
+                              + ((o->flags9 & 0x80u) ? 0.0 : (double)origin_y);
+            double disp_d = disp_units * vscale;
+            disp = (int32_t)(disp_d + (disp_d >= 0.0 ? 0.5 : -0.5));
+        }
 
         /* Vertical anchor + displacement (finalize_draw_list_entry,
          * renderer.c:7754-7768). The engine's vertical anchor is
@@ -719,10 +751,17 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             rx = half_w * (double)camera->yaw_sin / 16384.0;
             ry = half_w * (double)camera->yaw_cos / 16384.0;
         }
-        xl = hwr_bb_clamp_i16((int32_t)((double)o->world_x - rx));
-        yl = hwr_bb_clamp_i16((int32_t)((double)o->world_y - ry));
-        xr = hwr_bb_clamp_i16((int32_t)((double)o->world_x + rx));
-        yr = hwr_bb_clamp_i16((int32_t)((double)o->world_y + ry));
+        /* Horizontal origin: the engine adds (origin_x<<8) to the view X the
+         * quad centres on (renderer.c:5669 -> 7740). A world shift of origin_x
+         * world units along camera-right (yaw_sin,yaw_cos)/16384 projects to
+         * exactly that (a unit camera-right shift moves view X by 256). Applies
+         * to both the camera-facing and the rotated centre. */
+        cx = (double)o->world_x + (double)origin_x * (double)camera->yaw_sin / 16384.0;
+        cy = (double)o->world_y + (double)origin_x * (double)camera->yaw_cos / 16384.0;
+        xl = hwr_bb_clamp_i16((int32_t)(cx - rx));
+        yl = hwr_bb_clamp_i16((int32_t)(cy - ry));
+        xr = hwr_bb_clamp_i16((int32_t)(cx + rx));
+        yr = hwr_bb_clamp_i16((int32_t)(cy + ry));
 
         /* Billboards always mask: palette index 0 is the sprite transparency
          * key (the engine's object/entity sprites render with a transparent

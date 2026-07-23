@@ -145,9 +145,9 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
         count = section[list_offset];
         if (count == 0)
             continue;
-        if (!hwr_objects_section_fits(list_offset + 1u,
+        if (!hwr_objects_section_fits(list_offset + 2u,
                                       (uint32_t)count * HWR_OBJ_RECORD_STRIDE))
-            continue;
+            continue;                               /* records begin at +2, not +1 */
         record_offset = list_offset + 2u;
         for (j = 0; j < count; j++, record_offset += HWR_OBJ_RECORD_STRIDE) {
             const uint8_t *record = section + record_offset;
