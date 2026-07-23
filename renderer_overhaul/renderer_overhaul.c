@@ -127,6 +127,7 @@ static struct hwr_objects g_objects;
 static struct hwr_sprite_census g_sprite_census;
 static int g_objects_enabled = 1;
 static int g_object_stats_pending;
+static int g_billboard_stats_pending;
 /* Development aid: HWR_OBJ_DUMP=<path> periodically writes the enumerated object
  * list (atomically, via rename) for offline inspection. */
 static char g_obj_dump_path[2600];
@@ -949,12 +950,22 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
             }
         }
         pixels = g_scene.valid
-               ? hwr_scene_render(&g_scene, &g_world, api, render_width, render_height)
+               ? hwr_scene_render(&g_scene, &g_world, &g_objects, api,
+                                  render_width, render_height)
                : NULL;
         if (pixels == NULL && g_scene.valid && !g_scene_error_logged) {
             fprintf(stderr, "[renderer_overhaul] scene render failed: %s; using solid fallback\n",
                     hwr_gl_last_error());
             g_scene_error_logged = 1;
+        }
+        if (g_billboard_stats_pending && g_debug_enabled && pixels != NULL &&
+            g_scene.valid) {
+            fprintf(stderr,
+                    "[renderer_overhaul] billboards=%zu/%zu skipped-mesh=%zu\n",
+                    g_scene.billboards.stat_emitted,
+                    g_scene.billboards.stat_enumerated,
+                    g_scene.billboards.stat_skipped_mesh);
+            g_billboard_stats_pending = 0;
         }
     } else {
         pixels = NULL;
@@ -1001,7 +1012,7 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                                              probe[0] <= '9' ? probe[0] - '0' : 2;
                             hwr_gl_set_debug_vis(probe_mode);
                         }
-                        if (hwr_scene_render(&g_scene, &g_world, api,
+                        if (hwr_scene_render(&g_scene, &g_world, &g_objects, api,
                                              render_width, render_height) != NULL) {
                             step = 3;
                             if (hwr_gl_read_scene_indices(gltex, render_width,
@@ -1295,6 +1306,7 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         hwr_sprites_predecode(&g_shared_archive, 0, &g_sprite_census);
         hwr_sprites_predecode(&g_map_archive, HWR_SPRITE_ID_BIAS, &g_sprite_census);
         g_object_stats_pending = 1;
+        g_billboard_stats_pending = 1;
     }
     if (g_debug_enabled) {
         fprintf(stderr, "[renderer_overhaul] map data (gen=%u map=%s shared=%s)\n",

@@ -35,10 +35,27 @@ struct hwr_object {
     int16_t world_z;
     uint16_t graphic_id;
     uint8_t facing;
+    /* Record +0xe: the shade seed the 3D-object (mesh) path reads. Kept for the
+     * mesh renderer; the billboard path uses `seed` (+8) below instead. */
     uint8_t shade;
+    /* Record +8: the shade seed the type-1 billboard path composes with the
+     * owner sector's light (renderer.c:6180-6182). */
+    uint8_t seed;
     uint8_t source;
     uint8_t flags;
+    /* Owner sector index recorded during the per-sector enumeration, so the
+     * emitter can gate a billboard on the engine's visible-sector set and
+     * inherit that sector's shade/tint selection. HWR_OBJECT_NO_SECTOR when the
+     * source carries no owning sector (particles, pickup overlay). */
+    uint16_t sector_index;
+    /* Record +0xc: the actor pool backref (actor_index*0x22 + 1) the monster
+     * frame resolver follows to the live actor state; 0 for a non-monster or an
+     * unlinked record, which falls back to the static appearance table. */
+    uint16_t backref;
 };
+
+/* Sentinel owner-sector value for objects with no owning sector. */
+#define HWR_OBJECT_NO_SECTOR 0xffffu
 
 struct hwr_objects {
     struct hwr_object *items;

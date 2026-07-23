@@ -1,8 +1,10 @@
 #ifndef HWR_SCENE_H
 #define HWR_SCENE_H
 
+#include "hwr_billboards.h"
 #include "hwr_das.h"
 #include "hwr_gl.h"
+#include "hwr_objects.h"
 #include "hwr_world.h"
 
 #include <stddef.h>
@@ -176,6 +178,13 @@ struct hwr_scene {
     uint8_t *visible;
     size_t visible_count;
     int pvs_valid;
+    /* The camera-facing billboard layer. Its sprite frames are packed into the
+     * same texel store as the world textures at upload, and its per-frame quads
+     * are streamed after the world surfaces. Archive pointers are retained from
+     * the rebuild so the emitter can resolve object graphic ids each frame. */
+    struct hwr_billboards billboards;
+    struct hwr_das_archive *map_archive;
+    struct hwr_das_archive *shared_archive;
     int uploaded;
     int valid;
     int fallback_logged;
@@ -193,6 +202,7 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
                       const struct roth_api_v1 *api, int debug);
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
+                                 const struct hwr_objects *objects,
                                  const struct roth_api_v1 *api,
                                  uint32_t width, uint32_t height);
 void hwr_scene_clear(struct hwr_scene *scene);

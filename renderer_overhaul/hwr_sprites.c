@@ -13,6 +13,12 @@
 #define VA_G_DESC_TABLE_SHARED    0x85cecu  /* g_map_das_dir_table_buffer+0x4 */
 #define VA_G_MONSTER_STATIC_TABLE 0x85cf4u  /* g_ademo_das_fat_buffer+0x4 */
 #define VA_G_PART_TABLE           0x909b4u  /* g_floor_tex_caps+0x2 */
+/* The live cache slot directory (renderer.c:2b7e0): stride 6, holding a handle
+ * whose deref is the resident block pointer. */
+#define VA_G_DAS_CACHE_SLOTS      0x89930u
+/* Actor state pool (0x91e04, stride 0x22). The map-object +0xc backref is
+ * actor_index*0x22 + 1, so the slot record VA is 0x91e03 + backref. */
+#define VA_G_ACTOR_SLOT_BIAS      0x91e03u
 
 /* Selector-word flags (renderer.c:5894-5908). They live on the selector word, not
  * on the resolved child entry. */
@@ -103,25 +109,106 @@ void hwr_sprites_predecode(struct hwr_das_archive *archive, size_t first_id,
     }
 }
 
-/* Reads a little-endian u16 at host_ptr+offset, but only when that address falls
- * inside the bounded game_ram window, so a stray descriptor pointer fails closed
- * instead of dereferencing wild memory. Runtime descriptor tables live in engine
- * buffers inside the window; a pointer that resolves outside it (or before the
- * base) yields the miss sentinel. */
-static int hwr_sprites_peek_u16(const struct roth_api_v1 *api, uint32_t host_ptr,
-                                uint32_t offset, uint16_t *value)
+/* Reads a little-endian u16 directly from a stored engine host pointer. The
+ * monster/dir-object descriptor tables are separate engine heap allocations that
+ * live OUTSIDE the bounded game_ram accessor window (the plugin shares the
+ * process address space, exactly as the world-geometry sections are reached), so
+ * they cannot go through the window-checked peek. A null/low pointer reads 0. */
+static uint16_t hwr_sprites_host_u16(uint32_t host_ptr, uint32_t offset)
 {
-    uintptr_t base = (uintptr_t)api->game_ram->to_ptr(0);
-    uintptr_t target = (uintptr_t)host_ptr + offset;
-    if (base == 0 || (uintptr_t)host_ptr < base)
-        return -1;
-    {
-        uint64_t va = (uint64_t)(target - base);
-        if (va + 2u > (uint64_t)api->game_ram->size())
-            return -1;
-        *value = api->game_ram->u16((uint32_t)va);
+    if (host_ptr < 0x10000u)
         return 0;
+    {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)(host_ptr + offset);
+        return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
     }
+}
+
+static uint32_t hwr_sprites_host_u32(uint32_t host_ptr, uint32_t offset)
+{
+    if (host_ptr < 0x10000u)
+        return 0;
+    {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)(host_ptr + offset);
+        return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+               ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    }
+}
+
+/* The engine's per-face surface-id priority ladder (resolve_face_surface_id,
+ * renderer.c:12700-12742, VA 0x4f0ab). `rec_va` is the live actor slot record;
+ * `base` is the monster mapping-table entry (host ptr); `ci` is the coarse
+ * direction. The field is picked by the actor STATE flags byte at rec+8, with
+ * the priority 0x20 > 0x40 > 8 > 0x80 > ==5, each with a bit0 sub-select and a
+ * zero-fallback to the default word[base+ci+0x14]; a set cache byte rec+0x21
+ * validates the cached id first. Returns 0 (invalid) when every field is zero
+ * or a read leaves the window. */
+static uint16_t hwr_sprites_resolve_face_id(const struct roth_api_v1 *api,
+                                            uint32_t rec_va, uint32_t base,
+                                            uint32_t ci)
+{
+    uint32_t flags = api->game_ram->u32(rec_va + 8u);
+    uint8_t bl = (uint8_t)flags;
+    uint16_t v;
+    if (api->game_ram->u8(rec_va + 0x21u) != 0) {          /* cached id -> validate */
+        uint16_t primary = hwr_sprites_host_u16(base, ci + 0x14u);
+        uint16_t cached = hwr_sprites_host_u16(base, ci + 0x44u);
+        return (cached == 0 || cached == primary) ? primary : cached;
+    }
+    if (bl & 0xfcu) {
+        if (bl & 0x20u) {
+            if ((bl & 1u) && (v = hwr_sprites_host_u16(base, 0x58u)) != 0) return v;
+            if ((v = hwr_sprites_host_u16(base, 0x54u)) != 0) return v;
+            goto default_lookup;
+        }
+        if (bl & 0x40u) {
+            if ((v = hwr_sprites_host_u16(base, (bl & 1u) ? 0x5eu : 0x5cu)) != 0) return v;
+            goto dispatch_default;
+        }
+        if (bl & 8u) {
+            if ((bl & 1u) && (v = hwr_sprites_host_u16(base, ci + 0x34u)) != 0) return v;
+            if ((v = hwr_sprites_host_u16(base, ci + 0x24u)) != 0) return v;
+            goto default_lookup;
+        }
+        if (bl & 0x80u) {
+            if ((v = hwr_sprites_host_u16(base, ci + 0x44u)) != 0) return v;
+            goto default_lookup;
+        }
+        if (bl == 5u) {
+            if ((v = hwr_sprites_host_u16(base, 0x62u)) != 0) return v;
+            goto default_lookup;
+        }
+    }
+dispatch_default:
+    if (flags & 0x20000u) {
+        if ((v = hwr_sprites_host_u16(base, ci + 4u)) != 0) return v;
+    }
+default_lookup:
+    return hwr_sprites_host_u16(base, ci + 0x14u);
+}
+
+int hwr_sprites_live_frame_index(const struct roth_api_v1 *api,
+                                 uint16_t archive_id)
+{
+    uint16_t status;
+    uint8_t low;
+    uint32_t handle, block;
+    if (api == NULL || api->game_ram == NULL)
+        return -1;
+    status = api->game_ram->u16(VA_G_STATUS_TABLE + (uint32_t)archive_id * 2u);
+    low = (uint8_t)status;
+    if (low >= 0xfcu)
+        return -1;                                          /* not resident */
+    handle = api->game_ram->u32(VA_G_DAS_CACHE_SLOTS + (uint32_t)low * 6u);
+    if (handle < 0x10000u)
+        return -1;
+    /* The Pool handle and the block it points at are out-of-window engine heap
+     * (as the descriptor tables), so read the block pointer and its header
+     * current-frame index word (+0x18) by direct host deref. */
+    block = hwr_sprites_host_u32(handle, 0u);
+    if (block < 0x10000u)
+        return -1;
+    return (int)hwr_sprites_host_u16(block, 0x18u);
 }
 
 /* The 8- and 16-direction frame index (renderer.c:5896-5907). The direction is
@@ -158,9 +245,12 @@ static int hwr_sprites_resolve_grouped(const struct roth_api_v1 *api,
                                                   (selector & HWR_SEL_FINE) != 0);
         child_word_offset = 8u + ci;
     } else if ((selector & HWR_SEL_ACTOR) != 0) {
-        /* Actor-indexed grouped blocks pick their child from the entity's live
-         * frame byte; that byte's origin is settled during live emission. Until
-         * then the first variant stands in, matching the mesh path. */
+        /* Selector bit 0x4000 is the mesh-face SUB_TEXTURE_INDEX path (a
+         * Graphics-Folder sub-image pick, DAS.md FACE +0x1c) -- NOT an actor
+         * index; the record it reads lives in the geometry arena, never the
+         * actor pool, and a monster never takes it. The mesh renderer owns the
+         * real sub-image selection; a grouped block reached here keeps its first
+         * variant as a stand-in. */
         child_word_offset = 8u;
     } else {
         uint16_t part = api->game_ram->u16(VA_G_PART_TABLE + (uint32_t)selector);
@@ -197,6 +287,7 @@ static int hwr_sprites_resolve_leaf(const struct roth_api_v1 *api,
     entry = &owner->entries[entry_id];
     out->archive = owner;
     out->entry_id = entry_id;
+    out->archive_id = archive_id;
     out->klass = entry->resource_class;
     if (entry->resource_class == HWR_DAS_CLASS_GROUPED) {
         if (hwr_sprites_resolve_grouped(api, entry, facing, yaw, screen_angle_corr,
@@ -210,7 +301,8 @@ static int hwr_sprites_resolve_leaf(const struct roth_api_v1 *api,
 int hwr_sprites_resolve(const struct roth_api_v1 *api,
                         struct hwr_das_archive *map, struct hwr_das_archive *shared,
                         uint16_t graphic_id, uint8_t facing, uint16_t yaw,
-                        int32_t screen_angle_corr, struct hwr_sprite_lookup *out)
+                        int32_t screen_angle_corr, uint16_t backref,
+                        struct hwr_sprite_lookup *out)
 {
     uint16_t archive_id;
     uint16_t status;
@@ -227,17 +319,25 @@ int hwr_sprites_resolve(const struct roth_api_v1 *api,
     klass_byte = (uint8_t)status;
 
     if (klass_byte == 0xfcu) {
-        /* Monster set: pick the coarse 8-direction frame from the static
-         * appearance table (renderer.c:5841-5851). The entity-linked variant
-         * (a live actor with its own frame state) is refined during emission;
-         * the static pick is the engine's own fallback and stands in here. */
+        /* Monster set (renderer.c:5827-5880). The coarse 8-direction index is
+         * always used. With a live actor backref (map-object +0xc) the field is
+         * chosen from that actor's state byte by the priority ladder
+         * (resolve_face_surface_id, renderer.c:12700); an unlinked/out-of-range
+         * backref falls back to the static appearance table's default word
+         * (word[ent + ci + 0x14]), the engine's own pool-empty path. */
         uint32_t aid = (uint32_t)(status >> 8);
-        uint32_t table = api->game_ram->u32(VA_G_MONSTER_STATIC_TABLE);
+        uint32_t ent = api->game_ram->u32(VA_G_MONSTER_STATIC_TABLE);
         uint32_t ci = hwr_sprites_direction_index(facing, yaw, screen_angle_corr, 0);
-        uint16_t nid;
-        if (table == 0 ||
-            hwr_sprites_peek_u16(api, table, aid * HWR_MONSTER_STRIDE + ci + HWR_MONSTER_FRAME,
-                                 &nid) != 0)
+        uint16_t nid = 0;
+        if (ent < 0x10000u)
+            return -1;
+        ent += aid * HWR_MONSTER_STRIDE;
+        if (backref != 0u)
+            nid = hwr_sprites_resolve_face_id(api,
+                      VA_G_ACTOR_SLOT_BIAS + (uint32_t)backref, ent, ci);
+        if (nid == 0u)                                     /* pool-empty fallback */
+            nid = hwr_sprites_host_u16(ent, ci + HWR_MONSTER_FRAME);
+        if (nid == 0u)
             return -1;
         if ((nid & 0x8000u) != 0) {
             out->flip ^= 1;
@@ -258,17 +358,20 @@ int hwr_sprites_resolve(const struct roth_api_v1 *api,
         uint16_t selector;
         uint16_t nid;
         uint32_t ci;
-        if (table == 0 ||
-            hwr_sprites_peek_u16(api, table, aid * 2u, &rec_off) != 0 ||
-            hwr_sprites_peek_u16(api, table, rec_off, &selector) != 0)
+        if (table < 0x10000u)
             return -1;
+        /* The descriptor directory is an out-of-window engine allocation, read
+         * by direct host deref (as the monster table above). */
+        rec_off = hwr_sprites_host_u16(table, aid * 2u);
+        selector = hwr_sprites_host_u16(table, rec_off);
         if ((selector & HWR_SEL_DIRECTIONAL) != 0) {
             ci = hwr_sprites_direction_index(facing, yaw, screen_angle_corr,
                                              (selector & HWR_SEL_FINE) != 0);
         } else {
             ci = api->game_ram->u16(VA_G_PART_TABLE + (uint32_t)selector);
         }
-        if (hwr_sprites_peek_u16(api, table, (uint32_t)rec_off + ci + 2u, &nid) != 0)
+        nid = hwr_sprites_host_u16(table, (uint32_t)rec_off + ci + 2u);
+        if (nid == 0u)
             return -1;
         if ((nid & 0x8000u) != 0) {
             out->flip ^= 1;

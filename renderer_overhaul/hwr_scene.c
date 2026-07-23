@@ -957,6 +957,7 @@ void hwr_scene_clear(struct hwr_scene *scene)
     hwr_gl_scene_clear();
     hwr_scene_mesh_clear(&scene->mesh);
     hwr_scene_animations_clear(scene);
+    hwr_billboards_clear(&scene->billboards);
     free(scene->stream_vertices);
     free(scene->translucent_runs);
     free(scene->visible);
@@ -1410,6 +1411,18 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         fprintf(stderr, "[renderer_overhaul] animation frames retained: %u bytes across %u textures\n",
                 (unsigned)hwr_scene_animation_bytes(scene),
                 (unsigned)scene->animation_count);
+    /* Pack the sprite atlas into the SAME texel store, after the world textures,
+     * so a billboard vertex references a byte offset exactly as a wall vertex
+     * does. Appending leaves every world texture offset unchanged. */
+    if (hwr_billboards_pack(&scene->billboards, map_archive, shared_archive, api,
+                            &bytes, &size, &capacity) != 0) {
+        free(bytes);
+        return hwr_scene_fail(scene, "%s", scene->billboards.error);
+    }
+    if (debug)
+        fprintf(stderr, "[renderer_overhaul] billboard atlas: map slots=%u shared slots=%u store=%u bytes\n",
+                (unsigned)scene->billboards.map_dir_count,
+                (unsigned)scene->billboards.shared_dir_count, (unsigned)size);
     if (!hwr_gl_scene_upload(bytes, size, world->luts.colormap, world->luts.tint,
                              world->luts.glow, world->luts.blend)) {
         free(bytes);
@@ -1428,6 +1441,9 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
     if (scene == NULL)
         return -1;
     hwr_scene_clear(scene);
+    hwr_billboards_init(&scene->billboards);
+    scene->map_archive = map_archive;
+    scene->shared_archive = shared_archive;
     if (hwr_scene_build_mesh(&scene->mesh, world, debug) != 0)
         return hwr_scene_fail(scene, "%s", scene->mesh.error);
     if (hwr_upload_referenced_textures(scene, world, map_archive,
@@ -3007,6 +3023,13 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     size_t sky_cursor = 0;
     size_t opaque_cursor;
     size_t translucent_cursor;
+    /* Billboard quads emitted for this frame (0 when the layer is disabled):
+     * raw quads follow the opaque surfaces, masked/blend-capable quads follow
+     * the translucent surfaces, one run each. */
+    const struct hwr_billboards *bb = &scene->billboards;
+    size_t bb_opaque = bb->opaque_count;
+    size_t bb_translucent = bb->translucent_count;
+    size_t bb_runs = bb->run_count;
     /* The stream packs three back-to-back ranges: [sky][opaque][translucent].
      * Sky caps come first so they can be drawn as a depth-off background pass;
      * everything else keeps its opaque-vs-translucent classification. */
@@ -3025,6 +3048,8 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
          * length sub-quads (<=2*HWR_WALLSEG_MAX); everything else is 1:1. */
         visible_vertices += hwr_surface_reserve(surface);
     }
+    /* Billboards are exactly six vertices per quad, no per-face expansion. */
+    visible_vertices += bb_opaque + bb_translucent;
     if (visible_vertices > scene->stream_capacity) {
         struct hwr_gl_vertex *vertices = (struct hwr_gl_vertex *)realloc(
             scene->stream_vertices, visible_vertices * sizeof *vertices);
@@ -3067,17 +3092,23 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
             translucent_surfaces++;
         }
     }
-    if (translucent_surfaces > scene->translucent_run_capacity) {
+    /* Raw billboards ride the tail of the opaque range. */
+    if (bb_opaque != 0) {
+        memcpy(scene->stream_vertices + opaque_cursor, bb->opaque,
+               bb_opaque * sizeof *scene->stream_vertices);
+        opaque_cursor += bb_opaque;
+    }
+    if (translucent_surfaces + bb_runs > scene->translucent_run_capacity) {
         uint32_t *runs = (uint32_t *)realloc(
             scene->translucent_runs,
-            translucent_surfaces * sizeof *runs);
+            (translucent_surfaces + bb_runs) * sizeof *runs);
         if (runs == NULL) {
             free(translucent_order);
             free(depths);
             return hwr_scene_fail(scene, "out of memory recording translucent runs");
         }
         scene->translucent_runs = runs;
-        scene->translucent_run_capacity = translucent_surfaces;
+        scene->translucent_run_capacity = translucent_surfaces + bb_runs;
     }
     translucent_cursor = opaque_cursor;
     for (i = 0; i < translucent_surfaces; i++) {
@@ -3088,7 +3119,17 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         scene->translucent_runs[i] = (uint32_t)emitted;
         translucent_cursor += emitted;
     }
-    *translucent_run_count = translucent_surfaces;
+    /* Masked / blend-capable billboards, already depth-sorted back to front,
+     * ride the tail of the translucent range, each as its own blend run. */
+    if (bb_translucent != 0) {
+        size_t r;
+        memcpy(scene->stream_vertices + translucent_cursor, bb->translucent,
+               bb_translucent * sizeof *scene->stream_vertices);
+        translucent_cursor += bb_translucent;
+        for (r = 0; r < bb_runs; r++)
+            scene->translucent_runs[translucent_surfaces + r] = bb->runs[r];
+    }
+    *translucent_run_count = translucent_surfaces + bb_runs;
     free(translucent_order);
     free(depths);
     *sky_count = sky_cursor;
@@ -3245,6 +3286,7 @@ static void hwr_scene_log_visibility(const struct hwr_scene *scene,
 
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
+                                 const struct hwr_objects *objects,
                                  const struct roth_api_v1 *api,
                                  uint32_t width, uint32_t height)
 {
@@ -3280,6 +3322,11 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         hwr_scene_ensure_visible(scene, world->sector_count) == 0)
         scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
     hwr_scene_log_visibility(scene, world);
+    /* Resolve and project this frame's billboards against the same camera and
+     * visible-sector set, ready to append to the stream below. */
+    hwr_billboards_emit(&scene->billboards, objects, world, &camera,
+                        scene->visible, scene->visible_count, scene->pvs_valid,
+                        api);
     if (hwr_prepare_stream(scene, &camera, width, height,
                            &sky_count, &opaque_count, &translucent_count,
                            &translucent_run_count) != 0)

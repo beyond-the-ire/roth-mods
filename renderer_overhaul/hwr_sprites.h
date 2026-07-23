@@ -55,6 +55,9 @@ struct hwr_sprite_frame {
 struct hwr_sprite_lookup {
     struct hwr_das_archive *archive;
     size_t entry_id;
+    /* The resolved leaf's bias-applied archive id, so the emitter can read the
+     * live cache block's current frame index from the status table. */
+    uint16_t archive_id;
     /* Frame selector within the leaf resource. For an animated block this is the
      * base frame (playback advances it on the mod's own clock, as with surface
      * animations); for a grouped block it is the directional child, whose pixels
@@ -88,12 +91,26 @@ void hwr_sprites_predecode(struct hwr_das_archive *archive, size_t first_id,
  * tables and the directional frame table, and records any x-flip. `yaw` is the
  * view angle (g_sprite_view_angle domain, 0x200) and `screen_angle_corr` is the
  * per-sprite screen-angle term (viewX<<6)/depth the emitter derives from its own
- * projection; pass 0 before projection is available. Returns 0 with out->resolved
- * set on success. */
+ * projection; pass 0 before projection is available. `backref` is the object's
+ * actor pool backref (map-object +0xc); when nonzero the monster (0xfc) path
+ * runs the engine's live priority ladder off that actor's state byte, else it
+ * falls back to the static appearance table. Returns 0 with out->resolved set on
+ * success. */
 int hwr_sprites_resolve(const struct roth_api_v1 *api,
                         struct hwr_das_archive *map, struct hwr_das_archive *shared,
                         uint16_t graphic_id, uint8_t facing, uint16_t yaw,
-                        int32_t screen_angle_corr, struct hwr_sprite_lookup *out);
+                        int32_t screen_angle_corr, uint16_t backref,
+                        struct hwr_sprite_lookup *out);
+
+/* Reads the CURRENT frame index of a resolved sprite's live cache block: the
+ * status table (0x86d30) classifies the id, and a resident cache slot (low byte
+ * < 0xfc) resolves through g_das_cache_slots (0x89930, stride 6) to the block,
+ * whose header word at +0x18 is the frame index the engine's own timer machine
+ * advances. The pool relocates, so the block pointer is re-read every call and
+ * never cached. Returns the index (>= 0), or -1 when the block is not resident
+ * (the caller then free-runs or holds frame 0). */
+int hwr_sprites_live_frame_index(const struct roth_api_v1 *api,
+                                 uint16_t archive_id);
 
 /* Fills `frame` from a resolved lookup. Returns 0 on success, -1 when the leaf
  * carries no pixels (a directory placeholder) or the frame index is out of

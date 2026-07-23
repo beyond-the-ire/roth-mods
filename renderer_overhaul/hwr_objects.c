@@ -31,7 +31,9 @@
 #define HWR_OBJ_OFF_FLAGS7 0x07u  /* map: bit0x80 hidden; appearance: bit0 hidden */
 #define HWR_OBJ_OFF_FLAGS9 0x09u  /* bit1 = reflection-skip */
 #define HWR_OBJ_OFF_Z      0x0au
+#define HWR_OBJ_OFF_BACKREF 0x0cu  /* actor pool backref (actor_index*0x22 + 1) */
 #define HWR_OBJ_OFF_SHADE  0x0eu
+#define HWR_OBJ_OFF_SEED   0x08u   /* billboard shade seed (type-1 path) */
 
 /* Particle record layout: the rendered position is the integer triple, and the
  * busy byte marks a live slot. The 16.16 accumulators at +0x24.. are physics
@@ -160,6 +162,9 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
             item.graphic_id = hwr_obj_u16(record + HWR_OBJ_OFF_GFX);
             item.facing = record[HWR_OBJ_OFF_FACING];
             item.shade = record[HWR_OBJ_OFF_SHADE];
+            item.seed = record[HWR_OBJ_OFF_SEED];
+            item.sector_index = (uint16_t)sector;
+            item.backref = hwr_obj_u16(record + HWR_OBJ_OFF_BACKREF);
             if (record[HWR_OBJ_OFF_FLAGS9] & 2u)
                 item.flags |= HWR_OBJECT_FLAG_REFLECTION_SKIP;
             if (hwr_objects_push(objects, &item) != 0)
@@ -204,6 +209,7 @@ static int hwr_objects_walk_particles(struct hwr_objects *objects,
             struct hwr_object item;
             memset(&item, 0, sizeof item);
             item.source = HWR_OBJECT_PARTICLE;
+            item.sector_index = (uint16_t)HWR_OBJECT_NO_SECTOR;
             item.world_x = (int16_t)api->game_ram->u16(off + HWR_PARTICLE_OFF_X);
             item.world_y = (int16_t)api->game_ram->u16(off + HWR_PARTICLE_OFF_Y);
             item.world_z = (int16_t)api->game_ram->u16(off + HWR_PARTICLE_OFF_Z);
@@ -231,12 +237,14 @@ static int hwr_objects_walk_pickup(struct hwr_objects *objects,
         return 0;                                            /* not visible */
     memset(&item, 0, sizeof item);
     item.source = HWR_OBJECT_PICKUP_FLY;
+    item.sector_index = (uint16_t)HWR_OBJECT_NO_SECTOR;
     item.world_x = (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_X);
     item.world_y = (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_Y);
     item.world_z = (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_Z);
     item.graphic_id = api->game_ram->u16(appearance + HWR_OBJ_OFF_GFX);
     item.facing = api->game_ram->u8(appearance + HWR_OBJ_OFF_FACING);
     item.shade = api->game_ram->u8(appearance + HWR_OBJ_OFF_SHADE);
+    item.seed = api->game_ram->u8(appearance + HWR_OBJ_OFF_SEED);
     if (hwr_objects_push(objects, &item) != 0)
         return hwr_objects_fail(objects, "out of memory enumerating pickup overlay");
     return 0;
@@ -303,7 +311,7 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
         int have_frame = 0;
         memset(&frame, 0, sizeof frame);
         if (hwr_sprites_resolve(api, map_archive, shared_archive, o->graphic_id,
-                                o->facing, yaw, 0, &lookup) == 0 &&
+                                o->facing, yaw, 0, o->backref, &lookup) == 0 &&
             hwr_sprites_frame(&lookup, &frame) == 0)
             have_frame = 1;
         fprintf(file,
