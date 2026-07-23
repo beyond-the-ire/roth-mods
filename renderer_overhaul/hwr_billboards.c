@@ -77,6 +77,7 @@ void hwr_billboards_clear(struct hwr_billboards *bb)
     free(bb->shared_dir);
     free(bb->children);
     free(bb->opaque);
+    free(bb->flat);
     free(bb->translucent);
     free(bb->runs);
     memset(bb, 0, sizeof *bb);
@@ -468,6 +469,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     if (bb == NULL)
         return 0;
     bb->opaque_count = 0;
+    bb->flat_count = 0;
     bb->translucent_count = 0;
     bb->run_count = 0;
     bb->stat_emitted = 0;
@@ -748,15 +750,20 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
 
         if (!translucent) {
             /* Raw variants are fully opaque: depth-test naturally in the opaque
-             * pass. */
-            if (hwr_bb_reserve_verts(&bb->opaque, bb->opaque_count,
-                                     &bb->opaque_capacity, 6) != 0)
+             * pass. Fixed-orientation (rotated, f9 bit0x80) quads go to a
+             * separate list so the GL layer can bias them a hair toward the
+             * viewer -- they are coplanar with their wall and would z-fight it. */
+            int is_flat = (o->flags9 & 0x80u) != 0;
+            struct hwr_gl_vertex **dst = is_flat ? &bb->flat : &bb->opaque;
+            size_t *cnt = is_flat ? &bb->flat_count : &bb->opaque_count;
+            size_t *cap = is_flat ? &bb->flat_capacity : &bb->opaque_capacity;
+            if (hwr_bb_reserve_verts(dst, *cnt, cap, 6) != 0)
                 break;
-            hwr_bb_write_quad(bb->opaque + bb->opaque_count, xl, yl, xr, yr,
+            hwr_bb_write_quad(*dst + *cnt, xl, yl, xr, yr,
                               hwr_bb_clamp_i16(z_top), hwr_bb_clamp_i16(z_bottom),
                               offset, tw, th, (float)(2u * th), (float)(2u * tw),
                               material, composed, sector_flags);
-            bb->opaque_count += 6;
+            *cnt += 6;
             bb->stat_emitted++;
         } else {
             struct hwr_bb_trans *t;

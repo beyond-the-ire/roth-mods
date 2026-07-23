@@ -73,6 +73,13 @@ struct hwr_billboards {
     struct hwr_gl_vertex *opaque;
     size_t opaque_count;
     size_t opaque_capacity;
+    /* Fixed-orientation (rotated) opaque quads, kept apart from the camera-facing
+     * opaque quads so they can be drawn with a small depth bias toward the viewer:
+     * a flat wall decal is coplanar with its wall and would z-fight it, where the
+     * engine's painter order paints the decal after the wall. */
+    struct hwr_gl_vertex *flat;
+    size_t flat_count;
+    size_t flat_capacity;
     struct hwr_gl_vertex *translucent;
     size_t translucent_count;
     size_t translucent_capacity;

@@ -3011,6 +3011,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                               const struct hwr_gl_camera *camera,
                               uint32_t width, uint32_t height,
                               size_t *sky_count, size_t *opaque_count,
+                              size_t *flat_count,
                               size_t *translucent_count,
                               size_t *translucent_run_count)
 {
@@ -3028,6 +3029,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
      * the translucent surfaces, one run each. */
     const struct hwr_billboards *bb = &scene->billboards;
     size_t bb_opaque = bb->opaque_count;
+    size_t bb_flat = bb->flat_count;
     size_t bb_translucent = bb->translucent_count;
     size_t bb_runs = bb->run_count;
     /* The stream packs three back-to-back ranges: [sky][opaque][translucent].
@@ -3049,7 +3051,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         visible_vertices += hwr_surface_reserve(surface);
     }
     /* Billboards are exactly six vertices per quad, no per-face expansion. */
-    visible_vertices += bb_opaque + bb_translucent;
+    visible_vertices += bb_opaque + bb_flat + bb_translucent;
     if (visible_vertices > scene->stream_capacity) {
         struct hwr_gl_vertex *vertices = (struct hwr_gl_vertex *)realloc(
             scene->stream_vertices, visible_vertices * sizeof *vertices);
@@ -3092,11 +3094,18 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
             translucent_surfaces++;
         }
     }
-    /* Raw billboards ride the tail of the opaque range. */
+    /* Raw billboards ride the tail of the opaque range; the fixed-orientation
+     * (flat) quads follow them, still opaque but kept at the very tail so the GL
+     * layer can draw them with a depth bias toward the viewer. */
     if (bb_opaque != 0) {
         memcpy(scene->stream_vertices + opaque_cursor, bb->opaque,
                bb_opaque * sizeof *scene->stream_vertices);
         opaque_cursor += bb_opaque;
+    }
+    if (bb_flat != 0) {
+        memcpy(scene->stream_vertices + opaque_cursor, bb->flat,
+               bb_flat * sizeof *scene->stream_vertices);
+        opaque_cursor += bb_flat;
     }
     if (translucent_surfaces + bb_runs > scene->translucent_run_capacity) {
         uint32_t *runs = (uint32_t *)realloc(
@@ -3134,6 +3143,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     free(depths);
     *sky_count = sky_cursor;
     *opaque_count = opaque_cursor - sky_vertices;
+    *flat_count = bb_flat;
     *translucent_count = translucent_cursor - opaque_cursor;
     return 0;
 }
@@ -3294,6 +3304,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     uint8_t palette[1024];
     size_t sky_count;
     size_t opaque_count;
+    size_t flat_count;
     size_t translucent_count;
     size_t translucent_run_count;
     if (scene == NULL || !scene->valid || !scene->uploaded ||
@@ -3328,12 +3339,14 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                         scene->visible, scene->visible_count, scene->pvs_valid,
                         api);
     if (hwr_prepare_stream(scene, &camera, width, height,
-                           &sky_count, &opaque_count, &translucent_count,
+                           &sky_count, &opaque_count, &flat_count,
+                           &translucent_count,
                            &translucent_run_count) != 0)
         return NULL;
     hwr_build_palette(world, palette);
     return hwr_gl_scene_render(scene->stream_vertices, sky_count, opaque_count,
-                               translucent_count, scene->translucent_runs,
+                               flat_count, translucent_count,
+                               scene->translucent_runs,
                                translucent_run_count, &camera, palette,
                                width, height);
 }

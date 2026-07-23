@@ -1828,6 +1828,7 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
+                                    size_t flat_vertices,
                                     size_t translucent_vertices,
                                     const uint32_t *translucent_runs,
                                     size_t translucent_run_count,
@@ -2029,13 +2030,30 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         g_gl.disable(GL_POLYGON_OFFSET_FILL);
     }
     /* Opaque geometry overwrites the colour-only sky and wins against a
-     * farther sky occluder wherever it projects. */
+     * farther sky occluder wherever it projects. The world and camera-facing
+     * billboards draw first; the fixed-orientation (flat) billboards ride the
+     * opaque tail and draw last with a small bias TOWARD the viewer, so a decal
+     * coplanar with its wall wins the depth test against that wall (the engine
+     * paints it after the wall) while a nearer wall still occludes it. */
     g_gl.enable(GL_DEPTH_TEST);
     g_gl.depth_func(GL_LESS);
     g_gl.depth_mask(GL_TRUE);
-    if (opaque_vertices != 0)
-        g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
-                         (GLsizei)opaque_vertices);
+    {
+        size_t opaque_main = opaque_vertices >= flat_vertices
+                           ? opaque_vertices - flat_vertices : opaque_vertices;
+        if (opaque_main != 0)
+            g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
+                             (GLsizei)opaque_main);
+        if (flat_vertices != 0 && opaque_vertices >= flat_vertices) {
+            g_gl.enable(GL_POLYGON_OFFSET_FILL);
+            g_gl.polygon_offset(-1.0f, -1.0f);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                             (GLint)(sky_vertices + opaque_main),
+                             (GLsizei)flat_vertices);
+            g_gl.polygon_offset(0.0f, 0.0f);
+            g_gl.disable(GL_POLYGON_OFFSET_FILL);
+        }
+    }
     if (translucent_vertices != 0) {
         /* Translucent surfaces arrive depth-sorted back to front, and each
          * blends against what is already on screen -- INCLUDING the
