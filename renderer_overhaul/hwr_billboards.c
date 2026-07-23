@@ -11,6 +11,10 @@
  * table[k] = 16384*sin(2*pi*k/512), cos(k) = table[k + 0x80]). The rotated /
  * fixed-orientation object path indexes it to orient a flat face by its facing. */
 #define VA_G_SINCOS_TABLE        0x72080u
+/* The obj1 default texture record (g_default_shadow_texture_record, VA 0x29e5c):
+ * the 7x32 translucent ground-shadow oval. Block header: +0xa flags (0x0404),
+ * +0xc width (7), +0xe height (0x20), texels at +0x10. In-window low obj1. */
+#define VA_G_SHADOW_RECORD       0x29e5cu
 /* The engine's type-1 billboard projects its horizontal extent with this focal
  * (g_view_params_block+0xc) and its vertical extent with g_perspective_scale,
  * while the mod's world projection uses focal_x/focal_y. The size is matched by
@@ -45,6 +49,18 @@ int hwr_billboards_enabled(void)
     static int state = -1;
     if (state < 0) {
         const char *setting = getenv("HWR_BILLBOARDS");
+        state = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return state;
+}
+
+/* HWR_SHADOWS=0 suppresses the ground-shadow ovals (kept in the atlas, just not
+ * emitted), leaving every other billboard untouched. */
+static int hwr_bb_shadows_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_SHADOWS");
         state = setting != NULL && setting[0] == '0' ? 0 : 1;
     }
     return state;
@@ -310,13 +326,51 @@ static int hwr_bb_pack_archive(struct hwr_billboards *bb,
     return 0;
 }
 
+/* Packs the obj1 ground-shadow oval (VA 0x29e5c) into the atlas as bb->shadow. */
+static int hwr_bb_pack_shadow(struct hwr_billboards *bb,
+                              const struct roth_api_v1 *api,
+                              uint8_t **bytes, size_t *size, size_t *capacity)
+{
+    uint16_t flags, w, h;
+    size_t pixels, i;
+    uint8_t *texels;
+    memset(&bb->shadow, 0, sizeof bb->shadow);
+    if (api == NULL || api->game_ram == NULL)
+        return 0;
+    flags = api->game_ram->u16(VA_G_SHADOW_RECORD + 0xau);
+    w = api->game_ram->u16(VA_G_SHADOW_RECORD + 0xcu);
+    h = api->game_ram->u16(VA_G_SHADOW_RECORD + 0xeu);
+    if (w == 0 || h == 0 || w > 256u || h > 256u)
+        return 0;                                             /* not staged / implausible */
+    pixels = (size_t)w * h;
+    if (*size > UINT32_MAX - pixels)
+        return 0;
+    texels = (uint8_t *)malloc(pixels);
+    if (texels == NULL)
+        return -1;
+    for (i = 0; i < pixels; i++)
+        texels[i] = api->game_ram->u8(VA_G_SHADOW_RECORD + 0x10u + (uint32_t)i);
+    bb->shadow.base_offset = (uint32_t)*size;
+    if (hwr_bb_append(bytes, size, capacity, texels, pixels) != 0) {
+        free(texels);
+        return -1;
+    }
+    free(texels);
+    bb->shadow.width = w;
+    bb->shadow.height = h;
+    bb->shadow.flags = flags;                                 /* 0x0404 -> the 0x400 translucent path */
+    bb->shadow.frame_count = 1;
+    bb->shadow.klass = HWR_DAS_CLASS_PLAIN;
+    bb->shadow.present = 1;
+    return 0;
+}
+
 int hwr_billboards_pack(struct hwr_billboards *bb,
                         struct hwr_das_archive *map_archive,
                         struct hwr_das_archive *shared_archive,
                         const struct roth_api_v1 *api,
                         uint8_t **bytes, size_t *size, size_t *capacity)
 {
-    (void)api;
     if (bb == NULL)
         return -1;
     free(bb->map_dir);
@@ -331,6 +385,7 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
     bb->shared_dir_count = 0;
     bb->map_archive = map_archive;
     bb->shared_archive = shared_archive;
+    memset(&bb->shadow, 0, sizeof bb->shadow);
     bb->built = 0;
     if (!hwr_billboards_enabled())
         return 0;                                         /* kill switch: no atlas */
@@ -344,6 +399,8 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
                             &bb->shared_dir, &bb->shared_dir_count,
                             bytes, size, capacity) != 0)
         return hwr_bb_fail(bb, "out of memory packing shared sprite atlas");
+    if (hwr_bb_pack_shadow(bb, api, bytes, size, capacity) != 0)
+        return hwr_bb_fail(bb, "out of memory packing the ground shadow");
     bb->built = 1;
     return 0;
 }
@@ -447,6 +504,72 @@ static int hwr_bb_trans_cmp(const void *a, const void *b)
     return 0;
 }
 
+/* Appends the ground-shadow oval for one object to the pending translucent set.
+ * The engine emits it (renderer.c:8068-8098, the +9 bit0 "mirror double") as a
+ * type-1 billboard at the object's XY on the sector floor, textured with the
+ * 0xffff default record; here it is the same camera-facing translucent quad,
+ * sized from the shadow block (7x32 -> a wide 32x7 oval via the column-major
+ * map) and anchored at the floor z. Returns 0 (incl. a benign skip), -1 on OOM. */
+static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object *o,
+                              const struct hwr_world *world,
+                              const struct hwr_gl_camera *camera, int32_t depth,
+                              double hscale, double vscale,
+                              struct hwr_bb_trans **pending, size_t *pending_count,
+                              size_t *pending_capacity)
+{
+    uint16_t sw = bb->shadow.width, sh = bb->shadow.height, sfa = bb->shadow.flags;
+    int32_t floor_z;
+    uint8_t sflags = 0;                                     /* shadow shade seed = 0 (trace) */
+    double half_w = (double)((uint32_t)((uint32_t)sh * 2u) << 7) * hscale; /* sfa&0x80=0 -> cl=7 */
+    double vext_d = 2.0 * (double)sw * vscale;
+    double disp_d = 2.0 * (double)(sfa & 0xfu) * vscale;
+    double srx = half_w * (double)camera->yaw_sin / 16384.0;
+    double sry = half_w * (double)camera->yaw_cos / 16384.0;
+    int32_t szb, szt;
+    struct hwr_bb_trans *t;
+    if (o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+        o->sector_index < world->sector_count) {
+        floor_z = world->sectors[o->sector_index].floor_z;
+        sflags = world->sectors[o->sector_index].flags;
+    } else {
+        floor_z = o->world_z;
+    }
+    /* The engine anchors the oval straddling the floor and paints it whole over
+     * the floor (painter order). The mod's depth test would clip the below-floor
+     * half against the opaque floor, so the oval sits ON the floor (bottom edge
+     * at floor z) and extends up -- the whole oval clears the floor and shows.
+     * A small disp keeps its base a hair below to hug the contact line. */
+    (void)disp_d;
+    szb = floor_z;
+    szt = szb + (int32_t)(vext_d + 0.5);
+    if (*pending_count == *pending_capacity) {
+        size_t next = *pending_capacity != 0 ? *pending_capacity * 2u : 128u;
+        struct hwr_bb_trans *grown = (struct hwr_bb_trans *)realloc(
+            *pending, next * sizeof *grown);
+        if (grown == NULL)
+            return -1;
+        *pending = grown;
+        *pending_capacity = next;
+    }
+    t = &(*pending)[(*pending_count)++];
+    t->depth = depth;
+    t->xl = hwr_bb_clamp_i16((int32_t)((double)o->world_x - srx));
+    t->yl = hwr_bb_clamp_i16((int32_t)((double)o->world_y - sry));
+    t->xr = hwr_bb_clamp_i16((int32_t)((double)o->world_x + srx));
+    t->yr = hwr_bb_clamp_i16((int32_t)((double)o->world_y + sry));
+    t->z_top = hwr_bb_clamp_i16(szt);
+    t->z_bottom = hwr_bb_clamp_i16(szb);
+    t->offset = bb->shadow.base_offset;
+    t->tw = sw;
+    t->th = sh;
+    t->smax = (float)(2u * sh);
+    t->tmax = (float)(2u * sw);
+    t->material = (uint8_t)(HWR_GL_MATERIAL_MASKED | HWR_GL_MATERIAL_TRANSLUCENT);
+    t->light = 0;                                          /* engine draws the shadow at shade 0 */
+    t->sector_flags = sflags;
+    return 0;
+}
+
 int hwr_billboards_emit(struct hwr_billboards *bb,
                         const struct hwr_objects *objects,
                         const struct hwr_world *world,
@@ -462,6 +585,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     size_t i;
     int trace = hwr_bb_trace_level();
     int bb_log = getenv("HWR_BB_LOG") != NULL;
+    int shadows = hwr_bb_shadows_enabled();
     static uint32_t frame_no;
     int log_frame, throttle;
     size_t flat_seen = 0;
@@ -546,6 +670,17 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             continue;                                     /* near-depth cull */
         }
         corr = (int32_t)(((int64_t)view_x << 6) / depth); /* per-sprite screen-angle */
+
+        /* Ground shadow: the engine draws a translucent oval under any object
+         * whose map record has +9 bit0 (the type-1 "mirror double" gate,
+         * renderer.c:8068). Emitted independent of the object's own sprite so a
+         * shadow shows even if the sprite drops/meshes. */
+        if (shadows && bb->shadow.present && (o->flags9 & 1u) != 0) {
+            if (hwr_bb_push_shadow(bb, o, world, camera, depth, hscale, vscale,
+                                   &pending, &pending_count, &pending_capacity) != 0)
+                break;
+            bb->stat_emitted++;
+        }
 
         if (hwr_sprites_resolve(api, bb->map_archive, bb->shared_archive,
                                 o->graphic_id, o->facing, yaw, corr,

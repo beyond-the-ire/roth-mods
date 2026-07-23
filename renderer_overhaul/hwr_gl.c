@@ -2072,6 +2072,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         size_t run;
         GLint first = (GLint)(sky_vertices + opaque_vertices);
         g_gl.depth_mask(GL_FALSE);
+        /* LEQUAL (not LESS): a translucent surface coplanar with the opaque
+         * winner behind it -- the ground-shadow oval sitting on its sector floor
+         * -- must still draw (the engine paints it after the floor). A nearer
+         * wall has a strictly smaller depth and still occludes. Writes stay off,
+         * so this never lets a translucent surface shadow nearer geometry. */
+        g_gl.depth_func(GL_LEQUAL);
         if (blend_location >= 0)
             g_gl.uniform_1i(blend_location, 1);
         g_gl.active_texture(GL_TEXTURE5);
@@ -2090,6 +2096,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                 first += (GLint)translucent_runs[run];
             }
         }
+        g_gl.depth_func(GL_LESS);
         g_gl.depth_mask(GL_TRUE);
     }
 

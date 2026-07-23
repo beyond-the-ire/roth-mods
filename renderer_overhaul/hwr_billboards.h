@@ -65,6 +65,12 @@ struct hwr_billboards {
     struct hwr_bb_child *children;
     size_t child_count;
     size_t child_capacity;
+    /* The engine's ground-shadow: a 7x32 translucent oval from the obj1 default
+     * texture record (VA 0x29e5c), packed once at map load. The emitter draws it
+     * as a camera-facing translucent billboard under each object whose map record
+     * has +9 bit0 set (the engine's type-1 "mirror double" gate, which stores a
+     * second entry whose texture id 0xefff biases to the 0xffff default record). */
+    struct hwr_bb_slot shadow;
     int built;
 
     /* Per-frame emit scratch. Opaque (raw) quads depth-test naturally; masked/
