@@ -137,6 +137,13 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
  * rewritten yet, in which case the caller should try again next frame. */
 int hwr_gl_scene_update_texels(uint32_t offset, const uint8_t *bytes,
                                uint32_t size);
+/* opaque_billboard_vertices = the count at the tail of the opaque range (before
+ * the flat-decal tail) that are camera-facing object quads eligible for the
+ * owner-floor exception re-draw. shadow_vertices / shadow_run_count = the ground
+ * shadows appended at the tail of the translucent range and its run list, drawn
+ * as a dedicated floor-exception blend pass. floor_exception enables the
+ * owner-floor depth exception (HWR_FLOOR_EXCEPTION); when 0 both re-draw passes
+ * are skipped and the shadows fall back to the plain translucent tail. */
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t sky_vertices,
                                     size_t opaque_vertices,
@@ -144,6 +151,10 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t translucent_vertices,
                                     const uint32_t *translucent_runs,
                                     size_t translucent_run_count,
+                                    size_t opaque_billboard_vertices,
+                                    size_t shadow_vertices,
+                                    size_t shadow_run_count,
+                                    int floor_exception,
                                     const struct hwr_gl_camera *camera,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height);

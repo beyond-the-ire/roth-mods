@@ -92,6 +92,13 @@ struct hwr_billboards {
     uint32_t *runs;
     size_t run_count;
     size_t run_capacity;
+    /* Ground shadows are appended to the tail of the translucent stream (and its
+     * run list) when the owner-floor exception is enabled: the last shadow_count
+     * vertices / shadow_run_count runs. The GL layer draws that tail as the
+     * floor-exception shadow pass; when the exception is disabled these stay zero
+     * and the shadows ride the plain translucent tail at the raised anchor. */
+    size_t shadow_count;
+    size_t shadow_run_count;
 
     size_t stat_emitted;
     size_t stat_enumerated;
@@ -102,6 +109,11 @@ struct hwr_billboards {
 /* HWR_BILLBOARDS=0 disables the whole layer: no atlas is packed and no quads
  * are emitted, so the stream is byte-identical to the world-only path. */
 int hwr_billboards_enabled(void);
+
+/* HWR_FLOOR_EXCEPTION (default on): the owner-floor depth exception. The scene
+ * reads this to pass the matching flag to the GL layer so its exception passes
+ * agree with the tail the emitter staged. */
+int hwr_billboards_floor_exception_enabled(void);
 
 void hwr_billboards_init(struct hwr_billboards *bb);
 void hwr_billboards_clear(struct hwr_billboards *bb);

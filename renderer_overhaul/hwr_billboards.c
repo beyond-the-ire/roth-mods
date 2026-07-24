@@ -33,6 +33,10 @@
 #define HWR_BB_MESH_FLAG         0x8000u
 #define HWR_BB_BLEND_FLAG        0x0400u
 
+/* Owner-floor identity tag: floor_id = HWR_BB_FLOOR_TAG | (floor_z & 0xffff).
+ * Kept in step with the shader's constant in hwr_gl.c. */
+#define HWR_BB_FLOOR_TAG         0x40000000u
+
 /* A pending translucent quad, held until the whole set can be depth-sorted back
  * to front (the engine's sprite-queue order) before it joins the blend runs. */
 struct hwr_bb_trans {
@@ -42,7 +46,25 @@ struct hwr_bb_trans {
     uint16_t tw, th;
     float smax, tmax;
     uint8_t material, light, sector_flags;
+    /* Non-zero (HWR_BB_FLOOR_TAG | floor_z) marks this quad as an owner-floor
+     * participant drawn through the floor-exception pass; zero rides the plain
+     * translucent tail. */
+    uint32_t floor_id;
 };
+
+/* HWR_FLOOR_EXCEPTION=0 disables the owner-floor depth exception: shadows fall
+ * back to the raised anchor on the plain translucent tail and no below-floor
+ * object part is recovered (== the pre-exception behaviour). The GL layer reads
+ * the SAME cached decision so its passes agree with what the emitter staged. */
+int hwr_billboards_floor_exception_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_FLOOR_EXCEPTION");
+        state = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return state;
+}
 
 int hwr_billboards_enabled(void)
 {
@@ -463,7 +485,8 @@ static void hwr_bb_write_quad(struct hwr_gl_vertex *dst,
                               int16_t z_top, int16_t z_bottom,
                               uint32_t offset, uint16_t tw, uint16_t th,
                               float smax, float tmax,
-                              uint8_t material, uint8_t light, uint8_t sector_flags)
+                              uint8_t material, uint8_t light, uint8_t sector_flags,
+                              uint32_t floor_id)
 {
     struct hwr_gl_vertex corner;
     struct hwr_gl_vertex tl, tr, bl, br;
@@ -474,6 +497,10 @@ static void hwr_bb_write_quad(struct hwr_gl_vertex *dst,
     corner.material_flags = material;
     corner.light = light;
     corner.sector_flags = sector_flags;
+    /* The owner-floor id rides the flat-span attribute (a_flat_span.x): zero for
+     * billboards on the normal path, so its only reader is the floor-exception
+     * gate in the geometry shader. */
+    corner.flat_guard = floor_id;
     tl = tr = bl = br = corner;
     tl.x = xl; tl.y = yl; tl.z = z_top;    tl.wall_s = 0.0f; tl.wall_top = 0.0f;
     tr.x = xr; tr.y = yr; tr.z = z_top;    tr.wall_s = smax; tr.wall_top = 0.0f;
@@ -513,7 +540,7 @@ static int hwr_bb_trans_cmp(const void *a, const void *b)
 static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object *o,
                               const struct hwr_world *world,
                               const struct hwr_gl_camera *camera, int32_t depth,
-                              double hscale, double vscale,
+                              double hscale, double vscale, int exception,
                               struct hwr_bb_trans **pending, size_t *pending_count,
                               size_t *pending_capacity)
 {
@@ -526,6 +553,7 @@ static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object
     double srx = half_w * (double)camera->yaw_sin / 16384.0;
     double sry = half_w * (double)camera->yaw_cos / 16384.0;
     int32_t szb, szt;
+    uint32_t floor_id;
     struct hwr_bb_trans *t;
     if (o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
         o->sector_index < world->sector_count) {
@@ -534,14 +562,25 @@ static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object
     } else {
         floor_z = o->world_z;
     }
-    /* The engine anchors the oval straddling the floor and paints it whole over
-     * the floor (painter order). The mod's depth test would clip the below-floor
-     * half against the opaque floor, so the oval sits ON the floor (bottom edge
-     * at floor z) and extends up -- the whole oval clears the floor and shows.
-     * A small disp keeps its base a hair below to hug the contact line. */
-    (void)disp_d;
-    szb = floor_z;
-    szt = szb + (int32_t)(vext_d + 0.5);
+    floor_id = HWR_BB_FLOOR_TAG | (uint32_t)(uint16_t)floor_z;
+    if (exception) {
+        /* True floor Z: the engine's mirror-double anchors the oval at the sector
+         * floor via the 0x8N block modifier (z_bottom = objZ - disp, objZ = floor
+         * z), so it STRADDLES the floor. The floor-exception pass paints the
+         * below-floor half over the object's own floor while the monster (which
+         * stamped floor id 0) and any nearer geometry occlude it. */
+        int32_t disp = (int32_t)(disp_d + 0.5);
+        szb = floor_z - disp;
+        szt = szb + (int32_t)(vext_d + 0.5);
+    } else {
+        /* Kill-switch fallback (== the pre-exception behaviour): the depth test
+         * would clip a below-floor half, so raise the oval to sit ON the floor
+         * (bottom edge at floor z) so the whole oval clears the floor. */
+        (void)disp_d;
+        floor_id = 0u;
+        szb = floor_z;
+        szt = szb + (int32_t)(vext_d + 0.5);
+    }
     if (*pending_count == *pending_capacity) {
         size_t next = *pending_capacity != 0 ? *pending_capacity * 2u : 128u;
         struct hwr_bb_trans *grown = (struct hwr_bb_trans *)realloc(
@@ -567,6 +606,7 @@ static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object
     t->material = (uint8_t)(HWR_GL_MATERIAL_MASKED | HWR_GL_MATERIAL_TRANSLUCENT);
     t->light = 0;                                          /* engine draws the shadow at shade 0 */
     t->sector_flags = sflags;
+    t->floor_id = floor_id;
     return 0;
 }
 
@@ -582,10 +622,13 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     double focal_x, focal_y, xscale, pscale, hscale, vscale;
     struct hwr_bb_trans *pending = NULL;
     size_t pending_count = 0, pending_capacity = 0;
+    struct hwr_bb_trans *pending_shadow = NULL;
+    size_t pending_shadow_count = 0, pending_shadow_capacity = 0;
     size_t i;
     int trace = hwr_bb_trace_level();
     int bb_log = getenv("HWR_BB_LOG") != NULL;
     int shadows = hwr_bb_shadows_enabled();
+    int exception = hwr_billboards_floor_exception_enabled();
     static uint32_t frame_no;
     int log_frame, throttle;
     size_t flat_seen = 0;
@@ -596,6 +639,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     bb->flat_count = 0;
     bb->translucent_count = 0;
     bb->run_count = 0;
+    bb->shadow_count = 0;
+    bb->shadow_run_count = 0;
     bb->stat_emitted = 0;
     bb->stat_enumerated = 0;
     bb->stat_skipped_mesh = 0;
@@ -637,6 +682,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         const struct hwr_bb_slot *slot;
         int32_t view_x, depth, corr;
         uint32_t offset;
+        uint32_t obj_floor_id = 0u;
         uint16_t tw, th, fa;
         uint8_t sector_light = 0, sector_flags = 0, seed, composed, material;
         double half_w, famod, vext_d, rx, ry, cx, cy;
@@ -676,8 +722,14 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
          * renderer.c:8068). Emitted independent of the object's own sprite so a
          * shadow shows even if the sprite drops/meshes. */
         if (shadows && bb->shadow.present && (o->flags9 & 1u) != 0) {
+            /* With the floor exception on, shadows collect in their own set so
+             * the GL layer can draw them as the floor-gated blend pass; off, they
+             * join the plain translucent tail at the raised anchor. */
+            struct hwr_bb_trans **sp = exception ? &pending_shadow : &pending;
+            size_t *sc = exception ? &pending_shadow_count : &pending_count;
+            size_t *scap = exception ? &pending_shadow_capacity : &pending_capacity;
             if (hwr_bb_push_shadow(bb, o, world, camera, depth, hscale, vscale,
-                                   &pending, &pending_count, &pending_capacity) != 0)
+                                   exception, sp, sc, scap) != 0)
                 break;
             bb->stat_emitted++;
         }
@@ -913,6 +965,16 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         if (lookup.flip)
             material |= (uint8_t)HWR_GL_MATERIAL_HFLIP;
 
+        /* Owner-floor id for the camera-facing opaque path only: it lets the
+         * floor-exception pass recover a below-floor part (a negatively-offset
+         * object) over this object's own sector floor. Rotated wall decals and
+         * blend billboards do not participate (floor id 0). */
+        if (exception &&
+            o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+            o->sector_index < world->sector_count)
+            obj_floor_id = HWR_BB_FLOOR_TAG |
+                (uint32_t)(uint16_t)world->sectors[o->sector_index].floor_z;
+
         if (bb_log || (trace >= 2 && throttle))
             fprintf(stderr,
                     "[bb] o%zu id=%#06x nid=%#06x %ux%u fa=%#06x fmod=%.2g half=%.0f vext=%d wxy=%d,%d..%d,%d z=%d..%d depth=%d mat=%#x face=%u%s EMIT%s\n",
@@ -936,7 +998,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             hwr_bb_write_quad(*dst + *cnt, xl, yl, xr, yr,
                               hwr_bb_clamp_i16(z_top), hwr_bb_clamp_i16(z_bottom),
                               offset, tw, th, (float)(2u * th), (float)(2u * tw),
-                              material, composed, sector_flags);
+                              material, composed, sector_flags,
+                              is_flat ? 0u : obj_floor_id);
             *cnt += 6;
             bb->stat_emitted++;
         } else {
@@ -962,40 +1025,60 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             t->material = material;
             t->light = composed;
             t->sector_flags = sector_flags;
+            t->floor_id = 0u;               /* blend billboards do not floor-clip */
             bb->stat_emitted++;
         }
     }
 
     /* Depth-sort the masked/blend-capable quads back to front and lay them out,
      * one run each so the translucent pass refreshes its destination between a
-     * stacked pair. */
-    if (pending_count != 0) {
-        qsort(pending, pending_count, sizeof *pending, hwr_bb_trans_cmp);
+     * stacked pair. Ground shadows (when the floor exception is on) follow as a
+     * separate depth-sorted block at the very tail; the GL layer draws that tail
+     * as the floor-gated shadow pass. */
+    if (pending_count != 0 || pending_shadow_count != 0) {
+        size_t total_pending = pending_count + pending_shadow_count;
+        if (pending_count != 0)
+            qsort(pending, pending_count, sizeof *pending, hwr_bb_trans_cmp);
+        if (pending_shadow_count != 0)
+            qsort(pending_shadow, pending_shadow_count, sizeof *pending_shadow,
+                  hwr_bb_trans_cmp);
         if (hwr_bb_reserve_verts(&bb->translucent, bb->translucent_count,
-                                 &bb->translucent_capacity, pending_count * 6u) == 0) {
-            if (pending_count > bb->run_capacity) {
+                                 &bb->translucent_capacity, total_pending * 6u) == 0) {
+            if (total_pending > bb->run_capacity) {
                 uint32_t *runs = (uint32_t *)realloc(bb->runs,
-                                                     pending_count * sizeof *runs);
+                                                     total_pending * sizeof *runs);
                 if (runs != NULL) {
                     bb->runs = runs;
-                    bb->run_capacity = pending_count;
+                    bb->run_capacity = total_pending;
                 }
             }
-            if (pending_count <= bb->run_capacity) {
+            if (total_pending <= bb->run_capacity) {
                 for (i = 0; i < pending_count; i++) {
                     const struct hwr_bb_trans *t = &pending[i];
                     hwr_bb_write_quad(bb->translucent + bb->translucent_count,
                                       t->xl, t->yl, t->xr, t->yr, t->z_top, t->z_bottom,
                                       t->offset, t->tw, t->th, t->smax, t->tmax,
-                                      t->material, t->light, t->sector_flags);
+                                      t->material, t->light, t->sector_flags, t->floor_id);
                     bb->translucent_count += 6;
                     bb->runs[bb->run_count++] = 6u;
+                }
+                for (i = 0; i < pending_shadow_count; i++) {
+                    const struct hwr_bb_trans *t = &pending_shadow[i];
+                    hwr_bb_write_quad(bb->translucent + bb->translucent_count,
+                                      t->xl, t->yl, t->xr, t->yr, t->z_top, t->z_bottom,
+                                      t->offset, t->tw, t->th, t->smax, t->tmax,
+                                      t->material, t->light, t->sector_flags, t->floor_id);
+                    bb->translucent_count += 6;
+                    bb->runs[bb->run_count++] = 6u;
+                    bb->shadow_count += 6;
+                    bb->shadow_run_count += 1;
                 }
             }
         }
     }
 
     free(pending);
+    free(pending_shadow);
     if (log_frame)
         fprintf(stderr,
                 "[bb] frame %u: emit=%zu enum=%zu skip-mesh=%zu opaque-v=%zu trans-v=%zu runs=%zu | cam vox=%d voy=%d eyez=%d yaw=%u sin=%d cos=%d | Xsc=%.0f Psc=%.0f fx=%.0f fy=%.0f hsc=%.4f vsc=%.4f\n",

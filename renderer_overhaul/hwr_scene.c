@@ -3347,6 +3347,11 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     return hwr_gl_scene_render(scene->stream_vertices, sky_count, opaque_count,
                                flat_count, translucent_count,
                                scene->translucent_runs,
-                               translucent_run_count, &camera, palette,
+                               translucent_run_count,
+                               scene->billboards.opaque_count,
+                               scene->billboards.shadow_count,
+                               scene->billboards.shadow_run_count,
+                               hwr_billboards_floor_exception_enabled(),
+                               &camera, palette,
                                width, height);
 }

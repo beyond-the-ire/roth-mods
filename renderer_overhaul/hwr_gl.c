@@ -34,6 +34,12 @@
 #ifndef GL_COLOR_ATTACHMENT0
 #define GL_COLOR_ATTACHMENT0 0x8ce0
 #endif
+#ifndef GL_COLOR_ATTACHMENT1
+#define GL_COLOR_ATTACHMENT1 0x8ce1
+#endif
+#ifndef GL_R32UI
+#define GL_R32UI 0x8236
+#endif
 #ifndef GL_FRAMEBUFFER_COMPLETE
 #define GL_FRAMEBUFFER_COMPLETE 0x8cd5
 #endif
@@ -141,6 +147,7 @@ struct hwr_gl_functions {
     hwr_gl_depth_mask_fn depth_mask;
     hwr_gl_polygon_offset_fn polygon_offset;
     PFNGLCLEARBUFFERUIVPROC clear_buffer_uiv;
+    PFNGLDRAWBUFFERSPROC draw_buffers;
     hwr_gl_copy_tex_sub_image_2d_fn copy_tex_sub_image_2d;
     hwr_gl_pixel_store_i_fn pixel_store_i;
     hwr_gl_get_tex_image_fn get_tex_image;
@@ -163,6 +170,11 @@ static uint8_t *g_index_seed;
 static uint32_t g_index_seed_width;
 static uint32_t g_index_seed_height;
 static GLuint g_index_texture;
+/* Second colour attachment of the index FBO: per-pixel owner-floor identity of
+ * the opaque winner (FLOOR_TAG | (floor_z & 0xffff) for a flat floor, else 0),
+ * read by the floor-exception passes so an object may overlay its OWN sector
+ * floor while walls and nearer geometry still occlude it. */
+static GLuint g_floor_id_texture;
 static GLuint g_index_copy_texture;
 /* Snapshot of the index target as the frame STARTS (the persisted previous
  * frame), for surfaces whose engine counterpart reads pixels nothing repaints
@@ -571,6 +583,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(depth_mask, hwr_gl_depth_mask_fn, "glDepthMask");
     HWR_LOAD_GL(polygon_offset, hwr_gl_polygon_offset_fn, "glPolygonOffset");
     HWR_LOAD_GL(clear_buffer_uiv, PFNGLCLEARBUFFERUIVPROC, "glClearBufferuiv");
+    HWR_LOAD_GL(draw_buffers, PFNGLDRAWBUFFERSPROC, "glDrawBuffers");
     HWR_LOAD_GL(copy_tex_sub_image_2d, hwr_gl_copy_tex_sub_image_2d_fn, "glCopyTexSubImage2D");
     HWR_LOAD_GL(pixel_store_i, hwr_gl_pixel_store_i_fn, "glPixelStorei");
     HWR_LOAD_GL(get_tex_image, hwr_gl_get_tex_image_fn, "glGetTexImage");
@@ -662,6 +675,7 @@ static const char g_geometry_vertex_shader[] =
 static const char g_geometry_fragment_shader[] =
     "#version 330 core\n"
     "layout(location=0) out uint out_index;\n"
+    "layout(location=1) out uint out_floor_id;\n"
     "uniform usamplerBuffer u_texels;\n"
     "uniform usampler2D u_colormap;\n"
     "uniform usampler2D u_tint;\n"
@@ -687,6 +701,12 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_fill_index;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
+    /* Owner-floor depth exception. When u_floor_exception!=0 (the exception
+     * re-draw passes) a fragment survives only where the opaque winner recorded
+     * in u_floor_id equals this object's own sector-floor id (carried per-vertex
+     * in v_flat_span.x); a zero id means "does not participate". */
+    "uniform int u_floor_exception;\n"
+    "uniform usampler2D u_floor_id;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
      * the retired full-screen prepass did; these carry the same inputs. */
     "uniform int u_sky_valid;\n"
@@ -1014,6 +1034,20 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_debug_vis;\n"
     "void main() {\n"
     "  uint material=v_light_material.y;\n"
+    /* Owner-floor identity output for the world pass: a flat FLOOR fragment
+     * (material bit 3) publishes FLOOR_TAG | (its world z & 0xffff); everything
+     * else publishes 0. The exception passes bind COLOR1 as GL_NONE, so this
+     * write is harmlessly discarded there. */
+    "  out_floor_id=(material & 8u)!=0u ?"
+    " (0x40000000u | (uint(int(round(v_world.z))) & 0xffffu)) : 0u;\n"
+    /* Exception re-draw: keep only fragments standing over this object's OWN
+     * sector floor (the recorded opaque winner). A wall or nearer surface made
+     * itself the winner with a different (or zero) id and thus occludes. */
+    "  if (u_floor_exception!=0) {\n"
+    "    uint fid=v_flat_span.x;\n"
+    "    if (fid==0u) discard;\n"
+    "    if (texelFetch(u_floor_id,ivec2(gl_FragCoord.xy),0).r != fid) discard;\n"
+    "  }\n"
     /* Surface-identity probes must reveal the OPAQUE winner behind a
      * translucent surface, not the translucent surface itself.  The
      * translucent pass writes colour with depth-write off, so under any probe
@@ -1264,6 +1298,7 @@ static void hwr_destroy_scene_objects(void)
 static void hwr_destroy_framebuffer(void)
 {
     hwr_delete_texture(&g_index_texture);
+    hwr_delete_texture(&g_floor_id_texture);
     hwr_delete_texture(&g_index_copy_texture);
     hwr_delete_texture(&g_stale_copy_texture);
     if (g_depth_buffer != 0) {
@@ -1323,6 +1358,20 @@ static int hwr_create_framebuffer(uint32_t width, uint32_t height)
                       (GLsizei)height, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, NULL);
     g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                 GL_TEXTURE_2D, g_index_texture, 0);
+    /* The owner-floor identity attachment. R32UI holds FLOOR_TAG | (floor_z &
+     * 0xffff) for a visible floor fragment, zero everywhere else. Sampled (never
+     * written) by the floor-exception passes, so there is no feedback while it
+     * is a live draw buffer of the world pass. */
+    g_gl.gen_textures(1, &g_floor_id_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_floor_id_texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R32UI, (GLsizei)width,
+                      (GLsizei)height, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, NULL);
+    g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                                GL_TEXTURE_2D, g_floor_id_texture, 0);
     g_gl.gen_renderbuffers(1, &g_depth_buffer);
     g_gl.bind_renderbuffer(GL_RENDERBUFFER, g_depth_buffer);
     g_gl.renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
@@ -1832,6 +1881,10 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                     size_t translucent_vertices,
                                     const uint32_t *translucent_runs,
                                     size_t translucent_run_count,
+                                    size_t opaque_billboard_vertices,
+                                    size_t shadow_vertices,
+                                    size_t shadow_run_count,
+                                    int floor_exception,
                                     const struct hwr_gl_camera *camera,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height)
@@ -1865,6 +1918,20 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                      vertices, GL_STREAM_DRAW);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    /* The world pass records both the palette index (COLOR0) and the owner-floor
+     * identity (COLOR1); the exception/translucent passes switch back to COLOR0
+     * only so they never disturb the recorded ids. */
+    {
+        static const GLenum both_buffers[2] =
+            { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+        g_gl.draw_buffers(2, both_buffers);
+    }
+    /* The floor-id target is per-frame identity, never persisted: wipe it to
+     * zero ("no floor here") every frame regardless of the void-persist policy. */
+    {
+        const GLuint clear_floor[4] = { 0u, 0u, 0u, 0u };
+        g_gl.clear_buffer_uiv(GL_COLOR, 1, clear_floor);
+    }
     /* The original never wipes the view before drawing it, so a column no
      * surface covers keeps whatever the previous frame left in that pixel.
      * This shows up where a see-through surface has nothing but void behind
@@ -1935,6 +2002,13 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     hwr_set_sampler(g_geometry_program, "u_blend", 4);
     hwr_set_sampler(g_geometry_program, "u_dst", 5);
     hwr_set_sampler(g_geometry_program, "u_stale", 6);
+    hwr_set_sampler(g_geometry_program, "u_floor_id", 7);
+    /* The world pass never samples the floor id (it writes it); keep the gate off
+     * and clear unit 7 so sampling the attachment being written is impossible. */
+    hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
+    g_gl.active_texture(GL_TEXTURE0 + 7);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    g_gl.active_texture(GL_TEXTURE0);
     hwr_uniform_1i(g_geometry_program, "u_debug_vis", g_debug_vis);
     hwr_uniform_2i(g_geometry_program, "u_view_offset",
                    camera->view_offset_x, camera->view_offset_y);
@@ -2061,7 +2135,69 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
             g_gl.disable(GL_POLYGON_OFFSET_FILL);
         }
     }
-    if (translucent_vertices != 0) {
+    /* From here only the palette index is written; the recorded owner-floor ids
+     * stay intact for the exception passes to sample. */
+    {
+        static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
+        g_gl.draw_buffers(1, index_only);
+    }
+    /* The main translucent range excludes the ground shadows appended to its
+     * tail: those go through the floor-exception pass below. */
+    {
+        size_t trans_main_vertices = translucent_vertices >= shadow_vertices
+            ? translucent_vertices - shadow_vertices : translucent_vertices;
+        size_t trans_main_runs = translucent_run_count >= shadow_run_count
+            ? translucent_run_count - shadow_run_count : translucent_run_count;
+    /* Owner-floor depth exception (HWR_FLOOR_EXCEPTION). Re-draw the object quads
+     * that may overlay their OWN sector floor with the identity gate on and depth
+     * off: a fragment survives only where the recorded opaque winner is that
+     * object's floor, so the below-floor part is painted over the floor while
+     * walls and nearer geometry still occlude it. This also seats the ground
+     * shadow BEHIND its monster for free -- the monster stamped floor id 0 across
+     * its silhouette, so the shadow is gated out there. */
+    if (floor_exception && (opaque_billboard_vertices != 0 || shadow_vertices != 0)) {
+        size_t opaque_main = opaque_vertices >= flat_vertices
+                           ? opaque_vertices - flat_vertices : opaque_vertices;
+        g_gl.active_texture(GL_TEXTURE0 + 7);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_floor_id_texture);
+        g_gl.active_texture(GL_TEXTURE0);
+        hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
+        g_gl.disable(GL_DEPTH_TEST);
+        g_gl.depth_mask(GL_FALSE);
+        if (opaque_billboard_vertices != 0 &&
+            opaque_main >= opaque_billboard_vertices) {
+            if (blend_location >= 0)
+                g_gl.uniform_1i(blend_location, 0);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                (GLint)(sky_vertices + opaque_main - opaque_billboard_vertices),
+                (GLsizei)opaque_billboard_vertices);
+        }
+        if (shadow_vertices != 0) {
+            GLint first = (GLint)(sky_vertices + opaque_vertices + trans_main_vertices);
+            if (blend_location >= 0)
+                g_gl.uniform_1i(blend_location, 1);
+            g_gl.active_texture(GL_TEXTURE5);
+            g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
+            if (translucent_runs == NULL || shadow_run_count == 0) {
+                g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                           (GLsizei)width, (GLsizei)height);
+                g_gl.draw_arrays(GL_TRIANGLES, first, (GLsizei)shadow_vertices);
+            } else {
+                size_t run;
+                for (run = trans_main_runs; run < translucent_run_count; run++) {
+                    g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                                               (GLsizei)width, (GLsizei)height);
+                    g_gl.draw_arrays(GL_TRIANGLES, first,
+                                     (GLsizei)translucent_runs[run]);
+                    first += (GLint)translucent_runs[run];
+                }
+            }
+        }
+        hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
+        g_gl.enable(GL_DEPTH_TEST);
+        g_gl.depth_mask(GL_TRUE);
+    }
+    if (trans_main_vertices != 0) {
         /* Translucent surfaces arrive depth-sorted back to front, and each
          * blends against what is already on screen -- INCLUDING the
          * translucent surfaces drawn before it, the way the engine's painter
@@ -2082,13 +2218,13 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
             g_gl.uniform_1i(blend_location, 1);
         g_gl.active_texture(GL_TEXTURE5);
         g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
-        if (translucent_runs == NULL || translucent_run_count == 0) {
+        if (translucent_runs == NULL || trans_main_runs == 0) {
             g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                                        (GLsizei)width, (GLsizei)height);
             g_gl.draw_arrays(GL_TRIANGLES, first,
-                             (GLsizei)translucent_vertices);
+                             (GLsizei)trans_main_vertices);
         } else {
-            for (run = 0; run < translucent_run_count; run++) {
+            for (run = 0; run < trans_main_runs; run++) {
                 g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                                            (GLsizei)width, (GLsizei)height);
                 g_gl.draw_arrays(GL_TRIANGLES, first,
@@ -2098,6 +2234,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         }
         g_gl.depth_func(GL_LESS);
         g_gl.depth_mask(GL_TRUE);
+    }
     }
 
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
