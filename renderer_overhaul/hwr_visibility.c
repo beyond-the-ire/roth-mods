@@ -162,3 +162,148 @@ int hwr_compute_pvs(const struct hwr_world *world,
         return 0;
     return 1;
 }
+
+/* The sector portal-window clip is on by default; HWR_PORTAL_CLIP=0 disables it,
+ * leaving billboards unclipped exactly as before. */
+int hwr_portal_clip_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_PORTAL_CLIP");
+        state = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return state;
+}
+
+/* Poison sentinel for a sector that accumulated too many distinct windows; it is
+ * normalised back to 0 (no clip) once the walk finishes. */
+#define HWR_SPAN_POISON 0xffu
+
+/* After widening interval `i`, absorb any other interval it now bridges so the
+ * set stays a minimal list of disjoint windows. Bounded by HWR_SECTOR_CLIP_MAX. */
+static void hwr_span_recoalesce(struct hwr_sector_xspan *s, unsigned i)
+{
+    unsigned j = 0;
+    while (j < s->count) {
+        if (j != i &&
+            (int)s->lo[i] <= (int)s->hi[j] + 1 &&
+            (int)s->lo[j] <= (int)s->hi[i] + 1) {
+            if (s->lo[j] < s->lo[i]) s->lo[i] = s->lo[j];
+            if (s->hi[j] > s->hi[i]) s->hi[i] = s->hi[j];
+            s->count--;
+            s->lo[j] = s->lo[s->count];   /* compact: last fills the hole */
+            s->hi[j] = s->hi[s->count];
+            if (i == s->count)            /* i itself was the moved last one */
+                i = j;
+            j = 0;                        /* restart: the merge may bridge more */
+            continue;
+        }
+        j++;
+    }
+}
+
+/* Merges one screen-X window into a sector's set, coalescing overlapping or
+ * touching windows (a 1px gap still merges). Overflowing the cap poisons the
+ * sector so it reads as no-clip. */
+static void hwr_span_add(struct hwr_sector_xspan *s, int lo, int hi)
+{
+    unsigned i;
+    if (s->count == HWR_SPAN_POISON)
+        return;
+    if (lo > hi) {
+        int t = lo; lo = hi; hi = t;
+    }
+    for (i = 0; i < s->count; i++) {
+        if (lo <= (int)s->hi[i] + 1 && (int)s->lo[i] <= hi + 1) {
+            if (lo < (int)s->lo[i]) s->lo[i] = (int16_t)lo;
+            if (hi > (int)s->hi[i]) s->hi[i] = (int16_t)hi;
+            hwr_span_recoalesce(s, i);
+            return;
+        }
+    }
+    if (s->count >= HWR_SECTOR_CLIP_MAX) {
+        s->count = HWR_SPAN_POISON;       /* fail open for this sector */
+        return;
+    }
+    s->lo[s->count] = (int16_t)lo;
+    s->hi[s->count] = (int16_t)hi;
+    s->count++;
+}
+
+int hwr_compute_portal_windows(const struct hwr_world *world,
+                               const struct roth_api_v1 *api,
+                               struct hwr_sector_xspan *spans,
+                               size_t span_count)
+{
+    const uint8_t *section;
+    uintptr_t arena;
+    size_t sector_count;
+    size_t captured = 0;
+    uint32_t count;
+    uint32_t entries_end;
+    uint32_t k;
+    size_t s;
+    int ok = 1;
+
+    if (world == NULL || api == NULL || api->game_ram == NULL || spans == NULL)
+        return 0;
+    sector_count = world->sector_count;
+    if (sector_count == 0 || span_count < sector_count)
+        return 0;
+    if (!hwr_portal_clip_enabled())
+        return 0;
+    if (world->sector_offset_to_index == NULL)
+        return 0;
+
+    for (s = 0; s < sector_count; s++)
+        spans[s].count = 0;
+
+    arena = (uintptr_t)api->game_ram->u32(VA_G_RENDER_ARENA_PTR);
+    if (arena < 0x1000u)
+        return 0;
+    section = (const uint8_t *)(arena + HWR_RENDER_ARENA_WINDOW);
+
+    count = hwr_pvs_section_u16(section, HWR_DRAW_LIST_COUNT, &ok);
+    entries_end = HWR_DRAW_LIST_ENTRIES + count * 2u;
+    if (!ok || count == 0 || entries_end > HWR_SECTION_EXTENT)
+        return 0;
+
+    for (k = 0; k < count; k++) {
+        uint32_t node = hwr_pvs_section_u16(section, HWR_DRAW_LIST_ENTRIES + k * 2u, &ok);
+        uint32_t chain = hwr_pvs_section_u16(section, node + HWR_NODE_FACE_HEAD, &ok);
+        uint32_t guard = 0;
+        if (!ok)
+            return 0;
+        while (chain != 0 && guard++ < HWR_CHAIN_LIMIT) {
+            uint16_t recid = hwr_pvs_section_u16(section, chain + HWR_NODE_LINK_REC, &ok);
+            if (!ok)
+                return 0;
+            if (recid != HWR_NODE_REMOVED) {
+                uint16_t index = world->sector_offset_to_index[recid];
+                int lo, hi;
+                if (index == UINT16_MAX || index >= sector_count)
+                    return 0;
+                lo = (int)(int16_t)hwr_pvs_section_u16(section, chain + 4u, &ok);
+                hi = (int)(int16_t)hwr_pvs_section_u16(section, chain + 6u, &ok);
+                if (!ok)
+                    return 0;
+                hwr_span_add(&spans[index], lo, hi);
+                captured++;
+            }
+            chain = hwr_pvs_section_u16(section, chain + HWR_NODE_LINK_NEXT, &ok);
+            if (!ok)
+                return 0;
+        }
+        if (guard >= HWR_CHAIN_LIMIT)
+            return 0;
+    }
+
+    if (captured == 0)
+        return 0;
+
+    for (s = 0; s < sector_count; s++)
+        if (spans[s].count == HWR_SPAN_POISON)
+            spans[s].count = 0;             /* normalise poison -> no clip */
+
+    return 1;
+}

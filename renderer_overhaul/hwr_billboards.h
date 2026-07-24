@@ -4,6 +4,7 @@
 #include "hwr_das.h"
 #include "hwr_gl.h"
 #include "hwr_objects.h"
+#include "hwr_visibility.h"
 #include "hwr_world.h"
 #include "roth_sdk.h"
 
@@ -131,14 +132,18 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
 /* Resolves and projects this frame's billboards into bb->opaque / bb->translucent
  * (+ bb->runs). `visible`/`visible_count` are the PVS drawn-sector set; when
  * pvs_valid is set an object whose owner sector is not drawn is dropped, exactly
- * as the engine emits billboards per visible sector. Returns 0 (including an
- * empty result when disabled). */
+ * as the engine emits billboards per visible sector. `spans`/`span_count` (may be
+ * NULL / 0) are the per-sector visible screen-X portal windows; when present each
+ * billboard is clipped to its owner sector's window(s) the way the engine's
+ * per-entry x-window clips a type-1 draw, so a sprite past a portal edge is cut at
+ * the jamb. Returns 0 (including an empty result when disabled). */
 int hwr_billboards_emit(struct hwr_billboards *bb,
                         const struct hwr_objects *objects,
                         const struct hwr_world *world,
                         const struct hwr_gl_camera *camera,
                         const uint8_t *visible, size_t visible_count,
                         int pvs_valid,
+                        const struct hwr_sector_xspan *spans, size_t span_count,
                         const struct roth_api_v1 *api);
 
 #endif

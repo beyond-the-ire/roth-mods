@@ -961,6 +961,7 @@ void hwr_scene_clear(struct hwr_scene *scene)
     free(scene->stream_vertices);
     free(scene->translucent_runs);
     free(scene->visible);
+    free(scene->spans);
     memset(scene, 0, sizeof *scene);
 }
 
@@ -3276,6 +3277,14 @@ static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count
         scene->visible = buffer;
         scene->visible_count = sector_count;
     }
+    if (scene->span_count < sector_count) {
+        struct hwr_sector_xspan *buffer = (struct hwr_sector_xspan *)realloc(
+            scene->spans, sector_count * sizeof *buffer);
+        if (buffer == NULL)
+            return -1;
+        scene->spans = buffer;
+        scene->span_count = sector_count;
+    }
     return 0;
 }
 
@@ -3329,14 +3338,22 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
      * list cannot be read, pvs_valid stays 0 and the per-surface gate is a
      * no-op, leaving the frame identical to the plain stream-everything path. */
     scene->pvs_valid = 0;
+    scene->portal_clip_valid = 0;
     if (hwr_pvs_enabled() &&
-        hwr_scene_ensure_visible(scene, world->sector_count) == 0)
+        hwr_scene_ensure_visible(scene, world->sector_count) == 0) {
         scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
+        /* Lift each drawn sector's screen-X portal window(s) from the same node
+         * chains, so a billboard past a doorway edge is clipped to the jamb. */
+        scene->portal_clip_valid = hwr_compute_portal_windows(
+            world, api, scene->spans, scene->span_count);
+    }
     hwr_scene_log_visibility(scene, world);
     /* Resolve and project this frame's billboards against the same camera and
      * visible-sector set, ready to append to the stream below. */
     hwr_billboards_emit(&scene->billboards, objects, world, &camera,
                         scene->visible, scene->visible_count, scene->pvs_valid,
+                        scene->portal_clip_valid ? scene->spans : NULL,
+                        scene->portal_clip_valid ? scene->span_count : 0,
                         api);
     if (hwr_prepare_stream(scene, &camera, width, height,
                            &sky_count, &opaque_count, &flat_count,

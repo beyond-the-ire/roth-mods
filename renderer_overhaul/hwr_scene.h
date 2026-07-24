@@ -5,6 +5,7 @@
 #include "hwr_das.h"
 #include "hwr_gl.h"
 #include "hwr_objects.h"
+#include "hwr_visibility.h"
 #include "hwr_world.h"
 
 #include <stddef.h>
@@ -178,6 +179,14 @@ struct hwr_scene {
     uint8_t *visible;
     size_t visible_count;
     int pvs_valid;
+    /* Per-sector visible screen-X portal window(s) (HWR_PORTAL_CLIP). Lifted from
+     * the renderer's per-node interval chains and handed to the billboard emitter
+     * so a sprite standing past a portal edge is clipped to the doorway exactly as
+     * the software renderer's per-entry x-window does. spans is grown alongside
+     * visible; portal_clip_valid gates the clip (0 = billboards unclipped). */
+    struct hwr_sector_xspan *spans;
+    size_t span_count;
+    int portal_clip_valid;
     /* The camera-facing billboard layer. Its sprite frames are packed into the
      * same texel store as the world textures at upload, and its per-frame quads
      * are streamed after the world surfaces. Archive pointers are retained from
