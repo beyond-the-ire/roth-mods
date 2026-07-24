@@ -1,5 +1,7 @@
 #include "hwr_visibility.h"
 
+#include "hwr_objects.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -64,6 +66,14 @@ static int hwr_pvs_all(void)
 static uint16_t hwr_pvs_u16(const uint8_t *bytes)
 {
     return (uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
+}
+
+static uint32_t hwr_pvs_u32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] |
+           ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
 }
 
 /* Reads a u16 from the section at `offset`; clears *ok and returns 0 when the
@@ -230,80 +240,116 @@ static void hwr_span_add(struct hwr_sector_xspan *s, int lo, int hi)
     s->count++;
 }
 
-int hwr_compute_portal_windows(const struct hwr_world *world,
-                               const struct roth_api_v1 *api,
-                               struct hwr_sector_xspan *spans,
-                               size_t span_count)
+int hwr_compute_object_portal_windows(
+    const struct hwr_world *world, const struct hwr_objects *objects,
+    const struct roth_api_v1 *api, struct hwr_sector_xspan *spans,
+    size_t span_count)
 {
-    const uint8_t *section;
-    uintptr_t arena;
-    size_t sector_count;
+    const uint8_t *node_section;
+    uintptr_t arena, arena_end, worklist_limit;
     size_t captured = 0;
-    uint32_t count;
-    uint32_t entries_end;
-    uint32_t k;
-    size_t s;
-    int ok = 1;
+    size_t s, oi;
 
-    if (world == NULL || api == NULL || api->game_ram == NULL || spans == NULL)
+    if (world == NULL || objects == NULL || api == NULL ||
+        api->game_ram == NULL || spans == NULL)
         return 0;
-    sector_count = world->sector_count;
-    if (sector_count == 0 || span_count < sector_count)
+    if (world->sector_count == 0 || objects->count == 0 ||
+        span_count < objects->count || world->sector_section == NULL)
         return 0;
     if (!hwr_portal_clip_enabled())
         return 0;
-    if (world->sector_offset_to_index == NULL)
-        return 0;
 
-    for (s = 0; s < sector_count; s++)
-        spans[s].count = 0;
+    for (oi = 0; oi < objects->count; oi++)
+        spans[oi].count = 0;
 
     arena = (uintptr_t)api->game_ram->u32(VA_G_RENDER_ARENA_PTR);
-    if (arena < 0x1000u)
+    if (arena < 0x1000u ||
+        arena > UINTPTR_MAX - HWR_RENDER_ARENA_WINDOW)
         return 0;
-    section = (const uint8_t *)(arena + HWR_RENDER_ARENA_WINDOW);
-
-    count = hwr_pvs_section_u16(section, HWR_DRAW_LIST_COUNT, &ok);
-    entries_end = HWR_DRAW_LIST_ENTRIES + count * 2u;
-    if (!ok || count == 0 || entries_end > HWR_SECTION_EXTENT)
+    arena_end = arena + HWR_RENDER_ARENA_WINDOW;
+    worklist_limit =
+        (uintptr_t)api->game_ram->u32(VA_G_RENDER_ARENA_PTR + 4u);
+    if (worklist_limit <= arena || worklist_limit > arena_end)
         return 0;
+    node_section = (const uint8_t *)arena_end;
 
-    for (k = 0; k < count; k++) {
-        uint32_t node = hwr_pvs_section_u16(section, HWR_DRAW_LIST_ENTRIES + k * 2u, &ok);
-        uint32_t chain = hwr_pvs_section_u16(section, node + HWR_NODE_FACE_HEAD, &ok);
+    /* Each live sector record points into the high node section. Its worklist
+     * head is relative to the low arena; subsequent links are absolute host
+     * pointers. Walking every sector list once visits the exact nodes the
+     * software type-1 rasterizer consumes. */
+    for (s = 0; s < world->sector_count; s++) {
+        const struct hwr_sector *sector = &world->sectors[s];
+        const uint8_t *record =
+            world->sector_section + sector->section_offset;
+        uint32_t wall_base = hwr_pvs_u16(record + 4u);
+        uint32_t sector_node;
+        uint32_t head_rel;
+        uintptr_t node;
         uint32_t guard = 0;
+        int ok = 1;
+
+        if (wall_base < 8u)
+            continue;
+        sector_node = wall_base - 8u;
+        head_rel = hwr_pvs_section_u16(
+            node_section, sector_node + 4u, &ok);
         if (!ok)
-            return 0;
-        while (chain != 0 && guard++ < HWR_CHAIN_LIMIT) {
-            uint16_t recid = hwr_pvs_section_u16(section, chain + HWR_NODE_LINK_REC, &ok);
-            if (!ok)
-                return 0;
-            if (recid != HWR_NODE_REMOVED) {
-                uint16_t index = world->sector_offset_to_index[recid];
-                int lo, hi;
-                if (index == UINT16_MAX || index >= sector_count)
-                    return 0;
-                lo = (int)(int16_t)hwr_pvs_section_u16(section, chain + 4u, &ok);
-                hi = (int)(int16_t)hwr_pvs_section_u16(section, chain + 6u, &ok);
-                if (!ok)
-                    return 0;
-                hwr_span_add(&spans[index], lo, hi);
-                captured++;
+            goto fail_open;
+        if (head_rel == 0)
+            continue;
+        node = arena + head_rel;
+
+        while (node != 0 && guard++ < HWR_CHAIN_LIMIT) {
+            uint32_t entry;
+            uint32_t appearance;
+            uint32_t packed;
+            uintptr_t next;
+
+            if (node < arena || node >= worklist_limit ||
+                node > arena_end - 12u)
+                goto fail_open;
+            entry = hwr_pvs_u32((const uint8_t *)node + 4u);
+            next = (uintptr_t)hwr_pvs_u32((const uint8_t *)node);
+            if ((uintptr_t)entry < arena ||
+                (uintptr_t)entry >= worklist_limit ||
+                (uintptr_t)entry > arena_end - 0x26u)
+                goto fail_open;
+            if (hwr_pvs_u16((const uint8_t *)(uintptr_t)entry + 0x12u) == 1u) {
+                appearance =
+                    hwr_pvs_u32((const uint8_t *)(uintptr_t)entry + 8u);
+                for (oi = 0; oi < objects->count; oi++) {
+                    if (objects->items[oi].appearance_ptr == appearance)
+                        break;
+                }
+                if (oi < objects->count) {
+                    int lo, hi;
+                    packed = hwr_pvs_u32((const uint8_t *)node + 8u);
+                    /* The packed dword is {right in low16, left in high16}. */
+                    lo = (int)(int16_t)(uint16_t)(packed >> 16);
+                    hi = (int)(int16_t)(uint16_t)packed;
+                    if (lo < hi) {
+                        hwr_span_add(&spans[oi], lo, hi);
+                        captured++;
+                    }
+                }
             }
-            chain = hwr_pvs_section_u16(section, chain + HWR_NODE_LINK_NEXT, &ok);
-            if (!ok)
-                return 0;
+            node = next;
         }
         if (guard >= HWR_CHAIN_LIMIT)
-            return 0;
+            goto fail_open;
     }
 
     if (captured == 0)
         return 0;
 
-    for (s = 0; s < sector_count; s++)
-        if (spans[s].count == HWR_SPAN_POISON)
-            spans[s].count = 0;             /* normalise poison -> no clip */
+    for (oi = 0; oi < objects->count; oi++)
+        if (spans[oi].count == HWR_SPAN_POISON)
+            spans[oi].count = 0;             /* overflow -> no clip */
 
     return 1;
+
+fail_open:
+    for (oi = 0; oi < objects->count; oi++)
+        spans[oi].count = 0;
+    return 0;
 }

@@ -1042,6 +1042,15 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_debug_vis;\n"
     "void main() {\n"
     "  uint material=v_light_material.y;\n"
+    /* Portal-clipped billboards retain their original world quad and texture
+     * interpolation. Their exact framebuffer-X bounds are 16.16 values in the
+     * otherwise-unused flat span step/origin fields. This avoids the multi-pixel
+     * reprojection error caused by rounding a close sliced quad to int16 world
+     * coordinates. */
+    "  if ((v_flat_span.w & 0x40000000u)!=0u) {\n"
+    "    uint fx=uint(floor(gl_FragCoord.x*65536.0));\n"
+    "    if (fx<v_flat_span.y || fx>=v_flat_span.z) discard;\n"
+    "  }\n"
     /* Owner-floor identity output for the world pass: a world flat FLOOR
      * fragment publishes FLOOR_TAG | (its world z & 0xffff); direct-mapped mesh
      * flats and everything else publish 0. The exception passes bind COLOR1 as

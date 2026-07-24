@@ -3324,7 +3324,8 @@ static void hwr_scene_animate(struct hwr_scene *scene,
 }
 
 /* Grows the per-sector visibility bitset to hold sector_count bytes. */
-static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count)
+static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count,
+                                    size_t object_count)
 {
     if (sector_count == 0)
         return -1;
@@ -3335,13 +3336,13 @@ static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count
         scene->visible = buffer;
         scene->visible_count = sector_count;
     }
-    if (scene->span_count < sector_count) {
+    if (object_count != 0 && scene->span_count < object_count) {
         struct hwr_sector_xspan *buffer = (struct hwr_sector_xspan *)realloc(
-            scene->spans, sector_count * sizeof *buffer);
+            scene->spans, object_count * sizeof *buffer);
         if (buffer == NULL)
             return -1;
         scene->spans = buffer;
-        scene->span_count = sector_count;
+        scene->span_count = object_count;
     }
     return 0;
 }
@@ -3398,12 +3399,12 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     scene->pvs_valid = 0;
     scene->portal_clip_valid = 0;
     if (hwr_pvs_enabled() &&
-        hwr_scene_ensure_visible(scene, world->sector_count) == 0) {
+        hwr_scene_ensure_visible(scene, world->sector_count,
+                                 objects != NULL ? objects->count : 0u) == 0) {
         scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
-        /* Lift each drawn sector's screen-X portal window(s) from the same node
-         * chains, so a billboard past a doorway edge is clipped to the jamb. */
-        scene->portal_clip_valid = hwr_compute_portal_windows(
-            world, api, scene->spans, scene->span_count);
+        /* Reuse each type-1 worklist node's object-depth-specific window. */
+        scene->portal_clip_valid = hwr_compute_object_portal_windows(
+            world, objects, api, scene->spans, scene->span_count);
     }
     hwr_scene_log_visibility(scene, world);
     /* Mesh objects use the same owner-sector admission as billboards. Real 3D
@@ -3420,7 +3421,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     hwr_billboards_emit(&scene->billboards, objects, world, &camera,
                         scene->visible, scene->visible_count, scene->pvs_valid,
                         scene->portal_clip_valid ? scene->spans : NULL,
-                        scene->portal_clip_valid ? scene->span_count : 0,
+                        scene->portal_clip_valid && objects != NULL
+                            ? objects->count : 0,
                         api);
     if (hwr_prepare_stream(scene, &camera, width, height,
                            &sky_count, &opaque_count, &flat_count,

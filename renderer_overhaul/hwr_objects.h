@@ -65,6 +65,11 @@ struct hwr_object {
      * frame resolver follows to the live actor state; 0 for a non-monster or an
      * unlinked record, which falls back to the static appearance table. */
     uint16_t backref;
+    /* Live address of the appearance record used as draw-entry +8. The
+     * software renderer repeats this exact pointer in every type-1 worklist
+     * entry, allowing the hardware layer to recover the object's own portal
+     * windows instead of approximating them from its owner sector. */
+    uint32_t appearance_ptr;
 };
 
 /* Sentinel owner-sector value for objects with no owning sector. */

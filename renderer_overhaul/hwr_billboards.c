@@ -38,10 +38,8 @@
  * Kept in step with the shader's constant in hwr_gl.c. */
 #define HWR_BB_FLOOR_TAG         0x40000000u
 
-/* The owner sector's visible screen-X portal window(s), pre-converted to the GL
- * framebuffer-X the fragment coordinate lives in. `active` == 0 means no clip
- * (fail open); otherwise a billboard is cut to these disjoint windows the way the
- * engine's per-entry x-window cuts a type-1 draw. */
+/* One object's exact screen-X portal window(s), pre-converted to framebuffer-X.
+ * `active` == 0 means no clip (fail open). */
 struct hwr_bb_clip {
     int active;
     int count;
@@ -631,7 +629,8 @@ static void hwr_bb_write_quad_st(struct hwr_gl_vertex *dst,
                                  uint32_t offset, uint16_t tw, uint16_t th,
                                  float s_left, float s_right, float tmax,
                                  uint8_t material, uint8_t light,
-                                 uint8_t sector_flags, uint32_t floor_id)
+                                 uint8_t sector_flags, uint32_t floor_id,
+                                 float clip_lo, float clip_hi)
 {
     struct hwr_gl_vertex corner;
     struct hwr_gl_vertex tl, tr, bl, br;
@@ -646,6 +645,17 @@ static void hwr_bb_write_quad_st(struct hwr_gl_vertex *dst,
      * billboards on the normal path, so its only reader is the floor-exception
      * gate in the geometry shader. */
     corner.flat_guard = floor_id;
+    if (clip_hi > clip_lo) {
+        double lo = (double)clip_lo * 65536.0;
+        double hi = (double)clip_hi * 65536.0;
+        if (lo < 0.0) lo = 0.0;
+        if (hi < 0.0) hi = 0.0;
+        corner.flat_guard_step = lo >= 4294967295.0
+            ? UINT32_MAX : (uint32_t)(lo + 0.5);
+        corner.flat_guard_origin_y = (int32_t)(hi >= 4294967295.0
+            ? UINT32_MAX : (uint32_t)(hi + 0.5));
+        corner.flat_mapping_flags = HWR_GL_MAPPING_PORTAL_CLIP;
+    }
     tl = tr = bl = br = corner;
     /* s_left/s_right are the along-storage texture coords at the (possibly
      * portal-clipped) left and right edges: a full quad passes 0 and the frame's
@@ -680,24 +690,21 @@ static int hwr_bb_trans_cmp(const void *a, const void *b)
     return 0;
 }
 
-/* Builds one object's framebuffer-X clip window(s) from its owner sector's
- * lifted screen-X portal window(s). `ratio` = focal_x/Xscale maps the engine's
- * projection scale to the GL frame's, around the shared centre. Leaves the clip
- * inactive (fail open) for an object with no sector, no lifted window, or when
- * the store is absent. */
+/* Builds one object's framebuffer-X clip window(s) from the exact type-1
+ * worklist windows recovered for that object. `ratio` = focal_x/Xscale maps the
+ * engine projection to the GL frame around the shared centre. */
 static void hwr_bb_clip_build(struct hwr_bb_clip *clip,
                               const struct hwr_sector_xspan *spans,
-                              size_t span_count, uint16_t sector_index,
+                              size_t span_count, size_t object_index,
                               double ratio, double center_x)
 {
     const struct hwr_sector_xspan *s;
     unsigned i;
     clip->active = 0;
     clip->count = 0;
-    if (spans == NULL || sector_index == (uint16_t)HWR_OBJECT_NO_SECTOR ||
-        (size_t)sector_index >= span_count)
+    if (spans == NULL || object_index >= span_count)
         return;
-    s = &spans[sector_index];
+    s = &spans[object_index];
     if (s->count == 0)
         return;                                  /* no window captured: fail open */
     for (i = 0; i < s->count && clip->count < (int)HWR_SECTOR_CLIP_MAX; i++) {
@@ -710,42 +717,10 @@ static void hwr_bb_clip_build(struct hwr_bb_clip *clip,
     clip->active = clip->count > 0;
 }
 
-/* Rounds a lerp of two int16 world ordinates and clamps back to int16. */
-static int16_t hwr_bb_lerp_i16(int16_t a, int16_t b, double t)
-{
-    double v = (double)a + t * ((double)b - (double)a);
-    return hwr_bb_clamp_i16((int32_t)(v >= 0.0 ? v + 0.5 : v - 0.5));
-}
-
-/* Solves for the along-quad parameter t in [0,1] (0 at the left world corner,
- * 1 at the right) whose projected framebuffer-X equals `x`. The projection is
- * perspective (frag_x = focal_x*vx/depth + center_x with vx,depth linear in t),
- * so this inverts the rational exactly -- correct for both the equal-depth
- * camera-facing quad and the differing-depth rotated wall decal. */
-static double hwr_bb_t_at(double x, double focal_x, double center_x,
-                          int32_t vxl, int32_t dpl, int32_t vxr, int32_t dpr)
-{
-    double k = x - center_x;
-    double denom = focal_x * ((double)vxr - (double)vxl)
-                 - k * ((double)dpr - (double)dpl);
-    double t;
-    if (denom > -1e-9 && denom < 1e-9)
-        return 0.0;                              /* degenerate: caller guards */
-    t = (k * (double)dpl - focal_x * (double)vxl) / denom;
-    if (t < 0.0) t = 0.0;
-    if (t > 1.0) t = 1.0;
-    return t;
-}
-
-/* Emits one billboard quad, cut to its owner sector's screen-X portal window(s):
- * the engine hard-clips every type-1 draw to the packed x-window stored on its
- * worklist node (renderer.c:6255/7959), which is the object's own extent
- * intersected with the sector's visible window. The mod's quad already carries
- * the object extent, so intersecting it with the sector window reproduces that
- * clip. Slicing on the CPU mirrors the engine's per-column span cut exactly,
- * handles a sector visible through several portals by emitting one sub-quad per
- * surviving window, and needs no change to the shared world shader. Returns the
- * number of 6-vertex quads written (0 when fully outside every window). */
+/* Emits the original full billboard once per surviving exact portal window and
+ * carries each framebuffer-X cut to the fragment shader. Keeping the world
+ * corners intact is important near the camera: rounding a sliced corner back
+ * to int16 world space can move its reprojected edge by several pixels. */
 static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap,
                             int16_t xl, int16_t yl, int16_t xr, int16_t yr,
                             int16_t z_top, int16_t z_bottom, uint32_t offset,
@@ -764,7 +739,7 @@ static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap
             return 0;
         hwr_bb_write_quad_st(*dst + *cnt, xl, yl, xr, yr, z_top, z_bottom, offset,
                              tw, th, 0.0f, smax, tmax, material, light,
-                             sector_flags, floor_id);
+                             sector_flags, floor_id, 0.0f, 0.0f);
         *cnt += 6;
         return 1;
     }
@@ -778,7 +753,7 @@ static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap
             return 0;
         hwr_bb_write_quad_st(*dst + *cnt, xl, yl, xr, yr, z_top, z_bottom, offset,
                              tw, th, 0.0f, smax, tmax, material, light,
-                             sector_flags, floor_id);
+                             sector_flags, floor_id, 0.0f, 0.0f);
         *cnt += 6;
         return 1;
     }
@@ -795,7 +770,7 @@ static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap
                 return 0;
             hwr_bb_write_quad_st(*dst + *cnt, xl, yl, xr, yr, z_top, z_bottom,
                                  offset, tw, th, 0.0f, smax, tmax, material, light,
-                                 sector_flags, floor_id);
+                                 sector_flags, floor_id, 0.0f, 0.0f);
             *cnt += 6;
             return 1;
         }
@@ -804,25 +779,13 @@ static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap
     for (i = 0; i < clip->count; i++) {
         double a = qlo > (double)clip->lo[i] ? qlo : (double)clip->lo[i];
         double b = qhi < (double)clip->hi[i] ? qhi : (double)clip->hi[i];
-        double ta, tb, t0, t1;
-        int16_t nxl, nyl, nxr, nyr;
         if (b <= a)
             continue;                             /* window does not touch this quad */
-        ta = hwr_bb_t_at(a, focal_x, center_x, vxl, dpl, vxr, dpr);
-        tb = hwr_bb_t_at(b, focal_x, center_x, vxl, dpl, vxr, dpr);
-        t0 = ta < tb ? ta : tb;
-        t1 = ta < tb ? tb : ta;
-        if (t1 - t0 < 1e-6)
-            continue;
-        nxl = hwr_bb_lerp_i16(xl, xr, t0);
-        nyl = hwr_bb_lerp_i16(yl, yr, t0);
-        nxr = hwr_bb_lerp_i16(xl, xr, t1);
-        nyr = hwr_bb_lerp_i16(yl, yr, t1);
         if (hwr_bb_reserve_verts(dst, *cnt, cap, 6) != 0)
             break;
-        hwr_bb_write_quad_st(*dst + *cnt, nxl, nyl, nxr, nyr, z_top, z_bottom,
-                             offset, tw, th, (float)(smax * t0), (float)(smax * t1),
-                             tmax, material, light, sector_flags, floor_id);
+        hwr_bb_write_quad_st(*dst + *cnt, xl, yl, xr, yr, z_top, z_bottom,
+                             offset, tw, th, 0.0f, smax, tmax, material, light,
+                             sector_flags, floor_id, (float)a, (float)b);
         *cnt += 6;
         written++;
     }
@@ -906,7 +869,10 @@ static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object
     t->light = 0;                                          /* engine draws the shadow at shade 0 */
     t->sector_flags = sflags;
     t->floor_id = floor_id;
-    t->clip = *clip;                                       /* owner-sector portal window */
+    if (clip != NULL)
+        t->clip = *clip;
+    else
+        memset(&t->clip, 0, sizeof t->clip);                /* no exact shadow window: fail open */
     return 0;
 }
 
@@ -979,12 +945,11 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     hscale = xscale / (focal_x * 256.0);
     vscale = pscale / (focal_y * 256.0);
 
-    /* The lifted portal windows are in the engine's screen-X (Xscale/Xcenter)
-     * projection; the GL frame's fragment X uses focal_x around the same centre
-     * (span_src_wrap+0x24 == g_center_x). Mapping a window bound is therefore a
-     * scale about that centre by focal_x/Xscale. */
+    /* Billboard world extents above are already pre-scaled by Xscale/focal_x,
+     * so their GL projection lands in the engine's screen-X coordinates. Exact
+     * worklist window bounds therefore map identically around the shared centre. */
     clip_center = (double)camera->center_x;
-    clip_ratio = focal_x / xscale;
+    clip_ratio = 1.0;
 
 
     for (i = 0; i < objects->count; i++) {
@@ -1030,10 +995,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         }
         corr = (int32_t)(((int64_t)view_x << 6) / depth); /* per-sprite screen-angle */
 
-        /* This object's owner-sector portal window(s): everything it emits (its
-         * sprite, its ground shadow) is cut to the same window the engine's
-         * type-1 x-window would apply. */
-        hwr_bb_clip_build(&clip, spans, span_count, o->sector_index,
+        /* Recover the sprite entry's exact object-depth worklist window. */
+        hwr_bb_clip_build(&clip, spans, span_count, i,
                           clip_ratio, clip_center);
         if (clip.active) {
             clip_active_objs++;
@@ -1041,8 +1004,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                 fprintf(stderr,
                         "[bb-clip] o%zu sec=%u wins=%d fb[0]=%.1f..%.1f (eng %d..%d)\n",
                         i, o->sector_index, clip.count, clip.lo[0], clip.hi[0],
-                        (int)spans[o->sector_index].lo[0],
-                        (int)spans[o->sector_index].hi[0]);
+                        (int)spans[i].lo[0],
+                        (int)spans[i].hi[0]);
         }
 
         /* Ground shadow: the engine draws a translucent oval under any object
@@ -1056,8 +1019,12 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             struct hwr_bb_trans **sp = exception ? &pending_shadow : &pending;
             size_t *sc = exception ? &pending_shadow_count : &pending_count;
             size_t *scap = exception ? &pending_shadow_capacity : &pending_capacity;
+            /* The shadow is a separate synthetic type-1 entry with its own
+             * projected extent and exact window. The shared synthetic record
+             * cannot be associated back to one owner after sorting, so do not
+             * apply the sprite entry's narrower window to it. */
             if (hwr_bb_push_shadow(bb, o, world, camera, depth, hscale, vscale,
-                                   exception, &clip, sp, sc, scap) != 0)
+                                   exception, NULL, sp, sc, scap) != 0)
                 break;
             bb->stat_emitted++;
         }

@@ -37,6 +37,9 @@ enum hwr_gl_wall_wrap_flags {
  * faces use perspective-correct wall_s/wall_top as direct atlas coordinates,
  * bypassing the wall-column and world-plane mapping drivers. */
 #define HWR_GL_MAPPING_MESH 0x80000000u
+/* Billboard portal clips keep the original world quad intact and carry exact
+ * framebuffer-X bounds in flat_guard_step / flat_guard_origin_y. */
+#define HWR_GL_MAPPING_PORTAL_CLIP 0x40000000u
 
 struct hwr_gl_vertex {
     int16_t x;

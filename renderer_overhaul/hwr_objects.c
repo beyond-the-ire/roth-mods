@@ -170,6 +170,7 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
             item.backref = hwr_obj_u16(record + HWR_OBJ_OFF_BACKREF);
             item.flags7 = record[HWR_OBJ_OFF_FLAGS7];
             item.flags9 = record[HWR_OBJ_OFF_FLAGS9];
+            item.appearance_ptr = (uint32_t)(uintptr_t)record;
             if (record[HWR_OBJ_OFF_FLAGS9] & 2u)
                 item.flags |= HWR_OBJECT_FLAG_REFLECTION_SKIP;
             if (record[HWR_OBJ_OFF_FLAGS7] & 1u)
@@ -223,6 +224,7 @@ static int hwr_objects_walk_particles(struct hwr_objects *objects,
             item.graphic_id = api->game_ram->u16(off + HWR_PARTICLE_OFF_GFX);
             item.facing = api->game_ram->u8(off + HWR_PARTICLE_OFF_FACING);
             item.seed = api->game_ram->u8(off + HWR_PARTICLE_OFF_SEED);
+            item.appearance_ptr = node + 8u;
             if (hwr_objects_push(objects, &item) != 0)
                 return hwr_objects_fail(objects, "out of memory enumerating particles");
         }
@@ -253,6 +255,8 @@ static int hwr_objects_walk_pickup(struct hwr_objects *objects,
     item.facing = api->game_ram->u8(appearance + HWR_OBJ_OFF_FACING);
     item.object_id = api->game_ram->u16(appearance + HWR_OBJ_OFF_ID);
     item.seed = api->game_ram->u8(appearance + HWR_OBJ_OFF_SEED);
+    item.appearance_ptr =
+        (uint32_t)(uintptr_t)api->game_ram->to_ptr(appearance);
     if (hwr_objects_push(objects, &item) != 0)
         return hwr_objects_fail(objects, "out of memory enumerating pickup overlay");
     return 0;

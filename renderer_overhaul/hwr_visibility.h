@@ -8,16 +8,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* The most disjoint screen-X windows one sector's billboards are clipped to. A
- * sector visible through several open portals contributes one window per portal
- * visit; beyond this cap the sector falls back to no clip (fail open). */
+struct hwr_objects;
+
+/* The most disjoint screen-X windows retained for one object. An object visible
+ * through several open portals has one exact worklist window per visit; beyond
+ * this cap that object falls back to no clip. */
 #define HWR_SECTOR_CLIP_MAX 8u
 
-/* Per-sector visible screen-X portal window(s), lifted from the renderer's own
- * per-node interval chains. `count` == 0 means "no window captured" and is read
- * as NO CLIP (full width) so a sprite is never wrongly blanked. Bounds are in
- * the engine's screen-X space (the Xscale/Xcenter projection); the billboard
- * emitter maps them to framebuffer-X. */
+/* A set of visible screen-X portal windows. The store is indexed per object;
+ * `count` == 0 means "no exact window captured" and is read as NO CLIP. Bounds
+ * are in the engine's screen-X projection space. */
 struct hwr_sector_xspan {
     int16_t lo[HWR_SECTOR_CLIP_MAX];
     int16_t hi[HWR_SECTOR_CLIP_MAX];
@@ -53,17 +53,15 @@ int hwr_compute_pvs(const struct hwr_world *world,
  * (identical to the layer's earlier behaviour). */
 int hwr_portal_clip_enabled(void);
 
-/* Lifts each drawn sector's visible screen-X portal window(s) from the same
- * per-node interval chains hwr_compute_pvs walks, capturing the +4/+6 interval
- * words it discards. `spans` must hold `span_count` entries (>= sector_count);
- * every entry is reset to count 0 first. Overlapping intervals for one sector
- * are merged; a sector that overflows HWR_SECTOR_CLIP_MAX distinct windows falls
- * back to count 0 (no clip). Returns 1 when a usable window set was produced, or
- * 0 when the pass fell back to no-clip (disabled, no map, an empty or implausible
- * list, or an offset that could not be mapped). Never crashes. */
-int hwr_compute_portal_windows(const struct hwr_world *world,
-                               const struct roth_api_v1 *api,
-                               struct hwr_sector_xspan *spans,
-                               size_t span_count);
+/* Recovers the exact per-object screen-X windows already computed by the
+ * software renderer. Each type-1 low-arena worklist node stores its appearance
+ * record pointer and packed window; matching that pointer to the live object
+ * list avoids substituting the camera portal tree's sector-wide intervals.
+ * `spans` is indexed like objects->items and must have at least objects->count
+ * entries. Unmatched objects retain count 0 and therefore fail open. */
+int hwr_compute_object_portal_windows(
+    const struct hwr_world *world, const struct hwr_objects *objects,
+    const struct roth_api_v1 *api, struct hwr_sector_xspan *spans,
+    size_t span_count);
 
 #endif
