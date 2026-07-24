@@ -2164,14 +2164,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
         g_gl.disable(GL_DEPTH_TEST);
         g_gl.depth_mask(GL_FALSE);
-        if (opaque_billboard_vertices != 0 &&
-            opaque_main >= opaque_billboard_vertices) {
-            if (blend_location >= 0)
-                g_gl.uniform_1i(blend_location, 0);
-            g_gl.draw_arrays(GL_TRIANGLES,
-                (GLint)(sky_vertices + opaque_main - opaque_billboard_vertices),
-                (GLsizei)opaque_billboard_vertices);
-        }
+        /* Painter order WITHIN this depth-off stage decides where the below-floor
+         * parts overlap. The shadows go FIRST so they blend against the floor
+         * already in the index buffer (not against the object below-floor parts);
+         * the opaque object below-floor parts then paint OVER them, so the monster
+         * wins everywhere -- matching the engine's paint order above and below the
+         * floor line. */
         if (shadow_vertices != 0) {
             GLint first = (GLint)(sky_vertices + opaque_vertices + trans_main_vertices);
             if (blend_location >= 0)
@@ -2192,6 +2190,14 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                     first += (GLint)translucent_runs[run];
                 }
             }
+        }
+        if (opaque_billboard_vertices != 0 &&
+            opaque_main >= opaque_billboard_vertices) {
+            if (blend_location >= 0)
+                g_gl.uniform_1i(blend_location, 0);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                (GLint)(sky_vertices + opaque_main - opaque_billboard_vertices),
+                (GLsizei)opaque_billboard_vertices);
         }
         hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
         g_gl.enable(GL_DEPTH_TEST);
