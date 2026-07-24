@@ -959,6 +959,7 @@ void hwr_scene_clear(struct hwr_scene *scene)
     hwr_gl_scene_clear();
     hwr_scene_mesh_clear(&scene->mesh);
     hwr_scene_animations_clear(scene);
+    hwr_meshes_clear(&scene->object_meshes);
     hwr_billboards_clear(&scene->billboards);
     free(scene->stream_vertices);
     free(scene->translucent_runs);
@@ -1188,6 +1189,14 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
     memset(&stats, 0, sizeof stats);
     if (hwr_append_bytes(&bytes, &size, &capacity, &zero, 1) != 0)
         return hwr_scene_fail(scene, "out of memory creating texture buffer");
+    /* Copy mesh geometry and append its face dependencies before world texture
+     * packing can release any overlapping decoded archive entry. */
+    if (hwr_meshes_pack(&scene->object_meshes, map_archive, shared_archive,
+                        &bytes, &size, &capacity) != 0) {
+        free(bytes);
+        return hwr_scene_fail(scene, "%s",
+                              hwr_meshes_error(&scene->object_meshes));
+    }
     memset(scene->textures, 0, sizeof scene->textures);
     scene->sky_valid = 0;
     for (surface_index = 0; surface_index < scene->mesh.surface_count;
@@ -1415,6 +1424,13 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         fprintf(stderr, "[renderer_overhaul] animation frames retained: %u bytes across %u textures\n",
                 (unsigned)hwr_scene_animation_bytes(scene),
                 (unsigned)scene->animation_count);
+    if (debug)
+        fprintf(stderr,
+                "[renderer_overhaul] mesh atlas: resources=%u faces=%u materials=%u invalid=%u store=%u bytes\n",
+                (unsigned)scene->object_meshes.stat_resources,
+                (unsigned)scene->object_meshes.face_count,
+                (unsigned)scene->object_meshes.material_count,
+                (unsigned)scene->object_meshes.stat_invalid, (unsigned)size);
     hwr_perf_phase("world-atlas");
     /* Pack the sprite atlas into the SAME texel store, after the world textures,
      * so a billboard vertex references a byte offset exactly as a wall vertex
@@ -3040,7 +3056,11 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     /* Billboard quads emitted for this frame (0 when the layer is disabled):
      * raw quads follow the opaque surfaces, masked/blend-capable quads follow
      * the translucent surfaces, one run each. */
+    const struct hwr_meshes *object_meshes = &scene->object_meshes;
     const struct hwr_billboards *bb = &scene->billboards;
+    size_t object_mesh_opaque = object_meshes->opaque_count;
+    size_t object_mesh_translucent = object_meshes->translucent_count;
+    size_t object_mesh_runs = object_meshes->run_count;
     size_t bb_opaque = bb->opaque_count;
     size_t bb_flat = bb->flat_count;
     size_t bb_translucent = bb->translucent_count;
@@ -3064,7 +3084,8 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         visible_vertices += hwr_surface_reserve(surface);
     }
     /* Billboards are exactly six vertices per quad, no per-face expansion. */
-    visible_vertices += bb_opaque + bb_flat + bb_translucent;
+    visible_vertices += object_mesh_opaque + object_mesh_translucent +
+                        bb_opaque + bb_flat + bb_translucent;
     if (visible_vertices > scene->stream_capacity) {
         struct hwr_gl_vertex *vertices = (struct hwr_gl_vertex *)realloc(
             scene->stream_vertices, visible_vertices * sizeof *vertices);
@@ -3107,6 +3128,14 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
             translucent_surfaces++;
         }
     }
+    /* Object meshes precede the billboard tail. The floor-exception redraw
+     * identifies eligible billboards by their position at the end of the
+     * opaque range, so this ordering is load-bearing. */
+    if (object_mesh_opaque != 0) {
+        memcpy(scene->stream_vertices + opaque_cursor, object_meshes->opaque,
+               object_mesh_opaque * sizeof *scene->stream_vertices);
+        opaque_cursor += object_mesh_opaque;
+    }
     /* Raw billboards ride the tail of the opaque range; the fixed-orientation
      * (flat) quads follow them, still opaque but kept at the very tail so the GL
      * layer can draw them with a depth bias toward the viewer. */
@@ -3120,17 +3149,20 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                bb_flat * sizeof *scene->stream_vertices);
         opaque_cursor += bb_flat;
     }
-    if (translucent_surfaces + bb_runs > scene->translucent_run_capacity) {
+    if (translucent_surfaces + object_mesh_runs + bb_runs >
+        scene->translucent_run_capacity) {
         uint32_t *runs = (uint32_t *)realloc(
             scene->translucent_runs,
-            (translucent_surfaces + bb_runs) * sizeof *runs);
+            (translucent_surfaces + object_mesh_runs + bb_runs) *
+            sizeof *runs);
         if (runs == NULL) {
             free(translucent_order);
             free(depths);
             return hwr_scene_fail(scene, "out of memory recording translucent runs");
         }
         scene->translucent_runs = runs;
-        scene->translucent_run_capacity = translucent_surfaces + bb_runs;
+        scene->translucent_run_capacity =
+            translucent_surfaces + object_mesh_runs + bb_runs;
     }
     translucent_cursor = opaque_cursor;
     for (i = 0; i < translucent_surfaces; i++) {
@@ -3141,6 +3173,18 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         scene->translucent_runs[i] = (uint32_t)emitted;
         translucent_cursor += emitted;
     }
+    /* Blend-capable mesh faces are sorted back to front by the mesh layer and
+     * retain one destination-refresh run per face. */
+    if (object_mesh_translucent != 0) {
+        size_t r;
+        memcpy(scene->stream_vertices + translucent_cursor,
+               object_meshes->translucent,
+               object_mesh_translucent * sizeof *scene->stream_vertices);
+        translucent_cursor += object_mesh_translucent;
+        for (r = 0; r < object_mesh_runs; r++)
+            scene->translucent_runs[translucent_surfaces + r] =
+                object_meshes->runs[r];
+    }
     /* Masked / blend-capable billboards, already depth-sorted back to front,
      * ride the tail of the translucent range, each as its own blend run. */
     if (bb_translucent != 0) {
@@ -3149,9 +3193,11 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                bb_translucent * sizeof *scene->stream_vertices);
         translucent_cursor += bb_translucent;
         for (r = 0; r < bb_runs; r++)
-            scene->translucent_runs[translucent_surfaces + r] = bb->runs[r];
+            scene->translucent_runs[
+                translucent_surfaces + object_mesh_runs + r] = bb->runs[r];
     }
-    *translucent_run_count = translucent_surfaces + bb_runs;
+    *translucent_run_count =
+        translucent_surfaces + object_mesh_runs + bb_runs;
     free(translucent_order);
     free(depths);
     *sky_count = sky_cursor;
@@ -3360,6 +3406,15 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
             world, api, scene->spans, scene->span_count);
     }
     hwr_scene_log_visibility(scene, world);
+    /* Mesh objects use the same owner-sector admission as billboards. Real 3D
+     * faces are left intact at portal edges; depth and the sector gate provide
+     * the conservative first implementation without slicing perspective UVs. */
+    if (hwr_meshes_emit(&scene->object_meshes, objects, world, &camera,
+                        scene->visible, scene->visible_count, scene->pvs_valid,
+                        api) != 0) {
+        hwr_scene_fail(scene, "%s", hwr_meshes_error(&scene->object_meshes));
+        return NULL;
+    }
     /* Resolve and project this frame's billboards against the same camera and
      * visible-sector set, ready to append to the stream below. */
     hwr_billboards_emit(&scene->billboards, objects, world, &camera,

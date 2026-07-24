@@ -258,6 +258,10 @@ static int hwr_bb_pack_entry(struct hwr_billboards *bb,
     if (hwr_das_decode(archive, id) != 0)
         return 0;
     entry = &archive->entries[id];
+    /* A 3D object can resemble a small plain texture when its bound words are
+     * interpreted as dimensions. The mesh block type is authoritative. */
+    if ((entry->payload_flags & 0xff00u) == HWR_BB_MESH_FLAG)
+        return 0;
     switch (entry->resource_class) {
     case HWR_DAS_CLASS_PLAIN: {
         size_t pixels = (size_t)entry->width * entry->height;
@@ -1075,6 +1079,18 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             if (live >= 0)
                 lookup.frame_index = (uint16_t)live;      /* mirror the live block */
             /* else the free-run fallback holds frame 0 */
+        }
+        if (lookup.archive != NULL &&
+            lookup.entry_id < lookup.archive->entry_count &&
+            (lookup.archive->entries[lookup.entry_id].payload_flags &
+             0xff00u) == HWR_BB_MESH_FLAG) {
+            bb->stat_skipped_mesh++;
+            if (do_trace)
+                fprintf(stderr,
+                        "[bb] o%zu id=%#06x nid=%#06x%s SKIP mesh\n",
+                        i, o->graphic_id, lookup.archive_id,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
+            continue;
         }
         if (hwr_sprites_frame(&lookup, &frame) != 0) {
             if (do_trace)

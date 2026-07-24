@@ -32,7 +32,7 @@
 #define HWR_OBJ_OFF_FLAGS9 0x09u  /* bit1 = reflection-skip */
 #define HWR_OBJ_OFF_Z      0x0au
 #define HWR_OBJ_OFF_BACKREF 0x0cu  /* actor pool backref (actor_index*0x22 + 1) */
-#define HWR_OBJ_OFF_SHADE  0x0eu
+#define HWR_OBJ_OFF_ID     0x0eu
 #define HWR_OBJ_OFF_SEED   0x08u   /* billboard shade seed (type-1 path) */
 
 /* Particle record layout: the rendered position is the integer triple, and the
@@ -164,7 +164,7 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
             item.world_z = hwr_obj_i16(record + HWR_OBJ_OFF_Z);
             item.graphic_id = hwr_obj_u16(record + HWR_OBJ_OFF_GFX);
             item.facing = record[HWR_OBJ_OFF_FACING];
-            item.shade = record[HWR_OBJ_OFF_SHADE];
+            item.object_id = hwr_obj_u16(record + HWR_OBJ_OFF_ID);
             item.seed = record[HWR_OBJ_OFF_SEED];
             item.sector_index = (uint16_t)sector;
             item.backref = hwr_obj_u16(record + HWR_OBJ_OFF_BACKREF);
@@ -251,7 +251,7 @@ static int hwr_objects_walk_pickup(struct hwr_objects *objects,
     item.world_z = (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_Z);
     item.graphic_id = api->game_ram->u16(appearance + HWR_OBJ_OFF_GFX);
     item.facing = api->game_ram->u8(appearance + HWR_OBJ_OFF_FACING);
-    item.shade = api->game_ram->u8(appearance + HWR_OBJ_OFF_SHADE);
+    item.object_id = api->game_ram->u16(appearance + HWR_OBJ_OFF_ID);
     item.seed = api->game_ram->u8(appearance + HWR_OBJ_OFF_SEED);
     if (hwr_objects_push(objects, &item) != 0)
         return hwr_objects_fail(objects, "out of memory enumerating pickup overlay");
@@ -323,10 +323,10 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
             hwr_sprites_frame(&lookup, &frame) == 0)
             have_frame = 1;
         fprintf(file,
-                "%-10s x=%d y=%d z=%d facing=%u id=%#06x shade=%u flags=%#x f7=%#04x f9=%#04x",
+                "%-10s x=%d y=%d z=%d facing=%u id=%#06x light=%u object-id=%u flags=%#x f7=%#04x f9=%#04x",
                 hwr_objects_source_name(o->source), o->world_x, o->world_y,
-                o->world_z, o->facing, o->graphic_id, o->shade, o->flags,
-                o->flags7, o->flags9);
+                o->world_z, o->facing, o->graphic_id, o->seed, o->object_id,
+                o->flags, o->flags7, o->flags9);
         if (have_frame)
             fprintf(file, " frame=%u %ux%u fflags=%#x flip=%d\n",
                     lookup.frame_index, frame.width, frame.height, frame.flags,

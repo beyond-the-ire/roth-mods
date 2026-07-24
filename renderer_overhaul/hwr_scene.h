@@ -4,6 +4,7 @@
 #include "hwr_billboards.h"
 #include "hwr_das.h"
 #include "hwr_gl.h"
+#include "hwr_meshes.h"
 #include "hwr_objects.h"
 #include "hwr_visibility.h"
 #include "hwr_world.h"
@@ -187,6 +188,9 @@ struct hwr_scene {
     struct hwr_sector_xspan *spans;
     size_t span_count;
     int portal_clip_valid;
+    /* Object meshes and camera-facing billboards share the scene atlas. Meshes
+     * stream immediately before the billboard tail in the opaque range. */
+    struct hwr_meshes object_meshes;
     /* The camera-facing billboard layer. Its sprite frames are packed into the
      * same texel store as the world textures at upload, and its per-frame quads
      * are streamed after the world surfaces. Archive pointers are retained from

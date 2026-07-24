@@ -44,9 +44,8 @@ struct hwr_object {
     int16_t world_z;
     uint16_t graphic_id;
     uint8_t facing;
-    /* Record +0xe: the shade seed the 3D-object (mesh) path reads. Kept for the
-     * mesh renderer; the billboard path uses `seed` (+8) below instead. */
-    uint8_t shade;
+    /* Record +0xe: command-target id used by object-related map commands. */
+    uint16_t object_id;
     /* Record +8: the shade seed the type-1 billboard path composes with the
      * owner sector's light (renderer.c:6180-6182). */
     uint8_t seed;

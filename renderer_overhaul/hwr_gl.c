@@ -763,6 +763,12 @@ static const char g_geometry_fragment_shader[] =
     "  if ((flags & 4u)!=0u) return v_light_material.z;\n"
     "  if ((flags & 2u)!=0u) return v_light_material.z;\n"
     "  int w=int(v_dims.x), h=int(v_dims.y); int ix,iy;\n"
+    "  if ((v_flat_span.w & 0x80000000u)!=0u) {\n"
+    "    iy=int(floor(v_wall.x)) % h; if (iy<0) iy+=h;\n"
+    "    ix=int(floor(v_wall.y)) % w; if (ix<0) ix+=w;\n"
+    "    if ((flags & 32u)!=0u) iy=(h-1)-iy;\n"
+    "    return texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
+    "  }\n"
     "  if ((flags & 8u)!=0u) {\n"
     "    int scale=int(v_pan_scale_flags.z);\n"
     /* The flat driver's density class is JOINT over both dimensions — a
@@ -937,9 +943,11 @@ static const char g_geometry_fragment_shader[] =
      * projection is garbage (clamped near the shade origin -> a spurious BRIGHT
      * row that interpolates across the triangle).  The engine never samples a row
      * there (it near-clips the polygon first), so when v_flat_taint marks such a
-     * triangle, fall through to the per-pixel radial below -- engine-faithful for
-     * the surviving fragments and glitch-free. */
-    "      if (v_flat_taint==0u)"
+     * triangle, fall through to the per-pixel radial below. Direct-mapped mesh
+     * flats also use the radial because they do not carry the world's
+     * preprojected endpoint word. */
+    "      if (v_flat_taint==0u &&"
+    " (v_flat_span.w & 0x80000000u)==0u)"
     " return clamp(int(floor(v_wall_shade_endpoint/256.0)),0,31);\n"
     /* The per-pixel radial for tainted (near-clipped-corner) triangles.  The edge
      * term measures from the jittered shade origin (the light position); the
@@ -1034,11 +1042,12 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_debug_vis;\n"
     "void main() {\n"
     "  uint material=v_light_material.y;\n"
-    /* Owner-floor identity output for the world pass: a flat FLOOR fragment
-     * (material bit 3) publishes FLOOR_TAG | (its world z & 0xffff); everything
-     * else publishes 0. The exception passes bind COLOR1 as GL_NONE, so this
-     * write is harmlessly discarded there. */
-    "  out_floor_id=(material & 8u)!=0u ?"
+    /* Owner-floor identity output for the world pass: a world flat FLOOR
+     * fragment publishes FLOOR_TAG | (its world z & 0xffff); direct-mapped mesh
+     * flats and everything else publish 0. The exception passes bind COLOR1 as
+     * GL_NONE, so this write is harmlessly discarded there. */
+    "  out_floor_id=(material & 8u)!=0u &&"
+    " (v_flat_span.w & 0x80000000u)==0u ?"
     " (0x40000000u | (uint(int(round(v_world.z))) & 0xffffu)) : 0u;\n"
     /* Exception re-draw: keep only fragments standing over this object's OWN
      * sector floor (the recorded opaque winner). A wall or nearer surface made
