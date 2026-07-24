@@ -1260,7 +1260,12 @@ static void hwr_delete_texture(GLuint *texture)
     }
 }
 
-static void hwr_destroy_scene_objects(void)
+/* The four shader programs are built from compile-time-constant source, so they
+ * are linked once and kept alive for the context's lifetime rather than relinked
+ * on every scene upload (each relink is a compile + link of two shaders). They
+ * are deliberately NOT torn down with the per-scene buffers below; only the GL
+ * shutdown path releases them. */
+static void hwr_destroy_programs(void)
 {
     if (g_geometry_program != 0)
         g_gl.delete_program(g_geometry_program);
@@ -1274,6 +1279,35 @@ static void hwr_destroy_scene_objects(void)
     g_sky_program = 0;
     g_resolve_program = 0;
     g_probe_program = 0;
+}
+
+/* Links the four programs on first use (or after a shutdown); a no-op once they
+ * are live. Returns 1 when all four are ready, 0 (with the set cleared) on a
+ * link failure so the caller falls back to the solid renderer. */
+static int hwr_gl_ensure_programs(void)
+{
+    if (g_geometry_program != 0 && g_sky_program != 0 &&
+        g_resolve_program != 0 && g_probe_program != 0)
+        return 1;
+    hwr_destroy_programs();
+    g_geometry_program = hwr_link_program(g_geometry_vertex_shader,
+                                          g_geometry_fragment_shader);
+    g_sky_program = hwr_link_program(g_resolve_vertex_shader,
+                                     g_sky_fragment_shader);
+    g_resolve_program = hwr_link_program(g_resolve_vertex_shader,
+                                         g_resolve_fragment_shader);
+    g_probe_program = hwr_link_program(g_resolve_vertex_shader,
+                                       g_probe_fragment_shader);
+    if (g_geometry_program == 0 || g_sky_program == 0 ||
+        g_resolve_program == 0 || g_probe_program == 0) {
+        hwr_destroy_programs();
+        return 0;
+    }
+    return 1;
+}
+
+static void hwr_destroy_scene_objects(void)
+{
     if (g_scene_vao != 0)
         g_gl.delete_vertex_arrays(1, &g_scene_vao);
     if (g_resolve_vao != 0)
@@ -1508,6 +1542,21 @@ static uint32_t hwr_hash_bytes(const uint8_t *bytes, size_t count)
     return hash;
 }
 
+/* HWR_VERIFY_STORE=1 enables the whole-store self-test: an FNV hash of the
+ * uploaded texel store plus, on the first frame after an upload, a full read-
+ * back and re-hash. Both are linear passes over the multi-MB store (the readback
+ * also stalls the pipeline), so they are off by default; the cheap per-frame
+ * probe/colormap/sampler checks always run and still catch a corrupted store. */
+static int hwr_gl_store_verify_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_VERIFY_STORE");
+        state = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    return state;
+}
+
 int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                         const uint8_t colormap[0x2000],
                         const uint8_t tint[0x2000],
@@ -1521,19 +1570,8 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
         return 0;
     }
     hwr_destroy_scene_objects();
-    g_geometry_program = hwr_link_program(g_geometry_vertex_shader,
-                                          g_geometry_fragment_shader);
-    g_sky_program = hwr_link_program(g_resolve_vertex_shader,
-                                     g_sky_fragment_shader);
-    g_resolve_program = hwr_link_program(g_resolve_vertex_shader,
-                                         g_resolve_fragment_shader);
-    g_probe_program = hwr_link_program(g_resolve_vertex_shader,
-                                       g_probe_fragment_shader);
-    if (g_geometry_program == 0 || g_sky_program == 0 || g_resolve_program == 0 ||
-        g_probe_program == 0) {
-        hwr_destroy_scene_objects();
+    if (!hwr_gl_ensure_programs())
         return 0;
-    }
 
     g_gl.gen_buffers(1, &g_texture_buffer);
     g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
@@ -1626,7 +1664,8 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.use_program(0);
 
     memcpy(g_verify_colormap, colormap, sizeof g_verify_colormap);
-    g_verify_store_hash = hwr_hash_bytes(texture_bytes, texture_size);
+    g_verify_store_hash = hwr_gl_store_verify_enabled()
+                        ? hwr_hash_bytes(texture_bytes, texture_size) : 0;
     g_verify_store_size = texture_size;
     g_verify_probe_offset = (int)(texture_size / 2u);
     g_verify_probe_texel = texture_bytes[texture_size / 2u];
@@ -1743,7 +1782,12 @@ static void hwr_gl_scene_self_test(int first_run)
     unsigned pre_errors = hwr_gl_drain_errors();
     unsigned post_errors;
 
-    if (first_run) {
+    if (!hwr_gl_store_verify_enabled()) {
+        /* Whole-store hashing is opt-in; the probe/colormap/sampler checks
+         * below still run every self-test. Treat the store bit as satisfied so
+         * the status line does not report a spurious mismatch. */
+        store_ok = 1;
+    } else if (first_run) {
         /* Reading the whole store back stalls the pipeline for a visible
          * fraction of a second, so it runs only on the frame after an
          * upload; the recurring checks rely on the probe fetches instead. */
@@ -2317,6 +2361,7 @@ void hwr_gl_shutdown(void)
 {
     if (g_initialized && hwr_platform_make_current()) {
         hwr_destroy_scene_objects();
+        hwr_destroy_programs();
         hwr_destroy_framebuffer();
     }
     hwr_platform_shutdown();

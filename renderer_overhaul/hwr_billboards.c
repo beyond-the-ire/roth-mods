@@ -1,5 +1,6 @@
 #include "hwr_billboards.h"
 
+#include "hwr_perf.h"
 #include "hwr_sprites.h"
 
 #include <stdlib.h>
@@ -112,6 +113,27 @@ static int hwr_bb_trace_level(void)
               ? setting[0] - '0' : 0;
     }
     return level;
+}
+
+int hwr_billboards_closure_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_ATLAS_CLOSURE");
+        /* Off by default: enabled only when explicitly set to a non-zero value. */
+        state = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    return state;
+}
+
+int hwr_billboards_miss_log_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_ATLAS_MISS_LOG");
+        state = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return state;
 }
 
 void hwr_billboards_init(struct hwr_billboards *bb)
@@ -335,9 +357,80 @@ static int hwr_bb_pack_entry(struct hwr_billboards *bb,
     }
 }
 
+/* The map-archive sprite closure: the set of map entry ids the loaded map's
+ * objects can resolve to. When active, only marked map entries are packed. The
+ * shared half is never closure-scoped (game-wide effect sprites stay resident),
+ * so this only ever filters the map archive. */
+struct hwr_bb_closure {
+    int active;
+    uint8_t *map_refs;
+    size_t map_count;
+};
+
+static void hwr_bb_closure_free(struct hwr_bb_closure *c)
+{
+    if (c == NULL)
+        return;
+    free(c->map_refs);
+    memset(c, 0, sizeof *c);
+}
+
+static int hwr_bb_closure_test(const struct hwr_bb_closure *c, size_t id)
+{
+    return c->map_refs != NULL && id < c->map_count &&
+           (c->map_refs[id >> 3] & (uint8_t)(1u << (id & 7u))) != 0;
+}
+
+static void hwr_bb_closure_mark(struct hwr_bb_closure *c,
+                                const struct hwr_das_archive *map,
+                                const struct hwr_sprite_lookup *lk)
+{
+    if (!lk->resolved || lk->archive != map || lk->entry_id >= c->map_count)
+        return;
+    c->map_refs[lk->entry_id >> 3] |= (uint8_t)(1u << (lk->entry_id & 7u));
+}
+
+/* Builds the map closure by sweeping the existing resolver over every object at
+ * all coarse facings, unioning the live-state (backref) and static-appearance
+ * (backref 0) leaves. Returns 0 (c->active set) on success, -1 on OOM or bad
+ * inputs -- the caller then packs the whole map tail. */
+static int hwr_bb_closure_build(struct hwr_bb_closure *c,
+                                struct hwr_das_archive *map,
+                                struct hwr_das_archive *shared,
+                                const struct hwr_objects *objects,
+                                const struct roth_api_v1 *api)
+{
+    size_t i;
+    memset(c, 0, sizeof *c);
+    if (map == NULL || map->entry_count == 0 || objects == NULL ||
+        !objects->valid || api == NULL || api->game_ram == NULL)
+        return -1;
+    c->map_count = map->entry_count;
+    c->map_refs = (uint8_t *)calloc((c->map_count + 7u) / 8u, 1u);
+    if (c->map_refs == NULL)
+        return -1;
+    for (i = 0; i < objects->count; i++) {
+        const struct hwr_object *o = &objects->items[i];
+        uint32_t f;
+        for (f = 0; f < 256u; f += 16u) {
+            struct hwr_sprite_lookup lk;
+            if (hwr_sprites_resolve(api, map, shared, o->graphic_id, (uint8_t)f,
+                                    0, 0, o->backref, &lk) == 0)
+                hwr_bb_closure_mark(c, map, &lk);
+            if (o->backref != 0 &&
+                hwr_sprites_resolve(api, map, shared, o->graphic_id, (uint8_t)f,
+                                    0, 0, 0, &lk) == 0)
+                hwr_bb_closure_mark(c, map, &lk);
+        }
+    }
+    c->active = 1;
+    return 0;
+}
+
 static int hwr_bb_pack_archive(struct hwr_billboards *bb,
                                struct hwr_das_archive *archive, size_t first_id,
                                struct hwr_bb_slot **dir_out, size_t *dir_count_out,
+                               const struct hwr_bb_closure *closure,
                                uint8_t **bytes, size_t *size, size_t *capacity)
 {
     struct hwr_bb_slot *dir;
@@ -351,6 +444,11 @@ static int hwr_bb_pack_archive(struct hwr_billboards *bb,
     if (dir == NULL)
         return -1;
     for (id = first_id; id < count; id++) {
+        /* Under an active closure, unreferenced map entries stay present == 0
+         * (calloc default); the emitter treats that as an atlas miss and skips
+         * the sprite, exactly as an out-of-range id. */
+        if (closure != NULL && closure->active && !hwr_bb_closure_test(closure, id))
+            continue;
         if (hwr_bb_pack_entry(bb, archive, id, &dir[id], bytes, size, capacity) != 0) {
             free(dir);
             return -1;
@@ -403,9 +501,12 @@ static int hwr_bb_pack_shadow(struct hwr_billboards *bb,
 int hwr_billboards_pack(struct hwr_billboards *bb,
                         struct hwr_das_archive *map_archive,
                         struct hwr_das_archive *shared_archive,
+                        const struct hwr_objects *objects,
                         const struct roth_api_v1 *api,
                         uint8_t **bytes, size_t *size, size_t *capacity)
 {
+    struct hwr_bb_closure closure;
+    memset(&closure, 0, sizeof closure);
     if (bb == NULL)
         return -1;
     free(bb->map_dir);
@@ -424,16 +525,27 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
     bb->built = 0;
     if (!hwr_billboards_enabled())
         return 0;                                         /* kill switch: no atlas */
+    /* When the closure policy is on, scope the map tail to the reachable set;
+     * on any failure fall back to whole-archive packing (fail-safe). */
+    if (hwr_billboards_closure_enabled() &&
+        hwr_bb_closure_build(&closure, map_archive, shared_archive, objects, api) != 0)
+        memset(&closure, 0, sizeof closure);              /* fall back to whole-archive */
     /* Map object graphics occupy the archive tail from the id bias; the shared
-     * (ADEMO) archive holds the game-wide sprite set from its start. */
+     * (ADEMO) archive holds the game-wide sprite set from its start. The map
+     * half is closure-filtered; the shared half is always packed whole. */
     if (hwr_bb_pack_archive(bb, map_archive, HWR_SPRITE_ID_BIAS,
                             &bb->map_dir, &bb->map_dir_count,
-                            bytes, size, capacity) != 0)
+                            &closure, bytes, size, capacity) != 0) {
+        hwr_bb_closure_free(&closure);
         return hwr_bb_fail(bb, "out of memory packing map sprite atlas");
+    }
+    hwr_bb_closure_free(&closure);
+    hwr_perf_phase("bb-map");
     if (hwr_bb_pack_archive(bb, shared_archive, 0,
                             &bb->shared_dir, &bb->shared_dir_count,
-                            bytes, size, capacity) != 0)
+                            NULL, bytes, size, capacity) != 0)
         return hwr_bb_fail(bb, "out of memory packing shared sprite atlas");
+    hwr_perf_phase("bb-shared");
     if (hwr_bb_pack_shadow(bb, api, bytes, size, capacity) != 0)
         return hwr_bb_fail(bb, "out of memory packing the ground shadow");
     bb->built = 1;
@@ -832,6 +944,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     bb->stat_emitted = 0;
     bb->stat_enumerated = 0;
     bb->stat_skipped_mesh = 0;
+    bb->stat_atlas_miss = 0;
     if (!bb->built || objects == NULL || !objects->valid || camera == NULL ||
         world == NULL || api == NULL || api->game_ram == NULL)
         return 0;
@@ -984,10 +1097,18 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
 
         slot = hwr_bb_slot_of(bb, &lookup);
         if (slot == NULL || !slot->present) {
-            if (do_trace)
-                fprintf(stderr, "[bb] o%zu id=%#06x nid=%#06x%s DROP atlas-miss\n",
-                        i, o->graphic_id, lookup.archive_id,
-                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "");
+            /* The resolved sprite has no atlas slot: skip it (never crash). Under
+             * whole-archive packing this is an id past the archive; under the
+             * closure it means the closure walk missed a reachable id. Log the
+             * first few per frame loudly so an under-closure is discoverable. */
+            bb->stat_atlas_miss++;
+            if (hwr_billboards_miss_log_enabled() && bb->stat_atlas_miss <= 8u)
+                fprintf(stderr,
+                        "[renderer_overhaul] ATLAS-MISS: object id=%#06x nid=%#06x facing=%u "
+                        "backref=%u%s -- sprite skipped (closure=%d)\n",
+                        o->graphic_id, lookup.archive_id, o->facing, o->backref,
+                        (o->flags & HWR_OBJECT_FLAG_FLAT) ? " FLAT" : "",
+                        hwr_billboards_closure_enabled());
             continue;
         }
         if (slot->klass == HWR_DAS_CLASS_ANIMATED) {

@@ -1,5 +1,7 @@
 #include "hwr_scene.h"
 
+#include "hwr_perf.h"
+
 #include "hwr_settings.h"
 
 #include "hwr_gl.h"
@@ -1171,6 +1173,7 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                                            const struct hwr_world *world,
                                            struct hwr_das_archive *map_archive,
                                            struct hwr_das_archive *shared_archive,
+                                           const struct hwr_objects *objects,
                                            const struct roth_api_v1 *api,
                                            int debug)
 {
@@ -1412,11 +1415,12 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         fprintf(stderr, "[renderer_overhaul] animation frames retained: %u bytes across %u textures\n",
                 (unsigned)hwr_scene_animation_bytes(scene),
                 (unsigned)scene->animation_count);
+    hwr_perf_phase("world-atlas");
     /* Pack the sprite atlas into the SAME texel store, after the world textures,
      * so a billboard vertex references a byte offset exactly as a wall vertex
      * does. Appending leaves every world texture offset unchanged. */
-    if (hwr_billboards_pack(&scene->billboards, map_archive, shared_archive, api,
-                            &bytes, &size, &capacity) != 0) {
+    if (hwr_billboards_pack(&scene->billboards, map_archive, shared_archive,
+                            objects, api, &bytes, &size, &capacity) != 0) {
         free(bytes);
         return hwr_scene_fail(scene, "%s", scene->billboards.error);
     }
@@ -1429,6 +1433,7 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
         free(bytes);
         return hwr_scene_fail(scene, "%s", hwr_gl_last_error());
     }
+    hwr_perf_phase("upload");
     free(bytes);
     scene->uploaded = 1;
     return 0;
@@ -1437,19 +1442,26 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
 int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
                       struct hwr_das_archive *map_archive,
                       struct hwr_das_archive *shared_archive,
+                      const struct hwr_objects *objects,
                       const struct roth_api_v1 *api, int debug)
 {
     if (scene == NULL)
         return -1;
+    /* Close out the interval between the reload and this rebuild (per-frame
+     * world refresh + object enumeration that ran on the build dispatch) so it
+     * is not folded into the mesh number. A no-op outside a timing session. */
+    hwr_perf_phase("dispatch-gap");
     hwr_scene_clear(scene);
     hwr_billboards_init(&scene->billboards);
     scene->map_archive = map_archive;
     scene->shared_archive = shared_archive;
     if (hwr_scene_build_mesh(&scene->mesh, world, debug) != 0)
         return hwr_scene_fail(scene, "%s", scene->mesh.error);
+    hwr_perf_phase("mesh");
     if (hwr_upload_referenced_textures(scene, world, map_archive,
-                                       shared_archive, api, debug) != 0)
+                                       shared_archive, objects, api, debug) != 0)
         return -1;
+    hwr_perf_report();
     scene->valid = 1;
     return 0;
 }

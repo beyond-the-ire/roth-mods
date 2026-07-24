@@ -12,6 +12,7 @@
 #include "hwr_world.h"
 #include "hwr_sprites.h"
 #include "hwr_objects.h"
+#include "hwr_perf.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -132,6 +133,11 @@ static int g_billboard_stats_pending;
  * list (atomically, via rename) for offline inspection. */
 static char g_obj_dump_path[2600];
 static uint32_t g_obj_dump_counter;
+/* Shared-archive (ADEMO) persistence. The shared DAS is byte-identical on every
+ * map, so when a transition keeps the same shared basename the archive is left
+ * open and decoded rather than torn down, re-opened, and re-decoded. Holds the
+ * basename of the currently open shared archive (empty when none is open). */
+static char g_shared_open_basename[81];
 
 static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation);
 
@@ -442,14 +448,32 @@ static void hwr_data_settings_apply(uint32_t mask,
         g_debug_enabled = settings->debug;
 }
 
-static void hwr_map_data_clear(void)
+/* HWR_ATLAS_PERSIST=0 forces the shared archive + shared sprite atlas to be
+ * rebuilt on every map transition (the pre-persistence behaviour). */
+static int hwr_atlas_persist_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_ATLAS_PERSIST");
+        state = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return state;
+}
+
+static void hwr_map_data_clear(int keep_shared)
 {
     hwr_objects_clear(&g_objects);
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     memset(&g_sprite_census, 0, sizeof g_sprite_census);
     hwr_world_clear(&g_world);
     hwr_das_close(&g_map_archive);
-    hwr_das_close(&g_shared_archive);
+    /* The shared archive is closed only when it is not being carried across the
+     * transition; keeping it open preserves its decoded payloads (which the
+     * per-frame sprite emitter re-dereferences) and its packed atlas. */
+    if (!keep_shared) {
+        hwr_das_close(&g_shared_archive);
+        g_shared_open_basename[0] = 0;
+    }
 }
 
 static int hwr_read_archive_basename(const struct roth_api_v1 *api,
@@ -929,7 +953,8 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
 #endif
             hwr_gl_drain_errors();
             rebuild_result = hwr_scene_rebuild(&g_scene, &g_world, &g_map_archive,
-                                               &g_shared_archive, api, g_debug_enabled);
+                                               &g_shared_archive, &g_objects, api,
+                                               g_debug_enabled);
             upload_errors = hwr_gl_drain_errors();
 #ifndef _WIN32
             sigprocmask(SIG_SETMASK, &old_set, NULL);
@@ -1232,18 +1257,27 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     char map_path[2600];
     char shared_path[2600];
     char failure[256];
+    int keep_shared = 0;
 
+    hwr_perf_begin(generation);
     hwr_settings_apply_pending();
-    hwr_map_data_clear();
-    g_scene_rebuild_pending = 1;
-    g_scene_error_logged = 0;
-    g_backdrop_seed_pending = 0;
     failure[0] = 0;
+    /* Read the archive names before any teardown so the shared-archive
+     * persistence decision can be taken while the old archive is still open. */
     if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
         hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
         snprintf(failure, sizeof failure, "archive name is unavailable");
         goto failed;
     }
+    keep_shared = hwr_atlas_persist_enabled() &&
+                  g_shared_archive.entries != NULL &&
+                  g_shared_open_basename[0] != 0 &&
+                  strcmp(shared_name, g_shared_open_basename) == 0;
+    hwr_map_data_clear(keep_shared);
+    hwr_perf_phase("clear");
+    g_scene_rebuild_pending = 1;
+    g_scene_error_logged = 0;
+    g_backdrop_seed_pending = 0;
     if (g_plugin_dir[0] == 0) {
         snprintf(failure, sizeof failure, "plugin directory was not captured");
         goto failed;
@@ -1284,11 +1318,19 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         snprintf(failure, sizeof failure, "map DAS: %.220s", hwr_das_error(&g_map_archive));
         goto failed;
     }
-    if (hwr_das_open(&g_shared_archive, shared_path) != 0) {
-        snprintf(failure, sizeof failure, "shared DAS: %.217s",
-                 hwr_das_error(&g_shared_archive));
-        goto failed;
+    /* When the shared archive is being carried across the transition it is
+     * already open with the matching basename; only a fresh (or changed) shared
+     * archive is (re)opened here. */
+    if (!keep_shared) {
+        if (hwr_das_open(&g_shared_archive, shared_path) != 0) {
+            snprintf(failure, sizeof failure, "shared DAS: %.217s",
+                     hwr_das_error(&g_shared_archive));
+            goto failed;
+        }
+        snprintf(g_shared_open_basename, sizeof g_shared_open_basename, "%s",
+                 shared_name);
     }
+    hwr_perf_phase("open");
     if (hwr_world_snapshot(&g_world, api) != 0) {
         snprintf(failure, sizeof failure, "geometry: %.220s", hwr_world_error(&g_world));
         goto failed;
@@ -1297,6 +1339,7 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         snprintf(failure, sizeof failure, "color tables: %.216s", hwr_world_error(&g_world));
         goto failed;
     }
+    hwr_perf_phase("geometry");
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent
@@ -1304,7 +1347,9 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     memset(&g_sprite_census, 0, sizeof g_sprite_census);
     if (g_objects_enabled) {
         hwr_sprites_predecode(&g_shared_archive, 0, &g_sprite_census);
+        hwr_perf_phase("predecode-shared");
         hwr_sprites_predecode(&g_map_archive, HWR_SPRITE_ID_BIAS, &g_sprite_census);
+        hwr_perf_phase("predecode-map");
         g_object_stats_pending = 1;
         g_billboard_stats_pending = 1;
     }
@@ -1325,7 +1370,7 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
 failed:
     fprintf(stderr, "[renderer_overhaul] map data unavailable (gen=%u): %s\n",
             generation, failure);
-    hwr_map_data_clear();
+    hwr_map_data_clear(0);
     g_scene_rebuild_pending = 1;
 }
 
@@ -1358,7 +1403,7 @@ static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
 static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
     hwr_withdraw_if_owned(api);
-    hwr_map_data_clear();
+    hwr_map_data_clear(0);
     hwr_objects_clear(&g_objects);
     hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();

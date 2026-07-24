@@ -104,6 +104,11 @@ struct hwr_billboards {
     size_t stat_emitted;
     size_t stat_enumerated;
     size_t stat_skipped_mesh;
+    /* Per-frame count of resolved sprites whose atlas slot was absent (present
+     * == 0). Zero under whole-archive packing; a nonzero value under the sprite
+     * closure means the closure walk missed a reachable id (the sprite is
+     * skipped, never drawn) -- the atlas-miss logger surfaces it. */
+    size_t stat_atlas_miss;
     char error[192];
 };
 
@@ -126,8 +131,22 @@ void hwr_billboards_clear(struct hwr_billboards *bb);
 int hwr_billboards_pack(struct hwr_billboards *bb,
                         struct hwr_das_archive *map_archive,
                         struct hwr_das_archive *shared_archive,
+                        const struct hwr_objects *objects,
                         const struct roth_api_v1 *api,
                         uint8_t **bytes, size_t *size, size_t *capacity);
+
+/* HWR_ATLAS_CLOSURE=1 opts into map-archive sprite closure: only map sprites the
+ * loaded map's object set can resolve to are packed, instead of the whole map
+ * tail. Off by default (whole-archive packing) -- measurements show the map tail
+ * is a negligible share of the atlas, so the closure's build cost is not repaid;
+ * the switch exists so the policy can be validated with the atlas-miss logger
+ * before it is ever made the default. The shared (ADEMO) half is always packed
+ * whole, so game-wide effect sprites are never closure-scoped. */
+int hwr_billboards_closure_enabled(void);
+
+/* HWR_ATLAS_MISS_LOG (default on this round): logs, loudly and throttled, any
+ * emit-time atlas miss so an under-closure is discoverable rather than silent. */
+int hwr_billboards_miss_log_enabled(void);
 
 /* Resolves and projects this frame's billboards into bb->opaque / bb->translucent
  * (+ bb->runs). `visible`/`visible_count` are the PVS drawn-sector set; when

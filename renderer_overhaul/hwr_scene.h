@@ -208,6 +208,7 @@ int hwr_scene_mesh_references(const struct hwr_scene_mesh *mesh, uint16_t id);
 int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
                       struct hwr_das_archive *map_archive,
                       struct hwr_das_archive *shared_archive,
+                      const struct hwr_objects *objects,
                       const struct roth_api_v1 *api, int debug);
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
