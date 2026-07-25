@@ -35,9 +35,12 @@
 #define HWR_BB_MESH_FLAG         0x8000u
 #define HWR_BB_BLEND_FLAG        0x0400u
 
-/* Owner-floor identity tag: floor_id = HWR_BB_FLOOR_TAG | (floor_z & 0xffff).
- * Kept in step with the shader's constant in hwr_gl.c. */
+/* Opaque-winner identity tags carried through the existing exception buffer.
+ * Camera-facing objects match their owner floor by height; fixed-orientation
+ * wall art matches ordinary world walls belonging to its owner sector. Kept in
+ * step with the shader constants in hwr_gl.c. */
 #define HWR_BB_FLOOR_TAG         0x40000000u
+#define HWR_BB_WALL_TAG          0x80000000u
 
 /* One object's exact screen-X portal window(s), pre-converted to framebuffer-X.
  * `active` == 0 means no clip (fail open). */
@@ -694,6 +697,8 @@ static void hwr_bb_write_quad_st(struct hwr_gl_vertex *dst,
      * billboards on the normal path, so its only reader is the floor-exception
      * gate in the geometry shader. */
     corner.flat_guard = floor_id;
+    if ((floor_id & 0xc0000000u) == HWR_BB_WALL_TAG)
+        corner.wall_wrap_flags = HWR_GL_WALL_OWNER_OVERLAY;
     if (clip_hi > clip_lo) {
         double lo = (double)clip_lo * 65536.0;
         double hi = (double)clip_hi * 65536.0;
@@ -1353,14 +1358,19 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             material |= (uint8_t)HWR_GL_MATERIAL_HFLIP;
         is_flat = (o->flags9 & 0x80u) != 0;
 
-        /* Owner-floor id for every camera-facing object: it lets the exception
-         * pass recover a negatively-offset part over this object's own sector
-         * floor. Fixed-orientation wall decals do not participate. */
+        /* Camera-facing objects recover negatively-offset pixels over their own
+         * floor. Fixed-orientation wall art instead recovers pixels authored
+         * slightly through ordinary walls in its owner sector: stock paints the
+         * sector's secondary surfaces after its world faces. */
         if (exception && !is_flat &&
             o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
             o->sector_index < world->sector_count)
             obj_floor_id = HWR_BB_FLOOR_TAG |
                 (uint32_t)(uint16_t)world->sectors[o->sector_index].floor_z;
+        else if (exception && is_flat &&
+                 o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+                 o->sector_index < world->sector_count)
+            obj_floor_id = HWR_BB_WALL_TAG | (uint32_t)o->sector_index;
 
         if (bb_log || (trace >= 2 && throttle))
             fprintf(stderr,
@@ -1383,7 +1393,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                                  hwr_bb_clamp_i16(z_top), hwr_bb_clamp_i16(z_bottom),
                                  offset, tw, th, (float)(2u * th), (float)(2u * tw),
                                  material, composed, sector_flags,
-                                 is_flat ? 0u : obj_floor_id, camera, &clip) > 0)
+                                 obj_floor_id, camera, &clip) > 0)
                 bb->stat_emitted++;
         } else {
             struct hwr_bb_trans *t;

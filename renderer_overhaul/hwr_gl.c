@@ -708,10 +708,10 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_fill_index;\n"
     "uniform int u_wd_bias;\n"
     "uniform int u_blend_pass;\n"
-    /* Owner-floor depth exception. When u_floor_exception!=0 (the exception
+    /* Owner-surface depth exception. When u_floor_exception!=0 (the exception
      * re-draw passes) a fragment survives only where the opaque winner recorded
-     * in u_floor_id equals this object's own sector-floor id (carried per-vertex
-     * in v_flat_span.x); a zero id means "does not participate". */
+     * in u_floor_id equals the object's owner-floor or owner-wall id (carried
+     * per-vertex in v_flat_span.x); a zero id means "does not participate". */
     "uniform int u_floor_exception;\n"
     "uniform usampler2D u_floor_id;\n"
     /* Per-wall sky caps sample the parallax skybox in screen space, exactly as
@@ -1065,16 +1065,21 @@ static const char g_geometry_fragment_shader[] =
      * plane. This early exit deliberately bypasses texture masks and shading;
      * glDrawBuffers(GL_NONE) discards both outputs while depth is retained. */
     "  if (u_depth_only!=0) { out_index=0u; out_floor_id=0u; return; }\n"
-    /* Owner-floor identity output for the world pass: a world flat FLOOR
-     * fragment publishes FLOOR_TAG | (its world z & 0xffff); direct-mapped mesh
-     * flats and everything else publish 0. The exception passes bind COLOR1 as
-     * GL_NONE, so this write is harmlessly discarded there. */
+    /* Opaque winner identity. World flats publish FLOOR_TAG | z as before.
+     * Ordinary world walls and fixed-orientation wall art carry
+     * WALL_TAG | owner-sector in v_flat_span.x. Fixed wall art is marked as an
+     * overlay in v_pan_scale_flags.w and, like camera-facing floor objects,
+     * deliberately publishes zero. This preserves the host identity for the
+     * guarded redraw and the shadow gate across ordinary object silhouettes. */
     "  out_floor_id=(material & 8u)!=0u &&"
     " (v_flat_span.w & 0x80000000u)==0u ?"
-    " (0x40000000u | (uint(int(round(v_world.z))) & 0xffffu)) : 0u;\n"
-    /* Exception re-draw: keep only fragments standing over this object's OWN
-     * sector floor (the recorded opaque winner). A wall or nearer surface made
-     * itself the winner with a different (or zero) id and thus occludes. */
+    " (0x40000000u | (uint(int(round(v_world.z))) & 0xffffu)) :"
+    " ((v_flat_span.x & 0xc0000000u)==0x80000000u &&"
+    " (v_pan_scale_flags.w & 0x80u)==0u ?"
+    " v_flat_span.x : 0u);\n"
+    /* Exception re-draw: keep only fragments over the matching opaque owner
+     * surface. A nearer object, door, or wall from another sector records zero
+     * or a different id and therefore remains an occluder. */
     "  if (u_floor_exception!=0) {\n"
     "    uint fid=v_flat_span.x;\n"
     "    if (fid==0u) discard;\n"
@@ -2205,8 +2210,8 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
             g_gl.disable(GL_POLYGON_OFFSET_FILL);
         }
     }
-    /* From here only the palette index is written; the recorded owner-floor ids
-     * stay intact for the exception passes to sample. */
+    /* From here only the palette index is written; the recorded owner-surface
+     * ids stay intact for the exception passes to sample. */
     {
         static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
         g_gl.draw_buffers(1, index_only);
@@ -2218,14 +2223,14 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
             ? translucent_vertices - shadow_vertices : translucent_vertices;
         size_t trans_main_runs = translucent_run_count >= shadow_run_count
             ? translucent_run_count - shadow_run_count : translucent_run_count;
-    /* Owner-floor depth exception (HWR_FLOOR_EXCEPTION). Re-draw the object quads
-     * that may overlay their OWN sector floor with the identity gate on and depth
-     * off: a fragment survives only where the recorded opaque winner is that
-     * object's floor, so the below-floor part is painted over the floor while
-     * walls and nearer geometry still occlude it. This also seats the ground
-     * shadow BEHIND its monster for free -- the monster stamped floor id 0 across
-     * its silhouette, so the shadow is gated out there. */
-    if (floor_exception && (opaque_billboard_vertices != 0 || shadow_vertices != 0)) {
+    /* Owner-surface depth exception (HWR_FLOOR_EXCEPTION). Re-draw object quads
+     * that may overlay their own floor, plus fixed-orientation wall art authored
+     * slightly through its owner-sector wall. The identity gate keeps nearer
+     * objects, doors, and other sectors occluding. This also seats the ground
+     * shadow BEHIND its monster for free -- the monster stamped identity 0
+     * across its silhouette, so the shadow is gated out there. */
+    if (floor_exception && (opaque_billboard_vertices != 0 ||
+                            flat_vertices != 0 || shadow_vertices != 0)) {
         size_t opaque_main = opaque_vertices >= flat_vertices
                            ? opaque_vertices - flat_vertices : opaque_vertices;
         g_gl.active_texture(GL_TEXTURE0 + 7);
@@ -2270,6 +2275,13 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                 (GLint)(sky_vertices + opaque_main -
                         opaque_billboard_vertices),
                 (GLsizei)opaque_billboard_vertices);
+        }
+        if (flat_vertices != 0 && opaque_vertices >= flat_vertices) {
+            if (blend_location >= 0)
+                g_gl.uniform_1i(blend_location, 0);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                (GLint)(sky_vertices + opaque_vertices - flat_vertices),
+                (GLsizei)flat_vertices);
         }
         hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
         g_gl.enable(GL_DEPTH_TEST);

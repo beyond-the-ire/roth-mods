@@ -33,6 +33,11 @@ enum hwr_gl_wall_wrap_flags {
     HWR_GL_WALL_SOLID_FILL    = 1u << 3
 };
 
+/* Non-wall billboard marker: the fixed-orientation quad carries an owner-wall
+ * identity for the guarded redraw, but must not replace the wall's recorded
+ * identity during its normal depth-tested pass. */
+#define HWR_GL_WALL_OWNER_OVERLAY (1u << 7)
+
 /* High bits of flat_mapping_flags are available to non-flat geometry. Mesh
  * faces use perspective-correct wall_s/wall_top as direct atlas coordinates,
  * bypassing the wall-column and world-plane mapping drivers. */

@@ -13,6 +13,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Ordinary world-wall winner tag, shared with hwr_billboards.c and the geometry
+ * shader. The low bits identify the owning sector; the high class bit keeps it
+ * disjoint from the existing owner-floor height tags. */
+#define HWR_WORLD_WALL_TAG 0x80000000u
+
 #define HWR_WALL_U_REVERSED 0
 #define HWR_GROUP_PART_TABLE_VA 0x909b4u
 #define HWR_SKY_PROJECTION_TABLE_VA 0x8c484u
@@ -3062,6 +3067,13 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
     else if (surface->kind != HWR_SURFACE_DOOR) {
+        /* Stock paints fixed-orientation secondary surfaces after all world
+         * faces in their owner sector. Publish that sector on ordinary walls so
+         * the guarded billboard redraw can reproduce the painter overlap
+         * without leaking through a nearer wall from another sector. */
+        if (surface->sector_index <= (size_t)UINT32_MAX)
+            flat_guard = HWR_WORLD_WALL_TAG |
+                         (uint32_t)surface->sector_index;
         hwr_wall_span_state(&scene->mesh, surface, camera, width,
                             texture_width, texture_height, &wall_span);
         wall_tint_adjust =
@@ -3152,6 +3164,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
             tmpl.material_flags = flags;
             tmpl.direct_index = direct_index;
             tmpl.wall_tint_adjust = (uint8_t)wall_tint_adjust;
+            tmpl.flat_guard = flat_guard;
             tmpl.flat_mapping_flags = surface->mapping_flags;
             if (texture_height != 0 &&
                 (texture_height & (uint16_t)(texture_height - 1u)) == 0)
