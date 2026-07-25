@@ -588,14 +588,18 @@ int hwr_compute_door_portal_windows(
     struct hwr_sector_xspan *spans, size_t span_count)
 {
     const uint8_t *node_section;
+    struct hwr_sector_xspan *sector_spans = NULL;
     uintptr_t arena, arena_end, worklist_limit;
+    uint32_t draw_count, entries_end, k;
     size_t s, di;
+    int ok = 1;
 
     if (world == NULL || api == NULL || api->game_ram == NULL ||
         spans == NULL)
         return 0;
     if (world->sector_count == 0 || world->door_count == 0 ||
-        span_count < world->door_count || world->sector_section == NULL)
+        span_count < world->door_count || world->sector_section == NULL ||
+        world->sector_offset_to_index == NULL)
         return 0;
     if (!hwr_portal_clip_enabled())
         return 0;
@@ -613,6 +617,59 @@ int hwr_compute_door_portal_windows(
     if (worklist_limit <= arena || worklist_limit > arena_end)
         return 0;
     node_section = (const uint8_t *)arena_end;
+
+    /* Type-4 nodes do carry a packed interval at node+8, but unlike type-1
+     * object nodes it is not the interval stock uses to draw the door: the
+     * door collection pass runs after the main walk and that field can retain
+     * an unrelated/stale window. Stock instead collects the sector worklist
+     * once for every surviving ordered face-chain link, with link+4/+6 loaded
+     * as the current view bounds. Recover that exact per-sector window union
+     * before matching the worklist's type-4 records. */
+    sector_spans = (struct hwr_sector_xspan *)calloc(
+        world->sector_count, sizeof *sector_spans);
+    if (sector_spans == NULL)
+        return 0;
+    draw_count = hwr_pvs_section_u16(
+        node_section, HWR_DRAW_LIST_COUNT, &ok);
+    entries_end = HWR_DRAW_LIST_ENTRIES + draw_count * 2u;
+    if (!ok || draw_count == 0 || entries_end > HWR_SECTION_EXTENT)
+        goto fail_open;
+    for (k = 0; k < draw_count; k++) {
+        uint32_t draw_node = hwr_pvs_section_u16(
+            node_section, HWR_DRAW_LIST_ENTRIES + k * 2u, &ok);
+        uint32_t chain = hwr_pvs_section_u16(
+            node_section, draw_node + HWR_NODE_FACE_HEAD, &ok);
+        uint32_t guard = 0;
+        if (!ok)
+            goto fail_open;
+        while (chain != 0 && guard++ < HWR_CHAIN_LIMIT) {
+            uint16_t recid = hwr_pvs_section_u16(
+                node_section, chain + HWR_NODE_LINK_REC, &ok);
+            uint16_t lo = hwr_pvs_section_u16(
+                node_section, chain + 4u, &ok);
+            uint16_t hi = hwr_pvs_section_u16(
+                node_section, chain + 6u, &ok);
+            if (!ok)
+                goto fail_open;
+            if (recid != HWR_NODE_REMOVED) {
+                uint16_t sector_index =
+                    world->sector_offset_to_index[recid];
+                if (sector_index == UINT16_MAX ||
+                    sector_index >= world->sector_count)
+                    goto fail_open;
+                if ((int16_t)lo < (int16_t)hi)
+                    (void)hwr_reflection_span_add(
+                        &sector_spans[sector_index],
+                        (int16_t)lo, (int16_t)hi);
+            }
+            chain = hwr_pvs_section_u16(
+                node_section, chain + HWR_NODE_LINK_NEXT, &ok);
+            if (!ok)
+                goto fail_open;
+        }
+        if (guard >= HWR_CHAIN_LIMIT)
+            goto fail_open;
+    }
 
     for (s = 0; s < world->sector_count; s++) {
         const struct hwr_sector *sector = &world->sectors[s];
@@ -659,10 +716,17 @@ int hwr_compute_door_portal_windows(
                         break;
                 }
                 if (di < world->door_count) {
-                    /* Stock consumes only type-4 membership when collecting
-                     * hinged doors; its polygon stage uses global view bounds,
-                     * not this node's packed portal interval. */
-                    spans[di].count = 1;
+                    unsigned wi;
+                    /* This sector's worklist is rendered under every ordered
+                     * face-chain interval accumulated above. A matched door is
+                     * therefore visible only in their union. */
+                    if (sector_spans[s].count == 0)
+                        goto fail_open;
+                    for (wi = 0; wi < sector_spans[s].count; wi++)
+                        (void)hwr_reflection_span_add(
+                            &spans[di],
+                            sector_spans[s].lo[wi],
+                            sector_spans[s].hi[wi]);
                 }
             }
             node = next;
@@ -673,9 +737,11 @@ int hwr_compute_door_portal_windows(
 
     /* A structurally valid scan with no type-4 match is authoritative: stock
      * admitted no active door into the visible worklists. */
+    free(sector_spans);
     return 1;
 
 fail_open:
+    free(sector_spans);
     for (di = 0; di < world->door_count; di++)
         spans[di].count = 0;
     return 0;

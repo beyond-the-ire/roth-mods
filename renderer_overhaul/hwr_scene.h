@@ -227,8 +227,9 @@ struct hwr_scene {
     struct hwr_sector_xspan *spans;
     size_t span_count;
     int portal_clip_valid;
-    /* Type-4 primary-view admission records, indexed by live door. Reflected
-     * views reuse this storage for their reconstructed sector-window union. */
+    /* Type-4 primary-view face-chain window unions, indexed by live door.
+     * Reflected views reuse this storage for their reconstructed sector-window
+     * union. */
     struct hwr_sector_xspan door_spans[HWR_DOOR_MAX];
     int door_portal_clip_valid;
     /* Reflected walks retain every narrowed screen-X window per reached

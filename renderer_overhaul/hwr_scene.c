@@ -3513,12 +3513,21 @@ static void hwr_prepare_reflection_door_windows(
     }
 }
 
-static const struct hwr_sector_xspan *hwr_surface_reflection_windows(
+static const struct hwr_sector_xspan *hwr_surface_windows(
     const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera)
 {
     const struct hwr_sector_xspan *span;
-    if (!camera->reflected || !scene->reflection_clip_valid)
+    if (!camera->reflected) {
+        if (!scene->door_portal_clip_valid ||
+            surface->kind != HWR_SURFACE_DOOR ||
+            surface->door_index >= HWR_DOOR_MAX)
+            return NULL;
+        span = &scene->door_spans[surface->door_index];
+        return span->count != 0 && span->count <= HWR_SECTOR_CLIP_MAX
+             ? span : NULL;
+    }
+    if (!scene->reflection_clip_valid)
         return NULL;
     if (surface->kind == HWR_SURFACE_DOOR &&
         surface->door_index < HWR_DOOR_MAX) {
@@ -3540,7 +3549,7 @@ static size_t hwr_surface_window_count(
     const struct hwr_gl_camera *camera)
 {
     const struct hwr_sector_xspan *span =
-        hwr_surface_reflection_windows(scene, surface, camera);
+        hwr_surface_windows(scene, surface, camera);
     return span != NULL ? span->count : 1u;
 }
 
@@ -3550,7 +3559,7 @@ static size_t hwr_copy_gpu_surface_windows(
     struct hwr_gl_vertex *destination)
 {
     const struct hwr_sector_xspan *span =
-        hwr_surface_reflection_windows(scene, surface, camera);
+        hwr_surface_windows(scene, surface, camera);
     size_t emitted = 0;
     unsigned i;
     if (span == NULL)
@@ -3565,7 +3574,10 @@ static size_t hwr_copy_gpu_surface_windows(
                 continue;
         } else {
             left = span->lo[i];
-            right = (int)span->hi[i] + 1;
+            /* Primary ordered-chain bounds use stock's half-open
+             * [left,right) convention. Reflection spans are inclusive and
+             * are converted separately above. */
+            right = span->hi[i];
             if (left < 0)
                 left = 0;
             if (right > (int)width)
