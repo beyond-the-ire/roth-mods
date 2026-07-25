@@ -240,6 +240,235 @@ static void hwr_span_add(struct hwr_sector_xspan *s, int lo, int hi)
     s->count++;
 }
 
+/* Reflections need their own portal walk because the primary software pass
+ * overwrites the engine's reflected render tree before the hardware callback.
+ * Keep the walk in the engine's pre-X-flip screen coordinates; only the final
+ * GL aperture is flipped. */
+#define HWR_REFLECTION_NEAR      0x1000
+#define HWR_REFLECTION_BUDGET    0x0c65
+#define HWR_REFLECTION_MAX_DEPTH 0x003c
+
+struct hwr_reflection_pvs_ctx {
+    const struct hwr_world *world;
+    const struct hwr_gl_camera *camera;
+    struct hwr_sector_xspan *windows;
+    uint8_t *visible;
+    int budget;
+};
+
+static int32_t hwr_reflection_shift_right_6(int32_t value)
+{
+    if (value >= 0)
+        return value >> 6;
+    return -(int32_t)(((uint32_t)(-value) + 63u) >> 6);
+}
+
+static void hwr_reflection_view_point(const struct hwr_gl_camera *camera,
+                                      const struct hwr_vertex *vertex,
+                                      int32_t *view_x, int32_t *depth)
+{
+    int32_t dx = (int16_t)((uint16_t)vertex->world_x +
+                           (uint16_t)camera->view_offset_x);
+    int32_t dy = (int16_t)((uint16_t)vertex->world_y +
+                           (uint16_t)camera->view_offset_y);
+    *view_x = hwr_reflection_shift_right_6(
+        dx * camera->yaw_sin + dy * camera->yaw_cos);
+    *depth = hwr_reflection_shift_right_6(
+        dy * camera->yaw_sin - dx * camera->yaw_cos);
+}
+
+static int hwr_reflection_project_x(const struct hwr_gl_camera *camera,
+                                    int32_t view_x, int32_t depth)
+{
+    int64_t projected =
+        (int64_t)view_x * camera->focal_x / depth + camera->center_x;
+    if (projected < -0x3ffe)
+        return -0x3ffe;
+    if (projected > 0x3ffe)
+        return 0x3ffe;
+    return (int)projected;
+}
+
+/* Returns the directed portal interval after clipping its endpoints against the
+ * same 16-world-unit near plane used by the wall and object paths. */
+static int hwr_reflection_portal_interval(
+    const struct hwr_reflection_pvs_ctx *ctx, const struct hwr_wall *wall,
+    int *out_a, int *out_b)
+{
+    const struct hwr_world *world = ctx->world;
+    int32_t view_a, depth_a, view_b, depth_b;
+    int64_t numerator;
+    int32_t denominator;
+
+    if (wall->vertex_a_index >= world->vertex_count ||
+        wall->vertex_b_index >= world->vertex_count)
+        return 0;
+    hwr_reflection_view_point(ctx->camera,
+                              &world->vertices[wall->vertex_a_index],
+                              &view_a, &depth_a);
+    hwr_reflection_view_point(ctx->camera,
+                              &world->vertices[wall->vertex_b_index],
+                              &view_b, &depth_b);
+    if (depth_a < HWR_REFLECTION_NEAR &&
+        depth_b < HWR_REFLECTION_NEAR)
+        return 0;
+    if (depth_a < HWR_REFLECTION_NEAR) {
+        denominator = depth_b - depth_a;
+        if (denominator <= 0)
+            return 0;
+        numerator = (int64_t)(view_b - view_a) *
+                    (HWR_REFLECTION_NEAR - depth_a);
+        view_a += (int32_t)(numerator / denominator);
+        depth_a = HWR_REFLECTION_NEAR;
+    } else if (depth_b < HWR_REFLECTION_NEAR) {
+        denominator = depth_a - depth_b;
+        if (denominator <= 0)
+            return 0;
+        numerator = (int64_t)(view_a - view_b) *
+                    (HWR_REFLECTION_NEAR - depth_b);
+        view_b += (int32_t)(numerator / denominator);
+        depth_b = HWR_REFLECTION_NEAR;
+    }
+    *out_a = hwr_reflection_project_x(ctx->camera, view_a, depth_a);
+    *out_b = hwr_reflection_project_x(ctx->camera, view_b, depth_b);
+    return 1;
+}
+
+/* The stock coalescer merges overlapping reflected visits but retains windows
+ * that merely touch. If the bounded local store fills, retain its exact prefix
+ * and drop later windows (fail closed) instead of poisoning the sector into an
+ * unrestricted draw. */
+static int hwr_reflection_span_add(struct hwr_sector_xspan *span,
+                                   int lo, int hi)
+{
+    unsigned i;
+    if (lo > hi) {
+        int swap = lo;
+        lo = hi;
+        hi = swap;
+    }
+    for (i = 0; i < span->count; i++) {
+        if (lo <= span->hi[i] && span->lo[i] <= hi) {
+            unsigned j = 0;
+            if (lo < span->lo[i])
+                span->lo[i] = (int16_t)lo;
+            if (hi > span->hi[i])
+                span->hi[i] = (int16_t)hi;
+            while (j < span->count) {
+                if (j != i && span->lo[i] <= span->hi[j] &&
+                    span->lo[j] <= span->hi[i]) {
+                    if (span->lo[j] < span->lo[i])
+                        span->lo[i] = span->lo[j];
+                    if (span->hi[j] > span->hi[i])
+                        span->hi[i] = span->hi[j];
+                    span->count--;
+                    span->lo[j] = span->lo[span->count];
+                    span->hi[j] = span->hi[span->count];
+                    if (i == span->count)
+                        i = j;
+                    j = 0;
+                    continue;
+                }
+                j++;
+            }
+            return 1;
+        }
+    }
+    if (span->count >= HWR_SECTOR_CLIP_MAX)
+        return 0;
+    span->lo[span->count] = (int16_t)lo;
+    span->hi[span->count] = (int16_t)hi;
+    span->count++;
+    return 1;
+}
+
+static void hwr_reflection_pvs_flood(struct hwr_reflection_pvs_ctx *ctx,
+                                     size_t sector, size_t parent,
+                                     int left, int right, int depth)
+{
+    const struct hwr_world *world = ctx->world;
+    const struct hwr_sector *current;
+    struct hwr_sector_xspan *window;
+    size_t i;
+
+    if (sector >= world->sector_count || left > right || ctx->budget <= 0)
+        return;
+    window = &ctx->windows[sector];
+    if (!hwr_reflection_span_add(window, left, right))
+        return;                                      /* bounded fail-closed */
+    ctx->visible[sector] = 1;
+    ctx->budget--;
+    if (depth >= HWR_REFLECTION_MAX_DEPTH)
+        return;
+
+    current = &world->sectors[sector];
+    if (current->first_wall > world->wall_count ||
+        current->wall_count > world->wall_count - current->first_wall)
+        return;
+    for (i = 0; i < current->wall_count; i++) {
+        const struct hwr_wall *wall =
+            &world->walls[current->first_wall + i];
+        size_t neighbor_index = wall->neighbor_sector_index;
+        const struct hwr_sector *neighbor;
+        int portal_left, portal_right;
+        int next_left, next_right;
+
+        if (neighbor_index == SIZE_MAX ||
+            neighbor_index >= world->sector_count ||
+            neighbor_index == sector || neighbor_index == parent)
+            continue;
+        neighbor = &world->sectors[neighbor_index];
+        /* A portal only connects vertically overlapping, non-empty sectors. */
+        if (neighbor->ceiling_z <= neighbor->floor_z ||
+            neighbor->ceiling_z <= current->floor_z ||
+            neighbor->floor_z >= current->ceiling_z)
+            continue;
+        if (!hwr_reflection_portal_interval(ctx, wall,
+                                             &portal_left, &portal_right))
+            continue;
+        if (portal_left >= portal_right)
+            continue;                                  /* back-facing */
+        if (portal_left >= right || portal_right <= left)
+            continue;
+        next_left = portal_left > left ? portal_left : left;
+        next_right = portal_right < right ? portal_right : right;
+        if (next_left >= next_right)
+            continue;
+        hwr_reflection_pvs_flood(ctx, neighbor_index, sector,
+                                 next_left, next_right, depth + 1);
+    }
+}
+
+int hwr_compute_reflection_pvs(const struct hwr_world *world,
+                               const struct hwr_gl_camera *camera,
+                               size_t root_sector,
+                               int clip_left, int clip_right,
+                               uint8_t *visible,
+                               struct hwr_sector_xspan *spans,
+                               size_t span_count)
+{
+    struct hwr_reflection_pvs_ctx ctx;
+    size_t sector_count;
+
+    if (world == NULL || camera == NULL || visible == NULL || spans == NULL)
+        return 0;
+    sector_count = world->sector_count;
+    if (sector_count == 0 || root_sector >= sector_count ||
+        span_count < sector_count || camera->focal_x == 0 ||
+        clip_left > clip_right)
+        return 0;
+    memset(visible, 0, sector_count);
+    memset(spans, 0, sector_count * sizeof *spans);
+    ctx.world = world;
+    ctx.camera = camera;
+    ctx.windows = spans;
+    ctx.visible = visible;
+    ctx.budget = HWR_REFLECTION_BUDGET;
+    hwr_reflection_pvs_flood(&ctx, root_sector, root_sector,
+                             clip_left, clip_right, 0);
+    return visible[root_sector] != 0;
+}
+
 int hwr_compute_object_portal_windows(
     const struct hwr_world *world, const struct hwr_objects *objects,
     const struct roth_api_v1 *api, struct hwr_sector_xspan *spans,

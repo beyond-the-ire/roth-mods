@@ -1,6 +1,7 @@
 #include "hwr_meshes.h"
 
 #include "hwr_sprites.h"
+#include "hwr_visibility.h"
 
 #include <limits.h>
 #include <stdarg.h>
@@ -15,7 +16,6 @@
 #define HWR_MESH_NO_MATERIAL       UINT32_MAX
 
 #define VA_G_SINCOS_TABLE          0x72080u
-#define VA_G_SPRITE_VIEW_ANGLE     0x909f8u
 #define VA_G_VIEW_PARAMS_XSCALE    0x8527cu
 #define VA_G_PERSPECTIVE_SCALE     0x85288u
 #define VA_G_RENDER_TICK           0x90c0au
@@ -855,6 +855,32 @@ static void hwr_mesh_finish_vertex(struct hwr_gl_vertex *vertex,
     vertex->material_flags = flags;
 }
 
+static size_t hwr_mesh_clip_count(const struct hwr_sector_xspan *clip)
+{
+    return clip != NULL && clip->count != 0 &&
+           clip->count <= HWR_SECTOR_CLIP_MAX
+         ? clip->count : 1u;
+}
+
+static void hwr_mesh_apply_clip(struct hwr_gl_vertex *vertices, size_t count,
+                                const struct hwr_sector_xspan *clip,
+                                size_t window)
+{
+    uint32_t left;
+    uint32_t right;
+    size_t i;
+    if (clip == NULL || clip->count == 0 ||
+        clip->count > HWR_SECTOR_CLIP_MAX || window >= clip->count ||
+        clip->hi[window] <= clip->lo[window])
+        return;
+    left = (uint32_t)(uint16_t)clip->lo[window] << 16;
+    right = (uint32_t)(uint16_t)clip->hi[window] << 16;
+    for (i = 0; i < count; i++) {
+        vertices[i].portal_clip_left = left;
+        vertices[i].portal_clip_right = right;
+    }
+}
+
 static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
                               const struct hwr_mesh_resource *resource,
                               const struct hwr_mesh_face *face,
@@ -862,6 +888,7 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
                               const struct hwr_world *world,
                               const struct hwr_gl_camera *camera,
                               int32_t facing_sin, int32_t facing_cos,
+                              const struct hwr_sector_xspan *clip,
                               struct hwr_mesh_pending **pending,
                               size_t *pending_count,
                               size_t *pending_capacity)
@@ -875,6 +902,8 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
     size_t count = face->kind == HWR_MESH_FACE_TRIANGLE ? 3u : 4u;
     size_t output_count = count == 3u ? 3u : 6u;
     int translucent = 0;
+    size_t window_count;
+    size_t window;
     size_t i;
 
     if ((face->texture_id & 0xff00u) != 0xff00u) {
@@ -953,6 +982,7 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
     }
     translucent = material != NULL && (face->flags & 1u) != 0 &&
                   (material->qflags & 0x400u) != 0;
+    window_count = hwr_mesh_clip_count(clip);
     if (translucent) {
         double depth_sum = 0.0;
         double ignored;
@@ -965,18 +995,27 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
             triangles[4].material_flags |= HWR_GL_MATERIAL_TRANSLUCENT;
             triangles[5].material_flags |= HWR_GL_MATERIAL_TRANSLUCENT;
         }
-        if (hwr_mesh_push_pending(pending, pending_count, pending_capacity,
-                                  triangles, output_count,
-                                  depth_sum / (double)count) != 0)
-            return -1;
+        for (window = 0; window < window_count; window++) {
+            struct hwr_gl_vertex staged[6];
+            memcpy(staged, triangles, output_count * sizeof *staged);
+            hwr_mesh_apply_clip(staged, output_count, clip, window);
+            if (hwr_mesh_push_pending(pending, pending_count, pending_capacity,
+                                      staged, output_count,
+                                      depth_sum / (double)count) != 0)
+                return -1;
+        }
     } else {
         if (hwr_mesh_reserve_output(&meshes->opaque, meshes->opaque_count,
                                     &meshes->opaque_capacity,
-                                    output_count) != 0)
+                                    output_count * window_count) != 0)
             return -1;
-        memcpy(meshes->opaque + meshes->opaque_count, triangles,
-               output_count * sizeof *triangles);
-        meshes->opaque_count += output_count;
+        for (window = 0; window < window_count; window++) {
+            struct hwr_gl_vertex *destination =
+                meshes->opaque + meshes->opaque_count;
+            memcpy(destination, triangles, output_count * sizeof *triangles);
+            hwr_mesh_apply_clip(destination, output_count, clip, window);
+            meshes->opaque_count += output_count;
+        }
     }
     meshes->stat_faces++;
     return 0;
@@ -989,12 +1028,14 @@ static int hwr_mesh_emit_pin(struct hwr_meshes *meshes,
                              const struct hwr_world *world,
                              const struct hwr_gl_camera *camera,
                              int32_t facing_sin, int32_t facing_cos,
-                             double hscale, double vscale)
+                             double hscale, double vscale,
+                             const struct hwr_sector_xspan *clip)
 {
     const struct hwr_mesh_material *material;
     const struct hwr_mesh_local_vertex *local;
     struct hwr_gl_vertex pin;
     struct hwr_gl_vertex tl, tr, bl, br;
+    struct hwr_gl_vertex triangles[6];
     uint8_t light, sector_flags;
     double famod = 1.0;
     double half_w;
@@ -1004,6 +1045,8 @@ static int hwr_mesh_emit_pin(struct hwr_meshes *meshes,
     int32_t disp;
     int32_t z_top, z_bottom;
     double depth, view_x;
+    size_t window_count;
+    size_t window;
 
     if (face->material_index == HWR_MESH_NO_MATERIAL ||
         face->material_index >= meshes->material_count) {
@@ -1073,15 +1116,24 @@ static int hwr_mesh_emit_pin(struct hwr_meshes *meshes,
     tr.material_flags |= HWR_GL_MATERIAL_MASKED;
     bl.material_flags |= HWR_GL_MATERIAL_MASKED;
     br.material_flags |= HWR_GL_MATERIAL_MASKED;
+    triangles[0] = tl;
+    triangles[1] = tr;
+    triangles[2] = br;
+    triangles[3] = tl;
+    triangles[4] = br;
+    triangles[5] = bl;
+    window_count = hwr_mesh_clip_count(clip);
     if (hwr_mesh_reserve_output(&meshes->opaque, meshes->opaque_count,
-                                &meshes->opaque_capacity, 6u) != 0)
+                                &meshes->opaque_capacity,
+                                6u * window_count) != 0)
         return -1;
-    meshes->opaque[meshes->opaque_count++] = tl;
-    meshes->opaque[meshes->opaque_count++] = tr;
-    meshes->opaque[meshes->opaque_count++] = br;
-    meshes->opaque[meshes->opaque_count++] = tl;
-    meshes->opaque[meshes->opaque_count++] = br;
-    meshes->opaque[meshes->opaque_count++] = bl;
+    for (window = 0; window < window_count; window++) {
+        struct hwr_gl_vertex *destination =
+            meshes->opaque + meshes->opaque_count;
+        memcpy(destination, triangles, sizeof triangles);
+        hwr_mesh_apply_clip(destination, 6u, clip, window);
+        meshes->opaque_count += 6u;
+    }
     meshes->stat_pins++;
     return 0;
 }
@@ -1092,6 +1144,7 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
                     const struct hwr_gl_camera *camera,
                     const uint8_t *visible, size_t visible_count,
                     int pvs_valid,
+                    const struct hwr_sector_xspan *spans, size_t span_count,
                     const struct roth_api_v1 *api)
 {
     double hscale = 0.0;
@@ -1127,7 +1180,7 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
         hscale = xscale / (focal_x * 256.0);
         vscale = pscale / (focal_y * 256.0);
     }
-    yaw = api->game_ram->u16(VA_G_SPRITE_VIEW_ANGLE);
+    yaw = camera->yaw;
 
     for (i = 0; i < objects->count; i++) {
         const struct hwr_object *object = &objects->items[i];
@@ -1138,8 +1191,13 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
         double center_depth;
         int32_t correction;
         int32_t facing_sin, facing_cos;
+        const struct hwr_sector_xspan *clip =
+            spans != NULL && i < span_count ? &spans[i] : NULL;
         size_t face_index;
         if (object->source != HWR_OBJECT_MAP)
+            continue;
+        if (camera->reflected &&
+            (object->flags & HWR_OBJECT_FLAG_REFLECTION_SKIP) != 0)
             continue;
         if (pvs_valid && object->sector_index != HWR_OBJECT_NO_SECTOR &&
             object->sector_index < visible_count &&
@@ -1179,10 +1237,11 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
                     continue;
                 result = hwr_mesh_emit_pin(meshes, resource, face, object,
                                            world, camera, facing_sin, facing_cos,
-                                           hscale, vscale);
+                                           hscale, vscale, clip);
             } else {
                 result = hwr_mesh_emit_face(meshes, resource, face, object,
                                             world, camera, facing_sin, facing_cos,
+                                            clip,
                                             &pending, &pending_count,
                                             &pending_capacity);
             }

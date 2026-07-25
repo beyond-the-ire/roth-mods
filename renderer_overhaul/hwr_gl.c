@@ -50,6 +50,7 @@
 typedef GLenum (APIENTRY *hwr_gl_get_error_fn)(void);
 typedef const GLubyte *(APIENTRY *hwr_gl_get_string_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_viewport_fn)(GLint, GLint, GLsizei, GLsizei);
+typedef void (APIENTRY *hwr_gl_scissor_fn)(GLint, GLint, GLsizei, GLsizei);
 typedef void (APIENTRY *hwr_gl_clear_color_fn)(GLclampf, GLclampf, GLclampf, GLclampf);
 typedef void (APIENTRY *hwr_gl_clear_fn)(GLbitfield);
 typedef void (APIENTRY *hwr_gl_read_pixels_fn)(GLint, GLint, GLsizei, GLsizei,
@@ -90,6 +91,7 @@ struct hwr_gl_functions {
     hwr_gl_get_error_fn get_error;
     hwr_gl_get_string_fn get_string;
     hwr_gl_viewport_fn viewport;
+    hwr_gl_scissor_fn scissor;
     hwr_gl_clear_color_fn clear_color;
     hwr_gl_clear_fn clear;
     hwr_gl_read_pixels_fn read_pixels;
@@ -526,6 +528,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(get_error, hwr_gl_get_error_fn, "glGetError");
     HWR_LOAD_GL(get_string, hwr_gl_get_string_fn, "glGetString");
     HWR_LOAD_GL(viewport, hwr_gl_viewport_fn, "glViewport");
+    HWR_LOAD_GL(scissor, hwr_gl_scissor_fn, "glScissor");
     HWR_LOAD_GL(clear_color, hwr_gl_clear_color_fn, "glClearColor");
     HWR_LOAD_GL(clear, hwr_gl_clear_fn, "glClear");
     HWR_LOAD_GL(read_pixels, hwr_gl_read_pixels_fn, "glReadPixels");
@@ -612,9 +615,10 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=9) in uvec4 a_wall_source;\n"
     "layout(location=10) in uvec4 a_wall_rows;\n"
     "layout(location=11) in uvec4 a_wall_span;\n"
-    "layout(location=12) in uvec2 a_wall_vertical;\n"
+    "layout(location=12) in uvec4 a_wall_vertical;\n"
     "uniform ivec2 u_view_offset;\n"
     "uniform int u_eye_z;\n"
+    "uniform int u_x_flip;\n"
     "uniform vec2 u_basis;\n"
     "uniform ivec2 u_basis_fixed;\n"
     "uniform vec2 u_focal;\n"
@@ -634,7 +638,7 @@ static const char g_geometry_vertex_shader[] =
     "flat out uvec4 v_wall_source;\n"
     "flat out uvec4 v_wall_rows;\n"
     "flat out uvec4 v_wall_span;\n"
-    "flat out uvec2 v_wall_vertical;\n"
+    "flat out uvec4 v_wall_vertical;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
     "noperspective out float v_wall_shade_top;\n"
     "flat out uint v_wall_tint_adjust;\n"
@@ -645,6 +649,7 @@ static const char g_geometry_vertex_shader[] =
     "  int dy=wrap16(a_pos.y+u_view_offset.y);\n"
     "  float s=u_basis.x, c=u_basis.y;\n"
     "  float vx=s*float(dx)+c*float(dy);\n"
+    "  if (u_x_flip != 0) vx=-vx;\n"
     "  float depth=s*float(dy)-c*float(dx);\n"
     "  float zr=float(u_eye_z-a_pos.z);\n"  /* the engine's vertical span term is (eye - z) */
     "  float clip_x=(2.0*u_focal.x/u_viewport.x)*vx+"
@@ -690,11 +695,13 @@ static const char g_geometry_fragment_shader[] =
     "uniform int u_glow_phase;\n"
     "uniform ivec2 u_view_offset;\n"
     "uniform int u_eye_z;\n"
+    "uniform int u_x_flip;\n"
     "uniform ivec2 u_basis_fixed;\n"
     "uniform ivec2 u_focal_i;\n"
     "uniform ivec2 u_center_i;\n"
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
+    "uniform vec2 u_viewport;\n"
     "uniform ivec2 u_shade_origin;\n"
     "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
@@ -733,13 +740,17 @@ static const char g_geometry_fragment_shader[] =
     "flat in uvec4 v_wall_source;\n"
     "flat in uvec4 v_wall_rows;\n"
     "flat in uvec4 v_wall_span;\n"
-    "flat in uvec2 v_wall_vertical;\n"
+    "flat in uvec4 v_wall_vertical;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
     "noperspective in float v_wall_shade_top;\n"
     "flat in uint v_wall_tint_adjust;\n"
     "flat in uint v_flat_taint;\n"
     "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
     "int signed16(uint v) { int n=int(v & 65535u); return n>=32768 ? n-65536 : n; }\n"
+    "int source_column() {\n"
+    "  int column=int(gl_FragCoord.x);\n"
+    "  return u_x_flip != 0 ? 2*u_center_i.x-column : column;\n"
+    "}\n"
     "uint wall_quotient(int column) {\n"
     "  uint numerator=v_wall_source.x, denominator=v_wall_source.y;\n"
     "  uint numerator_step=v_wall_source.z; int denominator_step=int(v_wall_source.w);\n"
@@ -783,7 +794,7 @@ static const char g_geometry_fragment_shader[] =
     "    bool transparent=(flags & 1u)!=0u;\n"
     "    int dimension_shift=(square256 && !transparent) ? 1 : 0;\n"
     "    int pan_shift=square256 ? 1 : 0;\n"
-    "    int row=int(gl_FragCoord.y), column=int(gl_FragCoord.x);\n"
+    "    int row=int(gl_FragCoord.y), column=source_column();\n"
     "    int height_delta=abs(u_eye_z-int(v_world.z));\n"
     "    int remaining=int(v_flat_span.z)>u_center_i.y ? row-u_center_i.y : u_center_i.y-row;\n"
     "    uint dividend=uint(height_delta << (4-scale+dimension_shift))*uint(u_focal_i.y);\n"
@@ -953,7 +964,7 @@ static const char g_geometry_fragment_shader[] =
      * term measures from the jittered shade origin (the light position); the
      * jitter is the flicker. */
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
-    "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
     "      int edge_depth=(depth+max(px,py)) & 65535;\n"
     "      r=(edge_depth >> shr)-bias-u_flat_edge_bias;\n"
@@ -1001,7 +1012,7 @@ static const char g_geometry_fragment_shader[] =
     "    }\n"
     "    {\n"
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
-    "      int px=(abs(wrap16(int(gl_FragCoord.x)-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
     "      int edge_depth=(depth+max(px,py)) & 65535;\n"
     /* The engine's flags&0x40 wall block darkens the tinted bias by a per-face
@@ -1040,17 +1051,20 @@ static const char g_geometry_fragment_shader[] =
     "  return ((q & 1)==0 && checker!=0) ? max(row-1,0) : row;\n"
     "}\n"
     "uniform int u_debug_vis;\n"
+    "uniform int u_depth_only;\n"
     "void main() {\n"
     "  uint material=v_light_material.y;\n"
-    /* Portal-clipped billboards retain their original world quad and texture
-     * interpolation. Their exact framebuffer-X bounds are 16.16 values in the
-     * otherwise-unused flat span step/origin fields. This avoids the multi-pixel
-     * reprojection error caused by rounding a close sliced quad to int16 world
-     * coordinates. */
-    "  if ((v_flat_span.w & 0x40000000u)!=0u) {\n"
+    /* Portal-clipped geometry retains its original world vertices and texture
+     * interpolation. Exact framebuffer-X bounds travel as dedicated 16.16
+     * values, so walls, flats, meshes, and billboards share the same gate. */
+    "  if (v_wall_vertical.w>v_wall_vertical.z) {\n"
     "    uint fx=uint(floor(gl_FragCoord.x*65536.0));\n"
-    "    if (fx<v_flat_span.y || fx>=v_flat_span.z) discard;\n"
+    "    if (fx<v_wall_vertical.z || fx>=v_wall_vertical.w) discard;\n"
     "  }\n"
+    /* A scheduled primary mirror is colourless but still owns depth at its
+     * plane. This early exit deliberately bypasses texture masks and shading;
+     * glDrawBuffers(GL_NONE) discards both outputs while depth is retained. */
+    "  if (u_depth_only!=0) { out_index=0u; out_floor_id=0u; return; }\n"
     /* Owner-floor identity output for the world pass: a world flat FLOOR
      * fragment publishes FLOOR_TAG | (its world z & 0xffff); direct-mapped mesh
      * flats and everything else publish 0. The exception passes bind COLOR1 as
@@ -1087,7 +1101,8 @@ static const char g_geometry_fragment_shader[] =
      * letting it write depth would hide the geometry seen through the arch. */
     "    if (u_sky_occlusion_pass!=0 && (material & 64u)==0u) discard;\n"
     "    if (u_sky_valid==0) discard;\n"
-    "    int sx=int(gl_FragCoord.x), sy=int(gl_FragCoord.y);\n"
+    "    int sx=clamp(source_column(),0,int(u_viewport.x)-1);"
+    " int sy=int(gl_FragCoord.y);\n"
     "    int scolumn=int(texelFetch(u_texels,u_sky_projection_offset+sx).r);\n"
     "    scolumn=(scolumn-(u_sky_yaw << 1)) & 255;\n"
     "    int srow=u_sky_start_row+(u_sky_double_scanline!=0 ? (sy >> 1) : sy);\n"
@@ -1659,7 +1674,7 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.vertex_attrib_i_pointer(11, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_first_x));
     g_gl.enable_vertex_attrib_array(12);
-    g_gl.vertex_attrib_i_pointer(12, 2, GL_UNSIGNED_INT, (GLsizei)stride,
+    g_gl.vertex_attrib_i_pointer(12, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_vertical_origin));
     g_gl.gen_vertex_arrays(1, &g_resolve_vao);
 
@@ -1936,41 +1951,28 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
     return 1;
 }
 
-const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
-                                    size_t sky_vertices,
-                                    size_t opaque_vertices,
-                                    size_t flat_vertices,
-                                    size_t translucent_vertices,
-                                    const uint32_t *translucent_runs,
-                                    size_t translucent_run_count,
-                                    size_t opaque_billboard_vertices,
-                                    size_t shadow_vertices,
-                                    size_t shadow_run_count,
-                                    int floor_exception,
-                                    const struct hwr_gl_camera *camera,
-                                    const uint8_t palette_rgba[1024],
-                                    uint32_t width, uint32_t height)
+static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
+                              uint32_t width, uint32_t height)
 {
-    size_t total = sky_vertices + opaque_vertices + translucent_vertices;
-    /* Only ever seen on the first frame after the target is created or
-     * resized, so it should be unobtrusive rather than a marker colour. */
-    const GLuint clear_index[4] = { 0u, 0, 0, 0 };
+    const struct hwr_gl_vertex *vertices = view->vertices;
+    size_t sky_vertices = view->sky_vertices;
+    size_t mirror_depth_vertices = view->mirror_depth_vertices;
+    size_t opaque_vertices = view->opaque_vertices;
+    size_t flat_vertices = view->flat_vertices;
+    size_t translucent_vertices = view->translucent_vertices;
+    const uint32_t *translucent_runs = view->translucent_runs;
+    const uint8_t *translucent_run_flags = view->translucent_run_flags;
+    size_t translucent_run_count = view->translucent_run_count;
+    size_t opaque_billboard_vertices = view->opaque_billboard_vertices;
+    size_t shadow_vertices = view->shadow_vertices;
+    size_t shadow_run_count = view->shadow_run_count;
+    size_t translucent_billboard_run_count =
+        view->translucent_billboard_run_count;
+    int floor_exception = view->floor_exception;
+    const struct hwr_gl_camera *camera = &view->camera;
+    size_t total = sky_vertices + mirror_depth_vertices +
+                   opaque_vertices + translucent_vertices;
     GLint blend_location;
-    if (!g_initialized || !g_scene_uploaded || vertices == NULL || camera == NULL ||
-        palette_rgba == NULL || total > (size_t)INT32_MAX ||
-        total > (size_t)PTRDIFF_MAX / sizeof *vertices ||
-        !hwr_platform_make_current()) {
-        snprintf(g_error, sizeof g_error, "scene render inputs are invalid");
-        return NULL;
-    }
-    if ((g_fbo_width != width || g_fbo_height != height) &&
-        !hwr_create_framebuffer(width, height))
-        return NULL;
-    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
-    g_gl.active_texture(GL_TEXTURE1);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
-    g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
-                          GL_RGBA, GL_UNSIGNED_BYTE, palette_rgba);
 
     g_gl.bind_vertex_array(g_scene_vao);
     g_gl.bind_buffer(GL_ARRAY_BUFFER, g_scene_vbo);
@@ -1980,6 +1982,14 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                      vertices, GL_STREAM_DRAW);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    if (view->clip_right > view->clip_left) {
+        g_gl.enable(GL_SCISSOR_TEST);
+        g_gl.scissor(view->clip_left, 0,
+                     (GLsizei)(view->clip_right - view->clip_left),
+                     (GLsizei)height);
+    } else {
+        g_gl.disable(GL_SCISSOR_TEST);
+    }
     /* The world pass records both the palette index (COLOR0) and the owner-floor
      * identity (COLOR1); the exception/translucent passes switch back to COLOR0
      * only so they never disturb the recorded ids. */
@@ -1988,38 +1998,12 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
             { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
         g_gl.draw_buffers(2, both_buffers);
     }
-    /* The floor-id target is per-frame identity, never persisted: wipe it to
-     * zero ("no floor here") every frame regardless of the void-persist policy. */
+    /* Depth and floor ownership belong to this view alone. Colour remains so
+     * later views composite over earlier ones. */
     {
         const GLuint clear_floor[4] = { 0u, 0u, 0u, 0u };
         g_gl.clear_buffer_uiv(GL_COLOR, 1, clear_floor);
     }
-    /* The original never wipes the view before drawing it, so a column no
-     * surface covers keeps whatever the previous frame left in that pixel.
-     * This shows up where a see-through surface has nothing but void behind
-     * it: the blend reads those stale pixels as its background. Wiping to a
-     * constant here would lighten that result, so the target is cleared only
-     * when it is first created or resized. HWR_VOID_PERSIST=0 restores the
-     * per-frame wipe. */
-    if (g_void_persist < 0) {
-        const char *persist = getenv("HWR_VOID_PERSIST");
-        g_void_persist = persist != NULL && persist[0] == '0' ? 0 : 1;
-    }
-    if (!g_void_persist || g_index_target_dirty) {
-        /* At a map load the engine's framebuffer holds the backdrop image, so
-         * void starts as that art rather than as a flat colour; the seed carries
-         * the part of it the viewport covers. */
-        if (!hwr_consume_index_seed(width, height))
-            g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
-        g_index_target_dirty = 0;
-    }
-    /* Snapshot the persisted target before anything draws: this is the
-     * "previous frame" that stale-masked walls show through their holes and
-     * blend their high-bit texels against. */
-    g_gl.active_texture(GL_TEXTURE6);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
-    g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                               (GLsizei)width, (GLsizei)height);
     g_gl.clear(GL_DEPTH_BUFFER_BIT);
     hwr_bind_scene_textures();
     if (g_debug_vis < 0) {
@@ -2072,9 +2056,11 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     g_gl.bind_texture(GL_TEXTURE_2D, 0);
     g_gl.active_texture(GL_TEXTURE0);
     hwr_uniform_1i(g_geometry_program, "u_debug_vis", g_debug_vis);
+    hwr_uniform_1i(g_geometry_program, "u_depth_only", 0);
     hwr_uniform_2i(g_geometry_program, "u_view_offset",
                    camera->view_offset_x, camera->view_offset_y);
     hwr_uniform_1i(g_geometry_program, "u_eye_z", camera->eye_z);
+    hwr_uniform_1i(g_geometry_program, "u_x_flip", camera->x_flip != 0);
     hwr_uniform_2f(g_geometry_program, "u_basis",
                    (GLfloat)camera->yaw_sin / 16384.0f,
                    (GLfloat)camera->yaw_cos / 16384.0f);
@@ -2165,6 +2151,28 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         g_gl.polygon_offset(0.0f, 0.0f);
         g_gl.disable(GL_POLYGON_OFFSET_FILL);
     }
+    /* Reflections were composited before the primary view, whose depth buffer
+     * must be cleared because it uses a different camera. Re-stamp each
+     * scheduled mirror plane without touching colour so primary geometry
+     * behind that plane cannot paint over the reflected image. Geometry nearer
+     * than the plane still passes normally, and a translucent authored mirror
+     * overlay later passes at equal depth under GL_LEQUAL. */
+    if (mirror_depth_vertices != 0) {
+        static const GLenum no_buffers[1] = { GL_NONE };
+        static const GLenum both_buffers[2] =
+            { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+        g_gl.enable(GL_DEPTH_TEST);
+        g_gl.depth_func(GL_LESS);
+        g_gl.depth_mask(GL_TRUE);
+        g_gl.draw_buffers(1, no_buffers);
+        hwr_uniform_1i(g_geometry_program, "u_depth_only", 1);
+        g_gl.draw_arrays(GL_TRIANGLES,
+                         (GLint)(sky_vertices + opaque_vertices +
+                                 translucent_vertices),
+                         (GLsizei)mirror_depth_vertices);
+        hwr_uniform_1i(g_geometry_program, "u_depth_only", 0);
+        g_gl.draw_buffers(2, both_buffers);
+    }
     /* Opaque geometry overwrites the colour-only sky and wins against a
      * farther sky occluder wherever it projects. The world and camera-facing
      * billboards draw first; the fixed-orientation (flat) billboards ride the
@@ -2233,7 +2241,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
          * wins everywhere -- matching the engine's paint order above and below the
          * floor line. */
         if (shadow_vertices != 0) {
-            GLint first = (GLint)(sky_vertices + opaque_vertices + trans_main_vertices);
+            GLint first = (GLint)(sky_vertices + opaque_vertices +
+                                  trans_main_vertices);
             if (blend_location >= 0)
                 g_gl.uniform_1i(blend_location, 1);
             g_gl.active_texture(GL_TEXTURE5);
@@ -2258,7 +2267,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
             if (blend_location >= 0)
                 g_gl.uniform_1i(blend_location, 0);
             g_gl.draw_arrays(GL_TRIANGLES,
-                (GLint)(sky_vertices + opaque_main - opaque_billboard_vertices),
+                (GLint)(sky_vertices + opaque_main -
+                        opaque_billboard_vertices),
                 (GLsizei)opaque_billboard_vertices);
         }
         hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
@@ -2284,6 +2294,14 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
         g_gl.depth_func(GL_LEQUAL);
         if (blend_location >= 0)
             g_gl.uniform_1i(blend_location, 1);
+        /* The opaque/shadow exception block above is allowed to be absent in a
+         * scene containing only translucent pickups. Bind the floor identity
+         * target independently for this path instead of inheriting unit 7. */
+        if (floor_exception && translucent_billboard_run_count != 0) {
+            g_gl.active_texture(GL_TEXTURE0 + 7);
+            g_gl.bind_texture(GL_TEXTURE_2D, g_floor_id_texture);
+            g_gl.active_texture(GL_TEXTURE0);
+        }
         g_gl.active_texture(GL_TEXTURE5);
         g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
         if (translucent_runs == NULL || trans_main_runs == 0) {
@@ -2297,6 +2315,22 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
                                            (GLsizei)width, (GLsizei)height);
                 g_gl.draw_arrays(GL_TRIANGLES, first,
                                  (GLsizei)translucent_runs[run]);
+                /* A translucent object is one painter-order operation even
+                 * when its lower pixels need the owner-floor exception. Draw
+                 * both disjoint portions against the same pre-run destination
+                 * snapshot, then let the next run observe their combined
+                 * result. */
+                if (floor_exception && translucent_run_flags != NULL &&
+                    (translucent_run_flags[run] &
+                     HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION) != 0) {
+                    hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
+                    g_gl.disable(GL_DEPTH_TEST);
+                    g_gl.draw_arrays(GL_TRIANGLES, first,
+                                     (GLsizei)translucent_runs[run]);
+                    hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
+                    g_gl.enable(GL_DEPTH_TEST);
+                    g_gl.depth_func(GL_LEQUAL);
+                }
                 first += (GLint)translucent_runs[run];
             }
         }
@@ -2305,6 +2339,146 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
     }
     }
 
+    return 1;
+}
+
+static int hwr_gl_scene_view_valid(const struct hwr_gl_scene_view *view,
+                                   uint32_t width)
+{
+    size_t total;
+    size_t run;
+    size_t run_vertices = 0;
+    size_t opaque_main;
+    size_t translucent_main_runs;
+    size_t translucent_billboard_runs = 0;
+
+    if (view->sky_vertices > SIZE_MAX - view->mirror_depth_vertices)
+        return 0;
+    total = view->sky_vertices + view->mirror_depth_vertices;
+    if (total > SIZE_MAX - view->opaque_vertices)
+        return 0;
+    total += view->opaque_vertices;
+    if (total > SIZE_MAX - view->translucent_vertices)
+        return 0;
+    total += view->translucent_vertices;
+    if ((total != 0 && view->vertices == NULL) ||
+        total > (size_t)INT32_MAX ||
+        total > (size_t)PTRDIFF_MAX / sizeof *view->vertices ||
+        view->flat_vertices > view->opaque_vertices ||
+        view->shadow_vertices > view->translucent_vertices ||
+        view->shadow_run_count > view->translucent_run_count)
+        return 0;
+    opaque_main = view->opaque_vertices - view->flat_vertices;
+    translucent_main_runs =
+        view->translucent_run_count - view->shadow_run_count;
+    if (view->opaque_billboard_vertices > opaque_main ||
+        view->translucent_billboard_run_count > translucent_main_runs)
+        return 0;
+    if (view->translucent_run_count != 0) {
+        if (view->translucent_runs == NULL ||
+            view->translucent_run_flags == NULL)
+            return 0;
+        for (run = 0; run < view->translucent_run_count; run++) {
+            size_t count = view->translucent_runs[run];
+            uint8_t flags = view->translucent_run_flags[run];
+            if ((flags & (uint8_t)~HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION) != 0 ||
+                (run >= translucent_main_runs && flags != 0))
+                return 0;
+            if (run < translucent_main_runs &&
+                (flags & HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION) != 0)
+                translucent_billboard_runs++;
+            if (count > (size_t)INT32_MAX ||
+                run_vertices > SIZE_MAX - count)
+                return 0;
+            run_vertices += count;
+        }
+        if (run_vertices != view->translucent_vertices ||
+            translucent_billboard_runs !=
+                view->translucent_billboard_run_count)
+            return 0;
+    }
+    if (view->clip_left != view->clip_right &&
+        (view->clip_left < 0 || view->clip_right <= view->clip_left ||
+         (uint32_t)view->clip_right > width))
+        return 0;
+    return 1;
+}
+
+const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
+                                    size_t view_count,
+                                    const uint8_t palette_rgba[1024],
+                                    uint32_t width, uint32_t height)
+{
+    size_t view_index;
+    /* Only ever seen on the first frame after the target is created or
+     * resized, so it should be unobtrusive rather than a marker colour. */
+    const GLuint clear_index[4] = { 0u, 0, 0, 0 };
+
+    if (!g_initialized || !g_scene_uploaded || views == NULL ||
+        view_count == 0 || view_count > (size_t)INT32_MAX ||
+        palette_rgba == NULL || width == 0 || height == 0 ||
+        width > (uint32_t)INT32_MAX || height > (uint32_t)INT32_MAX ||
+        !hwr_platform_make_current()) {
+        snprintf(g_error, sizeof g_error, "scene render inputs are invalid");
+        return NULL;
+    }
+    for (view_index = 0; view_index < view_count; view_index++) {
+        if (!hwr_gl_scene_view_valid(&views[view_index], width)) {
+            snprintf(g_error, sizeof g_error,
+                     "scene view %lu is invalid", (unsigned long)view_index);
+            return NULL;
+        }
+    }
+    if ((g_fbo_width != width || g_fbo_height != height) &&
+        !hwr_create_framebuffer(width, height))
+        return NULL;
+
+    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                          GL_RGBA, GL_UNSIGNED_BYTE, palette_rgba);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.disable(GL_SCISSOR_TEST);
+    {
+        static const GLenum both_buffers[2] =
+            { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+        g_gl.draw_buffers(2, both_buffers);
+    }
+    /* The original never wipes the view before drawing it, so a column no
+     * surface covers keeps whatever the previous frame left in that pixel.
+     * This shows up where a see-through surface has nothing but void behind
+     * it: the blend reads those stale pixels as its background. Wiping to a
+     * constant here would lighten that result, so the target is cleared only
+     * when it is first created or resized. HWR_VOID_PERSIST=0 restores the
+     * per-frame wipe. */
+    if (g_void_persist < 0) {
+        const char *persist = getenv("HWR_VOID_PERSIST");
+        g_void_persist = persist != NULL && persist[0] == '0' ? 0 : 1;
+    }
+    if (!g_void_persist || g_index_target_dirty) {
+        /* At a map load the engine's framebuffer holds the backdrop image, so
+         * void starts as that art rather than as a flat colour; the seed carries
+         * the part of it the viewport covers. */
+        if (!hwr_consume_index_seed(width, height))
+            g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
+        g_index_target_dirty = 0;
+    }
+    /* Snapshot the persisted target before anything draws: this is the
+     * "previous frame" that stale-masked walls show through their holes and
+     * blend their high-bit texels against. */
+    g_gl.active_texture(GL_TEXTURE6);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
+    g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                               (GLsizei)width, (GLsizei)height);
+
+    for (view_index = 0; view_index < view_count; view_index++) {
+        if (!hwr_gl_render_view(&views[view_index], width, height))
+            return NULL;
+    }
+
+    g_gl.disable(GL_SCISSOR_TEST);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.disable(GL_DEPTH_TEST);

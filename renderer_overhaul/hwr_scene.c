@@ -146,6 +146,7 @@ static struct hwr_mesh_surface *hwr_add_surface(struct hwr_scene_mesh *mesh,
     memset(surface, 0, sizeof *surface);
     surface->first_vertex = mesh->vertex_count;
     surface->vertex_count = vertex_count;
+    surface->wall_offset = UINT16_MAX;
     surface->kind = kind;
     mesh->kind_counts[kind]++;
     return surface;
@@ -424,6 +425,7 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     if (surface == NULL)
         return -1;
     surface->sector_index = wall->sector_index;
+    surface->wall_offset = wall->section_offset;
     surface->extent = extent;
     surface->scale = wall->scale;
     surface->pan_u = wall->extent < 0 ? wall->pan_u : 0;
@@ -954,6 +956,7 @@ static void hwr_scene_animations_clear(struct hwr_scene *scene)
 
 void hwr_scene_clear(struct hwr_scene *scene)
 {
+    size_t i;
     if (scene == NULL)
         return;
     hwr_gl_scene_clear();
@@ -963,8 +966,15 @@ void hwr_scene_clear(struct hwr_scene *scene)
     hwr_billboards_clear(&scene->billboards);
     free(scene->stream_vertices);
     free(scene->translucent_runs);
+    free(scene->translucent_run_flags);
     free(scene->visible);
     free(scene->spans);
+    free(scene->reflection_spans);
+    for (i = 0; i < HWR_REFLECTION_MAX; i++) {
+        free(scene->reflections[i].vertices);
+        free(scene->reflections[i].runs);
+        free(scene->reflections[i].run_flags);
+    }
     memset(scene, 0, sizeof *scene);
 }
 
@@ -1518,6 +1528,7 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->eye_z = (int16_t)api->game_ram->u16(VA_G_EYE_Z);
     camera->yaw_sin = (int16_t)api->game_ram->u16(VA_G_CAMERA_SIN);
     camera->yaw_cos = (int16_t)api->game_ram->u16(VA_G_CAMERA_COS);
+    camera->yaw = api->game_ram->u16(VA_G_SKY_YAW);
     camera->focal_x = api->game_ram->u16(VA_G_FOCAL_X);
     camera->focal_y = api->game_ram->u16(VA_G_FOCAL_Y);
     camera->center_x = (int32_t)api->game_ram->u32(VA_G_CENTER_X);
@@ -1598,9 +1609,70 @@ static int hwr_face_cull_enabled(void)
     return enabled;
 }
 
-static int hwr_surface_visible(const struct hwr_scene *scene,
-                               const struct hwr_mesh_surface *surface,
-                               const struct hwr_gl_camera *camera)
+enum hwr_mirror_surface_mode {
+    HWR_MIRROR_SURFACE_NORMAL = 0,
+    HWR_MIRROR_SURFACE_OMIT,
+    HWR_MIRROR_SURFACE_SOLID
+};
+
+static enum hwr_mirror_surface_mode hwr_mirror_surface_mode(
+    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera)
+{
+    uint16_t logical;
+    size_t i;
+    int scheduled = 0;
+
+    if (surface->wall_offset == UINT16_MAX || surface->texture_id < 0)
+        return HWR_MIRROR_SURFACE_NORMAL;
+    logical = (uint16_t)surface->texture_id;
+    if (logical >= 0x1600u ||
+        (scene->textures[logical].qflags & 0x800u) == 0)
+        return HWR_MIRROR_SURFACE_NORMAL;
+
+    if (!camera->reflected) {
+        for (i = 0; i < scene->reflection_count; i++) {
+            if (scene->reflections[i].wall_offset == surface->wall_offset) {
+                scheduled = 1;
+                break;
+            }
+        }
+    }
+    if (!scheduled)
+        return HWR_MIRROR_SURFACE_SOLID;
+    /* A mirror carrying the transparency bit paints its authored overlay after
+     * registering the reflected view. A plain mirror paints nothing in the
+     * primary view, exposing the reflected pixels already underneath. */
+    return (scene->textures[logical].qflags & 0x400u) != 0
+         ? HWR_MIRROR_SURFACE_NORMAL : HWR_MIRROR_SURFACE_OMIT;
+}
+
+static int hwr_mirror_depth_surface(
+    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera)
+{
+    enum hwr_mirror_surface_mode mode;
+    uint16_t logical;
+
+    if (camera->reflected || surface->wall_offset == UINT16_MAX ||
+        surface->texture_id < 0)
+        return 0;
+    logical = (uint16_t)surface->texture_id;
+    if (logical >= 0x1600u ||
+        (scene->textures[logical].qflags & 0x800u) == 0)
+        return 0;
+    mode = hwr_mirror_surface_mode(scene, surface, camera);
+    /* A scheduled plain mirror is omitted from colour; a scheduled transparent
+     * mirror keeps its authored overlay. Both own the same primary-view depth
+     * plane, while unscheduled/nested mirrors remain ordinary solid geometry. */
+    return mode == HWR_MIRROR_SURFACE_OMIT ||
+           (mode == HWR_MIRROR_SURFACE_NORMAL &&
+            (scene->textures[logical].qflags & 0xc00u) == 0xc00u);
+}
+
+static int hwr_surface_geometry_visible(
+    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera)
 {
     const struct hwr_scene_mesh *mesh = &scene->mesh;
     int16_t z;
@@ -1630,6 +1702,16 @@ static int hwr_surface_visible(const struct hwr_scene *scene,
         ? camera->eye_z < z : camera->eye_z > z;
 }
 
+static int hwr_surface_visible(const struct hwr_scene *scene,
+                               const struct hwr_mesh_surface *surface,
+                               const struct hwr_gl_camera *camera)
+{
+    if (hwr_mirror_surface_mode(scene, surface, camera) ==
+        HWR_MIRROR_SURFACE_OMIT)
+        return 0;
+    return hwr_surface_geometry_visible(scene, surface, camera);
+}
+
 static int hwr_flat_transparent(const struct hwr_scene *scene,
                                 const struct hwr_mesh_surface *surface);
 
@@ -1648,6 +1730,21 @@ static int hwr_flat_blend_enabled(void)
     return enabled;
 }
 
+/* A scheduled mirror may carry the ordinary block-transparency bit as an
+ * authored pane over the reflected image.  Unlike a normal wall, that pane's
+ * masking/blending is selected by the texture itself even when the map part is
+ * not marked as a masked middle. */
+static int hwr_mirror_overlay(const struct hwr_scene *scene,
+                              const struct hwr_mesh_surface *surface,
+                              const struct hwr_gl_camera *camera)
+{
+    uint16_t logical = (uint16_t)surface->texture_id;
+    return logical < 0x1600u &&
+           hwr_mirror_surface_mode(scene, surface, camera) ==
+               HWR_MIRROR_SURFACE_NORMAL &&
+           (scene->textures[logical].qflags & 0xc00u) == 0xc00u;
+}
+
 /* HWR_WALL_STALE=0 restores the previous fully-opaque rendering of one-sided
  * walls whose texture carries the block transparency bit. */
 static int hwr_wall_stale_enabled(void)
@@ -1661,11 +1758,17 @@ static int hwr_wall_stale_enabled(void)
 }
 
 static int hwr_surface_translucent(struct hwr_scene *scene,
-                                   struct hwr_mesh_surface *surface)
+                                   struct hwr_mesh_surface *surface,
+                                   const struct hwr_gl_camera *camera)
 {
     uint16_t logical;
     uint16_t qflags;
+    if (hwr_mirror_surface_mode(scene, surface, camera) ==
+        HWR_MIRROR_SURFACE_SOLID)
+        return 0;
     if (hwr_flat_blend_enabled() && hwr_flat_transparent(scene, surface))
+        return 1;
+    if (hwr_mirror_overlay(scene, surface, camera))
         return 1;
     if ((surface->flags & (HWR_SURFACE_DIRECT | HWR_SURFACE_MASKED)) !=
         HWR_SURFACE_MASKED)
@@ -2264,6 +2367,13 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
             state->vertical_extent *= 2u;
         }
     }
+    /* The reflected pass reverses screen X after projection. The original
+     * integer wall accumulators are directed left-to-right, so their endpoint
+     * state would need a full handedness reversal. Reflected walls instead use
+     * the existing perspective-interpolated fallback, whose authored endpoint
+     * coordinates reverse naturally with the geometry. */
+    if (camera->x_flip)
+        return;
 
     hwr_wall_view_point(camera, end_a->x, end_a->y, &view_a, &depth_a_q8);
     hwr_wall_view_point(camera, end_b->x, end_b->y, &view_b, &depth_b_q8);
@@ -2678,11 +2788,11 @@ static size_t hwr_surface_reserve(const struct hwr_mesh_surface *surface)
     return surface->vertex_count;
 }
 
-static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
-                                 const struct hwr_mesh_surface *surface,
-                                 const struct hwr_gl_camera *camera,
-                                 uint32_t width, uint32_t height,
-                                 struct hwr_gl_vertex *destination)
+static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
+                                      const struct hwr_mesh_surface *surface,
+                                      const struct hwr_gl_camera *camera,
+                                      uint32_t width, uint32_t height,
+                                      struct hwr_gl_vertex *destination)
 {
     uint16_t logical = (uint16_t)surface->texture_id;
     uint16_t texture_width = 0;
@@ -2696,10 +2806,14 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
     int flat_square256 = 0;
     int wall_stale = 0;
     int wall_tint_adjust = 0;
+    int mirror_solid =
+        hwr_mirror_surface_mode(scene, surface, camera) ==
+        HWR_MIRROR_SURFACE_SOLID;
+    int mirror_overlay = hwr_mirror_overlay(scene, surface, camera);
     /* SOLID-FILL is allowed unless this is a masked (transparent) part whose
      * texture lacks the 0x2000000 override -- the engine's per-part `& 1`
      * exemption; windows / stained glass are never filled however saturated. */
-    int fill_ok = hwr_fill_face_allowed(scene, surface);
+    int fill_ok = !mirror_overlay && hwr_fill_face_allowed(scene, surface);
     struct hwr_wall_span_state wall_span = {0};
     size_t i;
     /* Sky caps carry only a position; the SKY-material fragment branch derives
@@ -2734,7 +2848,8 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                          texture_width == texture_height &&
                          (texture_width & 0xffu) == 0;
         flat_transparent = hwr_flat_transparent(scene, surface);
-    } else if (surface->kind == HWR_SURFACE_SOLID_MIDDLE &&
+    } else if (!mirror_overlay &&
+               surface->kind == HWR_SURFACE_SOLID_MIDDLE &&
                (surface->flags & (HWR_SURFACE_MASKED | HWR_SURFACE_DIRECT)) == 0 &&
                logical < 0x1600u && !scene->textures[logical].direct &&
                (scene->textures[logical].qflags & 0x400u) != 0 &&
@@ -2745,7 +2860,8 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
          * high-bit blends read the untouched -- previous-frame -- pixels. */
         wall_stale = 1;
     }
-    if ((surface->flags & HWR_SURFACE_MASKED) != 0 || flat_transparent)
+    if ((surface->flags & HWR_SURFACE_MASKED) != 0 || flat_transparent ||
+        mirror_overlay)
         flags |= HWR_GL_MATERIAL_MASKED;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         flags |= HWR_GL_MATERIAL_FLAT;
@@ -2761,6 +2877,16 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
     if ((surface->flags & HWR_SURFACE_TRANSLUCENT) != 0 ||
         (flat_transparent && hwr_flat_blend_enabled()))
         flags |= HWR_GL_MATERIAL_TRANSLUCENT;
+    if (mirror_solid) {
+        /* A mirror that was not admitted to the current top-level list, or any
+         * mirror encountered inside a reflected view, falls back to the
+         * engine's untextured solid path. */
+        flags = HWR_GL_MATERIAL_DIRECT;
+        direct_index = 0;
+        flat_transparent = 0;
+        wall_stale = 0;
+        fill_ok = 0;
+    }
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         hwr_flat_span_state(&scene->mesh, surface, camera, height,
                             flat_square256 && !flat_transparent,
@@ -3036,26 +3162,217 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
     return surface->vertex_count;
 }
 
+static void hwr_apply_frame_clip(struct hwr_gl_vertex *vertices, size_t count,
+                                 int left, int right)
+{
+    uint32_t fixed_left;
+    uint32_t fixed_right;
+    size_t i;
+    if (left < 0 || right <= left || right > 0xffff)
+        return;
+    fixed_left = (uint32_t)left << 16;
+    fixed_right = (uint32_t)right << 16;
+    for (i = 0; i < count; i++) {
+        vertices[i].portal_clip_left = fixed_left;
+        vertices[i].portal_clip_right = fixed_right;
+    }
+}
+
+static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
+                                   const struct hwr_mesh_surface *surface,
+                                   const struct hwr_gl_camera *camera,
+                                   uint32_t width, uint32_t height,
+                                   int clip_left, int clip_right,
+                                   struct hwr_gl_vertex *destination)
+{
+    size_t count = hwr_copy_gpu_surface_raw(
+        scene, surface, camera, width, height, destination);
+    hwr_apply_frame_clip(destination, count, clip_left, clip_right);
+    return count;
+}
+
+/* Converts one pre-X-flip engine portal interval (inclusive) to the GL
+ * framebuffer's half-open interval. */
+static int hwr_reflection_frame_window(const struct hwr_gl_camera *camera,
+                                       uint32_t width, int source_left,
+                                       int source_right,
+                                       int *frame_left, int *frame_right)
+{
+    int64_t left;
+    int64_t right;
+    if (source_left > source_right || width == 0)
+        return 0;
+    if (camera->x_flip) {
+        left = 2 * (int64_t)camera->center_x - source_right;
+        right = 2 * (int64_t)camera->center_x - source_left + 1;
+    } else {
+        left = source_left;
+        right = (int64_t)source_right + 1;
+    }
+    if (left < 0)
+        left = 0;
+    if (right > width)
+        right = width;
+    if (left >= right)
+        return 0;
+    *frame_left = (int)left;
+    *frame_right = (int)right;
+    return 1;
+}
+
+static void hwr_prepare_reflection_object_windows(
+    struct hwr_scene *scene, const struct hwr_objects *objects,
+    const struct hwr_gl_camera *camera, uint32_t width)
+{
+    size_t i;
+    if (objects == NULL || scene->spans == NULL ||
+        scene->span_count < objects->count)
+        return;
+    memset(scene->spans, 0, objects->count * sizeof *scene->spans);
+    for (i = 0; i < objects->count; i++) {
+        const struct hwr_object *object = &objects->items[i];
+        struct hwr_sector_xspan *destination = &scene->spans[i];
+        const struct hwr_sector_xspan *source;
+        unsigned k;
+        if (object->sector_index == HWR_OBJECT_NO_SECTOR ||
+            object->sector_index >= scene->reflection_span_count)
+            continue;
+        source = &scene->reflection_spans[object->sector_index];
+        if (source->count == 0 || source->count > HWR_SECTOR_CLIP_MAX)
+            continue;
+        for (k = 0; k < source->count; k++) {
+            int left, right;
+            if (!hwr_reflection_frame_window(
+                    camera, width, source->lo[k], source->hi[k],
+                    &left, &right))
+                continue;
+            destination->lo[destination->count] = (int16_t)left;
+            /* Reflected object spans are already framebuffer-space and use a
+             * half-open right edge, as the billboard fragment gate expects. */
+            destination->hi[destination->count] = (int16_t)right;
+            destination->count++;
+        }
+    }
+}
+
+static const struct hwr_sector_xspan *hwr_surface_reflection_windows(
+    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera)
+{
+    const struct hwr_sector_xspan *span;
+    if (!camera->reflected || !scene->reflection_clip_valid ||
+        surface->sector_index >= scene->reflection_span_count)
+        return NULL;
+    span = &scene->reflection_spans[surface->sector_index];
+    /* A poisoned/overflowed set fails open inside the mirror's global scissor. */
+    if (span->count == 0 || span->count > HWR_SECTOR_CLIP_MAX)
+        return NULL;
+    return span;
+}
+
+static size_t hwr_surface_window_count(
+    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera)
+{
+    const struct hwr_sector_xspan *span =
+        hwr_surface_reflection_windows(scene, surface, camera);
+    return span != NULL ? span->count : 1u;
+}
+
+static size_t hwr_copy_gpu_surface_windows(
+    struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera, uint32_t width, uint32_t height,
+    struct hwr_gl_vertex *destination)
+{
+    const struct hwr_sector_xspan *span =
+        hwr_surface_reflection_windows(scene, surface, camera);
+    size_t emitted = 0;
+    unsigned i;
+    if (span == NULL)
+        return hwr_copy_gpu_surface(scene, surface, camera, width, height,
+                                    0, 0, destination);
+    for (i = 0; i < span->count; i++) {
+        int left, right;
+        if (!hwr_reflection_frame_window(camera, width,
+                                         span->lo[i], span->hi[i],
+                                         &left, &right))
+            continue;
+        emitted += hwr_copy_gpu_surface(
+            scene, surface, camera, width, height, left, right,
+            destination + emitted);
+    }
+    return emitted;
+}
+
+enum hwr_translucent_source {
+    HWR_TRANSLUCENT_WORLD,
+    HWR_TRANSLUCENT_MESH,
+    HWR_TRANSLUCENT_BILLBOARD
+};
+
+struct hwr_translucent_item {
+    size_t source_index;
+    size_t first_vertex;
+    size_t vertex_count;
+    float depth;
+    uint8_t source;
+    uint8_t flags;
+};
+
+static float hwr_translucent_vertex_depth(
+    const struct hwr_gl_vertex *vertices, size_t count,
+    const struct hwr_gl_camera *camera)
+{
+    double x = 0.0;
+    double y = 0.0;
+    double sine = (double)camera->yaw_sin / 16384.0;
+    double cosine = (double)camera->yaw_cos / 16384.0;
+    size_t i;
+    for (i = 0; i < count; i++) {
+        x += (int16_t)((uint16_t)vertices[i].x +
+                       (uint16_t)camera->view_offset_x);
+        y += (int16_t)((uint16_t)vertices[i].y +
+                       (uint16_t)camera->view_offset_y);
+    }
+    if (count == 0)
+        return 0.0f;
+    return (float)((sine * y - cosine * x) / (double)count);
+}
+
+static void hwr_translucent_insert(struct hwr_translucent_item *items,
+                                   size_t *count,
+                                   const struct hwr_translucent_item *item)
+{
+    size_t position = *count;
+    /* Strict comparison preserves the existing order of equal-depth runs. */
+    while (position > 0 && items[position - 1u].depth < item->depth) {
+        items[position] = items[position - 1u];
+        position--;
+    }
+    items[position] = *item;
+    (*count)++;
+}
+
 static int hwr_prepare_stream(struct hwr_scene *scene,
                               const struct hwr_gl_camera *camera,
                               uint32_t width, uint32_t height,
-                              size_t *sky_count, size_t *opaque_count,
+                              size_t *sky_count, size_t *mirror_depth_count,
+                              size_t *opaque_count,
                               size_t *flat_count,
                               size_t *translucent_count,
                               size_t *translucent_run_count)
 {
-    size_t *translucent_order;
-    float *depths;
+    struct hwr_translucent_item *items = NULL;
     size_t visible_vertices = 0;
     size_t sky_vertices = 0;
     size_t translucent_surfaces = 0;
+    size_t item_count = 0;
     size_t i;
     size_t sky_cursor = 0;
     size_t opaque_cursor;
     size_t translucent_cursor;
-    /* Billboard quads emitted for this frame (0 when the layer is disabled):
-     * raw quads follow the opaque surfaces, masked/blend-capable quads follow
-     * the translucent surfaces, one run each. */
+    size_t object_first = 0;
+    size_t billboard_first = 0;
     const struct hwr_meshes *object_meshes = &scene->object_meshes;
     const struct hwr_billboards *bb = &scene->billboards;
     size_t object_mesh_opaque = object_meshes->opaque_count;
@@ -3065,25 +3382,56 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     size_t bb_flat = bb->flat_count;
     size_t bb_translucent = bb->translucent_count;
     size_t bb_runs = bb->run_count;
-    /* The stream packs three back-to-back ranges: [sky][opaque][translucent].
-     * Sky caps come first so they can be drawn as a depth-off background pass;
-     * everything else keeps its opaque-vs-translucent classification. */
+    size_t bb_shadow_runs = bb->shadow_run_count <= bb_runs
+                          ? bb->shadow_run_count : bb_runs;
+    size_t bb_main_runs = bb_runs - bb_shadow_runs;
+    size_t total_runs;
+
+    /* The stream packs [sky][opaque][translucent][mirror-depth]. Mirror planes
+     * live at the tail so their exact expanded count need not be known before
+     * the ordinary cursors are placed; GL submits that tail before opaque
+     * geometry while leaving reflected colour untouched. */
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
+        int regular_visible;
+        int mirror_depth_visible;
+        size_t reserve;
+        size_t windows;
         surface->flags &= (uint8_t)~HWR_SURFACE_TRANSLUCENT;
-        if (!hwr_surface_visible(scene, surface, camera))
+        regular_visible = hwr_surface_visible(scene, surface, camera);
+        mirror_depth_visible =
+            hwr_mirror_depth_surface(scene, surface, camera) &&
+            hwr_surface_geometry_visible(scene, surface, camera);
+        if (!regular_visible && !mirror_depth_visible)
             continue;
-        if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
-            sky_vertices += surface->vertex_count;
-        } else if (hwr_surface_translucent(scene, surface)) {
+        if (regular_visible &&
+            (surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
+            sky_vertices += surface->vertex_count *
+                            hwr_surface_window_count(scene, surface, camera);
+        } else if (regular_visible &&
+                   hwr_surface_translucent(scene, surface, camera)) {
             surface->flags |= HWR_SURFACE_TRANSLUCENT;
             translucent_surfaces++;
         }
         /* Reserve the worst-case expansion: a tinted wall is split into along-
          * length sub-quads (<=2*HWR_WALLSEG_MAX); everything else is 1:1. */
-        visible_vertices += hwr_surface_reserve(surface);
+        reserve = hwr_surface_reserve(surface);
+        windows = hwr_surface_window_count(scene, surface, camera);
+        if (windows != 0 && reserve > SIZE_MAX / windows)
+            return hwr_scene_fail(scene,
+                                  "reflected surface stream overflow");
+        reserve *= windows;
+        if (regular_visible) {
+            if (reserve > SIZE_MAX - visible_vertices)
+                return hwr_scene_fail(scene, "scene vertex count overflow");
+            visible_vertices += reserve;
+        }
+        if (mirror_depth_visible) {
+            if (reserve > SIZE_MAX - visible_vertices)
+                return hwr_scene_fail(scene, "scene vertex count overflow");
+            visible_vertices += reserve;
+        }
     }
-    /* Billboards are exactly six vertices per quad, no per-face expansion. */
     visible_vertices += object_mesh_opaque + object_mesh_translucent +
                         bb_opaque + bb_flat + bb_translucent;
     if (visible_vertices > scene->stream_capacity) {
@@ -3094,51 +3442,47 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         scene->stream_vertices = vertices;
         scene->stream_capacity = visible_vertices;
     }
-    translucent_order = translucent_surfaces != 0
-        ? (size_t *)malloc(translucent_surfaces * sizeof *translucent_order) : NULL;
-    depths = translucent_surfaces != 0
-        ? (float *)malloc(translucent_surfaces * sizeof *depths) : NULL;
-    if (translucent_surfaces != 0 && (translucent_order == NULL || depths == NULL)) {
-        free(translucent_order);
-        free(depths);
-        return hwr_scene_fail(scene, "out of memory sorting translucent surfaces");
+    if (translucent_surfaces > SIZE_MAX - object_mesh_runs ||
+        translucent_surfaces + object_mesh_runs > SIZE_MAX - bb_runs)
+        return hwr_scene_fail(scene, "too many translucent runs");
+    total_runs = translucent_surfaces + object_mesh_runs + bb_runs;
+    if (total_runs != 0) {
+        items = (struct hwr_translucent_item *)malloc(
+            (total_runs - bb_shadow_runs) * sizeof *items);
+        if (items == NULL && total_runs != bb_shadow_runs)
+            return hwr_scene_fail(scene,
+                                  "out of memory sorting translucent runs");
     }
-    translucent_surfaces = 0;
+
     opaque_cursor = sky_vertices;
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
         if (!hwr_surface_visible(scene, surface, camera))
             continue;
         if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0) {
-            sky_cursor += hwr_copy_gpu_surface(scene, surface, camera, width,
-                                 height, scene->stream_vertices + sky_cursor);
+            sky_cursor += hwr_copy_gpu_surface_windows(
+                scene, surface, camera, width, height,
+                scene->stream_vertices + sky_cursor);
         } else if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
-            opaque_cursor += hwr_copy_gpu_surface(scene, surface, camera, width,
-                                 height, scene->stream_vertices + opaque_cursor);
+            opaque_cursor += hwr_copy_gpu_surface_windows(
+                scene, surface, camera, width, height,
+                scene->stream_vertices + opaque_cursor);
         } else {
-            size_t position = translucent_surfaces;
-            float depth = hwr_surface_depth(surface, &scene->mesh, camera);
-            while (position > 0 && depths[position - 1u] < depth) {
-                depths[position] = depths[position - 1u];
-                translucent_order[position] = translucent_order[position - 1u];
-                position--;
-            }
-            depths[position] = depth;
-            translucent_order[position] = i;
-            translucent_surfaces++;
+            struct hwr_translucent_item item;
+            memset(&item, 0, sizeof item);
+            item.source_index = i;
+            item.depth = hwr_surface_depth(surface, &scene->mesh, camera);
+            item.source = HWR_TRANSLUCENT_WORLD;
+            hwr_translucent_insert(items, &item_count, &item);
         }
     }
-    /* Object meshes precede the billboard tail. The floor-exception redraw
-     * identifies eligible billboards by their position at the end of the
-     * opaque range, so this ordering is load-bearing. */
     if (object_mesh_opaque != 0) {
         memcpy(scene->stream_vertices + opaque_cursor, object_meshes->opaque,
                object_mesh_opaque * sizeof *scene->stream_vertices);
         opaque_cursor += object_mesh_opaque;
     }
-    /* Raw billboards ride the tail of the opaque range; the fixed-orientation
-     * (flat) quads follow them, still opaque but kept at the very tail so the GL
-     * layer can draw them with a depth bias toward the viewer. */
+    /* Raw billboards ride the tail of the opaque range; fixed-orientation
+     * quads remain last so the GL layer can apply their coplanar depth bias. */
     if (bb_opaque != 0) {
         memcpy(scene->stream_vertices + opaque_cursor, bb->opaque,
                bb_opaque * sizeof *scene->stream_vertices);
@@ -3149,57 +3493,111 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                bb_flat * sizeof *scene->stream_vertices);
         opaque_cursor += bb_flat;
     }
-    if (translucent_surfaces + object_mesh_runs + bb_runs >
-        scene->translucent_run_capacity) {
+
+    /* Merge every ordinary translucent operation in one camera-space order.
+     * The mesh and billboard emitters already establish stable order within
+     * their own equal-depth groups; insertion keeps those ties unchanged. */
+    for (i = 0; i < object_mesh_runs; i++) {
+        struct hwr_translucent_item item;
+        size_t count = object_meshes->runs[i];
+        memset(&item, 0, sizeof item);
+        item.first_vertex = object_first;
+        item.vertex_count = count;
+        item.depth = hwr_translucent_vertex_depth(
+            object_meshes->translucent + object_first, count, camera);
+        item.source = HWR_TRANSLUCENT_MESH;
+        hwr_translucent_insert(items, &item_count, &item);
+        object_first += count;
+    }
+    for (i = 0; i < bb_main_runs; i++) {
+        struct hwr_translucent_item item;
+        size_t count = bb->runs[i];
+        memset(&item, 0, sizeof item);
+        item.first_vertex = billboard_first;
+        item.vertex_count = count;
+        item.depth = hwr_translucent_vertex_depth(
+            bb->translucent + billboard_first, count, camera);
+        item.source = HWR_TRANSLUCENT_BILLBOARD;
+        item.flags = HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION;
+        hwr_translucent_insert(items, &item_count, &item);
+        billboard_first += count;
+    }
+
+    if (total_runs > scene->translucent_run_capacity) {
         uint32_t *runs = (uint32_t *)realloc(
-            scene->translucent_runs,
-            (translucent_surfaces + object_mesh_runs + bb_runs) *
-            sizeof *runs);
+            scene->translucent_runs, total_runs * sizeof *runs);
+        uint8_t *flags;
         if (runs == NULL) {
-            free(translucent_order);
-            free(depths);
-            return hwr_scene_fail(scene, "out of memory recording translucent runs");
+            free(items);
+            return hwr_scene_fail(scene,
+                                  "out of memory recording translucent runs");
         }
         scene->translucent_runs = runs;
-        scene->translucent_run_capacity =
-            translucent_surfaces + object_mesh_runs + bb_runs;
+        flags = (uint8_t *)realloc(scene->translucent_run_flags,
+                                  total_runs * sizeof *flags);
+        if (flags == NULL) {
+            free(items);
+            return hwr_scene_fail(scene,
+                                  "out of memory recording translucent run flags");
+        }
+        scene->translucent_run_flags = flags;
+        scene->translucent_run_capacity = total_runs;
     }
+
     translucent_cursor = opaque_cursor;
-    for (i = 0; i < translucent_surfaces; i++) {
-        const struct hwr_mesh_surface *surface =
-            &scene->mesh.surfaces[translucent_order[i]];
-        size_t emitted = hwr_copy_gpu_surface(scene, surface, camera, width,
-                             height, scene->stream_vertices + translucent_cursor);
+    for (i = 0; i < item_count; i++) {
+        const struct hwr_translucent_item *item = &items[i];
+        size_t emitted = item->vertex_count;
+        if (item->source == HWR_TRANSLUCENT_WORLD) {
+            const struct hwr_mesh_surface *surface =
+                &scene->mesh.surfaces[item->source_index];
+            emitted = hwr_copy_gpu_surface_windows(
+                scene, surface, camera, width, height,
+                scene->stream_vertices + translucent_cursor);
+        } else {
+            const struct hwr_gl_vertex *source =
+                item->source == HWR_TRANSLUCENT_MESH
+                ? object_meshes->translucent : bb->translucent;
+            if (emitted != 0)
+                memcpy(scene->stream_vertices + translucent_cursor,
+                       source + item->first_vertex,
+                       emitted * sizeof *scene->stream_vertices);
+        }
         scene->translucent_runs[i] = (uint32_t)emitted;
+        scene->translucent_run_flags[i] = item->flags;
         translucent_cursor += emitted;
     }
-    /* Blend-capable mesh faces are sorted back to front by the mesh layer and
-     * retain one destination-refresh run per face. */
-    if (object_mesh_translucent != 0) {
-        size_t r;
-        memcpy(scene->stream_vertices + translucent_cursor,
-               object_meshes->translucent,
-               object_mesh_translucent * sizeof *scene->stream_vertices);
-        translucent_cursor += object_mesh_translucent;
-        for (r = 0; r < object_mesh_runs; r++)
-            scene->translucent_runs[translucent_surfaces + r] =
-                object_meshes->runs[r];
+
+    /* Ground shadows retain their dedicated tail and are excluded from the
+     * ordinary blend loop. */
+    for (i = 0; i < bb_shadow_runs; i++) {
+        size_t run = bb_main_runs + i;
+        size_t count = bb->runs[run];
+        if (count != 0)
+            memcpy(scene->stream_vertices + translucent_cursor,
+                   bb->translucent + billboard_first,
+                   count * sizeof *scene->stream_vertices);
+        scene->translucent_runs[item_count + i] = (uint32_t)count;
+        scene->translucent_run_flags[item_count + i] = 0;
+        billboard_first += count;
+        translucent_cursor += count;
     }
-    /* Masked / blend-capable billboards, already depth-sorted back to front,
-     * ride the tail of the translucent range, each as its own blend run. */
-    if (bb_translucent != 0) {
-        size_t r;
-        memcpy(scene->stream_vertices + translucent_cursor, bb->translucent,
-               bb_translucent * sizeof *scene->stream_vertices);
-        translucent_cursor += bb_translucent;
-        for (r = 0; r < bb_runs; r++)
-            scene->translucent_runs[
-                translucent_surfaces + object_mesh_runs + r] = bb->runs[r];
+
+    {
+        size_t mirror_cursor = translucent_cursor;
+        for (i = 0; i < scene->mesh.surface_count; i++) {
+            const struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
+            if (!hwr_mirror_depth_surface(scene, surface, camera) ||
+                !hwr_surface_geometry_visible(scene, surface, camera))
+                continue;
+            mirror_cursor += hwr_copy_gpu_surface_windows(
+                scene, surface, camera, width, height,
+                scene->stream_vertices + mirror_cursor);
+        }
+        *mirror_depth_count = mirror_cursor - translucent_cursor;
     }
-    *translucent_run_count =
-        translucent_surfaces + object_mesh_runs + bb_runs;
-    free(translucent_order);
-    free(depths);
+    *translucent_run_count = item_count + bb_shadow_runs;
+    free(items);
     *sky_count = sky_cursor;
     *opaque_count = opaque_cursor - sky_vertices;
     *flat_count = bb_flat;
@@ -3336,6 +3734,15 @@ static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count
         scene->visible = buffer;
         scene->visible_count = sector_count;
     }
+    if (scene->reflection_span_count < sector_count) {
+        struct hwr_sector_xspan *buffer =
+            (struct hwr_sector_xspan *)realloc(
+                scene->reflection_spans, sector_count * sizeof *buffer);
+        if (buffer == NULL)
+            return -1;
+        scene->reflection_spans = buffer;
+        scene->reflection_span_count = sector_count;
+    }
     if (object_count != 0 && scene->span_count < object_count) {
         struct hwr_sector_xspan *buffer = (struct hwr_sector_xspan *)realloc(
             scene->spans, object_count * sizeof *buffer);
@@ -3362,6 +3769,265 @@ static void hwr_scene_log_visibility(const struct hwr_scene *scene,
             (unsigned)visible_sectors, (unsigned)world->sector_count);
 }
 
+#define VA_G_REFLECTION_COUNT   0x85340u
+#define VA_G_REFLECTION_RECORDS 0x85344u
+
+static int hwr_mirrors_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_MIRRORS");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+static size_t hwr_find_wall_offset(const struct hwr_world *world,
+                                   uint16_t wall_offset)
+{
+    size_t i;
+    for (i = 0; i < world->wall_count; i++)
+        if (world->walls[i].section_offset == wall_offset)
+            return i;
+    return SIZE_MAX;
+}
+
+static int16_t hwr_reflect_view_offset(int16_t offset, int16_t coordinate)
+{
+    uint16_t sum = (uint16_t)((uint16_t)offset + (uint16_t)coordinate);
+    return (int16_t)(uint16_t)((uint16_t)offset -
+                               (uint16_t)(sum + sum));
+}
+
+static int16_t hwr_negate_i16(int16_t value)
+{
+    return (int16_t)(uint16_t)(0u - (uint16_t)value);
+}
+
+static void hwr_reflect_camera(struct hwr_gl_camera *reflected,
+                               const struct hwr_gl_camera *primary,
+                               const struct hwr_world *world,
+                               const struct hwr_wall *wall)
+{
+    const struct hwr_vertex *a = &world->vertices[wall->vertex_a_index];
+    const struct hwr_vertex *b = &world->vertices[wall->vertex_b_index];
+    int16_t dx = (int16_t)(uint16_t)((uint16_t)a->world_x -
+                                      (uint16_t)b->world_x);
+    int16_t dy = (int16_t)(uint16_t)((uint16_t)a->world_y -
+                                      (uint16_t)b->world_y);
+
+    if (dx < 0)
+        dx = hwr_negate_i16(dx);
+    if (dy < 0)
+        dy = hwr_negate_i16(dy);
+    *reflected = *primary;
+    reflected->x_flip = 1;
+    reflected->reflected = 1;
+    if (dx >= dy) {
+        /* The wall spans X, so the engine snaps it to constant Y at endpoint
+         * A and reflects the view across that axis. */
+        reflected->view_offset_y = hwr_reflect_view_offset(
+            primary->view_offset_y, a->world_y);
+        reflected->yaw =
+            (uint16_t)(0u - primary->yaw + 0x100u);
+        reflected->yaw_sin = hwr_negate_i16(primary->yaw_sin);
+        reflected->yaw_cos = primary->yaw_cos;
+    } else {
+        /* The wall spans Y: snap to constant X at endpoint A. */
+        reflected->view_offset_x = hwr_reflect_view_offset(
+            primary->view_offset_x, a->world_x);
+        reflected->yaw = (uint16_t)(0u - primary->yaw);
+        reflected->yaw_sin = primary->yaw_sin;
+        reflected->yaw_cos = hwr_negate_i16(primary->yaw_cos);
+    }
+    reflected->sky_yaw = reflected->yaw;
+}
+
+static int hwr_reflection_project_x(const struct hwr_gl_camera *camera,
+                                    int16_t x, int16_t y, int fallback)
+{
+    int32_t view_x, depth;
+    hwr_wall_view_point(camera, x, y, &view_x, &depth);
+    if (depth < 0x1000)
+        return fallback;
+    return hwr_project_fixed(view_x, camera->focal_x, depth,
+                             camera->center_x);
+}
+
+static size_t hwr_scene_collect_reflections(
+    struct hwr_scene *scene, const struct hwr_world *world,
+    const struct roth_api_v1 *api, const struct hwr_gl_camera *primary,
+    uint32_t width)
+{
+    uint32_t count;
+    uint32_t i;
+
+    scene->reflection_count = 0;
+    if (!hwr_mirrors_enabled() || width == 0 ||
+        world->sector_offset_to_index == NULL)
+        return 0;
+    count = api->game_ram->u32(VA_G_REFLECTION_COUNT);
+    if (count > HWR_REFLECTION_MAX)
+        return 0;
+    for (i = 0; i < count; i++) {
+        uint32_t record = VA_G_REFLECTION_RECORDS + i * 8u;
+        uint32_t parent_key = api->game_ram->u32(record);
+        uint16_t target_offset = api->game_ram->u16(record + 4u);
+        uint16_t wall_offset = api->game_ram->u16(record + 6u);
+        uint16_t target_index = UINT16_MAX;
+        size_t wall_index;
+        const struct hwr_wall *wall;
+        const struct hwr_vertex *a;
+        const struct hwr_vertex *b;
+        struct hwr_scene_reflection *reflection;
+        int xa, xb, lo, hi, final_lo, final_hi;
+
+        if (parent_key != 0)
+            continue;
+        wall_index = hwr_find_wall_offset(world, wall_offset);
+        if (wall_index == SIZE_MAX)
+            continue;
+        wall = &world->walls[wall_index];
+        a = &world->vertices[wall->vertex_a_index];
+        b = &world->vertices[wall->vertex_b_index];
+        reflection = &scene->reflections[scene->reflection_count];
+        reflection->wall_offset = wall_offset;
+        reflection->renderable = 0;
+        scene->reflection_count++;
+
+        /* Registration and subview rendering are separate engine decisions.
+         * Even a record whose target/span cannot be rendered still owns its
+         * mirror surface in the primary pass, so retain the wall identity. */
+        if (target_offset == 0)
+            continue;
+        target_index = world->sector_offset_to_index[target_offset];
+        if (target_index == UINT16_MAX ||
+            target_index >= world->sector_count)
+            continue;
+        hwr_reflect_camera(&reflection->camera, primary, world, wall);
+
+        xa = hwr_reflection_project_x(&reflection->camera,
+                                      a->world_x, a->world_y,
+                                      (int)width - 1);
+        xb = hwr_reflection_project_x(&reflection->camera,
+                                      b->world_x, b->world_y, 0);
+        /* Endpoint A is the high edge and endpoint B the low edge. The
+         * original never sorts them: a reversed pair rejects the subview. */
+        if (xa < 0 || xb >= (int)width)
+            continue;
+        lo = xb < 0 ? 0 : xb;
+        hi = xa >= (int)width ? (int)width - 1 : xa;
+        if (lo > hi)
+            continue;
+        /* The engine projects the aperture before its rasterizer x-flips the
+         * destination. Convert that accepted source interval to framebuffer
+         * columns for the GL scissor. */
+        final_lo = 2 * reflection->camera.center_x - hi;
+        final_hi = 2 * reflection->camera.center_x - lo;
+        if (final_lo < 0)
+            final_lo = 0;
+        if (final_hi >= (int)width)
+            final_hi = (int)width - 1;
+        if (final_lo > final_hi)
+            continue;
+        reflection->target_sector_index = target_index;
+        reflection->source_clip_left = lo;
+        reflection->source_clip_right = hi;
+        reflection->clip_left = final_lo;
+        reflection->clip_right = final_hi + 1;
+        reflection->renderable = 1;
+    }
+    return scene->reflection_count;
+}
+
+static int hwr_scene_store_reflection(struct hwr_scene_reflection *reflection,
+                                      const struct hwr_scene *scene,
+                                      size_t sky_count,
+                                      size_t mirror_depth_count,
+                                      size_t opaque_count,
+                                      size_t flat_count,
+                                      size_t translucent_count,
+                                      size_t translucent_run_count)
+{
+    size_t vertex_count = sky_count + opaque_count + translucent_count +
+                          mirror_depth_count;
+    if (vertex_count > reflection->vertex_capacity) {
+        struct hwr_gl_vertex *vertices = (struct hwr_gl_vertex *)realloc(
+            reflection->vertices, vertex_count * sizeof *vertices);
+        if (vertices == NULL)
+            return -1;
+        reflection->vertices = vertices;
+        reflection->vertex_capacity = vertex_count;
+    }
+    if (translucent_run_count > reflection->run_capacity) {
+        uint32_t *runs = (uint32_t *)realloc(
+            reflection->runs, translucent_run_count * sizeof *runs);
+        uint8_t *flags;
+        if (runs == NULL)
+            return -1;
+        reflection->runs = runs;
+        flags = (uint8_t *)realloc(
+            reflection->run_flags, translucent_run_count * sizeof *flags);
+        if (flags == NULL)
+            return -1;
+        reflection->run_flags = flags;
+        reflection->run_capacity = translucent_run_count;
+    }
+    if (vertex_count != 0)
+        memcpy(reflection->vertices, scene->stream_vertices,
+               vertex_count * sizeof *reflection->vertices);
+    if (translucent_run_count != 0)
+        memcpy(reflection->runs, scene->translucent_runs,
+               translucent_run_count * sizeof *reflection->runs);
+    if (translucent_run_count != 0)
+        memcpy(reflection->run_flags, scene->translucent_run_flags,
+               translucent_run_count * sizeof *reflection->run_flags);
+    reflection->vertex_count = vertex_count;
+    reflection->run_count = translucent_run_count;
+    reflection->sky_count = sky_count;
+    reflection->mirror_depth_count = mirror_depth_count;
+    reflection->opaque_count = opaque_count;
+    reflection->flat_count = flat_count;
+    reflection->translucent_count = translucent_count;
+    reflection->opaque_billboard_count = scene->billboards.opaque_count;
+    reflection->shadow_count = scene->billboards.shadow_count;
+    reflection->shadow_run_count = scene->billboards.shadow_run_count;
+    reflection->translucent_billboard_run_count =
+        scene->billboards.run_count >= scene->billboards.shadow_run_count
+        ? scene->billboards.run_count - scene->billboards.shadow_run_count
+        : 0u;
+    return 0;
+}
+
+static int hwr_scene_emit_view(struct hwr_scene *scene,
+                               const struct hwr_world *world,
+                               const struct hwr_objects *objects,
+                               const struct roth_api_v1 *api,
+                               const struct hwr_gl_camera *camera,
+                               const struct hwr_sector_xspan *spans,
+                               size_t span_count,
+                               uint32_t width, uint32_t height,
+                               size_t *sky_count, size_t *mirror_depth_count,
+                               size_t *opaque_count,
+                               size_t *flat_count,
+                               size_t *translucent_count,
+                               size_t *translucent_run_count)
+{
+    if (hwr_meshes_emit(&scene->object_meshes, objects, world, camera,
+                        scene->visible, scene->visible_count, scene->pvs_valid,
+                        spans, span_count,
+                        api) != 0)
+        return hwr_scene_fail(scene, "%s",
+                              hwr_meshes_error(&scene->object_meshes));
+    hwr_billboards_emit(&scene->billboards, objects, world, camera,
+                        scene->visible, scene->visible_count, scene->pvs_valid,
+                        spans, span_count, api);
+    return hwr_prepare_stream(scene, camera, width, height,
+                              sky_count, mirror_depth_count, opaque_count,
+                              flat_count,
+                              translucent_count, translucent_run_count);
+}
+
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
                                  const struct hwr_objects *objects,
@@ -3369,12 +4035,17 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  uint32_t width, uint32_t height)
 {
     struct hwr_gl_camera camera;
+    struct hwr_gl_scene_view views[HWR_REFLECTION_MAX + 1u];
     uint8_t palette[1024];
     size_t sky_count;
+    size_t mirror_depth_count;
     size_t opaque_count;
     size_t flat_count;
     size_t translucent_count;
     size_t translucent_run_count;
+    size_t i;
+    size_t view_count = 0;
+    int floor_exception = hwr_billboards_floor_exception_enabled();
     if (scene == NULL || !scene->valid || !scene->uploaded ||
         world == NULL || !world->valid || api == NULL || api->game_ram == NULL)
         return NULL;
@@ -3393,51 +4064,135 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     camera.sky_yaw = api->game_ram->u16(VA_G_SKY_YAW);
     camera.sky_double_scanline = api->game_ram->u8(VA_G_DOUBLE_SCANLINE) != 0;
     camera.sky_valid = scene->sky_valid;
+    if (hwr_scene_ensure_visible(scene, world->sector_count,
+                                 objects != NULL ? objects->count : 0u) != 0) {
+        hwr_scene_fail(scene, "out of memory preparing view visibility");
+        return NULL;
+    }
+
+    /* The software pass consumed the reflected render tree before the hardware
+     * callback. Rebuild its portal-reachable sector set from the recorded root
+     * sector and pre-X-flip mirror aperture. Submitting the whole map here lets
+     * geometry behind the virtual reflected camera leak through the mirror. */
+    hwr_scene_collect_reflections(scene, world, api, &camera, width);
+    for (i = 0; i < scene->reflection_count; i++) {
+        struct hwr_scene_reflection *reflection = &scene->reflections[i];
+        if (!reflection->renderable)
+            continue;
+        scene->pvs_valid = hwr_compute_reflection_pvs(
+            world, &reflection->camera, reflection->target_sector_index,
+            reflection->source_clip_left, reflection->source_clip_right,
+            scene->visible, scene->reflection_spans,
+            scene->reflection_span_count);
+        if (!scene->pvs_valid) {
+            /* A failed reflected walk must not reveal unrelated sectors. The
+             * root alone is the safe, useful fallback for a valid record. */
+            memset(scene->visible, 0, world->sector_count);
+            scene->visible[reflection->target_sector_index] = 1;
+            memset(scene->reflection_spans, 0,
+                   world->sector_count * sizeof *scene->reflection_spans);
+            scene->reflection_spans[
+                reflection->target_sector_index].lo[0] =
+                    (int16_t)reflection->source_clip_left;
+            scene->reflection_spans[
+                reflection->target_sector_index].hi[0] =
+                    (int16_t)reflection->source_clip_right;
+            scene->reflection_spans[
+                reflection->target_sector_index].count = 1;
+            scene->pvs_valid = 1;
+        }
+        scene->reflection_clip_valid = 1;
+        hwr_prepare_reflection_object_windows(
+            scene, objects, &reflection->camera, width);
+        scene->portal_clip_valid =
+            objects != NULL && scene->span_count >= objects->count;
+        if (hwr_scene_emit_view(scene, world, objects, api,
+                                &reflection->camera,
+                                scene->portal_clip_valid
+                                    ? scene->spans : NULL,
+                                scene->portal_clip_valid && objects != NULL
+                                    ? objects->count : 0u,
+                                width, height, &sky_count,
+                                &mirror_depth_count, &opaque_count,
+                                &flat_count, &translucent_count,
+                                &translucent_run_count) != 0)
+            return NULL;
+        if (hwr_scene_store_reflection(reflection, scene, sky_count,
+                                       mirror_depth_count,
+                                       opaque_count, flat_count,
+                                       translucent_count,
+                                       translucent_run_count) != 0) {
+            hwr_scene_fail(scene,
+                           "out of memory retaining reflected view geometry");
+            return NULL;
+        }
+        memset(&views[view_count], 0, sizeof views[view_count]);
+        views[view_count].vertices = reflection->vertices;
+        views[view_count].sky_vertices = reflection->sky_count;
+        views[view_count].mirror_depth_vertices =
+            reflection->mirror_depth_count;
+        views[view_count].opaque_vertices = reflection->opaque_count;
+        views[view_count].flat_vertices = reflection->flat_count;
+        views[view_count].translucent_vertices =
+            reflection->translucent_count;
+        views[view_count].translucent_runs = reflection->runs;
+        views[view_count].translucent_run_flags = reflection->run_flags;
+        views[view_count].translucent_run_count = reflection->run_count;
+        views[view_count].opaque_billboard_vertices =
+            reflection->opaque_billboard_count;
+        views[view_count].shadow_vertices = reflection->shadow_count;
+        views[view_count].shadow_run_count = reflection->shadow_run_count;
+        views[view_count].translucent_billboard_run_count =
+            reflection->translucent_billboard_run_count;
+        views[view_count].floor_exception = floor_exception;
+        views[view_count].camera = reflection->camera;
+        views[view_count].clip_left = reflection->clip_left;
+        views[view_count].clip_right = reflection->clip_right;
+        view_count++;
+    }
     /* Per-frame visibility (HWR_PVS). When disabled or when the renderer's draw
      * list cannot be read, pvs_valid stays 0 and the per-surface gate is a
      * no-op, leaving the frame identical to the plain stream-everything path. */
     scene->pvs_valid = 0;
     scene->portal_clip_valid = 0;
-    if (hwr_pvs_enabled() &&
-        hwr_scene_ensure_visible(scene, world->sector_count,
-                                 objects != NULL ? objects->count : 0u) == 0) {
+    scene->reflection_clip_valid = 0;
+    if (hwr_pvs_enabled()) {
         scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
         /* Reuse each type-1 worklist node's object-depth-specific window. */
         scene->portal_clip_valid = hwr_compute_object_portal_windows(
             world, objects, api, scene->spans, scene->span_count);
     }
     hwr_scene_log_visibility(scene, world);
-    /* Mesh objects use the same owner-sector admission as billboards. Real 3D
-     * faces are left intact at portal edges; depth and the sector gate provide
-     * the conservative first implementation without slicing perspective UVs. */
-    if (hwr_meshes_emit(&scene->object_meshes, objects, world, &camera,
-                        scene->visible, scene->visible_count, scene->pvs_valid,
-                        api) != 0) {
-        hwr_scene_fail(scene, "%s", hwr_meshes_error(&scene->object_meshes));
+    if (hwr_scene_emit_view(
+            scene, world, objects, api, &camera,
+            scene->portal_clip_valid ? scene->spans : NULL,
+            scene->portal_clip_valid && objects != NULL ? objects->count : 0u,
+            width, height, &sky_count, &mirror_depth_count, &opaque_count,
+            &flat_count,
+            &translucent_count, &translucent_run_count) != 0)
         return NULL;
-    }
-    /* Resolve and project this frame's billboards against the same camera and
-     * visible-sector set, ready to append to the stream below. */
-    hwr_billboards_emit(&scene->billboards, objects, world, &camera,
-                        scene->visible, scene->visible_count, scene->pvs_valid,
-                        scene->portal_clip_valid ? scene->spans : NULL,
-                        scene->portal_clip_valid && objects != NULL
-                            ? objects->count : 0,
-                        api);
-    if (hwr_prepare_stream(scene, &camera, width, height,
-                           &sky_count, &opaque_count, &flat_count,
-                           &translucent_count,
-                           &translucent_run_count) != 0)
-        return NULL;
+    memset(&views[view_count], 0, sizeof views[view_count]);
+    views[view_count].vertices = scene->stream_vertices;
+    views[view_count].sky_vertices = sky_count;
+    views[view_count].mirror_depth_vertices = mirror_depth_count;
+    views[view_count].opaque_vertices = opaque_count;
+    views[view_count].flat_vertices = flat_count;
+    views[view_count].translucent_vertices = translucent_count;
+    views[view_count].translucent_runs = scene->translucent_runs;
+    views[view_count].translucent_run_flags = scene->translucent_run_flags;
+    views[view_count].translucent_run_count = translucent_run_count;
+    views[view_count].opaque_billboard_vertices =
+        scene->billboards.opaque_count;
+    views[view_count].shadow_vertices = scene->billboards.shadow_count;
+    views[view_count].shadow_run_count = scene->billboards.shadow_run_count;
+    views[view_count].translucent_billboard_run_count =
+        scene->billboards.run_count >= scene->billboards.shadow_run_count
+        ? scene->billboards.run_count - scene->billboards.shadow_run_count
+        : 0u;
+    views[view_count].floor_exception = floor_exception;
+    views[view_count].camera = camera;
+    view_count++;
+
     hwr_build_palette(world, palette);
-    return hwr_gl_scene_render(scene->stream_vertices, sky_count, opaque_count,
-                               flat_count, translucent_count,
-                               scene->translucent_runs,
-                               translucent_run_count,
-                               scene->billboards.opaque_count,
-                               scene->billboards.shadow_count,
-                               scene->billboards.shadow_run_count,
-                               hwr_billboards_floor_exception_enabled(),
-                               &camera, palette,
-                               width, height);
+    return hwr_gl_scene_render(views, view_count, palette, width, height);
 }

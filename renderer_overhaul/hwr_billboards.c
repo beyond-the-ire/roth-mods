@@ -6,8 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* View angle the direction resolver quantizes against (g_sprite_view_angle). */
-#define VA_G_SPRITE_VIEW_ANGLE   0x909f8u
 /* The engine's sincos table (g_sincos_table, 512 int16 entries scaled +/-16384;
  * table[k] = 16384*sin(2*pi*k/512), cos(k) = table[k + 0x80]). The rotated /
  * fixed-orientation object path indexes it to orient a flat face by its facing. */
@@ -650,11 +648,10 @@ static void hwr_bb_write_quad_st(struct hwr_gl_vertex *dst,
         double hi = (double)clip_hi * 65536.0;
         if (lo < 0.0) lo = 0.0;
         if (hi < 0.0) hi = 0.0;
-        corner.flat_guard_step = lo >= 4294967295.0
+        corner.portal_clip_left = lo >= 4294967295.0
             ? UINT32_MAX : (uint32_t)(lo + 0.5);
-        corner.flat_guard_origin_y = (int32_t)(hi >= 4294967295.0
-            ? UINT32_MAX : (uint32_t)(hi + 0.5));
-        corner.flat_mapping_flags = HWR_GL_MAPPING_PORTAL_CLIP;
+        corner.portal_clip_right = hi >= 4294967295.0
+            ? UINT32_MAX : (uint32_t)(hi + 0.5);
     }
     tl = tr = bl = br = corner;
     /* s_left/s_right are the along-storage texture coords at the (possibly
@@ -761,6 +758,12 @@ static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap
     projr = focal_x * (double)vxr / (double)dpr + center_x;
     qlo = projl < projr ? projl : projr;
     qhi = projl < projr ? projr : projl;
+    if (camera->x_flip) {
+        double flipped_lo = 2.0 * center_x - qhi;
+        double flipped_hi = 2.0 * center_x - qlo;
+        qlo = flipped_lo;
+        qhi = flipped_hi;
+    }
 
     /* Fully inside one window (within half a pixel): no cut, emit the quad whole
      * so a non-straddling sprite is never re-quantised. */
@@ -924,7 +927,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     log_frame = bb_log || (trace >= 1 && throttle);
     frame_no++;
 
-    yaw = api->game_ram->u16(VA_G_SPRITE_VIEW_ANGLE);
+    yaw = camera->yaw;
     focal_x = (double)camera->focal_x;
     focal_y = (double)camera->focal_y;
     /* The engine's type-1 billboard projects its horizontal extent with
@@ -965,10 +968,16 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         double half_w, famod, vext_d, rx, ry, cx, cy;
         int32_t disp, vext, z_top, z_bottom;
         int16_t xl, yl, xr, yr, origin_x, origin_y;
-        int translucent, do_trace, cl;
+        int translucent, do_trace, cl, is_flat;
         struct hwr_bb_clip clip;
 
         bb->stat_enumerated++;
+        if (!camera->reflected &&
+            (o->flags & HWR_OBJECT_FLAG_REFLECTION_ONLY) != 0)
+            continue;
+        if (camera->reflected &&
+            (o->flags & HWR_OBJECT_FLAG_REFLECTION_SKIP) != 0)
+            continue;
         if (o->flags & HWR_OBJECT_FLAG_FLAT)
             flat_seen++;
         do_trace = trace >= 2 && throttle && i < 260u;
@@ -1012,7 +1021,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
          * whose map record has +9 bit0 (the type-1 "mirror double" gate,
          * renderer.c:8068). Emitted independent of the object's own sprite so a
          * shadow shows even if the sprite drops/meshes. */
-        if (shadows && bb->shadow.present && (o->flags9 & 1u) != 0) {
+        if (shadows && bb->shadow.present && (o->flags9 & 1u) != 0 &&
+            (o->flags & HWR_OBJECT_FLAG_NO_SHADOW) == 0) {
             /* With the floor exception on, shadows collect in their own set so
              * the GL layer can draw them as the floor-gated blend pass; off, they
              * join the plain translucent tail at the raised anchor. */
@@ -1279,12 +1289,12 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             material |= (uint8_t)HWR_GL_MATERIAL_TRANSLUCENT;
         if (lookup.flip)
             material |= (uint8_t)HWR_GL_MATERIAL_HFLIP;
+        is_flat = (o->flags9 & 0x80u) != 0;
 
-        /* Owner-floor id for the camera-facing opaque path only: it lets the
-         * floor-exception pass recover a below-floor part (a negatively-offset
-         * object) over this object's own sector floor. Rotated wall decals and
-         * blend billboards do not participate (floor id 0). */
-        if (exception &&
+        /* Owner-floor id for every camera-facing object: it lets the exception
+         * pass recover a negatively-offset part over this object's own sector
+         * floor. Fixed-orientation wall decals do not participate. */
+        if (exception && !is_flat &&
             o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
             o->sector_index < world->sector_count)
             obj_floor_id = HWR_BB_FLOOR_TAG |
@@ -1304,7 +1314,6 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
              * pass. Fixed-orientation (rotated, f9 bit0x80) quads go to a
              * separate list so the GL layer can bias them a hair toward the
              * viewer -- they are coplanar with their wall and would z-fight it. */
-            int is_flat = (o->flags9 & 0x80u) != 0;
             struct hwr_gl_vertex **dst = is_flat ? &bb->flat : &bb->opaque;
             size_t *cnt = is_flat ? &bb->flat_count : &bb->opaque_count;
             size_t *cap = is_flat ? &bb->flat_capacity : &bb->opaque_capacity;
@@ -1337,7 +1346,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             t->material = material;
             t->light = composed;
             t->sector_flags = sector_flags;
-            t->floor_id = 0u;               /* blend billboards do not floor-clip */
+            t->floor_id = obj_floor_id;
             t->clip = clip;                 /* owner-sector portal window */
             bb->stat_emitted++;
         }

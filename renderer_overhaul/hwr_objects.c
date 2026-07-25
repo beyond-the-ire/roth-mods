@@ -16,6 +16,8 @@
 #define VA_G_PARTICLE_POOL      0x91864u
 #define VA_G_PICKUP_FLY_HEAD    0x71144u
 #define VA_G_ITEM_PICKUP_FLAGS  0x7fd84u
+#define VA_G_PLAYER_MIRROR_NODE 0x853dcu
+#define VA_G_PLAYER_MIRROR_APPEARANCE (VA_G_PLAYER_MIRROR_NODE + 8u)
 
 /* The object section is bounded the same way the geometry sections are. */
 #define HWR_OBJ_SECTION_EXTENT 0x10000u
@@ -262,6 +264,56 @@ static int hwr_objects_walk_pickup(struct hwr_objects *objects,
     return 0;
 }
 
+/* The stock reflected walk creates a third-person player as a normal type-1
+ * billboard in this synthetic node. By the hardware callback the software
+ * pass has already selected and advanced its settled animation state, so this
+ * layer only reads the record and never advances it again. */
+static int hwr_objects_walk_reflected_player(
+    struct hwr_objects *objects, const struct hwr_world *world,
+    const struct roth_api_v1 *api)
+{
+    const uint32_t appearance = VA_G_PLAYER_MIRROR_APPEARANCE;
+    uint16_t sector_offset =
+        api->game_ram->u16(VA_G_PLAYER_MIRROR_NODE + 4u);
+    uint16_t sector_index;
+    struct hwr_object item;
+
+    if (sector_offset == 0 || world->sector_offset_to_index == NULL)
+        return 0;
+    sector_index = world->sector_offset_to_index[sector_offset];
+    if (sector_index == UINT16_MAX || sector_index >= world->sector_count)
+        return 0;
+    if (api->game_ram->u16(appearance + HWR_OBJ_OFF_GFX) <= 0x0200u)
+        return 0;
+    memset(&item, 0, sizeof item);
+    item.source = HWR_OBJECT_PLAYER_REFLECTION;
+    item.world_x =
+        (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_X);
+    item.world_y =
+        (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_Y);
+    item.world_z =
+        (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_Z);
+    item.graphic_id =
+        api->game_ram->u16(appearance + HWR_OBJ_OFF_GFX);
+    item.facing = api->game_ram->u8(appearance + HWR_OBJ_OFF_FACING);
+    item.object_id =
+        api->game_ram->u16(appearance + HWR_OBJ_OFF_ID);
+    item.seed = api->game_ram->u8(appearance + HWR_OBJ_OFF_SEED);
+    item.sector_index = sector_index;
+    item.backref =
+        api->game_ram->u16(appearance + HWR_OBJ_OFF_BACKREF);
+    item.flags7 = api->game_ram->u8(appearance + HWR_OBJ_OFF_FLAGS7);
+    item.flags9 = api->game_ram->u8(appearance + HWR_OBJ_OFF_FLAGS9);
+    item.flags = HWR_OBJECT_FLAG_REFLECTION_ONLY |
+                 HWR_OBJECT_FLAG_NO_SHADOW;
+    item.appearance_ptr =
+        (uint32_t)(uintptr_t)api->game_ram->to_ptr(appearance);
+    if (hwr_objects_push(objects, &item) != 0)
+        return hwr_objects_fail(
+            objects, "out of memory enumerating reflected player");
+    return 0;
+}
+
 int hwr_objects_rebuild(struct hwr_objects *objects, const struct hwr_world *world,
                         const struct roth_api_v1 *api)
 {
@@ -283,6 +335,8 @@ int hwr_objects_rebuild(struct hwr_objects *objects, const struct hwr_world *wor
         return -1;
     if (hwr_objects_walk_pickup(objects, api) != 0)
         return -1;
+    if (hwr_objects_walk_reflected_player(objects, world, api) != 0)
+        return -1;
     objects->valid = 1;
     return 0;
 }
@@ -290,7 +344,7 @@ int hwr_objects_rebuild(struct hwr_objects *objects, const struct hwr_world *wor
 static const char *hwr_objects_source_name(uint8_t source)
 {
     static const char *const names[HWR_OBJECT_SOURCE_COUNT] = {
-        "map", "particle", "pickup-fly"
+        "map", "particle", "pickup-fly", "player-reflection"
     };
     return source < HWR_OBJECT_SOURCE_COUNT ? names[source] : "?";
 }
@@ -312,10 +366,12 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
     if (file == NULL)
         return;
     yaw = api->game_ram->u16(0x909f8u);   /* g_sprite_view_angle */
-    fprintf(file, "objects total=%zu map=%zu particle=%zu pickup-fly=%zu\n",
+    fprintf(file,
+            "objects total=%zu map=%zu particle=%zu pickup-fly=%zu player-reflection=%zu\n",
             objects->count, objects->source_counts[HWR_OBJECT_MAP],
             objects->source_counts[HWR_OBJECT_PARTICLE],
-            objects->source_counts[HWR_OBJECT_PICKUP_FLY]);
+            objects->source_counts[HWR_OBJECT_PICKUP_FLY],
+            objects->source_counts[HWR_OBJECT_PLAYER_REFLECTION]);
     for (i = 0; i < objects->count; i++) {
         const struct hwr_object *o = &objects->items[i];
         struct hwr_sprite_lookup lookup;

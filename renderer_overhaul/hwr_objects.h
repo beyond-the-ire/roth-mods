@@ -9,16 +9,17 @@
 #include <stdint.h>
 
 /* The object layer enumerates every billboard the engine would draw from its
- * persistent state and flattens it into one per-frame array. It reproduces the
- * two primary sources fully and reads the pickup-fly overlay's persistent form;
- * the player weapon viewmodel is deliberately left to the engine. Nothing is
- * cached across frames: pool-derived pointers are re-read from live state each
- * rebuild, so unlinked (collected/killed) objects disappear by construction. */
+ * persistent state and flattens it into one per-frame array, including the
+ * synthetic third-person player record used only by reflected subviews.
+ * Nothing is cached across frames: pool-derived pointers are re-read from live
+ * state each rebuild, so unlinked (collected/killed) objects disappear by
+ * construction. */
 
 enum hwr_object_source {
     HWR_OBJECT_MAP = 0,     /* per-sector map-object list */
     HWR_OBJECT_PARTICLE,    /* particle pool */
     HWR_OBJECT_PICKUP_FLY,  /* pickup-fly overlay (persistent source) */
+    HWR_OBJECT_PLAYER_REFLECTION, /* mirror-only synthetic player billboard */
     HWR_OBJECT_SOURCE_COUNT
 };
 
@@ -35,7 +36,13 @@ enum hwr_object_flags {
      * engine's ROTATED path, keyed on record +9 bit0x80 (see flags9 and
      * rwss_rotated_tail renderer.c:6093-6148) -- the emitter orients those by
      * facing. This flag is retained as the type-3 marker for diagnostics. */
-    HWR_OBJECT_FLAG_FLAT = 1u << 1
+    HWR_OBJECT_FLAG_FLAT = 1u << 1,
+    /* The stock mirror walk synthesizes the player as a world billboard; it is
+     * absent from the primary view's ordinary object enumeration. */
+    HWR_OBJECT_FLAG_REFLECTION_ONLY = 1u << 2,
+    /* The synthetic player record carries raw +9 bit0 for stock bookkeeping,
+     * but does not receive a map-object ground shadow. */
+    HWR_OBJECT_FLAG_NO_SHADOW = 1u << 3
 };
 
 struct hwr_object {

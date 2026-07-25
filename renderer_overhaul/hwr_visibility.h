@@ -13,7 +13,7 @@ struct hwr_objects;
 /* The most disjoint screen-X windows retained for one object. An object visible
  * through several open portals has one exact worklist window per visit; beyond
  * this cap that object falls back to no clip. */
-#define HWR_SECTOR_CLIP_MAX 8u
+#define HWR_SECTOR_CLIP_MAX 32u
 
 /* A set of visible screen-X portal windows. The store is indexed per object;
  * `count` == 0 means "no exact window captured" and is read as NO CLIP. Bounds
@@ -46,6 +46,24 @@ int hwr_compute_pvs(const struct hwr_world *world,
                     const struct hwr_gl_camera *camera,
                     const struct roth_api_v1 *api,
                     uint8_t *visible);
+
+/* Rebuilds the software renderer's mirror-only portal walk. Unlike the primary
+ * visibility pass, the engine's reflected tree is no longer present when the
+ * hardware callback runs, so it is recovered from static map topology. The
+ * root is the mirror record's target sector and [clip_left, clip_right] is the
+ * aperture in the reflected camera's pre-X-flip projection space.
+ *
+ * On success visible[] contains only sectors reached through that aperture.
+ * Returns 0 for invalid inputs or a failed root visit; callers should retain
+ * only the root sector in that case, never expose the whole map behind a
+ * mirror. */
+int hwr_compute_reflection_pvs(const struct hwr_world *world,
+                               const struct hwr_gl_camera *camera,
+                               size_t root_sector,
+                               int clip_left, int clip_right,
+                               uint8_t *visible,
+                               struct hwr_sector_xspan *spans,
+                               size_t span_count);
 
 /* Returns non-zero unless the sector portal-window clip for billboards is
  * switched off through HWR_PORTAL_CLIP=0. Read once and cached. When off, the

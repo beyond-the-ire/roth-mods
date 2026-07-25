@@ -65,6 +65,9 @@ struct hwr_mesh_surface {
     size_t first_vertex;
     size_t vertex_count;
     size_t sector_index;
+    /* Raw wall-record offset for wall surfaces; UINT16_MAX for flats. Mirror
+     * records identify their aperture with this exact runtime offset. */
+    uint16_t wall_offset;
     enum hwr_surface_kind kind;
     int16_t texture_id;
     uint16_t extent;
@@ -76,6 +79,37 @@ struct hwr_mesh_surface {
     uint8_t light;
     uint8_t mapping_flags;
     uint8_t flags;
+};
+
+#define HWR_REFLECTION_MAX 16u
+
+struct hwr_scene_reflection {
+    struct hwr_gl_vertex *vertices;
+    size_t vertex_count;
+    size_t vertex_capacity;
+    uint32_t *runs;
+    uint8_t *run_flags;
+    size_t run_count;
+    size_t run_capacity;
+    struct hwr_gl_camera camera;
+    size_t sky_count;
+    size_t mirror_depth_count;
+    size_t opaque_count;
+    size_t flat_count;
+    size_t translucent_count;
+    size_t opaque_billboard_count;
+    size_t shadow_count;
+    size_t shadow_run_count;
+    size_t translucent_billboard_run_count;
+    size_t target_sector_index;
+    uint16_t wall_offset;
+    uint8_t renderable;
+    /* Source aperture before the reflected rasterizer's destination X-flip.
+     * The mirror portal walk uses these engine screen-X columns. */
+    int32_t source_clip_left;
+    int32_t source_clip_right;
+    int32_t clip_left;
+    int32_t clip_right;
 };
 
 struct hwr_scene_mesh {
@@ -164,6 +198,7 @@ struct hwr_scene {
     /* Vertex counts of the depth-sorted translucent surfaces, in draw order,
      * so the renderer can refresh its destination snapshot between them. */
     uint32_t *translucent_runs;
+    uint8_t *translucent_run_flags;
     size_t translucent_run_capacity;
     struct hwr_scene_animation *animations;
     size_t animation_count;
@@ -186,6 +221,17 @@ struct hwr_scene {
     struct hwr_sector_xspan *spans;
     size_t span_count;
     int portal_clip_valid;
+    /* Reflected walks retain every narrowed screen-X window per reached
+     * sector. World geometry uses these directly; object sources receive a
+     * per-object copy in spans above. */
+    struct hwr_sector_xspan *reflection_spans;
+    size_t reflection_span_count;
+    int reflection_clip_valid;
+    /* Reflected subviews are rebuilt from the engine's authoritative per-frame
+     * mirror list. Their streams persist as reusable scratch so drawing several
+     * apertures does not allocate every frame. */
+    struct hwr_scene_reflection reflections[HWR_REFLECTION_MAX];
+    size_t reflection_count;
     /* Object meshes and camera-facing billboards share the scene atlas. Meshes
      * stream immediately before the billboard tail in the opaque range. */
     struct hwr_meshes object_meshes;

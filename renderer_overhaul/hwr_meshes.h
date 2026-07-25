@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct hwr_sector_xspan;
+
 enum hwr_mesh_face_kind {
     HWR_MESH_FACE_TRIANGLE = 0,
     HWR_MESH_FACE_QUAD,
@@ -115,6 +117,7 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
                     const struct hwr_gl_camera *camera,
                     const uint8_t *visible, size_t visible_count,
                     int pvs_valid,
+                    const struct hwr_sector_xspan *spans, size_t span_count,
                     const struct roth_api_v1 *api);
 
 void hwr_meshes_clear(struct hwr_meshes *meshes);

@@ -37,9 +37,9 @@ enum hwr_gl_wall_wrap_flags {
  * faces use perspective-correct wall_s/wall_top as direct atlas coordinates,
  * bypassing the wall-column and world-plane mapping drivers. */
 #define HWR_GL_MAPPING_MESH 0x80000000u
-/* Billboard portal clips keep the original world quad intact and carry exact
- * framebuffer-X bounds in flat_guard_step / flat_guard_origin_y. */
-#define HWR_GL_MAPPING_PORTAL_CLIP 0x40000000u
+enum hwr_gl_translucent_run_flags {
+    HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION = 1u << 0
+};
 
 struct hwr_gl_vertex {
     int16_t x;
@@ -98,6 +98,10 @@ struct hwr_gl_vertex {
     uint32_t wall_span_valid;
     int32_t wall_vertical_origin;
     uint32_t wall_vertical_seeded;
+    /* Optional 16.16 framebuffer-X portal interval. Equal endpoints disable
+     * the fragment gate. Dedicated fields keep flat mapping state intact. */
+    uint32_t portal_clip_left;
+    uint32_t portal_clip_right;
 };
 
 struct hwr_gl_camera {
@@ -129,6 +133,36 @@ struct hwr_gl_camera {
     uint16_t sky_yaw;
     uint8_t sky_double_scanline;
     uint8_t sky_valid;
+    /* Source-view metadata used while preparing alternate views.  The GL
+     * projection only consumes x_flip; yaw and reflected remain available to
+     * the scene builder that derives each view. */
+    uint16_t yaw;
+    uint8_t x_flip;
+    uint8_t reflected;
+};
+
+struct hwr_gl_scene_view {
+    const struct hwr_gl_vertex *vertices;
+    size_t sky_vertices;
+    /* Primary-view mirror planes are appended after the translucent range and
+     * submitted early as an invisible depth barrier. */
+    size_t mirror_depth_vertices;
+    size_t opaque_vertices;
+    size_t flat_vertices;
+    size_t translucent_vertices;
+    const uint32_t *translucent_runs;
+    const uint8_t *translucent_run_flags;
+    size_t translucent_run_count;
+    size_t opaque_billboard_vertices;
+    size_t shadow_vertices;
+    size_t shadow_run_count;
+    size_t translucent_billboard_run_count;
+    int floor_exception;
+    struct hwr_gl_camera camera;
+    /* Horizontal framebuffer interval owned by this view. Equal endpoints
+     * select the full target. */
+    int32_t clip_left;
+    int32_t clip_right;
 };
 
 int hwr_gl_init(void);
@@ -145,25 +179,13 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
  * rewritten yet, in which case the caller should try again next frame. */
 int hwr_gl_scene_update_texels(uint32_t offset, const uint8_t *bytes,
                                uint32_t size);
-/* opaque_billboard_vertices = the count at the tail of the opaque range (before
- * the flat-decal tail) that are camera-facing object quads eligible for the
- * owner-floor exception re-draw. shadow_vertices / shadow_run_count = the ground
- * shadows appended at the tail of the translucent range and its run list, drawn
- * as a dedicated floor-exception blend pass. floor_exception enables the
- * owner-floor depth exception (HWR_FLOOR_EXCEPTION); when 0 both re-draw passes
- * are skipped and the shadows fall back to the plain translucent tail. */
-const uint32_t *hwr_gl_scene_render(const struct hwr_gl_vertex *vertices,
-                                    size_t sky_vertices,
-                                    size_t opaque_vertices,
-                                    size_t flat_vertices,
-                                    size_t translucent_vertices,
-                                    const uint32_t *translucent_runs,
-                                    size_t translucent_run_count,
-                                    size_t opaque_billboard_vertices,
-                                    size_t shadow_vertices,
-                                    size_t shadow_run_count,
-                                    int floor_exception,
-                                    const struct hwr_gl_camera *camera,
+/* Views are composited in array order into one palette-index target, with
+ * reflected views preceding the primary view. Each view gets independent
+ * geometry, depth, owner-floor identity, camera state, and an optional
+ * horizontal clip. The palette update, persistent-index setup, final resolve,
+ * and readback occur once around the whole ordered sequence. */
+const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
+                                    size_t view_count,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height);
 void hwr_gl_scene_clear(void);
