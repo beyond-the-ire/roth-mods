@@ -179,6 +179,185 @@ static void hwr_dump_pgm(const char *suffix, const uint8_t *bytes,
     rename(temp_path, path);
 }
 
+static int hwr_arithmetic_shift_8(int value)
+{
+    return value >= 0 ? value / 256 : -((-value + 255) / 256);
+}
+
+static uint32_t hwr_palette_argb(unsigned index)
+{
+    int fade = 0xff - g_world.luts.damage_flash_level;
+    int r = g_world.luts.palette[index * 3u];
+    int g = g_world.luts.palette[index * 3u + 1u];
+    int b = g_world.luts.palette[index * 3u + 2u];
+
+    r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
+    g = (g * fade) >> 8;
+    b = (b * fade) >> 8;
+    return 0xff000000u |
+           ((uint32_t)(uint8_t)(r << 2) << 16) |
+           ((uint32_t)(uint8_t)(g << 2) << 8) |
+           (uint32_t)(uint8_t)(b << 2);
+}
+
+/* The authentic world frame has already been resolved through the live VGA
+ * palette. Recover its palette index for the thumbnail's four source samples.
+ * Exact matches are the normal path; nearest-colour fallback covers only
+ * presentation formats or drivers that perturb a channel during readback. */
+static uint8_t hwr_thumbnail_palette_index(uint32_t pixel,
+                                           const uint32_t palette[256])
+{
+    unsigned i;
+    unsigned best = 0;
+    uint32_t best_distance = UINT32_MAX;
+    int pr = (int)((pixel >> 16) & 0xffu);
+    int pg = (int)((pixel >> 8) & 0xffu);
+    int pb = (int)(pixel & 0xffu);
+
+    pixel |= 0xff000000u;
+    for (i = 0; i < 256u; i++) {
+        int dr;
+        int dg;
+        int db;
+        uint32_t distance;
+        if (palette[i] == pixel)
+            return (uint8_t)i;
+        dr = pr - (int)((palette[i] >> 16) & 0xffu);
+        dg = pg - (int)((palette[i] >> 8) & 0xffu);
+        db = pb - (int)(palette[i] & 0xffu);
+        distance = (uint32_t)(dr * dr + dg * dg + db * db);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = i;
+        }
+    }
+    return (uint8_t)best;
+}
+
+/* Match the present channel's engine-colorkey-over-world composition before
+ * reducing the frame. The engine draws its weapon and HUD after the suppressed
+ * world pass, so nonzero framebuffer pixels are the authentic chrome while
+ * zero still reveals the submitted hardware world. */
+static uint8_t hwr_thumbnail_composite_sample(
+    const uint32_t *world, uint32_t world_x, uint32_t world_y,
+    const uint32_t palette[256], const uint8_t *engine, uint32_t engine_pitch,
+    uint32_t viewport_x, uint32_t viewport_y,
+    uint32_t viewport_w, uint32_t viewport_h)
+{
+    uint32_t engine_x = viewport_x +
+        (uint32_t)(((uint64_t)world_x * viewport_w) / g_last_frame.w);
+    uint32_t engine_y = viewport_y +
+        (uint32_t)(((uint64_t)world_y * viewport_h) / g_last_frame.h);
+    uint8_t chrome = engine[(size_t)engine_y * engine_pitch + engine_x];
+
+    if (chrome != (uint8_t)g_last_frame.transparent_index)
+        return chrome;
+    return hwr_thumbnail_palette_index(
+        world[(size_t)world_y * g_last_frame.w + world_x], palette);
+}
+
+/* Reproduce capture_screen_thumbnail's 78x56 2x2 blend-LUT reduction from the
+ * composited world frame. The world may be any hardware resolution; its complete
+ * extent and the engine-resolution chrome map to the fixed payload the engine
+ * expects. */
+static int hwr_capture_world_thumbnail(const struct roth_api_v1 *api,
+                                       uint32_t dst, uint32_t src, uint32_t lut)
+{
+    const uint32_t *source;
+    const uint8_t *engine;
+    const uint8_t *blend;
+    uint8_t *output;
+    uint32_t palette[256];
+    uint32_t pitch;
+    uint32_t screen_height;
+    uint32_t viewport_x;
+    uint32_t viewport_y;
+    uint32_t viewport_w;
+    uint32_t viewport_h;
+    uint32_t hstep;
+    uint32_t vstep;
+    uint32_t yacc = 0;
+    uint32_t y;
+    unsigned i;
+
+    if (api == NULL || api->game_ram == NULL ||
+        !g_last_frame_valid || !g_world.valid || !g_world.luts.valid ||
+        g_last_frame.pixels == NULL ||
+        g_last_frame.w < 2u || g_last_frame.h < 2u ||
+        g_last_frame.vx < 0 || g_last_frame.vy < 0 ||
+        g_last_frame.vw == 0 || g_last_frame.vh == 0 ||
+        dst < 0x1000u || src < 0x1000u || lut < 0x1000u)
+        return 0;
+    pitch = api->game_ram->u32(VA_G_SCREEN_PITCH);
+    screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
+    viewport_x = (uint32_t)g_last_frame.vx;
+    viewport_y = (uint32_t)g_last_frame.vy;
+    viewport_w = g_last_frame.vw;
+    viewport_h = g_last_frame.vh;
+    if (pitch == 0 || pitch > 4096u || screen_height == 0 ||
+        screen_height > 4096u ||
+        viewport_x >= pitch || viewport_w > pitch - viewport_x ||
+        viewport_y >= screen_height ||
+        viewport_h > screen_height - viewport_y)
+        return 0;
+    source = (const uint32_t *)g_last_frame.pixels;
+    engine = (const uint8_t *)(uintptr_t)src;
+    blend = (const uint8_t *)(uintptr_t)lut;
+    output = (uint8_t *)(uintptr_t)dst;
+    for (i = 0; i < 256u; i++)
+        palette[i] = hwr_palette_argb(i);
+
+    output[0] = 2u;
+    output[1] = 0u;
+    output[2] = 0u;
+    output[3] = 0u;
+    output[4] = 0x4eu;
+    output[5] = 0u;
+    output[6] = 0x38u;
+    output[7] = 0u;
+    output += 8;
+
+    hstep = ((g_last_frame.w - 1u) << 16) / 0x4eu;
+    vstep = ((g_last_frame.h - 1u) << 16) / 0x38u;
+    for (y = 0; y < 0x38u; y++) {
+        uint32_t source_y = yacc >> 16;
+        uint32_t xacc = 0;
+        uint32_t x;
+        if (source_y >= g_last_frame.h - 1u)
+            source_y = g_last_frame.h - 2u;
+        for (x = 0; x < 0x4eu; x++) {
+            uint32_t source_x = xacc >> 16;
+            uint8_t top_mix;
+            uint8_t bottom_mix;
+            uint8_t i00;
+            uint8_t i01;
+            uint8_t i10;
+            uint8_t i11;
+
+            if (source_x >= g_last_frame.w - 1u)
+                source_x = g_last_frame.w - 2u;
+            i00 = hwr_thumbnail_composite_sample(
+                source, source_x, source_y, palette, engine, pitch,
+                viewport_x, viewport_y, viewport_w, viewport_h);
+            i01 = hwr_thumbnail_composite_sample(
+                source, source_x + 1u, source_y, palette, engine, pitch,
+                viewport_x, viewport_y, viewport_w, viewport_h);
+            i10 = hwr_thumbnail_composite_sample(
+                source, source_x, source_y + 1u, palette, engine, pitch,
+                viewport_x, viewport_y, viewport_w, viewport_h);
+            i11 = hwr_thumbnail_composite_sample(
+                source, source_x + 1u, source_y + 1u, palette, engine, pitch,
+                viewport_x, viewport_y, viewport_w, viewport_h);
+            top_mix = blend[(uint32_t)i01 << 8 | i00];
+            bottom_mix = blend[(uint32_t)i11 << 8 | i10];
+            *output++ = blend[(uint32_t)top_mix << 8 | bottom_mix];
+            xacc += hstep;
+        }
+        yacc += vstep;
+    }
+    return 1;
+}
+
 /* One atomic file per compare cycle: the soft, gl, and gl-texel planes stacked
  * vertically, with the cycle serial in a header comment so sweep tooling can
  * detect fresh sets. */
@@ -1188,6 +1367,15 @@ static void ROTH_CDECL hwr_render_world_sprite(struct roth_chain *chain,
     roth_next_render_world_sprite(chain, esi_record, es, fs, gs);
 }
 
+static void ROTH_CDECL hwr_capture_screen_thumbnail(
+    struct roth_chain *chain, const struct roth_api_v1 *api,
+    uint32_t dst, uint32_t src, uint32_t lut)
+{
+    if (hwr_capture_world_thumbnail(api, dst, src, lut))
+        return;
+    roth_next_capture_screen_thumbnail(chain, dst, src, lut);
+}
+
 static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
 {
     const char *plugin_dir;
@@ -1437,6 +1625,8 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
                               hwr_draw_floorceil_surface, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_render_world_sprite,
                               hwr_render_world_sprite, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_capture_screen_thumbnail,
+                              hwr_capture_screen_thumbnail, 0) != 0;
     if (failures != 0)
         fprintf(stderr, "[renderer_overhaul] %d override registration(s) failed\n", failures);
 }
