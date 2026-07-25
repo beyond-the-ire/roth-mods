@@ -837,6 +837,7 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     uint32_t render_height;
     int32_t result;
     int world_was_valid;
+    int refresh_result;
 
     g_wrap_serial++;
     hwr_settings_apply_pending();
@@ -921,8 +922,17 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     if (g_backdrop_seed_pending)
         hwr_submit_backdrop_seed(api, &viewport);
     world_was_valid = g_world.valid;
-    if (g_world.valid && hwr_world_refresh(&g_world, api) == 0 &&
+    refresh_result = g_world.valid ? hwr_world_refresh(&g_world, api) : -1;
+    if (refresh_result >= 0 &&
         hwr_world_refresh_lut_state(&g_world, api) == 0) {
+        if ((refresh_result & HWR_WORLD_REFRESH_TEXTURES) != 0) {
+            /* RAW texture commands have already settled the live geometry
+             * records during roth_next. Extend the resident texture union
+             * from those ids rather than invoking the remap hook again: that
+             * hook may execute commands. Previously seen variants remain
+             * resident, so repeated animation does not rebuild every tick. */
+            g_scene_rebuild_pending = 1;
+        }
         /* Enumerate this frame's billboards from the just-refreshed live state.
          * The layer stages data only; nothing consumes it in the render below
          * yet, so it never affects the current output. */

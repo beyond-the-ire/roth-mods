@@ -582,3 +582,101 @@ fail_open:
         spans[oi].count = 0;
     return 0;
 }
+
+int hwr_compute_door_portal_windows(
+    const struct hwr_world *world, const struct roth_api_v1 *api,
+    struct hwr_sector_xspan *spans, size_t span_count)
+{
+    const uint8_t *node_section;
+    uintptr_t arena, arena_end, worklist_limit;
+    size_t s, di;
+
+    if (world == NULL || api == NULL || api->game_ram == NULL ||
+        spans == NULL)
+        return 0;
+    if (world->sector_count == 0 || world->door_count == 0 ||
+        span_count < world->door_count || world->sector_section == NULL)
+        return 0;
+    if (!hwr_portal_clip_enabled())
+        return 0;
+
+    for (di = 0; di < world->door_count; di++)
+        spans[di].count = 0;
+
+    arena = (uintptr_t)api->game_ram->u32(VA_G_RENDER_ARENA_PTR);
+    if (arena < 0x1000u ||
+        arena > UINTPTR_MAX - HWR_RENDER_ARENA_WINDOW)
+        return 0;
+    arena_end = arena + HWR_RENDER_ARENA_WINDOW;
+    worklist_limit =
+        (uintptr_t)api->game_ram->u32(VA_G_RENDER_ARENA_PTR + 4u);
+    if (worklist_limit <= arena || worklist_limit > arena_end)
+        return 0;
+    node_section = (const uint8_t *)arena_end;
+
+    for (s = 0; s < world->sector_count; s++) {
+        const struct hwr_sector *sector = &world->sectors[s];
+        const uint8_t *record =
+            world->sector_section + sector->section_offset;
+        uint32_t wall_base = hwr_pvs_u16(record + 4u);
+        uint32_t sector_node;
+        uint32_t head_rel;
+        uintptr_t node;
+        uint32_t guard = 0;
+        int ok = 1;
+
+        if (wall_base < 8u)
+            continue;
+        sector_node = wall_base - 8u;
+        head_rel = hwr_pvs_section_u16(
+            node_section, sector_node + 4u, &ok);
+        if (!ok)
+            goto fail_open;
+        if (head_rel == 0)
+            continue;
+        node = arena + head_rel;
+
+        while (node != 0 && guard++ < HWR_CHAIN_LIMIT) {
+            uint32_t entry;
+            uint32_t door_ptr;
+            uintptr_t next;
+
+            if (node < arena || node >= worklist_limit ||
+                node > arena_end - 12u)
+                goto fail_open;
+            entry = hwr_pvs_u32((const uint8_t *)node + 4u);
+            next = (uintptr_t)hwr_pvs_u32((const uint8_t *)node);
+            if ((uintptr_t)entry < arena ||
+                (uintptr_t)entry >= worklist_limit ||
+                (uintptr_t)entry > arena_end - 0x26u)
+                goto fail_open;
+            if (hwr_pvs_u16(
+                    (const uint8_t *)(uintptr_t)entry + 0x12u) == 4u) {
+                door_ptr =
+                    hwr_pvs_u32((const uint8_t *)(uintptr_t)entry + 8u);
+                for (di = 0; di < world->door_count; di++) {
+                    if (world->doors[di].record_ptr == door_ptr)
+                        break;
+                }
+                if (di < world->door_count) {
+                    /* Stock consumes only type-4 membership when collecting
+                     * hinged doors; its polygon stage uses global view bounds,
+                     * not this node's packed portal interval. */
+                    spans[di].count = 1;
+                }
+            }
+            node = next;
+        }
+        if (guard >= HWR_CHAIN_LIMIT)
+            goto fail_open;
+    }
+
+    /* A structurally valid scan with no type-4 match is authoritative: stock
+     * admitted no active door into the visible worklists. */
+    return 1;
+
+fail_open:
+    for (di = 0; di < world->door_count; di++)
+        spans[di].count = 0;
+    return 0;
+}

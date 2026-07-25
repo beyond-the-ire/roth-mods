@@ -68,9 +68,9 @@ struct hwr_object {
      * inherit that sector's shade/tint selection. HWR_OBJECT_NO_SECTOR when the
      * source carries no owning sector (particles, pickup overlay). */
     uint16_t sector_index;
-    /* Record +0xc: the actor pool backref (actor_index*0x22 + 1) the monster
-     * frame resolver follows to the live actor state; 0 for a non-monster or an
-     * unlinked record, which falls back to the static appearance table. */
+    /* Record +0xc: live-pool backref. Monsters resolve actor appearance through
+     * actor_index*0x22+1; command-driven RLE animation can also address the
+     * actor or walker pool through this same value. Zero means unlinked. */
     uint16_t backref;
     /* Live address of the appearance record used as draw-entry +8. The
      * software renderer repeats this exact pointer in every type-1 worklist

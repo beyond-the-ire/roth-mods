@@ -82,4 +82,11 @@ int hwr_compute_object_portal_windows(
     const struct roth_api_v1 *api, struct hwr_sector_xspan *spans,
     size_t span_count);
 
+/* Recovers type-4 worklist membership for the post-tick primary hinged-door
+ * snapshot. Entries are matched by exact pool-record pointer. Their ranges are
+ * admission evidence only; stock does not scissor door geometry to them. */
+int hwr_compute_door_portal_windows(
+    const struct hwr_world *world, const struct roth_api_v1 *api,
+    struct hwr_sector_xspan *spans, size_t span_count);
+
 #endif

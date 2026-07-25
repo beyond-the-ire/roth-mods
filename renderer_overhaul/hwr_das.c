@@ -640,10 +640,13 @@ int hwr_das_group_child_view(const struct hwr_das_entry *entry,
 void hwr_das_release_decoded(struct hwr_das_archive *archive, size_t id)
 {
     struct hwr_das_entry *entry;
+    int had_decoded_storage;
     size_t i;
     if (archive == NULL || id >= archive->entry_count)
         return;
     entry = &archive->entries[id];
+    had_decoded_storage =
+        entry->raw_payload != NULL || entry->frames != NULL;
     for (i = 0; i < entry->frame_count; i++)
         free(entry->frames[i].pixels);
     free(entry->frames);
@@ -652,6 +655,12 @@ void hwr_das_release_decoded(struct hwr_das_archive *archive, size_t id)
     entry->frame_count = 0;
     entry->raw_payload = NULL;
     entry->raw_payload_size = 0;
+    /* A later scene rebuild must actually reload payload-backed resources.
+     * Keeping PLAIN/GROUPED/ANIMATED here made hwr_das_decode's classified
+     * fast path return with no pixels, turning every old texture into a
+     * one-pixel palette fill after the first live material transition. */
+    if (had_decoded_storage && !entry->decode_failed)
+        entry->resource_class = HWR_DAS_CLASS_UNREAD;
 }
 
 void hwr_das_build_census(struct hwr_das_archive *archive,

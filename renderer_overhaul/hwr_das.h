@@ -86,7 +86,7 @@ void hwr_das_close(struct hwr_das_archive *archive);
 /* Loads and classifies one FAT entry. Unknown resource kinds retain their raw bytes. */
 int hwr_das_decode(struct hwr_das_archive *archive, size_t id);
 
-/* Releases decoded byte/frame storage while retaining classification metadata. */
+/* Releases decoded storage; payload-backed entries become lazy/unread again. */
 void hwr_das_release_decoded(struct hwr_das_archive *archive, size_t id);
 
 /* Resolves a grouped child word to its payload-relative 16-byte-unit offset. */

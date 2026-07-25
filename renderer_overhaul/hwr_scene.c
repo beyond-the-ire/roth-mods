@@ -146,7 +146,9 @@ static struct hwr_mesh_surface *hwr_add_surface(struct hwr_scene_mesh *mesh,
     memset(surface, 0, sizeof *surface);
     surface->first_vertex = mesh->vertex_count;
     surface->vertex_count = vertex_count;
+    surface->neighbor_sector_index = SIZE_MAX;
     surface->wall_offset = UINT16_MAX;
+    surface->door_index = UINT8_MAX;
     surface->kind = kind;
     mesh->kind_counts[kind]++;
     return surface;
@@ -172,6 +174,11 @@ static void hwr_collect_texture_references(struct hwr_scene_mesh *mesh,
                                            const struct hwr_world *world)
 {
     size_t i;
+    for (i = 0; i < 0x1600u; i++) {
+        if ((world->texture_refs[i >> 3] &
+             (uint8_t)(1u << (i & 7u))) != 0)
+            hwr_mark_texture(mesh, (int16_t)i);
+    }
     for (i = 0; i < world->sector_count; i++) {
         const struct hwr_sector *sector = &world->sectors[i];
         int16_t ids[2] = { sector->ceiling_flat_id, sector->floor_flat_id };
@@ -506,6 +513,115 @@ static int hwr_emit_wall(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     return 0;
 }
 
+static int hwr_emit_doors(struct hwr_scene_mesh *mesh,
+                          const struct hwr_world *world)
+{
+    static const uint8_t endpoint_a[HWR_DOOR_SURFACE_COUNT] =
+        { 3u, 1u, 0u, 2u };
+    static const uint8_t endpoint_b[HWR_DOOR_SURFACE_COUNT] =
+        { 2u, 0u, 3u, 1u };
+    size_t di;
+    for (di = 0; di < world->door_count; di++) {
+        const struct hwr_door *door = &world->doors[di];
+        const struct hwr_sector *sector;
+        const struct hwr_sector *shade_sector;
+        size_t fi;
+        if (door->owner_sector_index >= world->sector_count)
+            continue;
+        sector = &world->sectors[door->owner_sector_index];
+        /* The neighbor worklist always admits an active primary door; the
+         * owner is only an additional admission while state bit 1 is clear.
+         * Use that mandatory pass's sector shade state, falling back to owner
+         * only for a malformed/missing neighbor. */
+        shade_sector = door->neighbor_sector_index < world->sector_count
+                     ? &world->sectors[door->neighbor_sector_index] : sector;
+        for (fi = 0; fi < HWR_DOOR_SURFACE_COUNT; fi++) {
+            const struct hwr_door_surface *face = &door->surfaces[fi];
+            struct hwr_mesh_surface *surface;
+            struct hwr_mesh_vertex *v;
+            uint8_t a = endpoint_a[fi];
+            uint8_t b = endpoint_b[fi];
+            uint16_t extent = face->extent;
+            float row[4];
+            float column[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+            float row_scale = 1.0f;
+            float column_scale = 1.0f;
+            if (face->texture_id >= 0 &&
+                (uint16_t)face->texture_id == world->world_span_colorkey)
+                continue;
+            if (sector->ceiling_z <= sector->floor_z)
+                continue;
+            if (extent == 0)
+                extent = hwr_wall_length(
+                    door->corner_x[a], door->corner_y[a],
+                    door->corner_x[b], door->corner_y[b]);
+            /* The direct DAS sampler's base row axis matches the accepted
+             * object-mesh path. Face bit 1 travels through mapping_flags below
+             * so it XORs with a grouped child's flip instead of being baked
+             * into these coordinates twice. */
+            row[0] = 0.0f; row[1] = 1.0f;
+            row[2] = 1.0f; row[3] = 0.0f;
+            if ((face->draw_flags & 0x20u) != 0) {
+                row_scale += (float)(face->scale & 0x0fu);
+                column_scale += (float)(face->scale >> 4);
+                row[0] *= row_scale; row[1] *= row_scale;
+                row[2] *= row_scale; row[3] *= row_scale;
+                column[0] *= column_scale; column[1] *= column_scale;
+                column[2] *= column_scale; column[3] *= column_scale;
+            }
+            surface = hwr_add_surface(mesh, HWR_SURFACE_DOOR, 6u);
+            if (surface == NULL)
+                return -1;
+            surface->sector_index = door->owner_sector_index;
+            surface->neighbor_sector_index = door->neighbor_sector_index;
+            surface->door_index = (uint8_t)di;
+            surface->door_state_flags = door->state_flags;
+            surface->texture_id = face->texture_id;
+            surface->extent = extent;
+            surface->aux = face->vertical_extent;
+            surface->scale = face->scale;
+            surface->mapping_flags = (uint8_t)(face->draw_flags & 2u);
+            surface->sector_flags = shade_sector->flags;
+            /* +0x0e is a shade seed (normally 0x80), not a Boolean. Stock
+             * combines it with the admitting sector ambient; when that
+             * ambient is zero the 0x80 seed deliberately survives. */
+            surface->light = face->shade_mode;
+            if (face->shade_mode != 0 && shade_sector->light != 0) {
+                surface->light = (uint8_t)(
+                    (uint8_t)(face->shade_mode - 0x80u) +
+                    shade_sector->light);
+            }
+            if (face->texture_id < 0)
+                surface->flags |= HWR_SURFACE_DIRECT;
+            else
+                hwr_mark_texture(mesh, face->texture_id);
+            if ((face->draw_flags & 1u) != 0)
+                surface->flags |= HWR_SURFACE_MASKED;
+            v = mesh->vertices + mesh->vertex_count;
+            hwr_set_vertex(&v[0], door->corner_x[a], door->corner_y[a],
+                           sector->ceiling_z, row[0], column[0]);
+            hwr_set_vertex(&v[1], door->corner_x[b], door->corner_y[b],
+                           sector->ceiling_z, row[1], column[1]);
+            hwr_set_vertex(&v[2], door->corner_x[b], door->corner_y[b],
+                           sector->floor_z, row[2], column[2]);
+            hwr_set_vertex(&v[3], door->corner_x[a], door->corner_y[a],
+                           sector->ceiling_z, row[0], column[0]);
+            hwr_set_vertex(&v[4], door->corner_x[b], door->corner_y[b],
+                           sector->floor_z, row[2], column[2]);
+            hwr_set_vertex(&v[5], door->corner_x[a], door->corner_y[a],
+                           sector->floor_z, row[3], column[3]);
+            v[1].reserved = HWR_WALL_CORNER_END_B;
+            v[2].reserved =
+                HWR_WALL_CORNER_END_B | HWR_WALL_CORNER_BOTTOM;
+            v[4].reserved =
+                HWR_WALL_CORNER_END_B | HWR_WALL_CORNER_BOTTOM;
+            v[5].reserved = HWR_WALL_CORNER_BOTTOM;
+            mesh->vertex_count += 6u;
+        }
+    }
+    return 0;
+}
+
 static int64_t hwr_cross(struct hwr_point a, struct hwr_point b,
                          struct hwr_point c)
 {
@@ -804,6 +920,36 @@ static int hwr_emit_portal_slab(struct hwr_scene_mesh *mesh,
                          wall->mapping_flags);
 }
 
+static int hwr_primary_door_owns_sector(const struct hwr_world *world,
+                                        uint16_t sector_offset)
+{
+    size_t i;
+    for (i = 0; i < world->door_count; i++) {
+        if (world->doors[i].owner_sector_offset == sector_offset)
+            return 1;
+    }
+    return 0;
+}
+
+/* Stock's final portal-overlay gate drops only the doorway middle while the
+ * private hinged-door record owns it. Upper/lower bands and sector geometry
+ * remain ordinary world surfaces. */
+static int hwr_portal_middle_suppressed(
+    const struct hwr_world *world, const struct hwr_sector *sector,
+    const struct hwr_sector *neighbor)
+{
+    uint16_t sentinel = (uint16_t)sector->sentinel;
+    uint16_t neighbor_sentinel = (uint16_t)neighbor->sentinel;
+    if (sentinel >= 0xfffeu) {
+        if (hwr_primary_door_owns_sector(world, sector->section_offset))
+            return 1;
+        if (sentinel == 0xfffeu)
+            return 1;
+    }
+    return neighbor_sentinel >= 0xfffeu &&
+           hwr_primary_door_owns_sector(world, neighbor->section_offset);
+}
+
 int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                          const struct hwr_world *world, int debug)
 {
@@ -855,7 +1001,10 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
                                   sector->floor_z, sector->floor_z,
                                   0, wall->mapping_flags) != 0)
                     goto failed;
-                if ((wall->mapping_flags & 1u) != 0) {
+                if (hwr_portal_middle_suppressed(
+                        world, sector, neighbor)) {
+                    /* The active private door supplies this opening's middle. */
+                } else if ((wall->mapping_flags & 1u) != 0) {
                     int16_t top = sector->ceiling_z < neighbor->ceiling_z
                                 ? sector->ceiling_z : neighbor->ceiling_z;
                     int16_t bottom = sector->floor_z > neighbor->floor_z
@@ -935,6 +1084,8 @@ int hwr_scene_build_mesh(struct hwr_scene_mesh *mesh,
             }
         }
     }
+    if (hwr_emit_doors(mesh, world) != 0)
+        goto failed;
     mesh->valid = 1;
     return 0;
 
@@ -1681,9 +1832,25 @@ static int hwr_surface_geometry_visible(
      * dropped -- including its sky caps -- so a sector stacked over or under the
      * camera's own, but not on the sight path, no longer bleeds through. Inert
      * while pvs_valid is 0. */
-    if (scene->pvs_valid && surface->sector_index < scene->visible_count &&
-        !scene->visible[surface->sector_index])
+    if (!camera->reflected && surface->kind == HWR_SURFACE_DOOR &&
+        scene->door_portal_clip_valid &&
+        surface->door_index < HWR_DOOR_MAX &&
+        scene->door_spans[surface->door_index].count == 0)
         return 0;
+    if (scene->pvs_valid) {
+        int owner_visible =
+            surface->sector_index < scene->visible_count &&
+            scene->visible[surface->sector_index];
+        int neighbor_visible =
+            surface->kind == HWR_SURFACE_DOOR &&
+            surface->neighbor_sector_index < scene->visible_count &&
+            scene->visible[surface->neighbor_sector_index];
+        if (surface->kind == HWR_SURFACE_DOOR &&
+            (surface->door_state_flags & 2u) != 0)
+            owner_visible = 0;
+        if (!owner_visible && !neighbor_visible)
+            return 0;
+    }
     if (surface->texture_id >= 0 &&
         (uint16_t)surface->texture_id < 0x1600u &&
         scene->textures[(uint16_t)surface->texture_id].skip)
@@ -2778,6 +2945,8 @@ static size_t hwr_surface_reserve(const struct hwr_mesh_surface *surface)
         return surface->vertex_count;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         return surface->vertex_count;
+    if (surface->kind == HWR_SURFACE_DOOR)
+        return surface->vertex_count;
     /* Band-triangle vertices sit only at the two wall ends (t==0 or t==1), never
      * strictly inside an along-slab, so a band triangle clipped to one slab is at
      * most a quad -> 2 output triangles = 6 vertices; over HWR_WALLSEG_MAX slabs
@@ -2892,7 +3061,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                             flat_square256 && !flat_transparent,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
-    else {
+    else if (surface->kind != HWR_SURFACE_DOOR) {
         hwr_wall_span_state(&scene->mesh, surface, camera, width,
                             texture_width, texture_height, &wall_span);
         wall_tint_adjust =
@@ -2905,6 +3074,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
      * so its far sub-quads can solid-fill while the near ones stay texel-shaded;
      * a face with no saturation stays single-ramp and byte-exact. */
     if ((surface->flags & HWR_SURFACE_FLAT) == 0 &&
+        surface->kind != HWR_SURFACE_DOOR &&
         (surface->sector_flags & 2u) != 0 && wall_span.valid &&
         fill_ok &&
         !hwr_wall_uses_image_fit(surface, texture_width, texture_height)) {
@@ -3022,7 +3192,15 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
         target->x = source->x;
         target->y = source->y;
         target->z = source->z;
-        if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
+        if (surface->kind == HWR_SURFACE_DOOR) {
+            float row_max = texture_height != 0
+                ? (float)texture_height - (1.0f / 64.0f) : 0.0f;
+            float column_max = texture_width != 0
+                ? (float)texture_width - (1.0f / 64.0f) : 0.0f;
+            target->wall_s = source->wall_s * row_max;
+            target->wall_top = source->wall_top * column_max;
+            target->flat_mapping_flags = HWR_GL_MAPPING_MESH;
+        } else if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
             const struct hwr_mesh_vertex *wall_vertices =
                 &scene->mesh.vertices[surface->first_vertex];
             int end_b = (source->reserved & HWR_WALL_CORNER_END_B) != 0;
@@ -3122,7 +3300,8 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
         target->flat_guard = flat_guard;
         target->flat_guard_step = flat_guard_step;
         target->flat_guard_origin_y = flat_guard_origin_y;
-        target->flat_mapping_flags = surface->mapping_flags;
+        if (surface->kind != HWR_SURFACE_DOOR)
+            target->flat_mapping_flags = surface->mapping_flags;
         target->wall_source_numerator = wall_span.numerator;
         target->wall_source_denominator = wall_span.denominator;
         target->wall_source_step = wall_span.numerator_step;
@@ -3146,6 +3325,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
      * texel shading, matching the engine (only counter==4 fills). */
     if (fill_ok &&
         (surface->flags & HWR_SURFACE_FLAT) == 0 &&
+        surface->kind != HWR_SURFACE_DOOR &&
         (surface->sector_flags & 2u) != 0) {
         int all_sat = 1;
         for (i = 0; i < surface->vertex_count; i++) {
@@ -3255,13 +3435,98 @@ static void hwr_prepare_reflection_object_windows(
     }
 }
 
+static void hwr_scene_door_span_add(struct hwr_sector_xspan *span,
+                                    int16_t lo, int16_t hi)
+{
+    unsigned i;
+    if (span->count == UINT8_MAX)
+        return;
+    if (lo > hi) {
+        int16_t swap = lo;
+        lo = hi;
+        hi = swap;
+    }
+    for (i = 0; i < span->count; i++) {
+        if ((int)lo <= (int)span->hi[i] + 1 &&
+            (int)span->lo[i] <= (int)hi + 1) {
+            unsigned j = 0;
+            if (lo < span->lo[i])
+                span->lo[i] = lo;
+            if (hi > span->hi[i])
+                span->hi[i] = hi;
+            while (j < span->count) {
+                if (j != i &&
+                    (int)span->lo[i] <= (int)span->hi[j] + 1 &&
+                    (int)span->lo[j] <= (int)span->hi[i] + 1) {
+                    if (span->lo[j] < span->lo[i])
+                        span->lo[i] = span->lo[j];
+                    if (span->hi[j] > span->hi[i])
+                        span->hi[i] = span->hi[j];
+                    span->count--;
+                    span->lo[j] = span->lo[span->count];
+                    span->hi[j] = span->hi[span->count];
+                    if (i == span->count)
+                        i = j;
+                    j = 0;
+                    continue;
+                }
+                j++;
+            }
+            return;
+        }
+    }
+    if (span->count >= HWR_SECTOR_CLIP_MAX) {
+        span->count = UINT8_MAX; /* overflow fails open in the mirror scissor */
+        return;
+    }
+    span->lo[span->count] = lo;
+    span->hi[span->count] = hi;
+    span->count++;
+}
+
+static void hwr_prepare_reflection_door_windows(
+    struct hwr_scene *scene, const struct hwr_world *world)
+{
+    size_t di;
+    memset(scene->door_spans, 0, sizeof scene->door_spans);
+    for (di = 0; di < world->door_count && di < HWR_DOOR_MAX; di++) {
+        const struct hwr_door *door = &world->doors[di];
+        size_t sectors[2];
+        size_t si;
+        sectors[0] = (door->state_flags & 2u) == 0
+                   ? door->owner_sector_index : SIZE_MAX;
+        sectors[1] = door->neighbor_sector_index;
+        for (si = 0; si < 2u; si++) {
+            const struct hwr_sector_xspan *source;
+            unsigned wi;
+            if (sectors[si] >= scene->reflection_span_count)
+                continue;
+            source = &scene->reflection_spans[sectors[si]];
+            if (source->count == 0 ||
+                source->count > HWR_SECTOR_CLIP_MAX)
+                continue;
+            for (wi = 0; wi < source->count; wi++)
+                hwr_scene_door_span_add(
+                    &scene->door_spans[di],
+                    source->lo[wi], source->hi[wi]);
+        }
+    }
+}
+
 static const struct hwr_sector_xspan *hwr_surface_reflection_windows(
     const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera)
 {
     const struct hwr_sector_xspan *span;
-    if (!camera->reflected || !scene->reflection_clip_valid ||
-        surface->sector_index >= scene->reflection_span_count)
+    if (!camera->reflected || !scene->reflection_clip_valid)
+        return NULL;
+    if (surface->kind == HWR_SURFACE_DOOR &&
+        surface->door_index < HWR_DOOR_MAX) {
+        span = &scene->door_spans[surface->door_index];
+        return span->count != 0 && span->count <= HWR_SECTOR_CLIP_MAX
+             ? span : NULL;
+    }
+    if (surface->sector_index >= scene->reflection_span_count)
         return NULL;
     span = &scene->reflection_spans[surface->sector_index];
     /* A poisoned/overflowed set fails open inside the mirror's global scissor. */
@@ -3293,10 +3558,21 @@ static size_t hwr_copy_gpu_surface_windows(
                                     0, 0, destination);
     for (i = 0; i < span->count; i++) {
         int left, right;
-        if (!hwr_reflection_frame_window(camera, width,
-                                         span->lo[i], span->hi[i],
-                                         &left, &right))
-            continue;
+        if (camera->reflected) {
+            if (!hwr_reflection_frame_window(camera, width,
+                                             span->lo[i], span->hi[i],
+                                             &left, &right))
+                continue;
+        } else {
+            left = span->lo[i];
+            right = (int)span->hi[i] + 1;
+            if (left < 0)
+                left = 0;
+            if (right > (int)width)
+                right = (int)width;
+            if (left >= right)
+                continue;
+        }
         emitted += hwr_copy_gpu_surface(
             scene, surface, camera, width, height, left, right,
             destination + emitted);
@@ -4102,6 +4378,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
             scene->pvs_valid = 1;
         }
         scene->reflection_clip_valid = 1;
+        hwr_prepare_reflection_door_windows(scene, world);
         hwr_prepare_reflection_object_windows(
             scene, objects, &reflection->camera, width);
         scene->portal_clip_valid =
@@ -4155,12 +4432,16 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
      * no-op, leaving the frame identical to the plain stream-everything path. */
     scene->pvs_valid = 0;
     scene->portal_clip_valid = 0;
+    scene->door_portal_clip_valid = 0;
     scene->reflection_clip_valid = 0;
     if (hwr_pvs_enabled()) {
         scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
         /* Reuse each type-1 worklist node's object-depth-specific window. */
         scene->portal_clip_valid = hwr_compute_object_portal_windows(
             world, objects, api, scene->spans, scene->span_count);
+        scene->door_portal_clip_valid =
+            hwr_compute_door_portal_windows(
+                world, api, scene->door_spans, HWR_DOOR_MAX);
     }
     hwr_scene_log_visibility(scene, world);
     if (hwr_scene_emit_view(

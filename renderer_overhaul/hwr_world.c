@@ -18,9 +18,16 @@
 #define VA_G_SHADE_LEVEL           0x90c16u
 #define VA_G_TINT_SHADE_LEVEL      0x90c18u
 #define VA_G_DAS_FILL_INDEX        0x89f10u
+#define VA_G_DOOR_COUNT            0x8b3f4u
+#define VA_G_DOOR_POOL             0x8b3f8u
 
 #define HWR_SECTION_EXTENT 0x10000u
 #define HWR_NO_INDEX UINT16_MAX
+#define HWR_DOOR_STRIDE 0x1f6u
+#define HWR_DOOR_CORNER_BASE 0xb6u
+#define HWR_DOOR_CORNER_STRIDE 0x10u
+#define HWR_DOOR_SURFACE_BASE 0xf6u
+#define HWR_DOOR_SURFACE_STRIDE 0x40u
 
 static uint16_t hwr_u16(const uint8_t *bytes)
 {
@@ -117,6 +124,40 @@ static void hwr_parse_slab(struct hwr_slab *slab)
     slab->upper_z = hwr_i16(slab->raw + 8);
     slab->upper_aux = hwr_u16(slab->raw + 0x0a);
     slab->flags = slab->raw[0x0c];
+}
+
+static int hwr_world_mark_texture(struct hwr_world *world, int16_t id)
+{
+    uint16_t logical;
+    uint8_t mask;
+    if (id < 0)
+        return 0;
+    logical = (uint16_t)id;
+    if (logical >= 0x1600u || logical == world->world_span_colorkey)
+        return 0;
+    mask = (uint8_t)(1u << (logical & 7u));
+    if ((world->texture_refs[logical >> 3] & mask) != 0)
+        return 0;
+    world->texture_refs[logical >> 3] |= mask;
+    return 1;
+}
+
+static void hwr_world_collect_texture_references(struct hwr_world *world)
+{
+    size_t i;
+    for (i = 0; i < world->sector_count; i++) {
+        hwr_world_mark_texture(world, world->sectors[i].ceiling_flat_id);
+        hwr_world_mark_texture(world, world->sectors[i].floor_flat_id);
+    }
+    for (i = 0; i < world->slab_count; i++) {
+        hwr_world_mark_texture(world, (int16_t)world->slabs[i].lower_surface_id);
+        hwr_world_mark_texture(world, (int16_t)world->slabs[i].upper_surface_id);
+    }
+    for (i = 0; i < world->wall_count; i++) {
+        hwr_world_mark_texture(world, (int16_t)world->walls[i].middle_id);
+        hwr_world_mark_texture(world, (int16_t)world->walls[i].upper_id);
+        hwr_world_mark_texture(world, (int16_t)world->walls[i].lower_id);
+    }
 }
 
 void hwr_world_clear(struct hwr_world *world)
@@ -374,6 +415,7 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     }
     next.world_span_colorkey = api->game_ram->u16(VA_G_WORLD_SPAN_COLORKEY);
     next.sky_fat_index = api->game_ram->u16(VA_G_SKY_FAT_INDEX);
+    hwr_world_collect_texture_references(&next);
     if (hwr_world_build_adjacency(&next) != 0) {
         hwr_world_clear(&next);
         return hwr_world_fail(world, "out of memory building wall adjacency index");
@@ -448,6 +490,7 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
 {
     size_t i;
     int scroll;
+    int new_texture_seen = 0;
     if (world == NULL || !world->valid || api == NULL || api->game_ram == NULL)
         return -1;
     scroll = hwr_scroll_enabled();
@@ -460,45 +503,52 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
         struct hwr_sector *sector = &world->sectors[i];
         const uint8_t *record = world->sector_section + sector->section_offset;
         memcpy(sector->raw, record, 4);
-        memcpy(sector->raw + 0x0a, record + 0x0a, 3);
-        sector->ceiling_z = hwr_i16(sector->raw);
-        sector->floor_z = hwr_i16(sector->raw + 2);
-        sector->flags = sector->raw[0x0a];
-        sector->light = sector->raw[0x0b];
-        sector->texture_map_override = (int8_t)sector->raw[0x0c];
+        /* Texture-state commands update correlated fields as one tuple: ids,
+         * scale/mapping flags and flip/tiling bits must settle together. */
+        memcpy(sector->raw + 6, record + 6, 7);
+        memcpy(sector->raw + 0x16, record + 0x16, 2);
         if (scroll) {
             /* Ceiling pan pair at +0x10, floor pan pair at +0x12. */
             memcpy(sector->raw + 0x10, record + 0x10, 4);
-            sector->ceiling_pan = hwr_u16(sector->raw + 0x10);
-            sector->floor_pan = hwr_u16(sector->raw + 0x12);
         }
+        hwr_parse_sector(sector);
+        new_texture_seen |= hwr_world_mark_texture(world, sector->ceiling_flat_id);
+        new_texture_seen |= hwr_world_mark_texture(world, sector->floor_flat_id);
     }
     for (i = 0; i < world->slab_count; i++) {
         struct hwr_slab *slab = &world->slabs[i];
         const uint8_t *record = world->sector_section + slab->section_offset;
-        memcpy(slab->raw + 2, record + 2, 2);
-        memcpy(slab->raw + 8, record + 8, 2);
-        slab->lower_z = hwr_i16(slab->raw + 2);
-        slab->upper_z = hwr_i16(slab->raw + 8);
+        memcpy(slab->raw, record, 4);
+        memcpy(slab->raw + 6, record + 6, 4);
+        slab->raw[0x0c] = record[0x0c];
         if (scroll) {
             /* Lower-pair pan at +0x04, upper-pair pan at +0x0a. */
             memcpy(slab->raw + 4, record + 4, 2);
             memcpy(slab->raw + 0x0a, record + 0x0a, 2);
-            slab->lower_aux = hwr_u16(slab->raw + 4);
-            slab->upper_aux = hwr_u16(slab->raw + 0x0a);
         }
+        hwr_parse_slab(slab);
+        new_texture_seen |= hwr_world_mark_texture(
+            world, (int16_t)slab->lower_surface_id);
+        new_texture_seen |= hwr_world_mark_texture(
+            world, (int16_t)slab->upper_surface_id);
     }
-    if (scroll) {
-        for (i = 0; i < world->wall_count; i++) {
-            struct hwr_wall *wall = &world->walls[i];
-            const uint8_t *record = world->sector_section + wall->mapping_offset;
+    for (i = 0; i < world->wall_count; i++) {
+        struct hwr_wall *wall = &world->walls[i];
+        const uint8_t *record = world->sector_section + wall->mapping_offset;
+        memcpy(wall->mapping_raw, record, 0x0a);
+        if (scroll) {
             /* A face's pan pair sits at +0x0a of its mapping record. Several
              * walls may share one mapping record, which simply re-reads the
              * same pair. */
             memcpy(wall->mapping_raw + 0x0a, record + 0x0a, 2);
-            wall->pan_u = wall->mapping_raw[0x0a];
-            wall->pan_v = wall->mapping_raw[0x0b];
         }
+        hwr_parse_wall(wall);
+        new_texture_seen |= hwr_world_mark_texture(
+            world, (int16_t)wall->middle_id);
+        new_texture_seen |= hwr_world_mark_texture(
+            world, (int16_t)wall->upper_id);
+        new_texture_seen |= hwr_world_mark_texture(
+            world, (int16_t)wall->lower_id);
     }
     for (i = 0; i < world->vertex_count; i++) {
         struct hwr_vertex *vertex = &world->vertices[i];
@@ -507,7 +557,71 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api)
         vertex->world_x = hwr_i16(vertex->raw + 8);
         vertex->world_y = hwr_i16(vertex->raw + 0x0a);
     }
-    return 0;
+    {
+        size_t count = api->game_ram->u8(VA_G_DOOR_COUNT);
+        if (count > HWR_DOOR_MAX)
+            count = HWR_DOOR_MAX;
+        world->door_count = 0;
+        for (i = 0; i < count; i++) {
+            uint8_t record[HWR_DOOR_STRIDE];
+            struct hwr_door *door = &world->doors[world->door_count];
+            uint32_t record_va =
+                VA_G_DOOR_POOL + (uint32_t)i * HWR_DOOR_STRIDE;
+            uint16_t owner;
+            uint16_t neighbor;
+            size_t k;
+            if (api->game_ram->read_block(
+                    record_va, record, sizeof record) != 0)
+                return hwr_world_fail(world,
+                                      "primary door %u cannot be read",
+                                      (unsigned)i);
+            owner = hwr_u16(record);
+            neighbor = hwr_u16(record + 0x10);
+            if (owner == 0 ||
+                world->sector_offset_to_index[owner] == HWR_NO_INDEX)
+                continue;
+            memset(door, 0, sizeof *door);
+            door->record_ptr =
+                (uint32_t)(uintptr_t)api->game_ram->to_ptr(record_va);
+            door->owner_sector_offset = owner;
+            door->neighbor_sector_offset = neighbor;
+            door->owner_sector_index =
+                world->sector_offset_to_index[owner];
+            door->neighbor_sector_index = SIZE_MAX;
+            if (neighbor != 0 &&
+                world->sector_offset_to_index[neighbor] != HWR_NO_INDEX)
+                door->neighbor_sector_index =
+                    world->sector_offset_to_index[neighbor];
+            door->state_flags = record[2];
+            door->angle = (int8_t)record[3];
+            for (k = 0; k < 4u; k++) {
+                const uint8_t *corner =
+                    record + HWR_DOOR_CORNER_BASE +
+                    k * HWR_DOOR_CORNER_STRIDE;
+                door->corner_x[k] = hwr_i16(corner);
+                door->corner_y[k] = hwr_i16(corner + 4);
+            }
+            for (k = 0; k < HWR_DOOR_SURFACE_COUNT; k++) {
+                const uint8_t *surface =
+                    record + HWR_DOOR_SURFACE_BASE +
+                    k * HWR_DOOR_SURFACE_STRIDE;
+                door->surfaces[k].texture_id =
+                    (int16_t)hwr_u16(surface + 0x0c);
+                door->surfaces[k].extent =
+                    hwr_u16(surface + 0x26) & 0x0fffu;
+                door->surfaces[k].vertical_extent =
+                    hwr_u16(surface + 0x24);
+                door->surfaces[k].draw_flags =
+                    hwr_u16(surface + 0x16);
+                door->surfaces[k].shade_mode = surface[0x0e];
+                door->surfaces[k].scale = surface[0x0f];
+                new_texture_seen |= hwr_world_mark_texture(
+                    world, door->surfaces[k].texture_id);
+            }
+            world->door_count++;
+        }
+    }
+    return new_texture_seen ? HWR_WORLD_REFRESH_TEXTURES : 0;
 }
 
 static int hwr_copy_pointer_region(const struct roth_api_v1 *api,

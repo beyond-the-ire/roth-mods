@@ -21,6 +21,9 @@
  * exact and independent of depth. */
 #define VA_G_VIEW_PARAMS_XSCALE  0x8527cu
 #define VA_G_PERSPECTIVE_SCALE   0x85288u
+#define VA_G_ANIM_CLOCK          0x8532au
+#define VA_G_ACTOR_SLOT_BIAS     0x91e03u
+#define VA_G_WALKER_SLOT_BIAS    0x90fe3u
 
 /* Near-depth cull, in the same view-depth units hwr_wall_view_point produces
  * (world distance * 256); 0x1000 == the engine's object near plane and the
@@ -61,6 +64,54 @@ struct hwr_bb_trans {
     /* This quad's owner-sector portal window(s); applied when it is laid out. */
     struct hwr_bb_clip clip;
 };
+
+static uint16_t hwr_bb_u16(const uint8_t *bytes)
+{
+    return (uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
+}
+
+/* RLE sub-image animation is selected per source record, not per texture.
+ * Two actors can therefore use the same archive id at different command
+ * counters. The current cache block's frame word is only the last one stock
+ * happened to draw, so derive the exact request from this object's live cell. */
+static uint16_t hwr_bb_rle_frame(
+    const struct hwr_das_entry *entry, const struct hwr_object *object,
+    const struct roth_api_v1 *api)
+{
+    uint16_t period;
+    uint16_t frame;
+    uint32_t cell = 0;
+    if (entry == NULL || object == NULL || api == NULL ||
+        api->game_ram == NULL || entry->raw_payload == NULL ||
+        entry->raw_payload_size < 0x0eu || entry->frame_count == 0)
+        return 0;
+    period = hwr_bb_u16(entry->raw_payload + 0x0au);
+    if (object->flags9 & 1u) {
+        if (object->backref != 0) {
+            uint32_t candidate =
+                VA_G_ACTOR_SLOT_BIAS + (uint32_t)object->backref;
+            if (api->game_ram->u8(candidate + 8u) & 0x6cu)
+                cell = candidate;
+        }
+    } else if (object->flags9 & 2u) {
+        if (object->backref != 0) {
+            uint32_t candidate =
+                VA_G_WALKER_SLOT_BIAS + (uint32_t)object->backref;
+            if (api->game_ram->u8(candidate + 8u) & 2u)
+                cell = candidate;
+        }
+    }
+    if (cell != 0) {
+        frame = api->game_ram->u16(cell + 0x1au);
+        if (period > 1u)
+            frame = (uint16_t)(frame / period);
+        return frame;   /* decode clamps an oversized request to the last frame */
+    }
+    if (period == 0)
+        return 0;
+    return (uint16_t)((((uint32_t)api->game_ram->u16(VA_G_ANIM_CLOCK) &
+                        0x7fffu) / period) % entry->frame_count);
+}
 
 /* HWR_FLOOR_EXCEPTION=0 disables the owner-floor depth exception: shadows fall
  * back to the raised anchor on the plain translucent tail and no below-floor
@@ -1052,10 +1103,21 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             continue;
         }
         if (lookup.klass == HWR_DAS_CLASS_ANIMATED) {
-            int live = hwr_sprites_live_frame_index(api, lookup.archive_id);
-            if (live >= 0)
-                lookup.frame_index = (uint16_t)live;      /* mirror the live block */
-            /* else the free-run fallback holds frame 0 */
+            const struct hwr_das_entry *entry =
+                lookup.archive != NULL &&
+                lookup.entry_id < lookup.archive->entry_count
+              ? &lookup.archive->entries[lookup.entry_id] : NULL;
+            if (entry != NULL && entry->raw_payload != NULL &&
+                entry->raw_payload_size >= 0x0eu &&
+                hwr_bb_u16(entry->raw_payload + 0x0cu) == 0xfffeu) {
+                lookup.frame_index = hwr_bb_rle_frame(entry, o, api);
+            } else {
+                int live =
+                    hwr_sprites_live_frame_index(api, lookup.archive_id);
+                if (live >= 0)
+                    lookup.frame_index = (uint16_t)live;
+                /* A missing delta cache block retains frame zero. */
+            }
         }
         if (lookup.archive != NULL &&
             lookup.entry_id < lookup.archive->entry_count &&

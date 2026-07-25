@@ -22,6 +22,7 @@ enum hwr_surface_kind {
     HWR_SURFACE_FLOOR,
     HWR_SURFACE_SLAB_LOWER,
     HWR_SURFACE_SLAB_UPPER,
+    HWR_SURFACE_DOOR,
     HWR_SURFACE_KIND_COUNT
 };
 
@@ -65,9 +66,14 @@ struct hwr_mesh_surface {
     size_t first_vertex;
     size_t vertex_count;
     size_t sector_index;
+    /* A door can be admitted through either of its two sectors. Ordinary
+     * surfaces leave this at SIZE_MAX. */
+    size_t neighbor_sector_index;
     /* Raw wall-record offset for wall surfaces; UINT16_MAX for flats. Mirror
      * records identify their aperture with this exact runtime offset. */
     uint16_t wall_offset;
+    uint8_t door_index;
+    uint8_t door_state_flags;
     enum hwr_surface_kind kind;
     int16_t texture_id;
     uint16_t extent;
@@ -221,6 +227,10 @@ struct hwr_scene {
     struct hwr_sector_xspan *spans;
     size_t span_count;
     int portal_clip_valid;
+    /* Type-4 primary-view admission records, indexed by live door. Reflected
+     * views reuse this storage for their reconstructed sector-window union. */
+    struct hwr_sector_xspan door_spans[HWR_DOOR_MAX];
+    int door_portal_clip_valid;
     /* Reflected walks retain every narrowed screen-X window per reached
      * sector. World geometry uses these directly; object sources receive a
      * per-object copy in spans above. */

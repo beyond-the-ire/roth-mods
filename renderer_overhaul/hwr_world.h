@@ -70,6 +70,37 @@ struct hwr_slab {
     uint8_t flags;
 };
 
+#define HWR_DOOR_MAX 6u
+#define HWR_DOOR_SURFACE_COUNT 4u
+
+enum hwr_world_refresh_flags {
+    HWR_WORLD_REFRESH_TEXTURES = 1u << 0
+};
+
+struct hwr_door_surface {
+    int16_t texture_id;
+    uint16_t extent;
+    uint16_t vertical_extent;
+    uint16_t draw_flags;
+    uint8_t shade_mode;
+    uint8_t scale;
+};
+
+/* One post-tick copy of a primary hinged-door record. Pool records compact
+ * when a door closes, so the renderer retains values only, never live pointers. */
+struct hwr_door {
+    int16_t corner_x[4];
+    int16_t corner_y[4];
+    struct hwr_door_surface surfaces[HWR_DOOR_SURFACE_COUNT];
+    uint32_t record_ptr;
+    uint16_t owner_sector_offset;
+    uint16_t neighbor_sector_offset;
+    size_t owner_sector_index;
+    size_t neighbor_sector_index;
+    uint8_t state_flags;
+    int8_t angle;
+};
+
 struct hwr_luts {
     uint8_t palette[768];
     uint8_t colormap[0x2000];
@@ -113,6 +144,12 @@ struct hwr_world {
     uint16_t first_vertex_offset;
     uint16_t world_span_colorkey;
     uint16_t sky_fat_index;
+    /* Union of every live world texture id observed since this map snapshot.
+     * The scene upload uses the union so a scripted material can switch back
+     * and forth without rebuilding the GPU texture store every frame. */
+    uint8_t texture_refs[0x1600 / 8];
+    struct hwr_door doors[HWR_DOOR_MAX];
+    size_t door_count;
     struct hwr_luts luts;
     int valid;
     char error[192];
@@ -121,7 +158,8 @@ struct hwr_world {
 /* Rebuilds all mod-owned geometry arrays from the currently loaded map. */
 int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api);
 
-/* Refreshes mutable heights, sector bytes, slab heights, and vertex world coordinates. */
+/* Refreshes mutable geometry, material ids, and surface state. Returns a
+ * hwr_world_refresh_flags mask, zero when unchanged, or -1 on failure. */
 int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api);
 
 /* Copies the engine-staged palette and color lookup tables into mod-owned memory. */
