@@ -33,10 +33,13 @@ jobs:
       - name: Build all mods
         run: |
           set -e
-          for mod in keybinds item_grabber doc_viewer; do
+          for mod in keybinds item_grabber doc_viewer debug_overlay; do
             echo "== building $mod =="
             make -C "roth-mods/$mod"
           done
+
+      - name: Run Debug Overlay offline checks
+        run: make -C roth-mods/debug_overlay check
 
       - name: Upload built plugins (workflow artifacts)
         uses: actions/upload-artifact@v4
@@ -70,7 +73,7 @@ jobs:
       - name: Build all mods (Windows) and assert the plugin export
         run: |
           set -e
-          for mod in keybinds item_grabber doc_viewer; do
+          for mod in keybinds item_grabber doc_viewer debug_overlay; do
             echo "== building $mod (Windows) =="
             make -C "roth-mods/$mod" CROSS=mingw
             i686-w64-mingw32-objdump -p "roth-mods/$mod/plugin.dll" | grep -qw roth_plugin_query_v1 \

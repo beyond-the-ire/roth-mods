@@ -17,6 +17,7 @@ lawfully owned copy of the game's data files) to run any of these.
 | [`keybinds`](keybinds/)         | Remap the game's action keys from a small text file, allowing you to build your own WASD layout. | A **data mod** plus the **scancode input seam**: rewriting the engine's keybind tables at boot and translating menu-navigation keys as input flows. |
 | [`doc_viewer`](doc_viewer/)     | Enlarges the inventory "inspect document" window so you can view more of the document at once.   | A full **engine-function replacement** with a clean passthrough: replace a function's body, or fall through to the original when disabled.          |
 | [`item_grabber`](item_grabber/) | An in-game item picker that can give any item in the game.                                       | The full **overlay toolkit**: a custom UI driven by the compose-tick, mouse-poll, and scancode seams, with engine calls behind it.                  |
+| [`debug_overlay`](debug_overlay/) | Shows accurately named timing, location, map-geometry, and interaction-cursor diagnostics in game. | A passive **debug overlay** with cross-thread timing publication, validated read-only state sampling, and clipped palette-index drawing.        |
 
 See each mod's `README.md` for screenshots and more information.
 
