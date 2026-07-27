@@ -63,8 +63,10 @@ typedef void (*hwr_settings_apply_fn)(uint32_t mask,
                                       const struct hwr_settings *settings,
                                       void *userdata);
 
+void hwr_settings_defaults(struct hwr_settings *settings);
 void hwr_settings_init_defaults(void);
 const struct hwr_settings *hwr_settings_get(void);
+void hwr_settings_replace(const struct hwr_settings *settings);
 int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata);
 void hwr_settings_apply_pending(void);
 

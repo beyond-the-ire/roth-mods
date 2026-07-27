@@ -749,7 +749,8 @@ static int hwr_bb_trans_cmp(const void *a, const void *b)
 static void hwr_bb_clip_build(struct hwr_bb_clip *clip,
                               const struct hwr_sector_xspan *spans,
                               size_t span_count, size_t object_index,
-                              double ratio, double center_x)
+                              double ratio, double source_center_x,
+                              double target_center_x)
 {
     const struct hwr_sector_xspan *s;
     unsigned i;
@@ -762,9 +763,11 @@ static void hwr_bb_clip_build(struct hwr_bb_clip *clip,
         return;                                  /* no window captured: fail open */
     for (i = 0; i < s->count && clip->count < (int)HWR_SECTOR_CLIP_MAX; i++) {
         clip->lo[clip->count] =
-            (float)(ratio * ((double)s->lo[i] - center_x) + center_x);
+            (float)(ratio * ((double)s->lo[i] - source_center_x) +
+                    target_center_x);
         clip->hi[clip->count] =
-            (float)(ratio * ((double)s->hi[i] - center_x) + center_x);
+            (float)(ratio * ((double)s->hi[i] - source_center_x) +
+                    target_center_x);
         clip->count++;
     }
     clip->active = clip->count > 0;
@@ -946,7 +949,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
 {
     uint16_t yaw;
     double focal_x, focal_y, xscale, pscale, hscale, vscale;
-    double clip_ratio, clip_center;
+    double clip_ratio, clip_source_center, clip_target_center;
     struct hwr_bb_trans *pending = NULL;
     size_t pending_count = 0, pending_capacity = 0;
     struct hwr_bb_trans *pending_shadow = NULL;
@@ -984,8 +987,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     frame_no++;
 
     yaw = camera->yaw;
-    focal_x = (double)camera->focal_x;
-    focal_y = (double)camera->focal_y;
+    focal_x = (double)camera->source_focal_x;
+    focal_y = (double)camera->source_focal_y;
     /* The engine's type-1 billboard projects its horizontal extent with
      * view_params_block+0xc and its vertical with g_perspective_scale, dividing
      * by g_view_clip_plane -- a view depth carried in a x256 fixed point (near
@@ -1004,11 +1007,20 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     hscale = xscale / (focal_x * 256.0);
     vscale = pscale / (focal_y * 256.0);
 
-    /* Billboard world extents above are already pre-scaled by Xscale/focal_x,
-     * so their GL projection lands in the engine's screen-X coordinates. Exact
-     * worklist window bounds therefore map identically around the shared centre. */
-    clip_center = (double)camera->center_x;
-    clip_ratio = 1.0;
+    /* Primary worklist bounds remain in engine screen space. Map them through
+     * the same focal/centre change as the target camera. Reflected spans were
+     * rebuilt with that target camera and are already framebuffer-space. */
+    if (camera->reflected) {
+        clip_source_center = (double)camera->center_x;
+        clip_target_center = (double)camera->center_x;
+        clip_ratio = 1.0;
+    } else {
+        clip_source_center = (double)camera->source_center_x;
+        clip_target_center = (double)camera->center_x;
+        clip_ratio = camera->source_focal_x != 0
+                   ? (double)camera->focal_x /
+                     (double)camera->source_focal_x : 1.0;
+    }
 
 
     for (i = 0; i < objects->count; i++) {
@@ -1062,7 +1074,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
 
         /* Recover the sprite entry's exact object-depth worklist window. */
         hwr_bb_clip_build(&clip, spans, span_count, i,
-                          clip_ratio, clip_center);
+                          clip_ratio, clip_source_center,
+                          clip_target_center);
         if (clip.active) {
             clip_active_objs++;
             if (clip_log && clip_active_objs <= 8u)
@@ -1478,7 +1491,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         fprintf(stderr,
                 "[bb-clip] frame %u: spans=%s ratio=%.5f center=%.1f Xsc=%.0f fx=%.0f active=%zu\n",
                 (unsigned)(frame_no - 1u), spans != NULL ? "yes" : "no",
-                clip_ratio, clip_center, xscale, focal_x, clip_active_objs);
+                clip_ratio, clip_target_center, xscale, focal_x,
+                clip_active_objs);
     if (log_frame)
         fprintf(stderr,
                 "[bb] frame %u: emit=%zu enum=%zu skip-mesh=%zu opaque-v=%zu trans-v=%zu runs=%zu | cam vox=%d voy=%d eyez=%d yaw=%u sin=%d cos=%d | Xsc=%.0f Psc=%.0f fx=%.0f fy=%.0f hsc=%.4f vsc=%.4f\n",

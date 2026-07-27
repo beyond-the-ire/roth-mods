@@ -47,6 +47,23 @@ int hwr_compute_pvs(const struct hwr_world *world,
                     const struct roth_api_v1 *api,
                     uint8_t *visible);
 
+/* Rebuilds the primary portal traversal in the engine's projection coordinate
+ * space. clip_left/clip_right may extend outside the original viewport, which
+ * discovers sectors visible only in a wider frustum. The engine's root-sector
+ * extent list is retained as the authoritative seed; its outermost intervals
+ * are extended to the requested bounds when widen_roots is nonzero.
+ *
+ * spans is indexed by sector and receives every distinct narrowed portal
+ * window. Returns nonzero when at least one valid root was traversed. */
+int hwr_compute_portal_pvs(const struct hwr_world *world,
+                           const struct hwr_gl_camera *camera,
+                           const struct roth_api_v1 *api,
+                           int clip_left, int clip_right,
+                           int widen_roots,
+                           uint8_t *visible,
+                           struct hwr_sector_xspan *spans,
+                           size_t span_count);
+
 /* Rebuilds the software renderer's mirror-only portal walk. Unlike the primary
  * visibility pass, the engine's reflected tree is no longer present when the
  * hardware callback runs, so it is recovered from static map topology. The

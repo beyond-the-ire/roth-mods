@@ -13,9 +13,13 @@
 #include "hwr_sprites.h"
 #include "hwr_objects.h"
 #include "hwr_perf.h"
+#include "hwr_config.h"
+#include "hwr_thumbnail.h"
+#include "hwr_util.h"
+#include "hwr_input.h"
+#include "hwr_composite.h"
 
-#include <ctype.h>
-#include <errno.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +29,6 @@
 #include <windows.h>
 #else
 #include <dirent.h>
-#include <signal.h>
 #endif
 
 #define VA_G_SCREEN_PITCH              0x85498u
@@ -39,6 +42,7 @@
 #define VA_G_LINE_DOUBLING_FLAG        0x90cbdu
 #define VA_G_MAP_DAS_NAME              0x7023cu
 #define VA_G_SHARED_DAS_NAME           0x702dcu
+#define VA_G_GDV_PALETTE_MODE          0x91de6u
 
 struct hwr_viewport {
     int32_t x;
@@ -69,6 +73,10 @@ static uint32_t g_watchdog_stall_count;
 static uint32_t g_poll_serial;
 static uint32_t g_poll_stall_count;
 static uint32_t g_poll_throttle;
+/* The timer-driven mouse pump can nest a GAME callback inside this override.
+ * Keep callbacks from re-submitting or reconfiguring buffers while a frame is
+ * being built. */
+static volatile sig_atomic_t g_world_render_active;
 static struct roth_world_frame_v1 g_last_frame;
 static int g_last_frame_valid;
 static uint32_t g_present_max_w;
@@ -76,15 +84,18 @@ static uint32_t g_present_max_h;
 static int g_present_caps_checked;
 static int g_present_caps_valid;
 static int g_channel_owned;
+static struct hwr_input_route g_input_route;
+static int g_input_route_active;
+static int g_gdv_palette_effect_active;
 static int g_suppress_active;
 static int g_gl_permanently_failed;
 static int g_gl_error_logged;
 static int g_scale_mode_logged;
-static int g_first_frame_applied;
 static int g_missing_window_logged;
 static int g_viewport_error_logged;
 static int g_sentinel_error_logged;
 static int g_submit_error_logged;
+static int g_internal_size_error_logged;
 static int g_debug_enabled;
 static int g_scene_rebuild_pending;
 static int g_luts_recheck_pending;
@@ -118,6 +129,7 @@ static struct hwr_das_archive g_map_archive;
 static struct hwr_das_archive g_shared_archive;
 static struct hwr_scene g_scene;
 static struct hwr_backdrop g_backdrop;
+static struct hwr_composite g_composite;
 /* Raised when the backdrop still owes the index target its starting pixels. */
 static int g_backdrop_seed_pending;
 static int g_backdrop_error_logged;
@@ -179,185 +191,6 @@ static void hwr_dump_pgm(const char *suffix, const uint8_t *bytes,
     rename(temp_path, path);
 }
 
-static int hwr_arithmetic_shift_8(int value)
-{
-    return value >= 0 ? value / 256 : -((-value + 255) / 256);
-}
-
-static uint32_t hwr_palette_argb(unsigned index)
-{
-    int fade = 0xff - g_world.luts.damage_flash_level;
-    int r = g_world.luts.palette[index * 3u];
-    int g = g_world.luts.palette[index * 3u + 1u];
-    int b = g_world.luts.palette[index * 3u + 2u];
-
-    r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
-    g = (g * fade) >> 8;
-    b = (b * fade) >> 8;
-    return 0xff000000u |
-           ((uint32_t)(uint8_t)(r << 2) << 16) |
-           ((uint32_t)(uint8_t)(g << 2) << 8) |
-           (uint32_t)(uint8_t)(b << 2);
-}
-
-/* The authentic world frame has already been resolved through the live VGA
- * palette. Recover its palette index for the thumbnail's four source samples.
- * Exact matches are the normal path; nearest-colour fallback covers only
- * presentation formats or drivers that perturb a channel during readback. */
-static uint8_t hwr_thumbnail_palette_index(uint32_t pixel,
-                                           const uint32_t palette[256])
-{
-    unsigned i;
-    unsigned best = 0;
-    uint32_t best_distance = UINT32_MAX;
-    int pr = (int)((pixel >> 16) & 0xffu);
-    int pg = (int)((pixel >> 8) & 0xffu);
-    int pb = (int)(pixel & 0xffu);
-
-    pixel |= 0xff000000u;
-    for (i = 0; i < 256u; i++) {
-        int dr;
-        int dg;
-        int db;
-        uint32_t distance;
-        if (palette[i] == pixel)
-            return (uint8_t)i;
-        dr = pr - (int)((palette[i] >> 16) & 0xffu);
-        dg = pg - (int)((palette[i] >> 8) & 0xffu);
-        db = pb - (int)(palette[i] & 0xffu);
-        distance = (uint32_t)(dr * dr + dg * dg + db * db);
-        if (distance < best_distance) {
-            best_distance = distance;
-            best = i;
-        }
-    }
-    return (uint8_t)best;
-}
-
-/* Match the present channel's engine-colorkey-over-world composition before
- * reducing the frame. The engine draws its weapon and HUD after the suppressed
- * world pass, so nonzero framebuffer pixels are the authentic chrome while
- * zero still reveals the submitted hardware world. */
-static uint8_t hwr_thumbnail_composite_sample(
-    const uint32_t *world, uint32_t world_x, uint32_t world_y,
-    const uint32_t palette[256], const uint8_t *engine, uint32_t engine_pitch,
-    uint32_t viewport_x, uint32_t viewport_y,
-    uint32_t viewport_w, uint32_t viewport_h)
-{
-    uint32_t engine_x = viewport_x +
-        (uint32_t)(((uint64_t)world_x * viewport_w) / g_last_frame.w);
-    uint32_t engine_y = viewport_y +
-        (uint32_t)(((uint64_t)world_y * viewport_h) / g_last_frame.h);
-    uint8_t chrome = engine[(size_t)engine_y * engine_pitch + engine_x];
-
-    if (chrome != (uint8_t)g_last_frame.transparent_index)
-        return chrome;
-    return hwr_thumbnail_palette_index(
-        world[(size_t)world_y * g_last_frame.w + world_x], palette);
-}
-
-/* Reproduce capture_screen_thumbnail's 78x56 2x2 blend-LUT reduction from the
- * composited world frame. The world may be any hardware resolution; its complete
- * extent and the engine-resolution chrome map to the fixed payload the engine
- * expects. */
-static int hwr_capture_world_thumbnail(const struct roth_api_v1 *api,
-                                       uint32_t dst, uint32_t src, uint32_t lut)
-{
-    const uint32_t *source;
-    const uint8_t *engine;
-    const uint8_t *blend;
-    uint8_t *output;
-    uint32_t palette[256];
-    uint32_t pitch;
-    uint32_t screen_height;
-    uint32_t viewport_x;
-    uint32_t viewport_y;
-    uint32_t viewport_w;
-    uint32_t viewport_h;
-    uint32_t hstep;
-    uint32_t vstep;
-    uint32_t yacc = 0;
-    uint32_t y;
-    unsigned i;
-
-    if (api == NULL || api->game_ram == NULL ||
-        !g_last_frame_valid || !g_world.valid || !g_world.luts.valid ||
-        g_last_frame.pixels == NULL ||
-        g_last_frame.w < 2u || g_last_frame.h < 2u ||
-        g_last_frame.vx < 0 || g_last_frame.vy < 0 ||
-        g_last_frame.vw == 0 || g_last_frame.vh == 0 ||
-        dst < 0x1000u || src < 0x1000u || lut < 0x1000u)
-        return 0;
-    pitch = api->game_ram->u32(VA_G_SCREEN_PITCH);
-    screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
-    viewport_x = (uint32_t)g_last_frame.vx;
-    viewport_y = (uint32_t)g_last_frame.vy;
-    viewport_w = g_last_frame.vw;
-    viewport_h = g_last_frame.vh;
-    if (pitch == 0 || pitch > 4096u || screen_height == 0 ||
-        screen_height > 4096u ||
-        viewport_x >= pitch || viewport_w > pitch - viewport_x ||
-        viewport_y >= screen_height ||
-        viewport_h > screen_height - viewport_y)
-        return 0;
-    source = (const uint32_t *)g_last_frame.pixels;
-    engine = (const uint8_t *)(uintptr_t)src;
-    blend = (const uint8_t *)(uintptr_t)lut;
-    output = (uint8_t *)(uintptr_t)dst;
-    for (i = 0; i < 256u; i++)
-        palette[i] = hwr_palette_argb(i);
-
-    output[0] = 2u;
-    output[1] = 0u;
-    output[2] = 0u;
-    output[3] = 0u;
-    output[4] = 0x4eu;
-    output[5] = 0u;
-    output[6] = 0x38u;
-    output[7] = 0u;
-    output += 8;
-
-    hstep = ((g_last_frame.w - 1u) << 16) / 0x4eu;
-    vstep = ((g_last_frame.h - 1u) << 16) / 0x38u;
-    for (y = 0; y < 0x38u; y++) {
-        uint32_t source_y = yacc >> 16;
-        uint32_t xacc = 0;
-        uint32_t x;
-        if (source_y >= g_last_frame.h - 1u)
-            source_y = g_last_frame.h - 2u;
-        for (x = 0; x < 0x4eu; x++) {
-            uint32_t source_x = xacc >> 16;
-            uint8_t top_mix;
-            uint8_t bottom_mix;
-            uint8_t i00;
-            uint8_t i01;
-            uint8_t i10;
-            uint8_t i11;
-
-            if (source_x >= g_last_frame.w - 1u)
-                source_x = g_last_frame.w - 2u;
-            i00 = hwr_thumbnail_composite_sample(
-                source, source_x, source_y, palette, engine, pitch,
-                viewport_x, viewport_y, viewport_w, viewport_h);
-            i01 = hwr_thumbnail_composite_sample(
-                source, source_x + 1u, source_y, palette, engine, pitch,
-                viewport_x, viewport_y, viewport_w, viewport_h);
-            i10 = hwr_thumbnail_composite_sample(
-                source, source_x, source_y + 1u, palette, engine, pitch,
-                viewport_x, viewport_y, viewport_w, viewport_h);
-            i11 = hwr_thumbnail_composite_sample(
-                source, source_x + 1u, source_y + 1u, palette, engine, pitch,
-                viewport_x, viewport_y, viewport_w, viewport_h);
-            top_mix = blend[(uint32_t)i01 << 8 | i00];
-            bottom_mix = blend[(uint32_t)i11 << 8 | i10];
-            *output++ = blend[(uint32_t)top_mix << 8 | bottom_mix];
-            xacc += hstep;
-        }
-        yacc += vstep;
-    }
-    return 1;
-}
-
 /* One atomic file per compare cycle: the soft, gl, and gl-texel planes stacked
  * vertically, with the cycle serial in a header comment so sweep tooling can
  * detect fresh sets. */
@@ -402,205 +235,6 @@ static int hwr_copy_soft_indices(const struct roth_api_v1 *api,
                viewport->width);
     }
     return 1;
-}
-
-static int hwr_ascii_equal_ci(const char *a, const char *b)
-{
-    while (*a != 0 && *b != 0) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
-            return 0;
-        a++;
-        b++;
-    }
-    return *a == 0 && *b == 0;
-}
-
-static char *hwr_trim(char *text)
-{
-    char *end;
-    while (*text != 0 && isspace((unsigned char)*text))
-        text++;
-    end = text + strlen(text);
-    while (end > text && isspace((unsigned char)end[-1]))
-        *--end = 0;
-    return text;
-}
-
-static int hwr_parse_u32(const char *text, int base, uint32_t maximum,
-                         uint32_t *value)
-{
-    char *end;
-    unsigned long parsed;
-
-    errno = 0;
-    parsed = strtoul(text, &end, base);
-    while (*end != 0 && isspace((unsigned char)*end))
-        end++;
-    if (errno != 0 || end == text || *end != 0 || parsed > maximum)
-        return 0;
-    *value = (uint32_t)parsed;
-    return 1;
-}
-
-static int hwr_parse_bool(const char *text, int *value)
-{
-    if (hwr_ascii_equal_ci(text, "1") || hwr_ascii_equal_ci(text, "true") ||
-        hwr_ascii_equal_ci(text, "yes") || hwr_ascii_equal_ci(text, "on")) {
-        *value = 1;
-        return 1;
-    }
-    if (hwr_ascii_equal_ci(text, "0") || hwr_ascii_equal_ci(text, "false") ||
-        hwr_ascii_equal_ci(text, "no") || hwr_ascii_equal_ci(text, "off")) {
-        *value = 0;
-        return 1;
-    }
-    return 0;
-}
-
-static int hwr_parse_float(const char *text, float *value)
-{
-    char *end;
-    double parsed;
-
-    errno = 0;
-    parsed = strtod(text, &end);
-    while (*end != 0 && isspace((unsigned char)*end))
-        end++;
-    if (errno != 0 || end == text || *end != 0 || parsed < 0.0 || parsed > 360.0)
-        return 0;
-    *value = (float)parsed;
-    return 1;
-}
-
-static int hwr_apply_config_value(const char *key, const char *value)
-{
-    const struct hwr_settings *settings = hwr_settings_get();
-    uint32_t number;
-    int boolean;
-    float real;
-
-    if (hwr_ascii_equal_ci(key, "enabled")) {
-        if (!hwr_parse_bool(value, &boolean))
-            return 0;
-        hwr_settings_set_enabled(boolean);
-    } else if (hwr_ascii_equal_ci(key, "debug")) {
-        if (!hwr_parse_bool(value, &boolean))
-            return 0;
-        hwr_settings_set_debug(boolean);
-    } else if (hwr_ascii_equal_ci(key, "solid_color")) {
-        if (!hwr_parse_u32(value, 16, 0x00ffffffu, &number))
-            return 0;
-        hwr_settings_set_solid_color(number);
-    } else if (hwr_ascii_equal_ci(key, "internal_w")) {
-        if (!hwr_parse_u32(value, 10, 16384u, &number))
-            return 0;
-        hwr_settings_set_internal_size(number, settings->internal_h);
-    } else if (hwr_ascii_equal_ci(key, "internal_h")) {
-        if (!hwr_parse_u32(value, 10, 16384u, &number))
-            return 0;
-        hwr_settings_set_internal_size(settings->internal_w, number);
-    } else if (hwr_ascii_equal_ci(key, "window_mode")) {
-        if (hwr_ascii_equal_ci(value, "default"))
-            hwr_settings_set_window_mode(HWR_WINDOW_DEFAULT);
-        else if (hwr_ascii_equal_ci(value, "windowed"))
-            hwr_settings_set_window_mode(HWR_WINDOW_WINDOWED);
-        else if (hwr_ascii_equal_ci(value, "borderless"))
-            hwr_settings_set_window_mode(HWR_WINDOW_BORDERLESS);
-        else
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "present_mode")) {
-        if (hwr_ascii_equal_ci(value, "fifo"))
-            hwr_settings_set_present_mode(HWR_PRESENT_FIFO);
-        else if (hwr_ascii_equal_ci(value, "immediate"))
-            hwr_settings_set_present_mode(HWR_PRESENT_IMMEDIATE);
-        else if (hwr_ascii_equal_ci(value, "adaptive"))
-            hwr_settings_set_present_mode(HWR_PRESENT_ADAPTIVE);
-        else
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "min_present_interval_us")) {
-        if (!hwr_parse_u32(value, 10, 10000000u, &number))
-            return 0;
-        hwr_settings_set_min_present_interval_us(number);
-    } else if (hwr_ascii_equal_ci(key, "fps_cap")) {
-        if (!hwr_parse_u32(value, 10, 1000000u, &number))
-            return 0;
-        hwr_settings_set_min_present_interval_us(number == 0 ? 0 : 1000000u / number);
-    } else if (hwr_ascii_equal_ci(key, "shade_depth_scale")) {
-        float scale;
-        char *end;
-        errno = 0;
-        scale = (float)strtod(value, &end);
-        if (errno != 0 || end == value || *hwr_trim(end) != 0)
-            return 0;
-        hwr_settings_set_shade_depth_scale(scale);
-    } else if (hwr_ascii_equal_ci(key, "fov_deg")) {
-        if (!hwr_parse_float(value, &real))
-            return 0;
-        hwr_settings_set_fov_deg(real);
-    } else if (hwr_ascii_equal_ci(key, "pitch_mode")) {
-        if (hwr_ascii_equal_ci(value, "horizon_shift"))
-            hwr_settings_set_pitch_mode(HWR_PITCH_HORIZON_SHIFT);
-        else if (hwr_ascii_equal_ci(value, "true_rotation"))
-            hwr_settings_set_pitch_mode(HWR_PITCH_TRUE_ROTATION);
-        else
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "render_mode")) {
-        if (hwr_ascii_equal_ci(value, "authentic"))
-            hwr_settings_set_render_mode(HWR_RENDER_AUTHENTIC);
-        else if (hwr_ascii_equal_ci(value, "enhanced"))
-            hwr_settings_set_render_mode(HWR_RENDER_ENHANCED);
-        else
-            return 0;
-    } else {
-        return -1;
-    }
-    return 1;
-}
-
-static void hwr_load_config(const struct roth_api_v1 *api)
-{
-    char path[2600];
-    char line[512];
-    FILE *file;
-    unsigned int line_number = 0;
-
-    snprintf(path, sizeof path, "%s/renderer_overhaul.cfg", api->plugin_dir());
-    file = fopen(path, "r");
-    if (file == NULL)
-        return;
-
-    while (fgets(line, sizeof line, file) != NULL) {
-        char *comment;
-        char *equals;
-        char *key;
-        char *value;
-        int result;
-
-        line_number++;
-        comment = strchr(line, '#');
-        if (comment != NULL)
-            *comment = 0;
-        key = hwr_trim(line);
-        if (*key == 0)
-            continue;
-        equals = strchr(key, '=');
-        if (equals == NULL) {
-            fprintf(stderr, "[renderer_overhaul] %s:%u: expected key=value; line ignored\n",
-                    path, line_number);
-            continue;
-        }
-        *equals = 0;
-        value = hwr_trim(equals + 1);
-        key = hwr_trim(key);
-        result = hwr_apply_config_value(key, value);
-        if (result == 0)
-            fprintf(stderr, "[renderer_overhaul] %s:%u: invalid value for '%s'; line ignored\n",
-                    path, line_number, key);
-        else if (result < 0)
-            fprintf(stderr, "[renderer_overhaul] %s:%u: unknown setting '%s'; line ignored\n",
-                    path, line_number, key);
-    }
-    fclose(file);
 }
 
 static void hwr_render_settings_apply(uint32_t mask,
@@ -770,11 +404,10 @@ static void hwr_gl_settings_apply(uint32_t mask,
                                   const struct hwr_settings *settings,
                                   void *userdata)
 {
+    (void)settings;
     (void)userdata;
-    if (mask & HWR_CHANGE_INTERNAL_SIZE) {
-        hwr_gl_resize(settings->internal_w, settings->internal_h);
+    if (mask & HWR_CHANGE_INTERNAL_SIZE)
         g_last_frame_valid = 0;   /* the cached frame references the old readback buffer */
-    }
 }
 
 static void hwr_window_settings_apply(uint32_t mask,
@@ -838,6 +471,7 @@ static void hwr_withdraw_if_owned(const struct roth_api_v1 *api)
 {
     int32_t result;
     g_last_frame_valid = 0;
+    g_gdv_palette_effect_active = 0;
     if (!g_channel_owned || api->present == NULL || g_channel_api == NULL)
         return;
     result = api->present->withdraw_world_frame(g_channel_api);
@@ -935,11 +569,13 @@ static int hwr_fill_sentinel(const struct roth_api_v1 *api,
  * engine scales the image across the whole screen, so the slice depends on where
  * the viewport falls within it. */
 static void hwr_submit_backdrop_seed(const struct roth_api_v1 *api,
-                                     const struct hwr_viewport *viewport)
+                                     const struct hwr_viewport *viewport,
+                                     uint32_t output_width,
+                                     uint32_t output_height)
 {
     uint32_t screen_width = api->game_ram->u32(VA_G_SCREEN_PITCH);
     uint32_t screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
-    size_t plane = (size_t)viewport->width * viewport->height;
+    size_t plane = (size_t)output_width * output_height;
     uint8_t *indices;
 
     g_backdrop_seed_pending = 0;
@@ -950,8 +586,9 @@ static void hwr_submit_backdrop_seed(const struct roth_api_v1 *api,
         return;
     if (hwr_backdrop_view_indices(&g_backdrop, screen_width, screen_height,
                                   (uint32_t)viewport->x, (uint32_t)viewport->y,
-                                  viewport->width, viewport->height, indices) == 0)
-        hwr_gl_set_index_seed(indices, viewport->width, viewport->height);
+                                  viewport->width, viewport->height,
+                                  output_width, output_height, indices) == 0)
+        hwr_gl_set_index_seed(indices, output_width, output_height);
     free(indices);
 }
 
@@ -1005,12 +642,13 @@ static void hwr_run_object_layer(const struct roth_api_v1 *api)
                          &g_shared_archive);
 }
 
-static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
-                                                   const struct roth_api_v1 *api,
-                                                   uint32_t eax_record)
+static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
+                                            const struct roth_api_v1 *api,
+                                            uint32_t eax_record)
 {
     struct hwr_viewport viewport;
     struct roth_world_frame_v1 frame;
+    struct hwr_frame_perf_sample frame_perf;
     const uint32_t *pixels;
     uint32_t render_width;
     uint32_t render_height;
@@ -1018,8 +656,15 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     int world_was_valid;
     int refresh_result;
 
-    g_wrap_serial++;
+    hwr_frame_perf_begin(&frame_perf);
+
+    /* File I/O and settings application belong at this non-reentrant render
+     * boundary, not in the timer-driven per-frame callback. */
+    hwr_config_poll();
     hwr_settings_apply_pending();
+    hwr_apply_window_requests(api);
+    g_wrap_serial++;
+    hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_PREFLIGHT);
 
     if (!g_render_settings.enabled || g_gl_permanently_failed) {
         roth_next_render_world_view_pass(chain, eax_record);
@@ -1049,6 +694,7 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         g_suppress_active = 1;
     roth_next_render_world_view_pass(chain, eax_record);
     g_suppress_active = 0;
+    hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_ENGINE_WALK);
 
     if (!hwr_read_viewport(api, &viewport)) {
         if (!g_viewport_error_logged) {
@@ -1062,18 +708,6 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_withdraw_if_owned(api);
         return;
     }
-    if (g_compare_path[0] == 0 && !hwr_fill_sentinel(api, &viewport)) {
-        if (!g_sentinel_error_logged) {
-            fprintf(stderr, "[renderer_overhaul] sentinel fill rejected: fb=0x%x arena=0x%x size=0x%x viewport=%d,%d %ux%u\n",
-                    api->game_ram->u32(VA_G_FRAMEBUFFER_PTR),
-                    (unsigned)(uintptr_t)api->game_ram->to_ptr(0),
-                    api->game_ram->size(),
-                    viewport.x, viewport.y, viewport.width, viewport.height);
-            g_sentinel_error_logged = 1;
-        }
-        hwr_withdraw_if_owned(api);
-        return;
-    }
     if (!hwr_gl_init()) {
         hwr_fail_gl(api);
         return;
@@ -1082,12 +716,34 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
 
     render_width = viewport.width;
     render_height = viewport.height;
+    if (g_compare_path[0] == 0) {
+        if (g_render_settings.internal_w != 0)
+            render_width = g_render_settings.internal_w;
+        if (g_render_settings.internal_h != 0)
+            render_height = g_render_settings.internal_h;
+        if (render_width < 2u || render_height < 2u) {
+            if (!g_internal_size_error_logged) {
+                fprintf(stderr,
+                        "[renderer_overhaul] internal size %ux%u is too small; using %ux%u\n",
+                        render_width, render_height,
+                        viewport.width, viewport.height);
+                g_internal_size_error_logged = 1;
+            }
+            render_width = viewport.width;
+            render_height = viewport.height;
+        } else {
+            g_internal_size_error_logged = 0;
+        }
+    }
     hwr_check_present_caps(api);
     if (g_present_caps_valid &&
         (render_width > g_present_max_w || render_height > g_present_max_h)) {
         hwr_withdraw_if_owned(api);
         return;
     }
+    if (g_last_frame_valid &&
+        (g_last_frame.w != render_width || g_last_frame.h != render_height))
+        g_last_frame_valid = 0;
     /* Safe point for a deferred map reload: nothing consumes g_world yet on this
      * dispatch, and (single game thread) no other dispatch's mesh build is in
      * flight, so re-snapshotting here cannot free geometry under
@@ -1099,7 +755,8 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_reload_map_data(api, g_map_reload_generation);
     }
     if (g_backdrop_seed_pending)
-        hwr_submit_backdrop_seed(api, &viewport);
+        hwr_submit_backdrop_seed(api, &viewport,
+                                 render_width, render_height);
     world_was_valid = g_world.valid;
     refresh_result = g_world.valid ? hwr_world_refresh(&g_world, api) : -1;
     if (refresh_result >= 0 &&
@@ -1163,9 +820,11 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                 g_scene_rebuild_pending = 0;
             }
         }
+        hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_PREPARE);
         pixels = g_scene.valid
                ? hwr_scene_render(&g_scene, &g_world, &g_objects, api,
-                                  render_width, render_height)
+                                  render_width, render_height,
+                                  viewport.width, viewport.height)
                : NULL;
         if (pixels == NULL && g_scene.valid && !g_scene_error_logged) {
             fprintf(stderr, "[renderer_overhaul] scene render failed: %s; using solid fallback\n",
@@ -1197,7 +856,12 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
             hwr_reload_map_data(api, 0);
             g_selfheal_retry = !g_world.valid;
         }
+        hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_PREPARE);
     }
+    if (g_compare_path[0] == 0 && pixels == NULL)
+        pixels = hwr_gl_render_frame(render_width, render_height,
+                                     g_render_settings.solid_color);
+    hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_RENDER);
     if (g_compare_path[0] != 0) {
         /* Compare mode: the software world is on screen; pair its indices
          * with the GL index attachment (plus a raw-texel plane and the LUTs
@@ -1227,7 +891,9 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
                             hwr_gl_set_debug_vis(probe_mode);
                         }
                         if (hwr_scene_render(&g_scene, &g_world, &g_objects, api,
-                                             render_width, render_height) != NULL) {
+                                             render_width, render_height,
+                                             viewport.width,
+                                             viewport.height) != NULL) {
                             step = 3;
                             if (hwr_gl_read_scene_indices(gltex, render_width,
                                                           render_height))
@@ -1261,9 +927,6 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
         hwr_withdraw_if_owned(api);
         return;
     }
-    if (pixels == NULL)
-        pixels = hwr_gl_render_frame(render_width, render_height,
-                                     g_render_settings.solid_color);
     if (pixels == NULL) {
         hwr_fail_gl(api);
         return;
@@ -1280,10 +943,67 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
     frame.vy = viewport.y;
     frame.vw = viewport.width;
     frame.vh = viewport.height;
-    frame.composite_mode = ROTH_COMPOSITE_ENGINE_COLORKEY_OVER_WORLD;
+    frame.composite_mode =
+        (uint64_t)render_width * (uint64_t)viewport.height !=
+        (uint64_t)render_height * (uint64_t)viewport.width
+            ? ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS
+            : ROTH_COMPOSITE_ENGINE_COLORKEY_OVER_WORLD;
     frame.transparent_index = 0;
     frame.flags = 0;
-    result = api->present->submit_world_frame(g_channel_api, &frame);
+    g_gdv_palette_effect_active = 0;
+    if (!hwr_composite_prepare(&g_composite, api, &frame, &g_world)) {
+        /* ABI 0.6 hosts and exceptional allocation/mapping failures retain the
+         * original index-0 colorkey path as a fail-safe. */
+        frame.engine_base_pixels = NULL;
+        frame.engine_base_pitch_bytes = 0;
+        if (!hwr_fill_sentinel(api, &viewport)) {
+            if (!g_sentinel_error_logged) {
+                fprintf(stderr, "[renderer_overhaul] engine baseline and sentinel fallback rejected: fb=0x%x arena=0x%x size=0x%x viewport=%d,%d %ux%u\n",
+                        api->game_ram->u32(VA_G_FRAMEBUFFER_PTR),
+                        (unsigned)(uintptr_t)api->game_ram->to_ptr(0),
+                        api->game_ram->size(),
+                        viewport.x, viewport.y,
+                        viewport.width, viewport.height);
+                g_sentinel_error_logged = 1;
+            }
+            hwr_withdraw_if_owned(api);
+            return;
+        }
+    }
+    hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_COMPOSITE);
+    {
+        static uint64_t submit_sum;
+        static uint64_t cadence_sum;
+        static uint64_t previous_done;
+        static unsigned submit_samples;
+        uint64_t submit_start = getenv("HWR_FRAME_PERF") != NULL
+                              ? hwr_perf_now_ns() : 0;
+        uint64_t now;
+        result = api->present->submit_world_frame(g_channel_api, &frame);
+        hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_SUBMIT);
+        if (submit_start != 0) {
+            now = hwr_perf_now_ns();
+            submit_sum += now - submit_start;
+            if (previous_done != 0)
+                cadence_sum += now - previous_done;
+            previous_done = now;
+            submit_samples++;
+            if (submit_samples >= 60u) {
+                fprintf(stderr,
+                        "[renderer_overhaul] frame transport avg/%u:"
+                        " host-copy=%.2fms cadence=%.2fms\n",
+                        submit_samples,
+                        (double)submit_sum /
+                            ((double)submit_samples * 1.0e6),
+                        (double)cadence_sum /
+                            ((double)(submit_samples - 1u) * 1.0e6));
+                submit_sum = 0;
+                cadence_sum = 0;
+                previous_done = 0;
+                submit_samples = 0;
+            }
+        }
+    }
     if (result == ROTH_OK) {
         g_channel_owned = 1;
         g_last_frame = frame;
@@ -1301,6 +1021,17 @@ static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
             g_last_frame_valid = 0;
         }
     }
+    hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_FINALIZE);
+    hwr_frame_perf_finish(&frame_perf);
+}
+
+static void ROTH_CDECL hwr_render_world_view_pass(struct roth_chain *chain,
+                                                   const struct roth_api_v1 *api,
+                                                   uint32_t eax_record)
+{
+    g_world_render_active = 1;
+    hwr_render_world_view_pass_impl(chain, api, eax_record);
+    g_world_render_active = 0;
 }
 
 /* Suppress every world-span leaf while inside our render wrap. Gating on the subpass byte alone
@@ -1371,9 +1102,176 @@ static void ROTH_CDECL hwr_capture_screen_thumbnail(
     struct roth_chain *chain, const struct roth_api_v1 *api,
     uint32_t dst, uint32_t src, uint32_t lut)
 {
-    if (hwr_capture_world_thumbnail(api, dst, src, lut))
+    if (g_last_frame_valid &&
+        hwr_thumbnail_capture(api, &g_last_frame, &g_world, dst, src, lut))
         return;
     roth_next_capture_screen_thumbnail(chain, dst, src, lut);
+}
+
+static void ROTH_CDECL hwr_grayscale_background_view(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    int32_t result;
+
+    /* This builds the authentic engine LUT and remaps the baseline plus all
+     * already-drawn 8bpp chrome. The hardware world is transformed only after
+     * that succeeds, preserving the preceding color-thumbnail capture. */
+    roth_next_grayscale_background_view(chain);
+    if (!g_last_frame_valid || g_channel_api == NULL ||
+        api->present == NULL)
+        return;
+    if (!hwr_composite_grayscale(
+            &g_composite, api, &g_last_frame, &g_world)) {
+        /* The authentic call has already remapped the engine framebuffer.
+         * Reveal that safe 8bpp fallback instead of leaving a color RGBA
+         * frame underneath grayscale chrome. */
+        hwr_withdraw_if_owned(api);
+        return;
+    }
+    result = api->present->submit_world_frame(g_channel_api, &g_last_frame);
+    if (result == ROTH_OK) {
+        g_channel_owned = 1;
+    } else {
+        if (result != ROTH_ERR_NOT_OWNER)
+            fprintf(stderr,
+                    "[renderer_overhaul] grayscale world submit failed: rc=%d\n",
+                    (int)result);
+        hwr_withdraw_if_owned(api);
+    }
+}
+
+/* The centered 4:3 engine layer and the wide world occupy the same physical
+ * canvas but use different coordinate systems. Gameplay UI sees coordinates
+ * local to the centered engine layer; each nested world-pick pass temporarily
+ * restores the full-canvas position and the matching wide projection. */
+static uint32_t ROTH_CDECL hwr_render_world_view(
+    struct roth_chain *chain, const struct roth_api_v1 *api,
+    uint16_t es, uint16_t fs, uint16_t gs)
+{
+    struct hwr_pick_projection saved;
+    uint32_t result;
+    int projection_changed;
+
+    if (!g_input_route_active)
+        return roth_next_render_world_view(chain, es, fs, gs);
+    hwr_input_set_world_mouse(api, &g_input_route);
+    projection_changed = hwr_input_begin_pick_projection(
+        api, &g_input_route, &saved);
+    result = roth_next_render_world_view(chain, es, fs, gs);
+    if (projection_changed)
+        hwr_input_end_pick_projection(api, &saved);
+    hwr_input_set_hud_mouse(api, &g_input_route);
+    return result;
+}
+
+static void ROTH_CDECL hwr_run_gameplay_frame(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    int centered;
+
+    if (!g_render_settings.enabled || !g_last_frame_valid) {
+        roth_next_run_gameplay_frame(chain);
+        return;
+    }
+    centered =
+        g_last_frame.composite_mode ==
+        ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS;
+    if (!hwr_input_prepare_route(
+            api, g_last_frame.w, g_last_frame.h, centered,
+            hwr_settings_get()->fov_deg, &g_input_route)) {
+        roth_next_run_gameplay_frame(chain);
+        return;
+    }
+    g_input_route_active = 1;
+    hwr_input_set_hud_mouse(api, &g_input_route);
+    roth_next_run_gameplay_frame(chain);
+    hwr_input_restore_world_cursor(api, &g_input_route);
+    g_input_route_active = 0;
+}
+
+/* Inventory and dialogue run outside run_gameplay_frame, but their hit tests
+ * still consume engine-layer coordinates. Keep the published cursor in
+ * full-canvas space and localize only the authentic hit-test call. */
+static void ROTH_CDECL hwr_handle_cursor_click(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    struct hwr_input_route route;
+
+    if (!g_render_settings.enabled || !g_last_frame_valid ||
+        g_last_frame.composite_mode !=
+            ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS ||
+        !hwr_input_prepare_ui_route(
+            api, g_last_frame.w, g_last_frame.h, 1, &route)) {
+        roth_next_handle_cursor_click(chain);
+        return;
+    }
+    hwr_input_set_hud_mouse(api, &route);
+    roth_next_handle_cursor_click(chain);
+    hwr_input_restore_world_cursor(api, &route);
+}
+
+/* Apply the exact brightness multiplier the GDV fade has just written to the
+ * VGA palette. Returns one when a frame was submitted, zero when no hardware
+ * frame is active, and minus one after falling back to authentic 8bpp. */
+static int hwr_submit_gdv_brightness(
+    const struct roth_api_v1 *api, uint32_t multiplier)
+{
+    int32_t result;
+
+    if (!g_last_frame_valid || g_channel_api == NULL ||
+        api->present == NULL)
+        return 0;
+    if (!hwr_composite_apply_brightness(
+            &g_composite, &g_last_frame, multiplier)) {
+        hwr_withdraw_if_owned(api);
+        return -1;
+    }
+    result = api->present->submit_world_frame(g_channel_api, &g_last_frame);
+    if (result != ROTH_OK) {
+        if (result != ROTH_ERR_NOT_OWNER)
+            fprintf(stderr,
+                    "[renderer_overhaul] palette-effect submit failed: rc=%d\n",
+                    (int)result);
+        hwr_withdraw_if_owned(api);
+        return -1;
+    }
+    g_channel_owned = 1;
+    return 1;
+}
+
+static void ROTH_CDECL hwr_gdv_clear_vga_palette(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    int applied;
+
+    roth_next_gdv_clear_vga_palette(chain);
+    if (api->game_ram->u8(VA_G_GDV_PALETTE_MODE) != 1)
+        return;
+    applied = hwr_submit_gdv_brightness(api, 0);
+    g_gdv_palette_effect_active = applied > 0;
+}
+
+static void ROTH_CDECL hwr_gdv_write_scaled_palette(
+    struct roth_chain *chain, const struct roth_api_v1 *api, uint32_t level)
+{
+    int applied;
+
+    roth_next_gdv_write_scaled_palette(chain, level);
+    if (api->game_ram->u8(VA_G_GDV_PALETTE_MODE) != 1)
+        return;
+    applied = hwr_submit_gdv_brightness(
+        api, (level << 2) & 0xffffu);
+    g_gdv_palette_effect_active = applied > 0;
+}
+
+static void ROTH_CDECL hwr_upload_palette_dac(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    roth_next_upload_palette_dac(chain);
+    if (!g_gdv_palette_effect_active)
+        return;
+    hwr_submit_gdv_brightness(api, 0x100u);
+    g_gdv_palette_effect_active = 0;
 }
 
 static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
@@ -1404,15 +1302,14 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
         hwr_settings_register_apply(hwr_gl_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_window_settings_apply, NULL) != 0)
         fprintf(stderr, "[renderer_overhaul] settings apply-hook registration failed\n");
-    hwr_load_config(api);
+    hwr_config_load(g_plugin_dir);
 }
 
 static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
 {
-    if (!g_first_frame_applied) {
-        hwr_settings_apply_pending();
-        g_first_frame_applied = 1;
-    }
+    if (g_world_render_active)
+        return;
+    hwr_settings_apply_pending();
     hwr_apply_window_requests(api);
 
     if (g_wrap_serial != g_watchdog_serial) {
@@ -1430,6 +1327,8 @@ static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
                                           struct roth_mouse_poll_v1 *poll)
 {
     (void)poll;
+    if (g_world_render_active)
+        return;
     if (g_wrap_serial != g_poll_serial) {
         g_poll_serial = g_wrap_serial;
         g_poll_stall_count = 0;
@@ -1605,6 +1504,7 @@ static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
     hwr_objects_clear(&g_objects);
     hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();
+    hwr_composite_clear(&g_composite);
     g_channel_api = NULL;
     g_api = NULL;
     g_plugin_dir[0] = 0;
@@ -1617,6 +1517,12 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
     (void)api;
     failures += roth_override(registrar, ROTH_FN_render_world_view_pass,
                               hwr_render_world_view_pass, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_render_world_view,
+                              hwr_render_world_view, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_run_gameplay_frame,
+                              hwr_run_gameplay_frame, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_handle_cursor_click,
+                              hwr_handle_cursor_click, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_draw_world_surface_spans,
                               hwr_draw_world_surface_spans, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_draw_scaled_sprite_spans,
@@ -1627,6 +1533,14 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
                               hwr_render_world_sprite, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_capture_screen_thumbnail,
                               hwr_capture_screen_thumbnail, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_grayscale_background_view,
+                              hwr_grayscale_background_view, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_gdv_clear_vga_palette,
+                              hwr_gdv_clear_vga_palette, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_gdv_write_scaled_palette,
+                              hwr_gdv_write_scaled_palette, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_upload_palette_dac,
+                              hwr_upload_palette_dac, 0) != 0;
     if (failures != 0)
         fprintf(stderr, "[renderer_overhaul] %d override registration(s) failed\n", failures);
 }

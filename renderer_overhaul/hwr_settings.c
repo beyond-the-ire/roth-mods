@@ -15,18 +15,25 @@ static struct hwr_apply_hook g_hooks[HWR_MAX_APPLY_HOOKS];
 static uint32_t g_hook_count;
 static uint32_t g_dirty;
 
-void hwr_settings_init_defaults(void)
+void hwr_settings_defaults(struct hwr_settings *settings)
 {
-    memset(&g_settings, 0, sizeof g_settings);
-    g_settings.enabled = 1;
+    if (settings == NULL)
+        return;
+    memset(settings, 0, sizeof *settings);
+    settings->enabled = 1;
     /* Shown only while the world is not renderable, such as during a map
      * change. Black is unobtrusive there; a marker colour reads as a flash. */
-    g_settings.solid_color = 0x000000u;
-    g_settings.window_mode = HWR_WINDOW_DEFAULT;
-    g_settings.present_mode = HWR_PRESENT_FIFO;
-    g_settings.pitch_mode = HWR_PITCH_HORIZON_SHIFT;
-    g_settings.render_mode = HWR_RENDER_AUTHENTIC;
-    g_settings.shade_depth_scale = 1.0f;
+    settings->solid_color = 0x000000u;
+    settings->window_mode = HWR_WINDOW_DEFAULT;
+    settings->present_mode = HWR_PRESENT_FIFO;
+    settings->pitch_mode = HWR_PITCH_HORIZON_SHIFT;
+    settings->render_mode = HWR_RENDER_AUTHENTIC;
+    settings->shade_depth_scale = 1.0f;
+}
+
+void hwr_settings_init_defaults(void)
+{
+    hwr_settings_defaults(&g_settings);
     g_hook_count = 0;
     g_dirty = HWR_CHANGE_ALL;
 }
@@ -34,6 +41,25 @@ void hwr_settings_init_defaults(void)
 const struct hwr_settings *hwr_settings_get(void)
 {
     return &g_settings;
+}
+
+void hwr_settings_replace(const struct hwr_settings *settings)
+{
+    if (settings == NULL)
+        return;
+    hwr_settings_set_enabled(settings->enabled);
+    hwr_settings_set_debug(settings->debug);
+    hwr_settings_set_shade_depth_scale(settings->shade_depth_scale);
+    hwr_settings_set_solid_color(settings->solid_color);
+    hwr_settings_set_internal_size(
+        settings->internal_w, settings->internal_h);
+    hwr_settings_set_window_mode(settings->window_mode);
+    hwr_settings_set_present_mode(settings->present_mode);
+    hwr_settings_set_min_present_interval_us(
+        settings->min_present_interval_us);
+    hwr_settings_set_fov_deg(settings->fov_deg);
+    hwr_settings_set_pitch_mode(settings->pitch_mode);
+    hwr_settings_set_render_mode(settings->render_mode);
 }
 
 int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata)
@@ -130,6 +156,8 @@ void hwr_settings_set_min_present_interval_us(uint32_t interval_us)
 
 void hwr_settings_set_fov_deg(float fov_deg)
 {
+    if (fov_deg != 0.0f && (fov_deg < 30.0f || fov_deg > 170.0f))
+        return;
     if (g_settings.fov_deg != fov_deg) {
         g_settings.fov_deg = fov_deg;
         g_dirty |= HWR_CHANGE_FOV;

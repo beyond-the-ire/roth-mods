@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -52,6 +53,80 @@ uint64_t hwr_perf_now_ns(void)
         return 0;
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 #endif
+}
+
+static int hwr_frame_perf_enabled(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_FRAME_PERF");
+        state = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    return state;
+}
+
+void hwr_frame_perf_begin(struct hwr_frame_perf_sample *sample)
+{
+    uint64_t now;
+    memset(sample, 0, sizeof *sample);
+    if (!hwr_frame_perf_enabled())
+        return;
+    now = hwr_perf_now_ns();
+    if (now == 0)
+        return;
+    sample->start = now;
+    sample->last = now;
+    sample->active = 1;
+}
+
+void hwr_frame_perf_mark(struct hwr_frame_perf_sample *sample,
+                         enum hwr_frame_perf_phase phase)
+{
+    uint64_t now;
+    if (!sample->active || phase < 0 || phase >= HWR_FRAME_PERF_PHASE_COUNT)
+        return;
+    now = hwr_perf_now_ns();
+    if (now < sample->last) {
+        sample->active = 0;
+        return;
+    }
+    sample->phase[phase] += now - sample->last;
+    sample->last = now;
+}
+
+void hwr_frame_perf_finish(struct hwr_frame_perf_sample *sample)
+{
+    static uint64_t phase_sum[HWR_FRAME_PERF_PHASE_COUNT];
+    static uint64_t total_sum;
+    static unsigned samples;
+    static const char *const phase_name[HWR_FRAME_PERF_PHASE_COUNT] = {
+        "preflight", "engine-walk", "prepare", "render",
+        "composite", "submit", "finalize"
+    };
+    uint64_t total;
+    size_t i;
+
+    if (!sample->active)
+        return;
+    total = sample->last - sample->start;
+    total_sum += total;
+    for (i = 0; i < HWR_FRAME_PERF_PHASE_COUNT; i++)
+        phase_sum[i] += sample->phase[i];
+    samples++;
+    sample->active = 0;
+
+    if (samples >= 60u) {
+        double divisor = (double)samples * 1.0e6;
+        fprintf(stderr, "[renderer_overhaul] frame pipeline avg/%u: total=%.2fms",
+                samples, total_sum / divisor);
+        for (i = 0; i < HWR_FRAME_PERF_PHASE_COUNT; i++)
+            fprintf(stderr, " %s=%.2fms", phase_name[i],
+                    phase_sum[i] / divisor);
+        fputc('\n', stderr);
+        memset(phase_sum, 0, sizeof phase_sum);
+        total_sum = 0;
+        samples = 0;
+    }
 }
 
 void hwr_perf_begin(uint32_t generation)

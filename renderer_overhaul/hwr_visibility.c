@@ -38,6 +38,11 @@
  * malformed link can never spin. */
 #define HWR_CHAIN_LIMIT 0x2000u
 
+#define VA_G_VISIBLE_EXTENT_COUNT 0x85220u
+#define VA_G_VISIBLE_EXTENT_LIST  0x85224u
+#define VA_G_PLAYER_SECTOR        0x90c12u
+#define HWR_VISIBLE_ROOT_MAX      10u
+
 /* The per-frame visibility gate is on by default. HWR_PVS=0 is the kill-switch:
  * it submits every sector's surfaces each frame instead of reading the
  * renderer's own drawn-sector set. */
@@ -171,6 +176,351 @@ int hwr_compute_pvs(const struct hwr_world *world,
     if (marked == 0)
         return 0;
     return 1;
+}
+
+struct hwr_portal_root {
+    size_t sector;
+    int left;
+    int right;
+};
+
+struct hwr_portal_pvs_ctx {
+    const struct hwr_world *world;
+    const struct hwr_gl_camera *camera;
+    uint8_t *visible;
+    struct hwr_sector_xspan *spans;
+    int budget;
+    int extend_near_to_frustum;
+};
+
+static int32_t hwr_portal_shift_right_6(int32_t value)
+{
+    if (value >= 0)
+        return value >> 6;
+    return -(int32_t)(((uint32_t)(-value) + 63u) >> 6);
+}
+
+static void hwr_portal_view_point(const struct hwr_gl_camera *camera,
+                                  const struct hwr_vertex *vertex,
+                                  int32_t *view_x, int32_t *depth)
+{
+    int32_t dx = (int16_t)((uint16_t)vertex->world_x +
+                           (uint16_t)camera->view_offset_x);
+    int32_t dy = (int16_t)((uint16_t)vertex->world_y +
+                           (uint16_t)camera->view_offset_y);
+    *view_x = hwr_portal_shift_right_6(
+        dx * camera->yaw_sin + dy * camera->yaw_cos);
+    *depth = hwr_portal_shift_right_6(
+        dy * camera->yaw_sin - dx * camera->yaw_cos);
+}
+
+static int hwr_portal_project_x(const struct hwr_gl_camera *camera,
+                                int32_t view_x, int32_t depth)
+{
+    int32_t focal = camera->source_focal_x != 0
+                  ? camera->source_focal_x : camera->focal_x;
+    int32_t center = camera->source_focal_x != 0
+                   ? camera->source_center_x : camera->center_x;
+    int64_t projected =
+        (int64_t)view_x * focal / depth + center;
+    if (projected < -0x3ffe)
+        return -0x3ffe;
+    if (projected > 0x3ffe)
+        return 0x3ffe;
+    return (int)projected;
+}
+
+/* The central oracle path reproduces the engine's 0x1000 near-plane clip.
+ * Widened side windows instead need the portal's complete angular interval:
+ * when an endpoint is behind the eye, its front-facing part approaches an
+ * infinite screen X and remains open all the way to that frustum edge. */
+static int hwr_portal_interval(const struct hwr_portal_pvs_ctx *ctx,
+                               const struct hwr_wall *wall,
+                               int *out_a, int *out_b)
+{
+    const struct hwr_world *world = ctx->world;
+    int32_t view_a, depth_a, view_b, depth_b;
+    int64_t numerator;
+    int32_t denominator;
+    int32_t view_at_eye;
+
+    if (wall->vertex_a_index >= world->vertex_count ||
+        wall->vertex_b_index >= world->vertex_count)
+        return 0;
+    hwr_portal_view_point(ctx->camera,
+                          &world->vertices[wall->vertex_a_index],
+                          &view_a, &depth_a);
+    hwr_portal_view_point(ctx->camera,
+                          &world->vertices[wall->vertex_b_index],
+                          &view_b, &depth_b);
+    if (!ctx->extend_near_to_frustum) {
+        if (depth_a < 0x1000 && depth_b < 0x1000)
+            return 0;
+        if (depth_a < 0x1000) {
+            denominator = depth_b - depth_a;
+            if (denominator <= 0)
+                return 0;
+            numerator =
+                (int64_t)(view_b - view_a) * (0x1000 - depth_a);
+            view_a += (int32_t)(numerator / denominator);
+            depth_a = 0x1000;
+        } else if (depth_b < 0x1000) {
+            denominator = depth_a - depth_b;
+            if (denominator <= 0)
+                return 0;
+            numerator =
+                (int64_t)(view_a - view_b) * (0x1000 - depth_b);
+            view_b += (int32_t)(numerator / denominator);
+            depth_b = 0x1000;
+        }
+        *out_a = hwr_portal_project_x(ctx->camera, view_a, depth_a);
+        *out_b = hwr_portal_project_x(ctx->camera, view_b, depth_b);
+        return 1;
+    }
+    if (depth_a <= 0 && depth_b <= 0)
+        return 0;
+    if (depth_a <= 0) {
+        denominator = depth_b - depth_a;
+        if (denominator <= 0)
+            return 0;
+        numerator = (int64_t)(view_b - view_a) * -depth_a;
+        view_at_eye = view_a + (int32_t)(numerator / denominator);
+        if (view_at_eye < 0)
+            *out_a = -0x3ffe;
+        else if (view_at_eye > 0)
+            *out_a = 0x3ffe;
+        else
+            *out_a = hwr_portal_project_x(
+                ctx->camera, view_b, depth_b);
+    } else {
+        *out_a = hwr_portal_project_x(ctx->camera, view_a, depth_a);
+    }
+    if (depth_b <= 0) {
+        denominator = depth_a - depth_b;
+        if (denominator <= 0)
+            return 0;
+        numerator = (int64_t)(view_a - view_b) * -depth_b;
+        view_at_eye = view_b + (int32_t)(numerator / denominator);
+        if (view_at_eye < 0)
+            *out_b = -0x3ffe;
+        else if (view_at_eye > 0)
+            *out_b = 0x3ffe;
+        else
+            *out_b = hwr_portal_project_x(
+                ctx->camera, view_a, depth_a);
+    } else {
+        *out_b = hwr_portal_project_x(ctx->camera, view_b, depth_b);
+    }
+    return 1;
+}
+
+/* Adds an interval only when it contributes new coverage. This is the visited
+ * state for a traversal: revisiting a sector through a new portal window is
+ * required, while an already-covered cycle terminates immediately. */
+static int hwr_portal_span_add(struct hwr_sector_xspan *span,
+                               int left, int right)
+{
+    unsigned i;
+    int old_left = left;
+    int old_right = right;
+    if (left > right) {
+        int swap = left;
+        left = right;
+        right = swap;
+    }
+    if (left < INT16_MIN)
+        left = INT16_MIN;
+    if (right > INT16_MAX)
+        right = INT16_MAX;
+    if (left >= right)
+        return 0;
+    for (i = 0; i < span->count; i++) {
+        if (left >= span->lo[i] && right <= span->hi[i])
+            return 0;
+    }
+    i = 0;
+    while (i < span->count) {
+        if (left <= (int)span->hi[i] + 1 &&
+            (int)span->lo[i] <= right + 1) {
+            if (span->lo[i] < left)
+                left = span->lo[i];
+            if (span->hi[i] > right)
+                right = span->hi[i];
+            span->count--;
+            span->lo[i] = span->lo[span->count];
+            span->hi[i] = span->hi[span->count];
+            i = 0;
+            continue;
+        }
+        i++;
+    }
+    if (span->count >= HWR_SECTOR_CLIP_MAX) {
+        /* A pathological cyclic map can exceed the bounded disjoint-window
+         * store. Collapse to its hull so traversal remains terminating and
+         * fails toward drawing too much instead of punching a void. */
+        for (i = 0; i < span->count; i++) {
+            if (span->lo[i] < left)
+                left = span->lo[i];
+            if (span->hi[i] > right)
+                right = span->hi[i];
+        }
+        span->count = 0;
+    }
+    span->lo[span->count] = (int16_t)left;
+    span->hi[span->count] = (int16_t)right;
+    span->count++;
+    return left != old_left || right != old_right || span->count != 0;
+}
+
+static void hwr_portal_pvs_walk(struct hwr_portal_pvs_ctx *ctx,
+                                size_t sector, size_t parent,
+                                int left, int right, int depth)
+{
+    const struct hwr_world *world = ctx->world;
+    const struct hwr_sector *current;
+    size_t i;
+
+    if (sector >= world->sector_count || left >= right ||
+        depth > 60 || ctx->budget <= 0)
+        return;
+    if (!hwr_portal_span_add(&ctx->spans[sector], left, right))
+        return;
+    ctx->visible[sector] = 1;
+    ctx->budget--;
+
+    current = &world->sectors[sector];
+    if (current->first_wall > world->wall_count ||
+        current->wall_count > world->wall_count - current->first_wall)
+        return;
+    for (i = 0; i < current->wall_count; i++) {
+        const struct hwr_wall *wall =
+            &world->walls[current->first_wall + i];
+        size_t neighbor_index = wall->neighbor_sector_index;
+        const struct hwr_sector *neighbor;
+        int portal_left, portal_right;
+        int next_left, next_right;
+
+        if (neighbor_index == SIZE_MAX ||
+            neighbor_index >= world->sector_count ||
+            neighbor_index == sector || neighbor_index == parent)
+            continue;
+        neighbor = &world->sectors[neighbor_index];
+        /* The recursive tree rejects empty sectors and portals whose vertical
+         * spans do not overlap the current sector. */
+        if (neighbor->ceiling_z <= neighbor->floor_z ||
+            neighbor->ceiling_z <= current->floor_z ||
+            neighbor->floor_z >= current->ceiling_z)
+            continue;
+        if (!hwr_portal_interval(ctx, wall, &portal_left, &portal_right))
+            continue;
+        if (portal_left >= portal_right)
+            continue;
+        if (portal_left >= right || portal_right <= left)
+            continue;
+        next_left = portal_left > left ? portal_left : left;
+        next_right = portal_right < right ? portal_right : right;
+        if (next_left >= next_right)
+            continue;
+        hwr_portal_pvs_walk(ctx, neighbor_index, sector,
+                            next_left, next_right, depth + 1);
+    }
+}
+
+static size_t hwr_portal_roots(const struct hwr_world *world,
+                               const struct roth_api_v1 *api,
+                               int clip_left, int clip_right,
+                               int widen,
+                               struct hwr_portal_root roots[
+                                   HWR_VISIBLE_ROOT_MAX])
+{
+    uint32_t count;
+    size_t root_count = 0;
+    size_t i;
+    if (world->sector_offset_to_index == NULL)
+        return 0;
+    count = api->game_ram->u32(VA_G_VISIBLE_EXTENT_COUNT);
+    if (count <= HWR_VISIBLE_ROOT_MAX) {
+        for (i = 0; i < count; i++) {
+            uint32_t address = VA_G_VISIBLE_EXTENT_LIST + (uint32_t)i * 6u;
+            uint16_t offset = api->game_ram->u16(address);
+            uint16_t index = world->sector_offset_to_index[offset];
+            int left = (int16_t)api->game_ram->u16(address + 2u);
+            int right = (int16_t)api->game_ram->u16(address + 4u);
+            if (index == UINT16_MAX || index >= world->sector_count ||
+                left >= right)
+                continue;
+            if (left < clip_left)
+                left = clip_left;
+            if (right > clip_right)
+                right = clip_right;
+            if (left >= right)
+                continue;
+            roots[root_count].sector = index;
+            roots[root_count].left = left;
+            roots[root_count].right = right;
+            root_count++;
+        }
+    }
+    if (root_count == 0) {
+        uint16_t offset = api->game_ram->u16(VA_G_PLAYER_SECTOR);
+        uint16_t index = world->sector_offset_to_index[offset];
+        if (index == UINT16_MAX || index >= world->sector_count)
+            return 0;
+        roots[0].sector = index;
+        roots[0].left = clip_left;
+        roots[0].right = clip_right;
+        return 1;
+    }
+    if (widen) {
+        size_t leftmost = 0;
+        size_t rightmost = 0;
+        for (i = 1; i < root_count; i++) {
+            if (roots[i].left < roots[leftmost].left)
+                leftmost = i;
+            if (roots[i].right > roots[rightmost].right)
+                rightmost = i;
+        }
+        roots[leftmost].left = clip_left;
+        roots[rightmost].right = clip_right;
+    }
+    return root_count;
+}
+
+int hwr_compute_portal_pvs(const struct hwr_world *world,
+                           const struct hwr_gl_camera *camera,
+                           const struct roth_api_v1 *api,
+                           int clip_left, int clip_right,
+                           int widen_roots,
+                           uint8_t *visible,
+                           struct hwr_sector_xspan *spans,
+                           size_t span_count)
+{
+    struct hwr_portal_root roots[HWR_VISIBLE_ROOT_MAX];
+    struct hwr_portal_pvs_ctx ctx;
+    size_t root_count;
+    size_t i;
+
+    if (world == NULL || camera == NULL || api == NULL ||
+        api->game_ram == NULL || visible == NULL || spans == NULL ||
+        world->sector_count == 0 || span_count < world->sector_count ||
+        clip_left >= clip_right)
+        return 0;
+    memset(visible, 0, world->sector_count);
+    memset(spans, 0, world->sector_count * sizeof *spans);
+    root_count = hwr_portal_roots(
+        world, api, clip_left, clip_right, widen_roots, roots);
+    if (root_count == 0)
+        return 0;
+    ctx.world = world;
+    ctx.camera = camera;
+    ctx.visible = visible;
+    ctx.spans = spans;
+    ctx.budget = 0x0c65;
+    ctx.extend_near_to_frustum = widen_roots;
+    for (i = 0; i < root_count && ctx.budget > 0; i++)
+        hwr_portal_pvs_walk(&ctx, roots[i].sector, roots[i].sector,
+                            roots[i].left, roots[i].right, 0);
+    return ctx.budget < 0x0c65;
 }
 
 /* The sector portal-window clip is on by default; HWR_PORTAL_CLIP=0 disables it,

@@ -2,6 +2,7 @@
 
 #include "hwr_perf.h"
 
+#include "hwr_projection.h"
 #include "hwr_settings.h"
 
 #include "hwr_gl.h"
@@ -1124,8 +1125,10 @@ void hwr_scene_clear(struct hwr_scene *scene)
     free(scene->translucent_runs);
     free(scene->translucent_run_flags);
     free(scene->visible);
+    free(scene->oracle_visible);
     free(scene->spans);
     free(scene->reflection_spans);
+    free(scene->wide_spans);
     for (i = 0; i < HWR_REFLECTION_MAX; i++) {
         free(scene->reflections[i].vertices);
         free(scene->reflections[i].runs);
@@ -3356,18 +3359,31 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
 }
 
 static void hwr_apply_frame_clip(struct hwr_gl_vertex *vertices, size_t count,
+                                 const struct hwr_gl_camera *camera,
                                  int left, int right)
 {
-    uint32_t fixed_left;
-    uint32_t fixed_right;
+    int64_t fixed_left;
+    int64_t fixed_right;
     size_t i;
-    if (left < 0 || right <= left || right > 0xffff)
+    if (right <= left || left < INT16_MIN || right > INT16_MAX)
         return;
-    fixed_left = (uint32_t)left << 16;
-    fixed_right = (uint32_t)right << 16;
+    if (camera != NULL && !camera->reflected) {
+        fixed_left = hwr_projection_map_x_fixed(camera, left);
+        fixed_right = hwr_projection_map_x_fixed(camera, right);
+    } else {
+        fixed_left = (int64_t)left * 65536;
+        fixed_right = (int64_t)right * 65536;
+    }
+    if (fixed_left < 0)
+        fixed_left = 0;
+    if (fixed_right > UINT32_MAX)
+        fixed_right = UINT32_MAX;
+    if (fixed_left >= fixed_right || fixed_left > UINT32_MAX ||
+        fixed_right < 0)
+        return;
     for (i = 0; i < count; i++) {
-        vertices[i].portal_clip_left = fixed_left;
-        vertices[i].portal_clip_right = fixed_right;
+        vertices[i].portal_clip_left = (uint32_t)fixed_left;
+        vertices[i].portal_clip_right = (uint32_t)fixed_right;
     }
 }
 
@@ -3380,7 +3396,7 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
 {
     size_t count = hwr_copy_gpu_surface_raw(
         scene, surface, camera, width, height, destination);
-    hwr_apply_frame_clip(destination, count, clip_left, clip_right);
+    hwr_apply_frame_clip(destination, count, camera, clip_left, clip_right);
     return count;
 }
 
@@ -3448,8 +3464,8 @@ static void hwr_prepare_reflection_object_windows(
     }
 }
 
-static void hwr_scene_door_span_add(struct hwr_sector_xspan *span,
-                                    int16_t lo, int16_t hi)
+static void hwr_scene_span_add(struct hwr_sector_xspan *span,
+                               int16_t lo, int16_t hi)
 {
     unsigned i;
     if (span->count == UINT8_MAX)
@@ -3497,6 +3513,96 @@ static void hwr_scene_door_span_add(struct hwr_sector_xspan *span,
     span->count++;
 }
 
+static void hwr_scene_add_wing_windows(
+    struct hwr_sector_xspan *destination,
+    const struct hwr_sector_xspan *source,
+    uint32_t source_width)
+{
+    unsigned i;
+    if (destination == NULL || source == NULL ||
+        source->count > HWR_SECTOR_CLIP_MAX ||
+        source_width > INT16_MAX)
+        return;
+    for (i = 0; i < source->count; i++) {
+        int left = source->lo[i];
+        int right = source->hi[i];
+        if (left < 0)
+            hwr_scene_span_add(
+                destination, (int16_t)left,
+                (int16_t)(right < 0 ? right : 0));
+        if (right > (int)source_width)
+            hwr_scene_span_add(
+                destination,
+                (int16_t)(left > (int)source_width
+                              ? left : (int)source_width),
+                (int16_t)right);
+    }
+}
+
+/* Retains only newly exposed side windows from the transcribed traversal, then
+ * restores a full central interval for sectors the engine itself drew. This
+ * makes widening additive: a disagreement can never replace the original
+ * center with a different cull result. */
+static void hwr_prepare_wide_sector_windows(
+    struct hwr_scene *scene, const struct hwr_world *world,
+    const uint8_t *engine_visible, int engine_valid,
+    uint32_t source_width)
+{
+    size_t i;
+    for (i = 0; i < world->sector_count; i++) {
+        struct hwr_sector_xspan original = scene->wide_spans[i];
+        struct hwr_sector_xspan *destination = &scene->wide_spans[i];
+        memset(destination, 0, sizeof *destination);
+        if (engine_valid) {
+            hwr_scene_add_wing_windows(
+                destination, &original, source_width);
+            if (engine_visible[i])
+                hwr_scene_span_add(
+                    destination, 0, (int16_t)source_width);
+        } else {
+            unsigned k;
+            for (k = 0; k < original.count; k++)
+                hwr_scene_span_add(
+                    destination, original.lo[k], original.hi[k]);
+        }
+        if (destination->count == 0 && engine_valid &&
+            !engine_visible[i])
+            scene->visible[i] = 0;
+    }
+}
+
+static void hwr_prepare_wide_object_windows(
+    struct hwr_scene *scene, const struct hwr_objects *objects,
+    uint32_t source_width)
+{
+    size_t i;
+    if (objects == NULL || scene->spans == NULL ||
+        scene->span_count < objects->count)
+        return;
+    for (i = 0; i < objects->count; i++) {
+        const struct hwr_object *object = &objects->items[i];
+        struct hwr_sector_xspan *destination = &scene->spans[i];
+        const struct hwr_sector_xspan *source;
+        int had_exact = destination->count != 0;
+        unsigned k;
+        if (object->sector_index == HWR_OBJECT_NO_SECTOR ||
+            object->sector_index >= scene->wide_span_count)
+            continue;
+        source = &scene->wide_spans[object->sector_index];
+        hwr_scene_add_wing_windows(destination, source, source_width);
+        if (had_exact || source->count > HWR_SECTOR_CLIP_MAX)
+            continue;
+        for (k = 0; k < source->count; k++) {
+            int left = source->lo[k] > 0 ? source->lo[k] : 0;
+            int right = source->hi[k] < (int)source_width
+                      ? source->hi[k] : (int)source_width;
+            if (left < right)
+                hwr_scene_span_add(
+                    destination, (int16_t)left, (int16_t)right);
+        }
+    }
+}
+
 static void hwr_prepare_reflection_door_windows(
     struct hwr_scene *scene, const struct hwr_world *world)
 {
@@ -3519,9 +3625,31 @@ static void hwr_prepare_reflection_door_windows(
                 source->count > HWR_SECTOR_CLIP_MAX)
                 continue;
             for (wi = 0; wi < source->count; wi++)
-                hwr_scene_door_span_add(
+                hwr_scene_span_add(
                     &scene->door_spans[di],
                     source->lo[wi], source->hi[wi]);
+        }
+    }
+}
+
+static void hwr_prepare_wide_door_windows(
+    struct hwr_scene *scene, const struct hwr_world *world,
+    uint32_t source_width)
+{
+    size_t di;
+    for (di = 0; di < world->door_count && di < HWR_DOOR_MAX; di++) {
+        const struct hwr_door *door = &world->doors[di];
+        size_t sectors[2];
+        size_t si;
+        sectors[0] = (door->state_flags & 2u) == 0
+                   ? door->owner_sector_index : SIZE_MAX;
+        sectors[1] = door->neighbor_sector_index;
+        for (si = 0; si < 2u; si++) {
+            if (sectors[si] >= scene->wide_span_count)
+                continue;
+            hwr_scene_add_wing_windows(
+                &scene->door_spans[di],
+                &scene->wide_spans[sectors[si]], source_width);
         }
     }
 }
@@ -3532,6 +3660,18 @@ static const struct hwr_sector_xspan *hwr_surface_windows(
 {
     const struct hwr_sector_xspan *span;
     if (!camera->reflected) {
+        if (scene->wide_clip_valid) {
+            if (surface->kind == HWR_SURFACE_DOOR &&
+                surface->door_index < HWR_DOOR_MAX) {
+                span = &scene->door_spans[surface->door_index];
+            } else if (surface->sector_index < scene->wide_span_count) {
+                span = &scene->wide_spans[surface->sector_index];
+            } else {
+                return NULL;
+            }
+            return span->count != 0 &&
+                   span->count <= HWR_SECTOR_CLIP_MAX ? span : NULL;
+        }
         if (!scene->door_portal_clip_valid ||
             surface->kind != HWR_SURFACE_DOOR ||
             surface->door_index >= HWR_DOOR_MAX)
@@ -3588,13 +3728,10 @@ static size_t hwr_copy_gpu_surface_windows(
         } else {
             left = span->lo[i];
             /* Primary ordered-chain bounds use stock's half-open
-             * [left,right) convention. Reflection spans are inclusive and
-             * are converted separately above. */
+             * [left,right) convention in SOURCE projection coordinates.
+             * Wide left-wing bounds are deliberately negative; the GPU clip
+             * mapper below converts and clamps them in target space. */
             right = span->hi[i];
-            if (left < 0)
-                left = 0;
-            if (right > (int)width)
-                right = (int)width;
             if (left >= right)
                 continue;
         }
@@ -3777,6 +3914,10 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
             hwr_translucent_insert(items, &item_count, &item);
         }
     }
+    /* Stock paints an object's opaque mesh after the sector's world faces.
+     * Preserve that order so an object face placed on a floor or ceiling owns
+     * the coplanar painter tie. The GL layer supplies the minimal toward-viewer
+     * offset needed to make that ownership stable under raster depth. */
     if (object_mesh_opaque != 0) {
         memcpy(scene->stream_vertices + opaque_cursor, object_meshes->opaque,
                object_mesh_opaque * sizeof *scene->stream_vertices);
@@ -4035,6 +4176,14 @@ static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count
         scene->visible = buffer;
         scene->visible_count = sector_count;
     }
+    if (scene->oracle_visible_count < sector_count) {
+        uint8_t *buffer =
+            (uint8_t *)realloc(scene->oracle_visible, sector_count);
+        if (buffer == NULL)
+            return -1;
+        scene->oracle_visible = buffer;
+        scene->oracle_visible_count = sector_count;
+    }
     if (scene->reflection_span_count < sector_count) {
         struct hwr_sector_xspan *buffer =
             (struct hwr_sector_xspan *)realloc(
@@ -4043,6 +4192,15 @@ static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count
             return -1;
         scene->reflection_spans = buffer;
         scene->reflection_span_count = sector_count;
+    }
+    if (scene->wide_span_count < sector_count) {
+        struct hwr_sector_xspan *buffer =
+            (struct hwr_sector_xspan *)realloc(
+                scene->wide_spans, sector_count * sizeof *buffer);
+        if (buffer == NULL)
+            return -1;
+        scene->wide_spans = buffer;
+        scene->wide_span_count = sector_count;
     }
     if (object_count != 0 && scene->span_count < object_count) {
         struct hwr_sector_xspan *buffer = (struct hwr_sector_xspan *)realloc(
@@ -4068,6 +4226,36 @@ static void hwr_scene_log_visibility(const struct hwr_scene *scene,
     fprintf(stderr,
             "[renderer_overhaul] portal-reachable visibility: %u/%u sectors\n",
             (unsigned)visible_sectors, (unsigned)world->sector_count);
+}
+
+static void hwr_scene_check_visibility_oracle(
+    struct hwr_scene *scene, const struct hwr_world *world,
+    int engine_valid, int transcribed_valid)
+{
+    size_t missing = 0;
+    size_t extra = 0;
+    size_t i;
+    if (!engine_valid || !transcribed_valid)
+        return;
+    for (i = 0; i < world->sector_count; i++) {
+        if (scene->oracle_visible[i] && !scene->visible[i])
+            missing++;
+        else if (!scene->oracle_visible[i] && scene->visible[i])
+            extra++;
+    }
+    if (missing != 0 || extra != 0) {
+        if (!scene->wide_oracle_error_logged) {
+            fprintf(stderr,
+                    "[renderer_overhaul] widened portal walk differs in the original view: missing=%u extra=%u; retaining the engine center\n",
+                    (unsigned)missing, (unsigned)extra);
+            scene->wide_oracle_error_logged = 1;
+        }
+    } else {
+        scene->wide_oracle_error_logged = 0;
+        if (getenv("HWR_PVS_ORACLE_LOG") != NULL)
+            fprintf(stderr,
+                    "[renderer_overhaul] widened portal walk matches the original view\n");
+    }
 }
 
 #define VA_G_REFLECTION_COUNT   0x85340u
@@ -4290,6 +4478,7 @@ static int hwr_scene_store_reflection(struct hwr_scene_reflection *reflection,
     reflection->opaque_count = opaque_count;
     reflection->flat_count = flat_count;
     reflection->translucent_count = translucent_count;
+    reflection->opaque_mesh_count = scene->object_meshes.opaque_count;
     reflection->opaque_billboard_count = scene->billboards.opaque_count;
     reflection->shadow_count = scene->billboards.shadow_count;
     reflection->shadow_run_count = scene->billboards.shadow_run_count;
@@ -4333,7 +4522,9 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
                                  const struct hwr_objects *objects,
                                  const struct roth_api_v1 *api,
-                                 uint32_t width, uint32_t height)
+                                 uint32_t width, uint32_t height,
+                                 uint32_t source_width,
+                                 uint32_t source_height)
 {
     struct hwr_gl_camera camera;
     struct hwr_gl_scene_view views[HWR_REFLECTION_MAX + 1u];
@@ -4347,6 +4538,9 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     size_t i;
     size_t view_count = 0;
     int floor_exception = hwr_billboards_floor_exception_enabled();
+    int source_left = 0;
+    int source_right = 0;
+    int wide_projection = 0;
     if (scene == NULL || !scene->valid || !scene->uploaded ||
         world == NULL || !world->valid || api == NULL || api->game_ram == NULL)
         return NULL;
@@ -4356,6 +4550,17 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     }
     hwr_scene_animate(scene, api);
     hwr_read_camera(&camera, world, api);
+    if (!hwr_projection_scale_camera(
+            &camera, source_width, source_height, width, height,
+            hwr_settings_get()->fov_deg)) {
+        hwr_scene_fail(scene, "projection dimensions are not representable");
+        return NULL;
+    }
+    if (hwr_projection_source_x_bounds(
+            &camera, width, &source_left, &source_right)) {
+        wide_projection =
+            source_left != 0 || source_right != (int)source_width;
+    }
     camera.sky_texture_offset = scene->sky_texture_offset;
     camera.sky_projection_offset = scene->sky_projection_offset;
     camera.sky_source_offset = scene->sky_source_offset;
@@ -4440,6 +4645,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         views[view_count].translucent_runs = reflection->runs;
         views[view_count].translucent_run_flags = reflection->run_flags;
         views[view_count].translucent_run_count = reflection->run_count;
+        views[view_count].opaque_mesh_vertices =
+            reflection->opaque_mesh_count;
         views[view_count].opaque_billboard_vertices =
             reflection->opaque_billboard_count;
         views[view_count].shadow_vertices = reflection->shadow_count;
@@ -4459,14 +4666,76 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     scene->portal_clip_valid = 0;
     scene->door_portal_clip_valid = 0;
     scene->reflection_clip_valid = 0;
+    scene->wide_clip_valid = 0;
     if (hwr_pvs_enabled()) {
-        scene->pvs_valid = hwr_compute_pvs(world, &camera, api, scene->visible);
-        /* Reuse each type-1 worklist node's object-depth-specific window. */
-        scene->portal_clip_valid = hwr_compute_object_portal_windows(
-            world, objects, api, scene->spans, scene->span_count);
-        scene->door_portal_clip_valid =
-            hwr_compute_door_portal_windows(
-                world, api, scene->door_spans, HWR_DOOR_MAX);
+        if (wide_projection) {
+            int engine_valid;
+            int central_valid;
+            int wide_valid;
+            size_t s;
+
+            memset(scene->oracle_visible, 0, world->sector_count);
+            engine_valid = hwr_compute_pvs(
+                world, &camera, api, scene->oracle_visible);
+            central_valid = hwr_compute_portal_pvs(
+                world, &camera, api, 0, (int)source_width, 0,
+                scene->visible, scene->wide_spans,
+                scene->wide_span_count);
+            hwr_scene_check_visibility_oracle(
+                scene, world, engine_valid, central_valid);
+            wide_valid = hwr_compute_portal_pvs(
+                world, &camera, api, source_left, source_right, 1,
+                scene->visible, scene->wide_spans,
+                scene->wide_span_count);
+            if (wide_valid) {
+                if (engine_valid)
+                    for (s = 0; s < world->sector_count; s++)
+                        if (scene->oracle_visible[s])
+                            scene->visible[s] = 1;
+                hwr_prepare_wide_sector_windows(
+                    scene, world, scene->oracle_visible,
+                    engine_valid, source_width);
+                scene->pvs_valid = 1;
+                scene->wide_clip_valid = hwr_portal_clip_enabled();
+            } else if (engine_valid) {
+                memcpy(scene->visible, scene->oracle_visible,
+                       world->sector_count);
+                scene->pvs_valid = 1;
+            }
+
+            if (objects != NULL && scene->spans != NULL &&
+                scene->span_count >= objects->count)
+                memset(scene->spans, 0,
+                       objects->count * sizeof *scene->spans);
+            memset(scene->door_spans, 0, sizeof scene->door_spans);
+            /* Preserve the engine's object-depth-specific center windows, then
+             * add only the side portions of the widened sector windows. */
+            scene->portal_clip_valid =
+                hwr_compute_object_portal_windows(
+                    world, objects, api, scene->spans, scene->span_count);
+            scene->door_portal_clip_valid =
+                hwr_compute_door_portal_windows(
+                    world, api, scene->door_spans, HWR_DOOR_MAX);
+            if (scene->wide_clip_valid) {
+                hwr_prepare_wide_object_windows(
+                    scene, objects, source_width);
+                hwr_prepare_wide_door_windows(
+                    scene, world, source_width);
+                scene->portal_clip_valid =
+                    objects != NULL &&
+                    scene->span_count >= objects->count;
+                scene->door_portal_clip_valid = 1;
+            }
+        } else {
+            scene->pvs_valid =
+                hwr_compute_pvs(world, &camera, api, scene->visible);
+            /* Reuse each type-1 worklist node's object-depth-specific window. */
+            scene->portal_clip_valid = hwr_compute_object_portal_windows(
+                world, objects, api, scene->spans, scene->span_count);
+            scene->door_portal_clip_valid =
+                hwr_compute_door_portal_windows(
+                    world, api, scene->door_spans, HWR_DOOR_MAX);
+        }
     }
     hwr_scene_log_visibility(scene, world);
     if (hwr_scene_emit_view(
@@ -4487,6 +4756,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     views[view_count].translucent_runs = scene->translucent_runs;
     views[view_count].translucent_run_flags = scene->translucent_run_flags;
     views[view_count].translucent_run_count = translucent_run_count;
+    views[view_count].opaque_mesh_vertices =
+        scene->object_meshes.opaque_count;
     views[view_count].opaque_billboard_vertices =
         scene->billboards.opaque_count;
     views[view_count].shadow_vertices = scene->billboards.shadow_count;

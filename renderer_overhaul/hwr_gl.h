@@ -119,6 +119,15 @@ struct hwr_gl_camera {
     uint16_t focal_y;
     int32_t center_x;
     int32_t horizon;
+    /* Engine-space projection retained when the target framebuffer differs
+     * from the engine viewport. Portal windows and intrinsic object sizes are
+     * authored in this source space. */
+    uint16_t source_focal_x;
+    uint16_t source_focal_y;
+    int32_t source_center_x;
+    int32_t source_horizon;
+    uint16_t source_width;
+    uint16_t source_height;
     int16_t shade_origin_x;
     int16_t shade_origin_y;
     uint8_t shade_level;
@@ -158,6 +167,8 @@ struct hwr_gl_scene_view {
     const uint32_t *translucent_runs;
     const uint8_t *translucent_run_flags;
     size_t translucent_run_count;
+    /* Opaque 3D object-mesh vertices between world faces and billboards. */
+    size_t opaque_mesh_vertices;
     size_t opaque_billboard_vertices;
     size_t shadow_vertices;
     size_t shadow_run_count;
@@ -173,7 +184,6 @@ struct hwr_gl_scene_view {
 int hwr_gl_init(void);
 const uint32_t *hwr_gl_render_frame(uint32_t width, uint32_t height,
                                     uint32_t color);
-void hwr_gl_resize(uint32_t width, uint32_t height);
 int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                         const uint8_t colormap[0x2000],
                         const uint8_t tint[0x2000],

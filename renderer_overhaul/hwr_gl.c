@@ -1,5 +1,7 @@
 #include "hwr_gl.h"
+#include "hwr_perf.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -366,6 +368,7 @@ static void hwr_platform_shutdown(void)
 typedef void *EGLDeviceEXT;
 typedef EGLBoolean (*hwr_egl_query_devices_fn)(EGLint, EGLDeviceEXT *, EGLint *);
 typedef EGLDisplay (*hwr_egl_get_platform_display_fn)(EGLenum, void *, const EGLint *);
+typedef const char *(*hwr_egl_query_device_string_fn)(EGLDeviceEXT, EGLint);
 
 static EGLDisplay g_display = EGL_NO_DISPLAY;
 static EGLContext g_context = EGL_NO_CONTEXT;
@@ -401,20 +404,41 @@ static int hwr_try_device_display(void)
 {
     hwr_egl_query_devices_fn query_devices;
     hwr_egl_get_platform_display_fn get_platform_display;
+    hwr_egl_query_device_string_fn query_device_string;
     EGLDeviceEXT devices[16];
     EGLint count = 0;
     EGLint i;
+    int pass;
 
     query_devices = (hwr_egl_query_devices_fn)eglGetProcAddress("eglQueryDevicesEXT");
     get_platform_display = (hwr_egl_get_platform_display_fn)
         eglGetProcAddress("eglGetPlatformDisplayEXT");
+    query_device_string = (hwr_egl_query_device_string_fn)
+        eglGetProcAddress("eglQueryDeviceStringEXT");
     if (query_devices == NULL || get_platform_display == NULL ||
         !query_devices((EGLint)(sizeof devices / sizeof devices[0]), devices, &count))
         return 0;
-    for (i = 0; i < count; i++) {
-        EGLDisplay display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL);
-        if (hwr_initialize_display(display))
-            return 1;
+    /*
+     * EGL device enumeration may include Mesa's CPU rasterizer alongside real
+     * DRM devices.  Try every non-software device first, preserving the
+     * implementation's preferred GPU order, and retain software as a last
+     * resort for systems with no working hardware EGL stack.
+     */
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < count; i++) {
+            const char *device_extensions =
+                query_device_string != NULL
+                    ? query_device_string(devices[i], EGL_EXTENSIONS)
+                    : NULL;
+            int software = hwr_has_extension(device_extensions,
+                                             "EGL_MESA_device_software");
+            EGLDisplay display;
+            if ((pass == 0 && software) || (pass != 0 && !software))
+                continue;
+            display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL);
+            if (hwr_initialize_display(display))
+                return 1;
+        }
     }
     return 0;
 }
@@ -456,8 +480,15 @@ static int hwr_platform_init(void)
     };
     const char *extensions;
 
-    if (!hwr_initialize_display(eglGetDisplay(EGL_DEFAULT_DISPLAY)) &&
-        !hwr_try_device_display()) {
+    /*
+     * Prefer an enumerated render device to EGL_DEFAULT_DISPLAY.  On systems
+     * with both a hardware vendor stack and Mesa installed, the 32-bit
+     * default-display path can successfully initialize Mesa's llvmpipe even
+     * though a hardware EGL device is available.  The device path above
+     * explicitly demotes EGL_MESA_device_software candidates.
+     */
+    if (!hwr_try_device_display() &&
+        !hwr_initialize_display(eglGetDisplay(EGL_DEFAULT_DISPLAY))) {
         hwr_set_egl_error("no EGL display could be initialized");
         return 0;
     }
@@ -702,6 +733,9 @@ static const char g_geometry_fragment_shader[] =
     "uniform vec2 u_focal;\n"
     "uniform vec2 u_center;\n"
     "uniform vec2 u_viewport;\n"
+    "uniform ivec2 u_source_viewport;\n"
+    "uniform ivec2 u_source_focal;\n"
+    "uniform ivec2 u_source_center;\n"
     "uniform ivec2 u_shade_origin;\n"
     "uniform int u_flat_edge_bias;\n"
     "uniform float u_depth_scale;\n"
@@ -1106,9 +1140,33 @@ static const char g_geometry_fragment_shader[] =
      * letting it write depth would hide the geometry seen through the arch. */
     "    if (u_sky_occlusion_pass!=0 && (material & 64u)==0u) discard;\n"
     "    if (u_sky_valid==0) discard;\n"
-    "    int sx=clamp(source_column(),0,int(u_viewport.x)-1);"
-    " int sy=int(gl_FragCoord.y);\n"
-    "    int scolumn=int(texelFetch(u_texels,u_sky_projection_offset+sx).r);\n"
+    "    int tx=source_column(); int ty=int(gl_FragCoord.y);\n"
+    "    float source_x=float(u_source_center.x)+"
+    " (float(tx)-u_center.x)*float(u_source_focal.x)/u_focal.x;\n"
+    "    float source_y=float(u_source_center.y)+"
+    " (float(ty)-u_center.y)*float(u_source_focal.y)/u_focal.y;\n"
+    "    int sx=int(floor(source_x));"
+    " int sy=clamp(int(floor(source_y)),0,u_source_viewport.y-1);\n"
+    "    int scolumn;\n"
+    "    if (sx>=0 && sx<u_source_viewport.x) {\n"
+    "      scolumn=int(texelFetch(u_texels,u_sky_projection_offset+sx).r);\n"
+    "    } else {\n"
+    /* The packed engine table covers only the original viewport. Continue its
+     * defining perspective law for newly exposed columns. The table stores
+     * the low byte of a 1024-unit turn (the 256-column sky repeats four times
+     * per turn). Anchor the continuation to the live endpoint because the
+     * engine's fixed-point table fill can differ from the analytic value by a
+     * texel at the boundary. */
+    "      float angle=atan((float(u_source_center.x)-source_x)/"
+    " float(u_source_focal.x));\n"
+    "      int edge_x=sx<0 ? 0 : u_source_viewport.x-1;\n"
+    "      int edge_column=int(texelFetch(u_texels,"
+    " u_sky_projection_offset+edge_x).r);\n"
+    "      float edge_angle=atan((float(u_source_center.x)-float(edge_x))/"
+    " float(u_source_focal.x));\n"
+    "      scolumn=(edge_column+int(round((angle-edge_angle)*"
+    " 162.97466172610084))) & 255;\n"
+    "    }\n"
     "    scolumn=(scolumn-(u_sky_yaw << 1)) & 255;\n"
     "    int srow=u_sky_start_row+(u_sky_double_scanline!=0 ? (sy >> 1) : sy);\n"
     "    srow=clamp(srow,0,u_sky_texture_height-1);\n"
@@ -1188,6 +1246,11 @@ static const char g_sky_fragment_shader[] =
     "#version 330 core\n"
     "layout(location=0) out uint out_index;\n"
     "uniform usamplerBuffer u_texels;\n"
+    "uniform ivec2 u_source_viewport;\n"
+    "uniform ivec2 u_source_focal;\n"
+    "uniform ivec2 u_source_center;\n"
+    "uniform vec2 u_focal;\n"
+    "uniform vec2 u_center;\n"
     "uniform int u_texture_offset;\n"
     "uniform int u_source_offset;\n"
     "uniform int u_projection_offset;\n"
@@ -1197,10 +1260,29 @@ static const char g_sky_fragment_shader[] =
     "uniform int u_double_scanline;\n"
     "uniform int u_debug_vis;\n"
     "void main() {\n"
-    "  int x=int(gl_FragCoord.x), y=int(gl_FragCoord.y);\n"
-    "  int column=int(texelFetch(u_texels,u_projection_offset+x).r);\n"
+    "  int tx=int(gl_FragCoord.x), ty=int(gl_FragCoord.y);\n"
+    "  float source_x=float(u_source_center.x)+"
+    " (float(tx)-u_center.x)*float(u_source_focal.x)/u_focal.x;\n"
+    "  float source_y=float(u_source_center.y)+"
+    " (float(ty)-u_center.y)*float(u_source_focal.y)/u_focal.y;\n"
+    "  int sx=int(floor(source_x));"
+    " int sy=clamp(int(floor(source_y)),0,u_source_viewport.y-1);\n"
+    "  int column;\n"
+    "  if (sx>=0 && sx<u_source_viewport.x)"
+    " column=int(texelFetch(u_texels,u_projection_offset+sx).r);\n"
+    "  else {\n"
+    "    float angle=atan((float(u_source_center.x)-source_x)/"
+    " float(u_source_focal.x));\n"
+    "    int edge_x=sx<0 ? 0 : u_source_viewport.x-1;\n"
+    "    int edge_column=int(texelFetch(u_texels,"
+    " u_projection_offset+edge_x).r);\n"
+    "    float edge_angle=atan((float(u_source_center.x)-float(edge_x))/"
+    " float(u_source_focal.x));\n"
+    "    column=(edge_column+int(round((angle-edge_angle)*"
+    " 162.97466172610084))) & 255;\n"
+    "  }\n"
     "  column=(column-(u_yaw << 1)) & 255;\n"
-    "  int row=u_start_row+(u_double_scanline!=0 ? (y >> 1) : y);\n"
+    "  int row=u_start_row+(u_double_scanline!=0 ? (sy >> 1) : sy);\n"
     "  row=clamp(row,0,u_texture_height-1);\n"
     "  uint texel=texelFetch(u_texels,u_texture_offset+u_source_offset+row*256+column).r;\n"
     "  out_index=u_debug_vis==1 ? 255u : texel;\n"
@@ -1956,6 +2038,90 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
     return 1;
 }
 
+/* Returns the target-space interval occupied by the original source viewport.
+ * Pixels outside this interval exist only because the target is wider. */
+static int hwr_source_projection_bounds(const struct hwr_gl_camera *camera,
+                                        uint32_t width,
+                                        int *out_left, int *out_right)
+{
+    double mapped_left;
+    double mapped_right;
+    int left;
+    int right;
+
+    if (camera == NULL || out_left == NULL || out_right == NULL ||
+        camera->source_focal_x == 0 || camera->source_width == 0)
+        return 0;
+    mapped_left = (double)camera->center_x +
+        (-(double)camera->source_center_x) *
+        camera->focal_x / camera->source_focal_x;
+    mapped_right = (double)camera->center_x +
+        ((double)camera->source_width - camera->source_center_x) *
+        camera->focal_x / camera->source_focal_x;
+    if (mapped_left > mapped_right) {
+        double swap = mapped_left;
+        mapped_left = mapped_right;
+        mapped_right = swap;
+    }
+    left = (int)ceil(mapped_left);
+    right = (int)ceil(mapped_right);
+    if (left < 0)
+        left = 0;
+    if ((uint32_t)left > width)
+        left = (int)width;
+    if (right < 0)
+        right = 0;
+    if ((uint32_t)right > width)
+        right = (int)width;
+    *out_left = left;
+    *out_right = right;
+    return 1;
+}
+
+/* Persistence is an engine quirk only inside the source viewport. Keeping it
+ * in the extra ultrawide wings lets a menu, a previous room, or an earlier sky
+ * remain indefinitely whenever the current scene has no surface there. Reset
+ * just those target-only pixels before taking the stale-texture snapshot; an
+ * active sky wing or ordinary geometry may then paint them normally. */
+static void hwr_clear_wide_persistence_wings(
+    const struct hwr_gl_scene_view *views, size_t view_count,
+    uint32_t width, uint32_t height, const GLuint clear_index[4])
+{
+    const struct hwr_gl_scene_view *primary = NULL;
+    static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
+    static const GLenum both_buffers[2] =
+        { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    size_t i;
+    int center_left;
+    int center_right;
+
+    for (i = view_count; i != 0; i--) {
+        if (!views[i - 1].camera.reflected) {
+            primary = &views[i - 1];
+            break;
+        }
+    }
+    if (primary == NULL ||
+        !hwr_source_projection_bounds(&primary->camera, width,
+                                      &center_left, &center_right) ||
+        (center_left == 0 && (uint32_t)center_right == width))
+        return;
+
+    g_gl.draw_buffers(1, index_only);
+    g_gl.enable(GL_SCISSOR_TEST);
+    if (center_left > 0) {
+        g_gl.scissor(0, 0, center_left, (GLsizei)height);
+        g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
+    }
+    if ((uint32_t)center_right < width) {
+        g_gl.scissor(center_right, 0, (GLsizei)width - center_right,
+                     (GLsizei)height);
+        g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
+    }
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.draw_buffers(2, both_buffers);
+}
+
 static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                               uint32_t width, uint32_t height)
 {
@@ -1968,6 +2134,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     const uint32_t *translucent_runs = view->translucent_runs;
     const uint8_t *translucent_run_flags = view->translucent_run_flags;
     size_t translucent_run_count = view->translucent_run_count;
+    size_t opaque_mesh_vertices = view->opaque_mesh_vertices;
     size_t opaque_billboard_vertices = view->opaque_billboard_vertices;
     size_t shadow_vertices = view->shadow_vertices;
     size_t shadow_run_count = view->shadow_run_count;
@@ -1975,6 +2142,11 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         view->translucent_billboard_run_count;
     int floor_exception = view->floor_exception;
     const struct hwr_gl_camera *camera = &view->camera;
+    int sky_active = (camera->sky_valid &&
+                      camera->sky_texture_height != 0 &&
+                      camera->source_width != 0 &&
+                      camera->source_height != 0 &&
+                      camera->source_width <= 0x288u) ? 1 : 0;
     size_t total = sky_vertices + mirror_depth_vertices +
                    opaque_vertices + translucent_vertices;
     GLint blend_location;
@@ -2083,6 +2255,12 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                    camera->shade_origin_x, camera->shade_origin_y);
     hwr_uniform_1i(g_geometry_program, "u_flat_edge_bias", camera->flat_edge_bias);
     hwr_uniform_2f(g_geometry_program, "u_viewport", (GLfloat)width, (GLfloat)height);
+    hwr_uniform_2i(g_geometry_program, "u_source_viewport",
+                   camera->source_width, camera->source_height);
+    hwr_uniform_2i(g_geometry_program, "u_source_focal",
+                   camera->source_focal_x, camera->source_focal_y);
+    hwr_uniform_2i(g_geometry_program, "u_source_center",
+                   camera->source_center_x, camera->source_horizon);
     hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
     hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
     hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
@@ -2098,8 +2276,6 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
          * full-screen prepass used, gated on the identical draw condition
          * (valid sky texture and a viewport the projection table covers) so the
          * caps sample the skybox only when the backdrop previously would have. */
-        int sky_active = (camera->sky_valid && camera->sky_texture_height != 0 &&
-                          width <= 0x288u) ? 1 : 0;
         hwr_uniform_1i(g_geometry_program, "u_sky_valid", sky_active);
         hwr_uniform_1i(g_geometry_program, "u_sky_texture_offset",
                        (GLint)camera->sky_texture_offset);
@@ -2179,20 +2355,42 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         g_gl.draw_buffers(2, both_buffers);
     }
     /* Opaque geometry overwrites the colour-only sky and wins against a
-     * farther sky occluder wherever it projects. The world and camera-facing
-     * billboards draw first; the fixed-orientation (flat) billboards ride the
-     * opaque tail and draw last with a small bias TOWARD the viewer, so a decal
-     * coplanar with its wall wins the depth test against that wall (the engine
-     * paints it after the wall) while a nearer wall still occludes it. */
+     * farther sky occluder wherever it projects. Stock paints sector faces
+     * before 3D object meshes. Give the following mesh pass the smallest
+     * toward-viewer polygon offset so independently projected coplanar
+     * fragments cannot reverse that painter tie; the object reliably covers
+     * its floor or ceiling while an actually nearer world face still occludes.
+     *
+     * Fixed-orientation (flat) billboards ride the opaque tail and draw last
+     * with a small bias TOWARD the viewer, so a decal coplanar with its wall
+     * wins the depth test against that wall (the engine paints it after the
+     * wall) while a nearer wall still occludes it. */
     g_gl.enable(GL_DEPTH_TEST);
     g_gl.depth_func(GL_LESS);
     g_gl.depth_mask(GL_TRUE);
     {
         size_t opaque_main = opaque_vertices >= flat_vertices
                            ? opaque_vertices - flat_vertices : opaque_vertices;
-        if (opaque_main != 0)
+        size_t world_vertices =
+            opaque_main - opaque_mesh_vertices - opaque_billboard_vertices;
+        if (world_vertices != 0)
             g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
-                             (GLsizei)opaque_main);
+                             (GLsizei)world_vertices);
+        if (opaque_mesh_vertices != 0) {
+            g_gl.enable(GL_POLYGON_OFFSET_FILL);
+            g_gl.polygon_offset(-1.0f, -1.0f);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                             (GLint)(sky_vertices + world_vertices),
+                             (GLsizei)opaque_mesh_vertices);
+            g_gl.polygon_offset(0.0f, 0.0f);
+            g_gl.disable(GL_POLYGON_OFFSET_FILL);
+        }
+        if (opaque_billboard_vertices != 0)
+            g_gl.draw_arrays(
+                GL_TRIANGLES,
+                (GLint)(sky_vertices + world_vertices +
+                        opaque_mesh_vertices),
+                (GLsizei)opaque_billboard_vertices);
         if (flat_vertices != 0 && opaque_vertices >= flat_vertices) {
             /* Depth TEST stays (a nearer wall still occludes the decal), but
              * depth WRITES are off: the decal is a later painter overlay on its
@@ -2383,7 +2581,9 @@ static int hwr_gl_scene_view_valid(const struct hwr_gl_scene_view *view,
     opaque_main = view->opaque_vertices - view->flat_vertices;
     translucent_main_runs =
         view->translucent_run_count - view->shadow_run_count;
-    if (view->opaque_billboard_vertices > opaque_main ||
+    if (view->opaque_mesh_vertices > opaque_main ||
+        view->opaque_billboard_vertices >
+            opaque_main - view->opaque_mesh_vertices ||
         view->translucent_billboard_run_count > translucent_main_runs)
         return 0;
     if (view->translucent_run_count != 0) {
@@ -2422,6 +2622,20 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
                                     uint32_t width, uint32_t height)
 {
     size_t view_index;
+    uint64_t perf_t0 = 0;
+    uint64_t perf_setup = 0;
+    uint64_t perf_views = 0;
+    uint64_t perf_resolve = 0;
+    static uint64_t perf_setup_sum;
+    static uint64_t perf_views_sum;
+    static uint64_t perf_resolve_sum;
+    static uint64_t perf_readback_sum;
+    static uint64_t perf_total_sum;
+    static size_t perf_view_sum;
+    static size_t perf_copy_sum;
+    static unsigned perf_samples;
+    static int perf_enabled = -1;
+    size_t full_copy_count = 1u; /* previous-frame stale target */
     /* Only ever seen on the first frame after the target is created or
      * resized, so it should be unobtrusive rather than a marker colour. */
     const GLuint clear_index[4] = { 0u, 0, 0, 0 };
@@ -2435,12 +2649,30 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         return NULL;
     }
     for (view_index = 0; view_index < view_count; view_index++) {
+        size_t main_runs =
+            views[view_index].translucent_run_count >=
+            views[view_index].shadow_run_count
+                ? views[view_index].translucent_run_count -
+                  views[view_index].shadow_run_count : 0u;
         if (!hwr_gl_scene_view_valid(&views[view_index], width)) {
             snprintf(g_error, sizeof g_error,
                      "scene view %lu is invalid", (unsigned long)view_index);
             return NULL;
         }
+        if (views[view_index].shadow_vertices != 0)
+            full_copy_count += views[view_index].shadow_run_count != 0
+                             ? views[view_index].shadow_run_count : 1u;
+        if (views[view_index].translucent_vertices >
+            views[view_index].shadow_vertices)
+            full_copy_count += main_runs != 0 ? main_runs : 1u;
     }
+    if (perf_enabled < 0) {
+        const char *setting = getenv("HWR_FRAME_PERF");
+        perf_enabled =
+            setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    if (perf_enabled)
+        perf_t0 = hwr_perf_now_ns();
     if ((g_fbo_width != width || g_fbo_height != height) &&
         !hwr_create_framebuffer(width, height))
         return NULL;
@@ -2477,6 +2709,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
             g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
         g_index_target_dirty = 0;
     }
+    hwr_clear_wide_persistence_wings(views, view_count, width, height,
+                                     clear_index);
     /* Snapshot the persisted target before anything draws: this is the
      * "previous frame" that stale-masked walls show through their holes and
      * blend their high-bit texels against. */
@@ -2484,11 +2718,15 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
     g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                                (GLsizei)width, (GLsizei)height);
+    if (perf_enabled)
+        perf_setup = hwr_perf_now_ns();
 
     for (view_index = 0; view_index < view_count; view_index++) {
         if (!hwr_gl_render_view(&views[view_index], width, height))
             return NULL;
     }
+    if (perf_enabled)
+        perf_views = hwr_perf_now_ns();
 
     g_gl.disable(GL_SCISSOR_TEST);
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
@@ -2502,8 +2740,45 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     g_gl.active_texture(GL_TEXTURE1);
     g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
     g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    if (perf_enabled)
+        perf_resolve = hwr_perf_now_ns();
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
+    if (perf_enabled) {
+        uint64_t done = hwr_perf_now_ns();
+        perf_setup_sum += perf_setup - perf_t0;
+        perf_views_sum += perf_views - perf_setup;
+        perf_resolve_sum += perf_resolve - perf_views;
+        perf_readback_sum += done - perf_resolve;
+        perf_total_sum += done - perf_t0;
+        perf_view_sum += view_count;
+        perf_copy_sum += full_copy_count;
+        perf_samples++;
+        if (perf_samples >= 60u) {
+            double divisor = (double)perf_samples * 1.0e6;
+            fprintf(stderr,
+                    "[renderer_overhaul] frame perf %ux%u avg/%u:"
+                    " setup=%.2fms views-submit=%.2fms"
+                    " resolve-submit=%.2fms gpu+readback=%.2fms"
+                    " total=%.2fms views=%.1f full-copies=%.1f\n",
+                    width, height, perf_samples,
+                    perf_setup_sum / divisor,
+                    perf_views_sum / divisor,
+                    perf_resolve_sum / divisor,
+                    perf_readback_sum / divisor,
+                    perf_total_sum / divisor,
+                    (double)perf_view_sum / perf_samples,
+                    (double)perf_copy_sum / perf_samples);
+            perf_setup_sum = 0;
+            perf_views_sum = 0;
+            perf_resolve_sum = 0;
+            perf_readback_sum = 0;
+            perf_total_sum = 0;
+            perf_view_sum = 0;
+            perf_copy_sum = 0;
+            perf_samples = 0;
+        }
+    }
     g_render_count++;
     if (g_verify_pending || (g_render_count & 1023u) == 0u) {
         int first_run = g_verify_pending;
@@ -2549,16 +2824,6 @@ int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height)
     g_gl.get_tex_image(GL_TEXTURE_2D, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, out);
     g_gl.bind_texture(GL_TEXTURE_2D, 0);
     return hwr_gl_drain_errors() == 0;
-}
-
-void hwr_gl_resize(uint32_t width, uint32_t height)
-{
-    if (!g_initialized)
-        return;
-    if (width == 0 || height == 0 || width != g_fbo_width || height != g_fbo_height) {
-        if (hwr_platform_make_current())
-            hwr_destroy_framebuffer();
-    }
 }
 
 void hwr_gl_shutdown(void)

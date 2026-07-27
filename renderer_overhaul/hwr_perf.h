@@ -15,6 +15,32 @@ int hwr_perf_enabled(void);
 /* Monotonic nanosecond clock (CLOCK_MONOTONIC / QueryPerformanceCounter). */
 uint64_t hwr_perf_now_ns(void);
 
+/* Complete steady-frame timing under HWR_FRAME_PERF. The caller marks the
+ * boundary after each phase in order; every 60 completed samples the profiler
+ * reports both the whole override and the individual contributions. */
+enum hwr_frame_perf_phase {
+    HWR_FRAME_PERF_PREFLIGHT,
+    HWR_FRAME_PERF_ENGINE_WALK,
+    HWR_FRAME_PERF_PREPARE,
+    HWR_FRAME_PERF_RENDER,
+    HWR_FRAME_PERF_COMPOSITE,
+    HWR_FRAME_PERF_SUBMIT,
+    HWR_FRAME_PERF_FINALIZE,
+    HWR_FRAME_PERF_PHASE_COUNT
+};
+
+struct hwr_frame_perf_sample {
+    uint64_t start;
+    uint64_t last;
+    uint64_t phase[HWR_FRAME_PERF_PHASE_COUNT];
+    int active;
+};
+
+void hwr_frame_perf_begin(struct hwr_frame_perf_sample *sample);
+void hwr_frame_perf_mark(struct hwr_frame_perf_sample *sample,
+                         enum hwr_frame_perf_phase phase);
+void hwr_frame_perf_finish(struct hwr_frame_perf_sample *sample);
+
 /* Starts a fresh timing session labelled `generation`; captures t0. A no-op
  * when the gate is off. Always resets, so a session left un-reported by an
  * aborted build cannot poison the next one. */

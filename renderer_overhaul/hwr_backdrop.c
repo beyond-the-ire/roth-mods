@@ -240,16 +240,20 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
                               uint32_t screen_width, uint32_t screen_height,
                               uint32_t view_x, uint32_t view_y,
                               uint32_t view_width, uint32_t view_height,
+                              uint32_t output_width, uint32_t output_height,
                               uint8_t *out)
 {
     uint16_t *columns;
     uint32_t *rows;
+    uint8_t *view;
     uint32_t filled;
     uint32_t y;
 
     if (backdrop == NULL || !backdrop->valid || backdrop->pixels == NULL || out == NULL)
         return -1;
-    if (screen_width == 0 || screen_height == 0 || view_width == 0 || view_height == 0)
+    if (screen_width == 0 || screen_height == 0 ||
+        view_width == 0 || view_height == 0 ||
+        output_width == 0 || output_height == 0)
         return -1;
     /* Ordered so neither bound is computed from a subtraction that could wrap. */
     if (view_width > screen_width || view_height > screen_height)
@@ -262,16 +266,18 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
 
     columns = (uint16_t *)malloc(sizeof *columns * view_width);
     rows = (uint32_t *)malloc(sizeof *rows * screen_height);
-    if (columns == NULL || rows == NULL) {
+    view = (uint8_t *)malloc((size_t)view_width * view_height);
+    if (columns == NULL || rows == NULL || view == NULL) {
         free(columns);
         free(rows);
+        free(view);
         return -1;
     }
     hwr_backdrop_column_table(backdrop->width, screen_width, view_x, view_width, columns);
     filled = hwr_backdrop_row_table(backdrop->height, screen_height, rows);
 
     for (y = 0; y < view_height; y++) {
-        uint8_t *destination = out + (size_t)y * view_width;
+        uint8_t *destination = view + (size_t)y * view_width;
         uint32_t screen_row = view_y + y;
         const uint8_t *source;
         uint32_t x;
@@ -283,7 +289,18 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
         for (x = 0; x < view_width; x++)
             destination[x] = source[columns[x]];
     }
+    for (y = 0; y < output_height; y++) {
+        const uint8_t *source = view +
+            (size_t)(((uint64_t)y * view_height) / output_height) *
+            view_width;
+        uint8_t *destination = out + (size_t)y * output_width;
+        uint32_t x;
+        for (x = 0; x < output_width; x++)
+            destination[x] =
+                source[((uint64_t)x * view_width) / output_width];
+    }
     free(columns);
     free(rows);
+    free(view);
     return 0;
 }

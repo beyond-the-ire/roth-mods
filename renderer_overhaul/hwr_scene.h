@@ -103,6 +103,7 @@ struct hwr_scene_reflection {
     size_t opaque_count;
     size_t flat_count;
     size_t translucent_count;
+    size_t opaque_mesh_count;
     size_t opaque_billboard_count;
     size_t shadow_count;
     size_t shadow_run_count;
@@ -221,6 +222,11 @@ struct hwr_scene {
     uint8_t *visible;
     size_t visible_count;
     int pvs_valid;
+    /* The engine's original-frustum result is retained while a wider portal
+     * walk is built. It is both a continuous central-view oracle and the
+     * authoritative center of the final visibility product. */
+    uint8_t *oracle_visible;
+    size_t oracle_visible_count;
     /* Per-object screen-X portal window(s) (HWR_PORTAL_CLIP), recovered from
      * the software renderer's type-1 worklist entries. spans is indexed like
      * the live object array; portal_clip_valid gates the clip. */
@@ -238,13 +244,20 @@ struct hwr_scene {
     struct hwr_sector_xspan *reflection_spans;
     size_t reflection_span_count;
     int reflection_clip_valid;
+    /* Primary-view sector windows reconstructed for a frustum that differs
+     * from the engine viewport. The original center remains engine-owned;
+     * these windows clip geometry newly exposed in the side regions. */
+    struct hwr_sector_xspan *wide_spans;
+    size_t wide_span_count;
+    int wide_clip_valid;
+    int wide_oracle_error_logged;
     /* Reflected subviews are rebuilt from the engine's authoritative per-frame
      * mirror list. Their streams persist as reusable scratch so drawing several
      * apertures does not allocate every frame. */
     struct hwr_scene_reflection reflections[HWR_REFLECTION_MAX];
     size_t reflection_count;
-    /* Object meshes and camera-facing billboards share the scene atlas. Meshes
-     * stream immediately before the billboard tail in the opaque range. */
+    /* Object meshes and camera-facing billboards share the scene atlas. Opaque
+     * meshes follow world faces so they own coplanar painter ties. */
     struct hwr_meshes object_meshes;
     /* The camera-facing billboard layer. Its sprite frames are packed into the
      * same texel store as the world textures at upload, and its per-frame quads
@@ -273,7 +286,9 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  const struct hwr_world *world,
                                  const struct hwr_objects *objects,
                                  const struct roth_api_v1 *api,
-                                 uint32_t width, uint32_t height);
+                                 uint32_t width, uint32_t height,
+                                 uint32_t source_width,
+                                 uint32_t source_height);
 void hwr_scene_clear(struct hwr_scene *scene);
 const char *hwr_scene_error(const struct hwr_scene *scene);
 
