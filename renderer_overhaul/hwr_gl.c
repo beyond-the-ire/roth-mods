@@ -1099,23 +1099,32 @@ static const char g_geometry_fragment_shader[] =
      * plane. This early exit deliberately bypasses texture masks and shading;
      * glDrawBuffers(GL_NONE) discards both outputs while depth is retained. */
     "  if (u_depth_only!=0) { out_index=0u; out_floor_id=0u; return; }\n"
-    /* Opaque winner identity. World flats publish FLOOR_TAG | z as before.
-     * Ordinary world walls and fixed-orientation wall art carry
-     * WALL_TAG | owner-sector in v_flat_span.x. Fixed wall art is marked as an
-     * overlay in v_pan_scale_flags.w and, like camera-facing floor objects,
-     * deliberately publishes zero. This preserves the host identity for the
-     * guarded redraw and the shadow gate across ordinary object silhouettes. */
+    /* Opaque winner identity. World flats publish FLOOR_TAG | z as before,
+     * except the few that a mid-platform of their own sector has to paint over:
+     * those carry a sector-scoped identity in v_wall_source.x (a flat has no
+     * wall-column state) so the platform's redraw cannot spill onto a
+     * neighbouring flat that sits at the same height. Ordinary world walls and
+     * fixed-orientation wall art carry WALL_TAG | owner-sector in
+     * v_flat_span.x. Fixed wall art is marked as an overlay in
+     * v_pan_scale_flags.w and, like camera-facing floor objects, deliberately
+     * publishes zero. This preserves the host identity for the guarded redraw
+     * and the shadow gate across ordinary object silhouettes. */
     "  out_floor_id=(material & 8u)!=0u &&"
     " (v_flat_span.w & 0x80000000u)==0u ?"
-    " (0x40000000u | (uint(int(round(v_world.z))) & 0xffffu)) :"
+    " (v_wall_source.x!=0u ? v_wall_source.x :"
+    " (0x40000000u | (uint(int(round(v_world.z))) & 0xffffu))) :"
     " ((v_flat_span.x & 0xc0000000u)==0x80000000u &&"
     " (v_pan_scale_flags.w & 0x80u)==0u ?"
     " v_flat_span.x : 0u);\n"
     /* Exception re-draw: keep only fragments over the matching opaque owner
      * surface. A nearer object, door, or wall from another sector records zero
-     * or a different id and therefore remains an occluder. */
+     * or a different id and therefore remains an occluder. A flat spends
+     * v_flat_span on its span state, so it carries the identity it must find
+     * in v_wall_source.y instead. */
     "  if (u_floor_exception!=0) {\n"
-    "    uint fid=v_flat_span.x;\n"
+    "    bool world_flat=(material & 8u)!=0u &&"
+    " (v_flat_span.w & 0x80000000u)==0u;\n"
+    "    uint fid=world_flat ? v_wall_source.y : v_flat_span.x;\n"
     "    if (fid==0u) discard;\n"
     "    if (texelFetch(u_floor_id,ivec2(gl_FragCoord.xy),0).r != fid) discard;\n"
     "  }\n"
@@ -2137,8 +2146,10 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     size_t opaque_billboard_vertices = view->opaque_billboard_vertices;
     size_t shadow_vertices = view->shadow_vertices;
     size_t shadow_run_count = view->shadow_run_count;
-    size_t translucent_billboard_run_count =
-        view->translucent_billboard_run_count;
+    size_t translucent_exception_run_count =
+        view->translucent_exception_run_count;
+    const struct hwr_gl_exception_run *slab_runs = view->slab_runs;
+    size_t slab_run_count = view->slab_run_count;
     int floor_exception = view->floor_exception;
     const struct hwr_gl_camera *camera = &view->camera;
     int sky_active = (camera->sky_valid &&
@@ -2427,13 +2438,31 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
      * shadow BEHIND its monster for free -- the monster stamped identity 0
      * across its silhouette, so the shadow is gated out there. */
     if (floor_exception && (opaque_billboard_vertices != 0 ||
-                            flat_vertices != 0 || shadow_vertices != 0)) {
+                            flat_vertices != 0 || shadow_vertices != 0 ||
+                            slab_run_count != 0)) {
         size_t opaque_main = opaque_vertices >= flat_vertices
                            ? opaque_vertices - flat_vertices : opaque_vertices;
         g_gl.active_texture(GL_TEXTURE0 + 7);
         g_gl.bind_texture(GL_TEXTURE_2D, g_floor_id_texture);
         g_gl.active_texture(GL_TEXTURE0);
         hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
+        /* Opaque mid-platform surfaces go FIRST, while the depth test is still
+         * on: they are world geometry, and the objects, shadows and wall art
+         * that follow stand on top of them. GEQUAL admits exactly the fragments
+         * the ordinary pass rejected -- everything at or behind the recorded
+         * winner -- so a platform coplanar with its own flat also stops losing
+         * the tie, and the identity gate keeps the redraw over that flat. */
+        if (slab_run_count != 0) {
+            size_t run;
+            g_gl.depth_func(GL_GEQUAL);
+            g_gl.depth_mask(GL_FALSE);
+            if (blend_location >= 0)
+                g_gl.uniform_1i(blend_location, 0);
+            for (run = 0; run < slab_run_count; run++)
+                g_gl.draw_arrays(GL_TRIANGLES, (GLint)slab_runs[run].first,
+                                 (GLsizei)slab_runs[run].count);
+            g_gl.depth_func(GL_LESS);
+        }
         g_gl.disable(GL_DEPTH_TEST);
         g_gl.depth_mask(GL_FALSE);
         /* Painter order WITHIN this depth-off stage decides where the below-floor
@@ -2506,7 +2535,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         /* The opaque/shadow exception block above is allowed to be absent in a
          * scene containing only translucent pickups. Bind the floor identity
          * target independently for this path instead of inheriting unit 7. */
-        if (floor_exception && translucent_billboard_run_count != 0) {
+        if (floor_exception && translucent_exception_run_count != 0) {
             g_gl.active_texture(GL_TEXTURE0 + 7);
             g_gl.bind_texture(GL_TEXTURE_2D, g_floor_id_texture);
             g_gl.active_texture(GL_TEXTURE0);
@@ -2528,16 +2557,27 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                  * when its lower pixels need the owner-floor exception. Draw
                  * both disjoint portions against the same pre-run destination
                  * snapshot, then let the next run observe their combined
-                 * result. */
+                 * result. A world mid-platform takes the same route with the
+                 * depth test set to GREATER rather than switched off: the two
+                 * portions must stay disjoint, or a translucent platform would
+                 * blend twice into every pixel the ordinary pass already
+                 * covered. */
                 if (floor_exception && translucent_run_flags != NULL &&
                     (translucent_run_flags[run] &
-                     HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION) != 0) {
+                     (uint8_t)(HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION |
+                               HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION)) != 0) {
+                    int slab = (translucent_run_flags[run] &
+                                HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION) != 0;
                     hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
-                    g_gl.disable(GL_DEPTH_TEST);
+                    if (slab)
+                        g_gl.depth_func(GL_GREATER);
+                    else
+                        g_gl.disable(GL_DEPTH_TEST);
                     g_gl.draw_arrays(GL_TRIANGLES, first,
                                      (GLsizei)translucent_runs[run]);
                     hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
-                    g_gl.enable(GL_DEPTH_TEST);
+                    if (!slab)
+                        g_gl.enable(GL_DEPTH_TEST);
                     g_gl.depth_func(GL_LEQUAL);
                 }
                 first += (GLint)translucent_runs[run];
@@ -2559,7 +2599,7 @@ static int hwr_gl_scene_view_valid(const struct hwr_gl_scene_view *view,
     size_t run_vertices = 0;
     size_t opaque_main;
     size_t translucent_main_runs;
-    size_t translucent_billboard_runs = 0;
+    size_t translucent_exception_runs = 0;
 
     if (view->sky_vertices > SIZE_MAX - view->mirror_depth_vertices)
         return 0;
@@ -2583,8 +2623,25 @@ static int hwr_gl_scene_view_valid(const struct hwr_gl_scene_view *view,
     if (view->opaque_mesh_vertices > opaque_main ||
         view->opaque_billboard_vertices >
             opaque_main - view->opaque_mesh_vertices ||
-        view->translucent_billboard_run_count > translucent_main_runs)
+        view->translucent_exception_run_count > translucent_main_runs)
         return 0;
+    /* Every mid-platform redraw range has to lie inside the opaque range this
+     * view already submits: the stage redraws staged geometry, it never
+     * introduces any. */
+    if (view->slab_run_count != 0) {
+        size_t slab;
+        if (view->slab_runs == NULL ||
+            view->slab_run_count > HWR_GL_SLAB_EXCEPTION_MAX)
+            return 0;
+        for (slab = 0; slab < view->slab_run_count; slab++) {
+            size_t first = view->slab_runs[slab].first;
+            size_t count = view->slab_runs[slab].count;
+            if (count == 0 || first < view->sky_vertices ||
+                first - view->sky_vertices > opaque_main ||
+                count > opaque_main - (first - view->sky_vertices))
+                return 0;
+        }
+    }
     if (view->translucent_run_count != 0) {
         if (view->translucent_runs == NULL ||
             view->translucent_run_flags == NULL)
@@ -2592,20 +2649,22 @@ static int hwr_gl_scene_view_valid(const struct hwr_gl_scene_view *view,
         for (run = 0; run < view->translucent_run_count; run++) {
             size_t count = view->translucent_runs[run];
             uint8_t flags = view->translucent_run_flags[run];
-            if ((flags & (uint8_t)~HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION) != 0 ||
+            uint8_t known = (uint8_t)(
+                HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION |
+                HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION);
+            if ((flags & (uint8_t)~known) != 0 ||
                 (run >= translucent_main_runs && flags != 0))
                 return 0;
-            if (run < translucent_main_runs &&
-                (flags & HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION) != 0)
-                translucent_billboard_runs++;
+            if (run < translucent_main_runs && (flags & known) != 0)
+                translucent_exception_runs++;
             if (count > (size_t)INT32_MAX ||
                 run_vertices > SIZE_MAX - count)
                 return 0;
             run_vertices += count;
         }
         if (run_vertices != view->translucent_vertices ||
-            translucent_billboard_runs !=
-                view->translucent_billboard_run_count)
+            translucent_exception_runs !=
+                view->translucent_exception_run_count)
             return 0;
     }
     if (view->clip_left != view->clip_right &&

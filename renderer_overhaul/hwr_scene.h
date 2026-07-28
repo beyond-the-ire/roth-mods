@@ -85,6 +85,15 @@ struct hwr_mesh_surface {
     uint8_t light;
     uint8_t mapping_flags;
     uint8_t flags;
+    /* Owner-surface identity, carried on flats only (walls publish theirs
+     * through the flat-span attribute, which a flat needs for its span state).
+     * A flat that a mid-platform has to paint over publishes owner_identity
+     * instead of the default height-derived one, and that platform's own
+     * surface carries the same value in exception_identity so its depth-off
+     * redraw is confined to the flat of its OWN sector. Zero on everything
+     * else, which is what keeps the default identity in place. */
+    uint32_t owner_identity;
+    uint32_t exception_identity;
 };
 
 #define HWR_REFLECTION_MAX 16u
@@ -107,7 +116,9 @@ struct hwr_scene_reflection {
     size_t opaque_billboard_count;
     size_t shadow_count;
     size_t shadow_run_count;
-    size_t translucent_billboard_run_count;
+    size_t translucent_exception_run_count;
+    struct hwr_gl_exception_run slab_runs[HWR_GL_SLAB_EXCEPTION_MAX];
+    size_t slab_run_count;
     size_t target_sector_index;
     uint16_t wall_offset;
     uint8_t renderable;
@@ -207,6 +218,11 @@ struct hwr_scene {
     uint32_t *translucent_runs;
     uint8_t *translucent_run_flags;
     size_t translucent_run_capacity;
+    /* Opaque mid-platform ranges staged this view, for the owner-identity
+     * redraw. A view carrying more than the array holds keeps the extras on the
+     * ordinary depth-tested path, which is what they have today. */
+    struct hwr_gl_exception_run slab_runs[HWR_GL_SLAB_EXCEPTION_MAX];
+    size_t slab_run_count;
     struct hwr_scene_animation *animations;
     size_t animation_count;
     uint32_t sky_texture_offset;

@@ -785,6 +785,73 @@ static int hwr_triangulate(const struct hwr_point *points, size_t count,
     return output == (count - 2u) * 3u ? 0 : -1;
 }
 
+/* A sector-scoped owner identity, disjoint from the height-derived one the
+ * shader publishes for every other flat: the bit pair that marks the flat
+ * family is kept, one more bit separates a floor from a ceiling, and the rest
+ * is the sector. Scoping it by sector is what stops a mid-platform's redraw
+ * from spilling onto a NEIGHBOUR's flat that happens to sit at the same height
+ * -- the overhang the engine covers up by painting the nearer sector after the
+ * farther one, which a depth-off redraw cannot reproduce. */
+#define HWR_FLAT_OWNER_TAG       0x60000000u
+#define HWR_FLAT_OWNER_CEILING   0x10000000u
+#define HWR_FLAT_OWNER_INDEX_MAX 0x0fffffffu
+
+/* HWR_SLAB_DEPTH_EXCEPTION=0 restores the plain depth-tested treatment of
+ * mid-platform surfaces: one that sits at or through the flat of its own sector
+ * loses to that flat again. Follows the owner-surface exception switch, since
+ * this reuses that pass and its identity buffer. */
+static int hwr_slab_exception_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SLAB_DEPTH_EXCEPTION");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled && hwr_billboards_floor_exception_enabled();
+}
+
+/* The engine paints a sector's mid-platform LAST and has no depth buffer, so a
+ * platform surface always covers the sector's own ceiling and floor, however
+ * the two are ordered in height (render_world_face_list_subpass, renderer.c:
+ * ceiling, then floor, then walls, then secondary surfaces, then the platform).
+ * Almost every authored platform stands above its floor and below its ceiling,
+ * where the depth test reproduces that for free. These two cases -- a platform
+ * top at or below its own floor, a platform underside at or above its own
+ * ceiling -- are the ones where depth and paint order disagree, and they are
+ * the ones routed through the depth exception. */
+static void hwr_flat_identities(const struct hwr_world *world,
+                                const struct hwr_sector *sector,
+                                size_t sector_index,
+                                enum hwr_surface_kind kind,
+                                uint32_t *owner, uint32_t *exception)
+{
+    const struct hwr_slab *slab;
+    uint32_t floor_id;
+    uint32_t ceiling_id;
+
+    *owner = 0;
+    *exception = 0;
+    if (!hwr_slab_exception_enabled() ||
+        sector_index > HWR_FLAT_OWNER_INDEX_MAX ||
+        sector->slab_index >= world->slab_count)
+        return;
+    slab = &world->slabs[sector->slab_index];
+    floor_id = HWR_FLAT_OWNER_TAG | (uint32_t)sector_index;
+    ceiling_id = floor_id | HWR_FLAT_OWNER_CEILING;
+    if (slab->upper_z <= sector->floor_z) {
+        if (kind == HWR_SURFACE_FLOOR)
+            *owner = floor_id;
+        else if (kind == HWR_SURFACE_SLAB_UPPER)
+            *exception = floor_id;
+    }
+    if (slab->lower_z >= sector->ceiling_z) {
+        if (kind == HWR_SURFACE_CEILING)
+            *owner = ceiling_id;
+        else if (kind == HWR_SURFACE_SLAB_LOWER)
+            *exception = ceiling_id;
+    }
+}
+
 static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *world,
                          const struct hwr_sector *sector, size_t sector_index,
                          const struct hwr_point *points, const uint16_t *triangles,
@@ -802,6 +869,8 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
     surface = hwr_add_surface(mesh, kind, count);
     if (surface == NULL)
         return -1;
+    hwr_flat_identities(world, sector, sector_index, kind,
+                        &surface->owner_identity, &surface->exception_identity);
     surface->sector_index = sector_index;
     surface->aux = aux;
     surface->scale = scale;
@@ -3504,6 +3573,16 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
         target->wall_span_valid = wall_span.valid;
         target->wall_vertical_origin = wall_span.vertical_origin;
         target->wall_vertical_seeded = wall_span.vertical_seeded;
+        /* A flat has no wall-column state, so that attribute carries the two
+         * owner identities instead: the one this flat publishes as the opaque
+         * winner, and the one its depth-off redraw has to find already
+         * recorded. Both are zero on every flat that is not part of a
+         * platform-over-its-own-flat pair, which leaves the shader on its
+         * default height-derived identity. */
+        if ((surface->flags & HWR_SURFACE_FLAT) != 0) {
+            target->wall_source_numerator = surface->owner_identity;
+            target->wall_source_denominator = surface->exception_identity;
+        }
     }
     /* Whole-face SOLID-FILL: a tinted wall that reaches this single-ramp path
      * (not subdivided) fills only when EVERY one of its corner words saturated
@@ -4035,7 +4114,8 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                               size_t *opaque_count,
                               size_t *flat_count,
                               size_t *translucent_count,
-                              size_t *translucent_run_count)
+                              size_t *translucent_run_count,
+                              size_t *exception_run_count)
 {
     struct hwr_translucent_item *items = NULL;
     size_t visible_vertices = 0;
@@ -4130,6 +4210,7 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     }
 
     opaque_cursor = sky_vertices;
+    scene->slab_run_count = 0;
     for (i = 0; i < scene->mesh.surface_count; i++) {
         struct hwr_mesh_surface *surface = &scene->mesh.surfaces[i];
         if (!hwr_surface_visible(scene, surface, camera))
@@ -4139,15 +4220,31 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
                 scene, surface, camera, width, height,
                 scene->stream_vertices + sky_cursor);
         } else if ((surface->flags & HWR_SURFACE_TRANSLUCENT) == 0) {
-            opaque_cursor += hwr_copy_gpu_surface_windows(
+            size_t first = opaque_cursor;
+            size_t emitted = hwr_copy_gpu_surface_windows(
                 scene, surface, camera, width, height,
                 scene->stream_vertices + opaque_cursor);
+            opaque_cursor += emitted;
+            /* An opaque platform surface over its own flat: keep it on the
+             * ordinary depth-tested path -- it still owns everything nearer
+             * than the flat -- and record the range so the exception stage can
+             * redraw it where that flat won instead. */
+            if (surface->exception_identity != 0 && emitted != 0 &&
+                scene->slab_run_count < HWR_GL_SLAB_EXCEPTION_MAX &&
+                first <= UINT32_MAX && emitted <= UINT32_MAX) {
+                struct hwr_gl_exception_run *run =
+                    &scene->slab_runs[scene->slab_run_count++];
+                run->first = (uint32_t)first;
+                run->count = (uint32_t)emitted;
+            }
         } else {
             struct hwr_translucent_item item;
             memset(&item, 0, sizeof item);
             item.source_index = i;
             item.depth = hwr_surface_depth(surface, &scene->mesh, camera);
             item.source = HWR_TRANSLUCENT_WORLD;
+            if (surface->exception_identity != 0)
+                item.flags = HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION;
             hwr_translucent_insert(items, &item_count, &item);
         }
     }
@@ -4276,6 +4373,12 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
         *mirror_depth_count = mirror_cursor - translucent_cursor;
     }
     *translucent_run_count = item_count + bb_shadow_runs;
+    *exception_run_count = 0;
+    for (i = 0; i < item_count; i++)
+        if ((scene->translucent_run_flags[i] &
+             (uint8_t)(HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION |
+                       HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION)) != 0)
+            (*exception_run_count)++;
     free(items);
     *sky_count = sky_cursor;
     *opaque_count = opaque_cursor - sky_vertices;
@@ -4659,7 +4762,8 @@ static int hwr_scene_store_reflection(struct hwr_scene_reflection *reflection,
                                       size_t opaque_count,
                                       size_t flat_count,
                                       size_t translucent_count,
-                                      size_t translucent_run_count)
+                                      size_t translucent_run_count,
+                                      size_t exception_run_count)
 {
     size_t vertex_count = sky_count + opaque_count + translucent_count +
                           mirror_depth_count;
@@ -4705,10 +4809,11 @@ static int hwr_scene_store_reflection(struct hwr_scene_reflection *reflection,
     reflection->opaque_billboard_count = scene->billboards.opaque_count;
     reflection->shadow_count = scene->billboards.shadow_count;
     reflection->shadow_run_count = scene->billboards.shadow_run_count;
-    reflection->translucent_billboard_run_count =
-        scene->billboards.run_count >= scene->billboards.shadow_run_count
-        ? scene->billboards.run_count - scene->billboards.shadow_run_count
-        : 0u;
+    reflection->translucent_exception_run_count = exception_run_count;
+    reflection->slab_run_count = scene->slab_run_count;
+    if (scene->slab_run_count != 0)
+        memcpy(reflection->slab_runs, scene->slab_runs,
+               scene->slab_run_count * sizeof *reflection->slab_runs);
     return 0;
 }
 
@@ -4724,7 +4829,8 @@ static int hwr_scene_emit_view(struct hwr_scene *scene,
                                size_t *opaque_count,
                                size_t *flat_count,
                                size_t *translucent_count,
-                               size_t *translucent_run_count)
+                               size_t *translucent_run_count,
+                               size_t *exception_run_count)
 {
     if (hwr_meshes_emit(&scene->object_meshes, objects, world, camera,
                         scene->visible, scene->visible_count, scene->pvs_valid,
@@ -4738,7 +4844,8 @@ static int hwr_scene_emit_view(struct hwr_scene *scene,
     return hwr_prepare_stream(scene, camera, width, height,
                               sky_count, mirror_depth_count, opaque_count,
                               flat_count,
-                              translucent_count, translucent_run_count);
+                              translucent_count, translucent_run_count,
+                              exception_run_count);
 }
 
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,
@@ -4758,6 +4865,7 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     size_t flat_count;
     size_t translucent_count;
     size_t translucent_run_count;
+    size_t exception_run_count;
     size_t i;
     size_t view_count = 0;
     int floor_exception = hwr_billboards_floor_exception_enabled();
@@ -4845,13 +4953,15 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                 width, height, &sky_count,
                                 &mirror_depth_count, &opaque_count,
                                 &flat_count, &translucent_count,
-                                &translucent_run_count) != 0)
+                                &translucent_run_count,
+                                &exception_run_count) != 0)
             return NULL;
         if (hwr_scene_store_reflection(reflection, scene, sky_count,
                                        mirror_depth_count,
                                        opaque_count, flat_count,
                                        translucent_count,
-                                       translucent_run_count) != 0) {
+                                       translucent_run_count,
+                                       exception_run_count) != 0) {
             hwr_scene_fail(scene,
                            "out of memory retaining reflected view geometry");
             return NULL;
@@ -4874,8 +4984,10 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
             reflection->opaque_billboard_count;
         views[view_count].shadow_vertices = reflection->shadow_count;
         views[view_count].shadow_run_count = reflection->shadow_run_count;
-        views[view_count].translucent_billboard_run_count =
-            reflection->translucent_billboard_run_count;
+        views[view_count].translucent_exception_run_count =
+            reflection->translucent_exception_run_count;
+        views[view_count].slab_runs = reflection->slab_runs;
+        views[view_count].slab_run_count = reflection->slab_run_count;
         views[view_count].floor_exception = floor_exception;
         views[view_count].camera = reflection->camera;
         views[view_count].clip_left = reflection->clip_left;
@@ -4967,7 +5079,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
             scene->portal_clip_valid && objects != NULL ? objects->count : 0u,
             width, height, &sky_count, &mirror_depth_count, &opaque_count,
             &flat_count,
-            &translucent_count, &translucent_run_count) != 0)
+            &translucent_count, &translucent_run_count,
+            &exception_run_count) != 0)
         return NULL;
     memset(&views[view_count], 0, sizeof views[view_count]);
     views[view_count].vertices = scene->stream_vertices;
@@ -4985,10 +5098,9 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         scene->billboards.opaque_count;
     views[view_count].shadow_vertices = scene->billboards.shadow_count;
     views[view_count].shadow_run_count = scene->billboards.shadow_run_count;
-    views[view_count].translucent_billboard_run_count =
-        scene->billboards.run_count >= scene->billboards.shadow_run_count
-        ? scene->billboards.run_count - scene->billboards.shadow_run_count
-        : 0u;
+    views[view_count].translucent_exception_run_count = exception_run_count;
+    views[view_count].slab_runs = scene->slab_runs;
+    views[view_count].slab_run_count = scene->slab_run_count;
     views[view_count].floor_exception = floor_exception;
     views[view_count].camera = camera;
     view_count++;

@@ -39,6 +39,85 @@ static int hwr_arithmetic_shift_8(int value)
 static uint32_t g_present_argb[256];
 static int g_present_valid;
 
+/* Palette indices the engine writes into the framebuffer as LITERALS while it
+ * draws chrome over the seeded plane.
+ *
+ * The presentation layer can only infer "this pixel is still world" by finding
+ * the live engine pixel unchanged from the plane the mod seeded there. That is
+ * a necessary condition, not a sufficient one: a chrome pixel written with the
+ * same index the mod happened to seed is indistinguishable from an untouched
+ * one, and the full-resolution world is revealed through opaque chrome.
+ *
+ * Index 0 is the whole set, and it is the dominant one by construction. Popup
+ * and message-box interiors are a per-row memset of literal 0
+ * (clear_framebuffer_rect, renderer.c), and the held-item icon writes a literal
+ * 0 outline byte on both sides of every drawn run
+ * (draw_translucent_icon_spans, blit_2d.c). Index 0 is also what the world's
+ * black seam texels between texture cells quantize to, so the
+ * misclassification is STRUCTURED -- it traces those seams as lines rather
+ * than speckling -- which is exactly the artifact this avoids. */
+static const uint8_t g_reserved_indices[] = { 0u };
+
+/* index -> the index the baseline may emit in its place */
+static uint8_t g_present_substitute[256];
+
+static int hwr_index_reserved(unsigned index)
+{
+    unsigned i;
+    for (i = 0; i < sizeof g_reserved_indices; i++)
+        if (g_reserved_indices[i] == index)
+            return 1;
+    return 0;
+}
+
+/* One 6-bit palette step per channel, in the published 0..252 scale. A
+ * substitute farther away than this would visibly recolour the plane the
+ * engine's read-modify-write chrome effects blend against, so beyond it the
+ * reserved index is kept and the artifact is preferred to a wrong colour. */
+#define HWR_SUBSTITUTE_TOLERANCE 48u
+
+/* Steer the baseline away from the reserved indices without changing the colour
+ * it stands for. Every retail palette carries index 0 several times over, so on
+ * stock data an exact duplicate is always found and the substitution is
+ * colour-exact; the tolerance only decides what third-party data gets. */
+static void hwr_composite_build_substitute(void)
+{
+    unsigned r;
+    unsigned i;
+
+    for (i = 0; i < 256u; i++)
+        g_present_substitute[i] = (uint8_t)i;
+    for (r = 0; r < sizeof g_reserved_indices; r++) {
+        unsigned reserved = g_reserved_indices[r];
+        uint32_t target = g_present_argb[reserved];
+        uint32_t best_distance = UINT32_MAX;
+        unsigned best = reserved;
+        int tr = (int)((target >> 16) & 0xffu);
+        int tg = (int)((target >> 8) & 0xffu);
+        int tb = (int)(target & 0xffu);
+        for (i = 0; i < 256u; i++) {
+            int dr;
+            int dg;
+            int db;
+            uint32_t distance;
+            if (hwr_index_reserved(i))
+                continue;
+            dr = tr - (int)((g_present_argb[i] >> 16) & 0xffu);
+            dg = tg - (int)((g_present_argb[i] >> 8) & 0xffu);
+            db = tb - (int)(g_present_argb[i] & 0xffu);
+            distance = (uint32_t)(dr * dr + dg * dg + db * db);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = i;
+                if (distance == 0)
+                    break;
+            }
+        }
+        if (best_distance <= HWR_SUBSTITUTE_TOLERANCE)
+            g_present_substitute[reserved] = (uint8_t)best;
+    }
+}
+
 void hwr_composite_publish_palette(const uint8_t palette_rgb[768],
                                    const uint8_t *grayscale_lut,
                                    int32_t damage_level,
@@ -78,6 +157,7 @@ void hwr_composite_publish_palette(const uint8_t palette_rgb[768],
         }
     }
     g_present_valid = 1;
+    hwr_composite_build_substitute();
 }
 
 uint32_t hwr_composite_present_argb(unsigned index)
@@ -384,10 +464,15 @@ int hwr_composite_prepare(struct hwr_composite *composite,
         source_row = source +
             (size_t)composite->engine_source_y[y] * frame->w;
         for (x = 0; x < frame->vw; x++) {
+            /* The substitution is what keeps the plane distinguishable from the
+             * chrome drawn over it. Both copies below -- the one written into
+             * the engine framebuffer and the one submitted as the baseline --
+             * come from this array, so they can never disagree. */
             composite->engine_base[(size_t)y * frame->vw + x] =
-                hwr_palette_cube_index(
-                    composite, &palette,
-                    source_row[composite->engine_source_x[x]]);
+                g_present_substitute[
+                    hwr_palette_cube_index(
+                        composite, &palette,
+                        source_row[composite->engine_source_x[x]])];
         }
     }
 
@@ -470,6 +555,14 @@ int hwr_composite_grayscale_baseline(struct hwr_composite *composite,
     pixels = (size_t)frame->vw * frame->vh;
     if (pixels > composite->engine_base_capacity)
         return 0;
+    /* The remap has to be exactly the engine's, because the engine has just run
+     * the same table over the same pixels of its own framebuffer -- substituting
+     * afterwards would make the two disagree and hide the world entirely.  It
+     * needs no substitution: the engine builds this table as 0x4f minus a
+     * green-weighted luminance of each 6-bit palette entry
+     * (build_view_grayscale_lut, video_display.c), and that luminance is
+     * ((63*4 + 63 + 63*8) * 0x500) >> 16 = 15 at most, so every entry it can
+     * ever produce lies in 0x40..0x4f and none of them is a reserved index. */
     for (i = 0; i < pixels; i++)
         composite->engine_base[i] = lut[composite->engine_base[i]];
     return 1;

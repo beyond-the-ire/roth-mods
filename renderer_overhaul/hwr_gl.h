@@ -50,8 +50,23 @@ enum hwr_gl_wall_wrap_flags {
  * bypassing the wall-column and world-plane mapping drivers. */
 #define HWR_GL_MAPPING_MESH 0x80000000u
 enum hwr_gl_translucent_run_flags {
-    HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION = 1u << 0
+    HWR_GL_TRANSLUCENT_RUN_FLOOR_EXCEPTION = 1u << 0,
+    /* A world mid-platform surface that has to win over the flat of its own
+     * sector. Unlike an object part it is redrawn with the depth test set to
+     * GREATER rather than switched off, so the redraw covers exactly the
+     * fragments the ordinary pass rejected and a translucent slab is never
+     * blended into the same pixel twice. */
+    HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION = 1u << 1
 };
+
+/* One contiguous vertex range inside the opaque range, redrawn by the
+ * owner-identity exception stage. */
+struct hwr_gl_exception_run {
+    uint32_t first;
+    uint32_t count;
+};
+
+#define HWR_GL_SLAB_EXCEPTION_MAX 64u
 
 struct hwr_gl_vertex {
     int16_t x;
@@ -179,7 +194,11 @@ struct hwr_gl_scene_view {
     size_t opaque_billboard_vertices;
     size_t shadow_vertices;
     size_t shadow_run_count;
-    size_t translucent_billboard_run_count;
+    /* Main translucent runs carrying either exception flag. */
+    size_t translucent_exception_run_count;
+    /* Opaque mid-platform surfaces redrawn over the flat of their own sector. */
+    const struct hwr_gl_exception_run *slab_runs;
+    size_t slab_run_count;
     int floor_exception;
     struct hwr_gl_camera camera;
     /* Horizontal framebuffer interval owned by this view. Equal endpoints
