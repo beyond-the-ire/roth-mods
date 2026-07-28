@@ -1222,7 +1222,18 @@ static const char g_geometry_fragment_shader[] =
     " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
     " texelFetch(u_colormap,ivec2(int(texel),row),0).r; }\n"
     "  if (u_debug_vis==1) { out_index=255u; return; }\n"  /* direct/glow marker */
-    "  if (u_blend_pass!=0 && (material & 16u)!=0u && (texel & 128u)!=0u) {\n"
+    /* A palette-colour surface on the solid-colour blend writer: EVERY pixel it
+     * covers blends, with no high-bit gate and no index-0 skip, and the blend
+     * table is indexed by the source colour first and the destination second --
+     * the transpose of the textured rule below.  The table is uploaded
+     * row-major, so texel (x,y) is table[y*256+x] and table[(src<<8)|dst] is
+     * (x,y) = (dst,src).  The two branches are exclusive: a solid colour with
+     * its high bit set must not also take the textured path and blend twice. */
+    "  if (u_blend_pass!=0 && (v_light_material.w & 16u)!=0u) {\n"
+    "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
+    "    mapped=texelFetch(u_blend,ivec2(int(dst),int(mapped)),0).r;\n"
+    "  } else if (u_blend_pass!=0 && (material & 16u)!=0u &&"
+    " (texel & 128u)!=0u) {\n"
     "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(dst)),0).r;\n"
     "  }\n"

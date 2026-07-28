@@ -30,7 +30,14 @@ enum hwr_gl_wall_wrap_flags {
      * ramp (== 0x1fff).  The engine's counter==4 fast path skips per-texel
      * shading and solid-fills the block with the map fill index; the shader
      * outputs u_fill_index directly for these fragments. */
-    HWR_GL_WALL_SOLID_FILL    = 1u << 3
+    HWR_GL_WALL_SOLID_FILL    = 1u << 3,
+    /* A palette-colour (untextured) wall part drawn through the span driver's
+     * solid-colour BLEND writer.  That writer differs from the textured one in
+     * two ways this bit selects for: it blends EVERY pixel -- there is no
+     * high-bit gate and no index-0 skip -- and it indexes the blend table by
+     * the SOURCE colour first and the destination pixel second, the transpose
+     * of the textured rule. */
+    HWR_GL_WALL_SOLID_BLEND   = 1u << 4
 };
 
 /* Non-wall billboard marker: the fixed-orientation quad carries an owner-wall

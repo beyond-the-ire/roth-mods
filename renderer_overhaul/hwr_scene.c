@@ -2004,6 +2004,90 @@ static int hwr_wall_stale_enabled(void)
     return enabled;
 }
 
+/* HWR_PORTAL_BLEND=0 restores the previous fully-opaque rendering of two-sided
+ * portal parts whose texture carries the block transparency bit. */
+static int hwr_portal_blend_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_PORTAL_BLEND");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+/* HWR_SOLID_BLEND=0 restores the previous fully-opaque rendering of
+ * palette-colour wall parts authored with the blend flag pair. */
+static int hwr_solid_blend_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SOLID_BLEND");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+/* Texture-driven translucency on a part the map itself marks plain.  The span
+ * driver takes its blend switch straight off the resolved block's attribute
+ * word as it binds the texture, with no reference to the face's own flags, so a
+ * portal slab side, step, or opening whose texture carries the transparency bit
+ * blends exactly like a marked middle would.  Both blend writers also skip
+ * index-0 texels, so such a part is masked as well -- hence one helper feeding
+ * both the run classification and the material bits.
+ *
+ * Scoped to the parts that genuinely have geometry behind them.  A one-sided
+ * middle is owned by the stale-mask path (nothing is ever drawn behind it, so
+ * its holes and blends read the previous frame instead); flats have their own
+ * texture-only test; and a block that resolves to a solid colour rather than an
+ * image forces the blend switch off, so it never qualifies. */
+static int hwr_texture_blend_part(const struct hwr_scene *scene,
+                                  const struct hwr_mesh_surface *surface)
+{
+    uint16_t logical;
+    if (!hwr_portal_blend_enabled())
+        return 0;
+    if ((surface->flags & (HWR_SURFACE_FLAT | HWR_SURFACE_DIRECT |
+                           HWR_SURFACE_MASKED)) != 0)
+        return 0;
+    switch (surface->kind) {
+    case HWR_SURFACE_PORTAL_UPPER:
+    case HWR_SURFACE_PORTAL_LOWER:
+    case HWR_SURFACE_PORTAL_MIDDLE:
+    case HWR_SURFACE_PORTAL_SLAB:
+        break;
+    default:
+        return 0;
+    }
+    logical = (uint16_t)surface->texture_id;
+    if (logical >= 0x1600u || scene->textures[logical].direct)
+        return 0;
+    return (scene->textures[logical].qflags & 0x400u) != 0;
+}
+
+/* A wall part that selects a palette colour instead of a texture.  The span
+ * driver's untextured branch reads the blend switch from the low two bits of
+ * the face's texture-mapping flags and blends only when BOTH are set; the
+ * second bit means horizontal flip on a textured face and is meaningless on a
+ * flat colour, so it was reused here as the blend modifier.
+ *
+ * Two exclusions, both from the driver rather than from taste.  Flats have no
+ * untextured blend writer at all -- their driver's untextured fills have no
+ * blend variant -- so a solid floor or ceiling never blends.  And a door leaf
+ * reaches the driver through a different entry whose mode word forces the low
+ * bit set, so its blend condition is not this one; no retail door can satisfy
+ * this test anyway, since a leaf's mapping flags carry only the flip bit. */
+static int hwr_solid_blend_surface(const struct hwr_mesh_surface *surface)
+{
+    if (!hwr_solid_blend_enabled())
+        return 0;
+    if ((surface->flags & HWR_SURFACE_DIRECT) == 0 ||
+        (surface->flags & HWR_SURFACE_FLAT) != 0 ||
+        surface->kind == HWR_SURFACE_DOOR)
+        return 0;
+    return (surface->mapping_flags & 3u) == 3u;
+}
+
 static int hwr_surface_translucent(struct hwr_scene *scene,
                                    struct hwr_mesh_surface *surface,
                                    const struct hwr_gl_camera *camera)
@@ -2017,9 +2101,10 @@ static int hwr_surface_translucent(struct hwr_scene *scene,
         return 1;
     if (hwr_mirror_overlay(scene, surface, camera))
         return 1;
-    if ((surface->flags & (HWR_SURFACE_DIRECT | HWR_SURFACE_MASKED)) !=
-        HWR_SURFACE_MASKED)
-        return 0;
+    if ((surface->flags & HWR_SURFACE_DIRECT) != 0)
+        return hwr_solid_blend_surface(surface);
+    if ((surface->flags & HWR_SURFACE_MASKED) == 0)
+        return hwr_texture_blend_part(scene, surface);
     logical = (uint16_t)surface->texture_id;
     qflags = logical < 0x1600u ? scene->textures[logical].qflags : 0;
     /* The transparency bit alone decides this.  The block's other high bit is
@@ -3054,6 +3139,10 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
     int flat_transparent = 0;
     int flat_square256 = 0;
     int wall_stale = 0;
+    /* Both decided by the same helpers the run classification uses, so the
+     * material bits can never disagree with which pass a surface lands in. */
+    int texture_blend = hwr_texture_blend_part(scene, surface);
+    int solid_blend = hwr_solid_blend_surface(surface);
     int wall_tint_adjust = 0;
     int mirror_solid =
         hwr_mirror_surface_mode(scene, surface, camera) ==
@@ -3109,8 +3198,13 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
          * high-bit blends read the untouched -- previous-frame -- pixels. */
         wall_stale = 1;
     }
-    if ((surface->flags & HWR_SURFACE_MASKED) != 0 || flat_transparent ||
-        mirror_overlay)
+    /* A solid-colour blend writer fills every pixel it covers, so a part on
+     * that path must NOT carry the masked writer's index-0 skip.  The
+     * suppression is scoped to exactly those parts: an ordinary palette-colour
+     * middle keeps whatever it has today, including the handful of retail
+     * openings authored with palette index 0. */
+    if (((surface->flags & HWR_SURFACE_MASKED) != 0 && !solid_blend) ||
+        flat_transparent || mirror_overlay || texture_blend)
         flags |= HWR_GL_MATERIAL_MASKED;
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
         flags |= HWR_GL_MATERIAL_FLAT;
@@ -3134,6 +3228,8 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
         direct_index = 0;
         flat_transparent = 0;
         wall_stale = 0;
+        texture_blend = 0;
+        solid_blend = 0;
         fill_ok = 0;
     }
     if ((surface->flags & HWR_SURFACE_FLAT) != 0)
@@ -3249,6 +3345,8 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                 tmpl.wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
             if (wall_stale)
                 tmpl.wall_wrap_flags |= HWR_GL_WALL_STALE_MASK;
+            if (solid_blend)
+                tmpl.wall_wrap_flags |= HWR_GL_WALL_SOLID_BLEND;
             tmpl.wall_source_numerator = wall_span.numerator;
             tmpl.wall_source_denominator = wall_span.denominator;
             tmpl.wall_source_step = wall_span.numerator_step;
@@ -3349,6 +3447,8 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                 target->wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
             if (wall_stale)
                 target->wall_wrap_flags |= HWR_GL_WALL_STALE_MASK;
+            if (solid_blend)
+                target->wall_wrap_flags |= HWR_GL_WALL_SOLID_BLEND;
         } else {
             target->wall_s = source->wall_s;
             target->wall_top = source->wall_top;
