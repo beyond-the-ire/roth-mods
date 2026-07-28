@@ -1521,6 +1521,24 @@ static void ROTH_CDECL hwr_upload_palette_dac(
     g_gdv_palette_effect_active = 0;
 }
 
+/* The original's void law is "never clear the view": a pixel no surface covers
+ * keeps what the previous frame left there. The one thing that does restart it
+ * is this routine, which paints the backdrop image over the WHOLE screen -- not
+ * just the frame around the view -- and is reached on a map load, on every
+ * return to gameplay, and on closing the inventory. Re-arming the seed here
+ * gives the canvas the same restart at the same moments, so how old a persisted
+ * pixel can get is bounded exactly as it is in the original. The target is
+ * invalidated either way: with no usable backdrop image the honest starting
+ * point is a flat one, not the previous map. */
+static void ROTH_CDECL hwr_load_backdrop_raw(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    (void)api;
+    roth_next_load_backdrop_raw(chain);
+    g_backdrop_seed_pending = g_backdrop.valid;
+    hwr_gl_invalidate_index_target();
+}
+
 /* The present entry: called immediately before every page flip, from every
  * screen the engine drives, including the blocking screen-slide loops that no
  * per-frame callback reaches. Running after the chain reads the framebuffer in
@@ -1637,6 +1655,11 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     g_scene_rebuild_pending = 1;
     g_scene_error_logged = 0;
     g_backdrop_seed_pending = 0;
+    /* Persisted pixels belong to the map that drew them. Invalidating here as
+     * well as at the backdrop repaint covers a missing or unusable backdrop
+     * image: the next map then starts from a flat target rather than from the
+     * previous map's picture. */
+    hwr_gl_invalidate_index_target();
     if (g_plugin_dir[0] == 0) {
         snprintf(failure, sizeof failure, "plugin directory was not captured");
         goto failed;
@@ -1820,6 +1843,8 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
                               hwr_play_gdv_cutscene, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_flush_dirty_rects,
                               hwr_flush_dirty_rects, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_load_backdrop_raw,
+                              hwr_load_backdrop_raw, 0) != 0;
     if (failures != 0)
         fprintf(stderr, "[renderer_overhaul] %d override registration(s) failed\n", failures);
 }

@@ -1987,6 +1987,11 @@ int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t heigh
     return 1;
 }
 
+void hwr_gl_invalidate_index_target(void)
+{
+    g_index_target_dirty = 1;
+}
+
 /* Lays a pending seed of the right size into the index target and drops it, so
  * later frames persist into those pixels rather than replacing them. */
 static int hwr_consume_index_seed(uint32_t width, uint32_t height)
@@ -2046,11 +2051,24 @@ static int hwr_source_projection_bounds(const struct hwr_gl_camera *camera,
     return 1;
 }
 
-/* Persistence is an engine quirk only inside the source viewport. Keeping it
- * in the extra ultrawide wings lets a menu, a previous room, or an earlier sky
- * remain indefinitely whenever the current scene has no surface there. Reset
- * just those target-only pixels before taking the stale-texture snapshot; an
- * active sky wing or ordinary geometry may then paint them normally. */
+/* Wiping the target-only wings every frame was an early conservative choice,
+ * and it is not what the original does: the original never clears the view, so
+ * a pixel no surface covers keeps the previous frame over a backdrop start, and
+ * that is now applied to the whole canvas rather than only to the columns the
+ * source viewport maps onto. A wing therefore holds content exactly as long as
+ * the centre does, and the same repaints that reset the original's void reset
+ * the whole canvas here. HWR_WING_WIPE=1 restores the per-frame wipe for
+ * diagnosis; it is off by default and nothing else depends on it. */
+static int hwr_wing_wipe_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_WING_WIPE");
+        enabled = setting != NULL && setting[0] != 0 && setting[0] != '0';
+    }
+    return enabled;
+}
+
 static void hwr_clear_wide_persistence_wings(
     const struct hwr_gl_scene_view *views, size_t view_count,
     uint32_t width, uint32_t height, const GLuint clear_index[4])
@@ -2063,6 +2081,8 @@ static void hwr_clear_wide_persistence_wings(
     int center_left;
     int center_right;
 
+    if (!hwr_wing_wipe_enabled())
+        return;
     for (i = view_count; i != 0; i--) {
         if (!views[i - 1].camera.reflected) {
             primary = &views[i - 1];
@@ -2604,8 +2624,9 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     static unsigned perf_samples;
     static int perf_enabled = -1;
     size_t full_copy_count = 1u; /* previous-frame stale target */
-    /* Only ever seen on the first frame after the target is created or
-     * resized, so it should be unobtrusive rather than a marker colour. */
+    /* Only reached where the target has no starting art -- the frame after it
+     * is created or resized, or a backdrop repaint with no usable image -- so
+     * it should be unobtrusive rather than a marker colour. */
     const GLuint clear_index[4] = { 0u, 0, 0, 0 };
 
     if (!g_initialized || !g_scene_uploaded || views == NULL ||
@@ -2670,9 +2691,10 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         g_void_persist = persist != NULL && persist[0] == '0' ? 0 : 1;
     }
     if (!g_void_persist || g_index_target_dirty) {
-        /* At a map load the engine's framebuffer holds the backdrop image, so
-         * void starts as that art rather than as a flat colour; the seed carries
-         * the part of it the viewport covers. */
+        /* Whenever the original repaints its screen with the backdrop image --
+         * at a map load, and on every return to gameplay from the inventory or
+         * a menu -- void restarts as that art rather than as a flat colour, and
+         * the seed carries it. */
         if (!hwr_consume_index_seed(width, height))
             g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
         g_index_target_dirty = 0;

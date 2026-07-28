@@ -3536,8 +3536,15 @@ static void hwr_prepare_reflection_object_windows(
     }
 }
 
-static void hwr_scene_span_add(struct hwr_sector_xspan *span,
-                               int16_t lo, int16_t hi)
+/* `gap` is how far apart two stored windows may be and still be fused into
+ * one. Windows gate half-open column ranges, so `gap == 0` fuses exactly the
+ * ones that touch or overlap and leaves a store that admits precisely the
+ * columns it was given. `gap == 1` also fuses across a single column neither
+ * window admits, which widens the store by that column -- harmless where the
+ * windows being combined are already a full interval, and the long-standing
+ * behaviour of every caller that asks for it. */
+static void hwr_scene_span_add_gap(struct hwr_sector_xspan *span,
+                                   int16_t lo, int16_t hi, int gap)
 {
     unsigned i;
     if (span->count == UINT8_MAX)
@@ -3548,8 +3555,8 @@ static void hwr_scene_span_add(struct hwr_sector_xspan *span,
         hi = swap;
     }
     for (i = 0; i < span->count; i++) {
-        if ((int)lo <= (int)span->hi[i] + 1 &&
-            (int)span->lo[i] <= (int)hi + 1) {
+        if ((int)lo <= (int)span->hi[i] + gap &&
+            (int)span->lo[i] <= (int)hi + gap) {
             unsigned j = 0;
             if (lo < span->lo[i])
                 span->lo[i] = lo;
@@ -3557,8 +3564,8 @@ static void hwr_scene_span_add(struct hwr_sector_xspan *span,
                 span->hi[i] = hi;
             while (j < span->count) {
                 if (j != i &&
-                    (int)span->lo[i] <= (int)span->hi[j] + 1 &&
-                    (int)span->lo[j] <= (int)span->hi[i] + 1) {
+                    (int)span->lo[i] <= (int)span->hi[j] + gap &&
+                    (int)span->lo[j] <= (int)span->hi[i] + gap) {
                     if (span->lo[j] < span->lo[i])
                         span->lo[i] = span->lo[j];
                     if (span->hi[j] > span->hi[i])
@@ -3585,6 +3592,12 @@ static void hwr_scene_span_add(struct hwr_sector_xspan *span,
     span->count++;
 }
 
+static void hwr_scene_span_add(struct hwr_sector_xspan *span,
+                               int16_t lo, int16_t hi)
+{
+    hwr_scene_span_add_gap(span, lo, hi, 1);
+}
+
 static void hwr_scene_add_wing_windows(
     struct hwr_sector_xspan *destination,
     const struct hwr_sector_xspan *source,
@@ -3595,19 +3608,65 @@ static void hwr_scene_add_wing_windows(
         source->count > HWR_SECTOR_CLIP_MAX ||
         source_width > INT16_MAX)
         return;
+    /* Side windows are combined with the exact rule: some destinations already
+     * carry the original's own centre window for this object or door, and
+     * fusing across a column no window admits would hand them a column of the
+     * centre the original clipped away. */
     for (i = 0; i < source->count; i++) {
         int left = source->lo[i];
         int right = source->hi[i];
         if (left < 0)
-            hwr_scene_span_add(
+            hwr_scene_span_add_gap(
                 destination, (int16_t)left,
-                (int16_t)(right < 0 ? right : 0));
+                (int16_t)(right < 0 ? right : 0), 0);
         if (right > (int)source_width)
-            hwr_scene_span_add(
+            hwr_scene_span_add_gap(
                 destination,
                 (int16_t)(left > (int)source_width
                               ? left : (int)source_width),
-                (int16_t)right);
+                (int16_t)right, 0);
+    }
+}
+
+/* The traversal projects portal endpoints into whole source columns, dividing
+ * toward zero, while the geometry those windows clip is projected in floating
+ * point. A window edge can therefore land up to one source column inside the
+ * opening it describes. In the centre that is harmless -- the interval there is
+ * the full one, and depth alone resolves the surfaces -- but a side window is a
+ * hard gate, and in that one column the far sector is discarded while the near
+ * wall has already ended at the true, fractional edge, so nothing covers it.
+ *
+ * Dividing toward zero always moves an endpoint TOWARD the view centre, and by
+ * less than one column: a bound at or below zero can be short on its left, one
+ * at or above zero short on its right. Widening each window on exactly those
+ * sides, before it is split into wings, makes the stored side windows a
+ * guaranteed superset of the true opening while leaving every edge that faces
+ * the centre where the traversal put it. The extra fragments a widened window
+ * admits lie behind the near geometry that forms the edge and lose the depth
+ * test. The traversal's own result stays exact -- it also serves as the centre
+ * visibility oracle -- and so do the boundary cuts the split makes, which are
+ * policy rather than projection. HWR_WING_CLIP_DILATE=0 restores the unwidened
+ * windows. */
+static int hwr_wing_clip_dilate_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_WING_CLIP_DILATE");
+        enabled = !(setting != NULL && setting[0] == '0');
+    }
+    return enabled;
+}
+
+static void hwr_scene_span_dilate(struct hwr_sector_xspan *span)
+{
+    unsigned i;
+    if (span->count > HWR_SECTOR_CLIP_MAX)
+        return;
+    for (i = 0; i < span->count; i++) {
+        if (span->lo[i] <= 0 && span->lo[i] > INT16_MIN)
+            span->lo[i] = (int16_t)(span->lo[i] - 1);
+        if (span->hi[i] >= 0 && span->hi[i] < INT16_MAX)
+            span->hi[i] = (int16_t)(span->hi[i] + 1);
     }
 }
 
@@ -3621,11 +3680,17 @@ static void hwr_prepare_wide_sector_windows(
     uint32_t source_width)
 {
     size_t i;
+    int dilate = hwr_wing_clip_dilate_enabled();
     for (i = 0; i < world->sector_count; i++) {
         struct hwr_sector_xspan original = scene->wide_spans[i];
         struct hwr_sector_xspan *destination = &scene->wide_spans[i];
         memset(destination, 0, sizeof *destination);
         if (engine_valid) {
+            /* Only where the centre is the engine's own interval: without that
+             * anchor these windows gate the whole canvas, and widening them
+             * would move a boundary the original decided. */
+            if (dilate)
+                hwr_scene_span_dilate(&original);
             hwr_scene_add_wing_windows(
                 destination, &original, source_width);
             if (engine_visible[i])

@@ -215,6 +215,11 @@ void hwr_gl_scene_clear(void);
  * of matching dimensions consumes them, once. Returns 0 on failure, in which
  * case the flat clear stands. */
 int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t height);
+/* Declares the standing palette-index target no longer a valid starting point,
+ * so the next scene render lays down a pending seed -- or, with none pending, a
+ * flat clear -- instead of persisting into whatever is already there. Safe to
+ * call before the renderer exists. */
+void hwr_gl_invalidate_index_target(void);
 void hwr_gl_shutdown(void);
 const char *hwr_gl_last_error(void);
 unsigned hwr_gl_drain_errors(void);
