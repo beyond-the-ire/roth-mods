@@ -1,5 +1,6 @@
 #include "hwr_scene.h"
 
+#include "hwr_composite.h"
 #include "hwr_perf.h"
 
 #include "hwr_projection.h"
@@ -4118,37 +4119,13 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
     return 0;
 }
 
-static int hwr_arithmetic_shift_8(int value)
-{
-    return value >= 0 ? value / 256 : -((-value + 255) / 256);
-}
-
+/* A freshly drawn world carries no held palette effect: the desaturated
+ * inventory background belongs to an image the engine has already stopped
+ * redrawing, so it can only exist on a held frame. */
 static void hwr_build_palette(const struct hwr_world *world, uint8_t rgba[1024])
 {
-    int32_t counter = world->luts.damage_flash_level;
-    int fade = 0xff - (int)counter;
-    unsigned i;
-    /* upload_palette_dac (video_display.c:344-362) uploads the palette
-     * untouched while the pain accumulator is zero, and otherwise collapses it
-     * toward dark red with fade = 0xff - counter held at zero from below. The
-     * accumulator runs to 0x164, so a heavy hit saturates the tint instead of
-     * coming back out of it. */
-    if (counter != 0 && fade < 0)
-        fade = 0;
-    for (i = 0; i < 256; i++) {
-        int r = world->luts.palette[i * 3u];
-        int g = world->luts.palette[i * 3u + 1u];
-        int b = world->luts.palette[i * 3u + 2u];
-        if (counter != 0) {
-            r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
-            g = (g * fade) >> 8;
-            b = (b * fade) >> 8;
-        }
-        rgba[i * 4u] = (uint8_t)(r << 2);
-        rgba[i * 4u + 1u] = (uint8_t)(g << 2);
-        rgba[i * 4u + 2u] = (uint8_t)(b << 2);
-        rgba[i * 4u + 3u] = 0xffu;
-    }
+    hwr_composite_publish_palette(world->luts.palette, NULL,
+                                  world->luts.damage_flash_level, rgba);
 }
 
 /* Steps a delta animation's countdown, byte for byte as the engine steps it.

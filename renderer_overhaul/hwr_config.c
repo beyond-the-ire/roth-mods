@@ -96,9 +96,11 @@ static int hwr_apply_config_value(struct hwr_settings *settings,
             return 0;
         settings->debug = boolean;
     } else if (hwr_ascii_equal_ci(key, "solid_color")) {
+        /* Retired: there is no manufactured world frame to colour any more.
+         * The key is still accepted so an existing configuration file keeps
+         * loading as a whole. */
         if (!hwr_parse_u32(value, 16, 0x00ffffffu, &number))
             return 0;
-        settings->solid_color = number;
     } else if (hwr_ascii_equal_ci(key, "internal_w")) {
         if (!hwr_parse_u32(value, 10, 16384u, &number))
             return 0;

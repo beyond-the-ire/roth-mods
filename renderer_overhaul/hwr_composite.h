@@ -10,6 +10,8 @@
 struct hwr_composite {
     uint8_t *engine_base;
     size_t engine_base_capacity;
+    uint8_t *engine_shadow;
+    size_t engine_shadow_capacity;
     uint32_t *engine_source_x;
     size_t engine_source_x_capacity;
     uint32_t *engine_source_y;
@@ -35,12 +37,20 @@ int hwr_composite_prepare(struct hwr_composite *composite,
                           struct roth_world_frame_v1 *frame,
                           const struct hwr_world *world);
 
-/* Apply the engine's already-built grayscale LUT to both the wide RGBA world
- * and its engine-index baseline. The caller resubmits the updated frame. */
-int hwr_composite_grayscale(struct hwr_composite *composite,
-                            const struct roth_api_v1 *api,
-                            struct roth_world_frame_v1 *frame,
-                            const struct hwr_world *world);
+/* Attach a baseline that no live engine pixel can equal, so the host draws the
+ * engine layer opaquely over the whole viewport. The submitted world then only
+ * supplies the canvas outside the engine's own picture, which is what keeps
+ * the canvas stable while the engine owns the content it is drawing. */
+int hwr_composite_engine_shadow(struct hwr_composite *composite,
+                                const struct roth_api_v1 *api,
+                                struct roth_world_frame_v1 *frame);
+
+/* Carry the engine's grayscale remap into the attached index baseline, which
+ * the engine has just applied to its own framebuffer. The world image itself
+ * follows through the presentation palette, not through a pixel pass. */
+int hwr_composite_grayscale_baseline(struct hwr_composite *composite,
+                                     const uint8_t lut[256],
+                                     const struct roth_world_frame_v1 *frame);
 
 /* Scale a frozen world frame by the engine's VGA fade multiplier. The original
  * RGBA pixels are captured lazily on the first step and reused for the complete
@@ -57,8 +67,20 @@ int hwr_composite_source_to_engine(const struct roth_api_v1 *api,
                                    uint32_t source_x, uint32_t source_y,
                                    uint32_t *engine_x, uint32_t *engine_y);
 
-uint32_t hwr_composite_palette_argb(const struct hwr_world *world,
-                                    unsigned index);
+/* Build the palette the world image is presented through, from the engine's
+ * live palette plus whatever palette-level effects are in force, and publish it
+ * as the reference every consumer of the submitted pixels shares. Passing a
+ * grayscale table folds the engine's index remap into the same table, so an
+ * effect never has to be run over the pixels twice. rgba_out, when given,
+ * receives the 256-entry RGBA table the renderer resolves through. */
+void hwr_composite_publish_palette(const uint8_t palette_rgb[768],
+                                   const uint8_t *grayscale_lut,
+                                   int32_t damage_level,
+                                   uint8_t rgba_out[1024]);
+
+/* The published palette entry for an engine index. */
+uint32_t hwr_composite_present_argb(unsigned index);
+
 uint8_t hwr_composite_palette_index(uint32_t pixel,
                                     const uint32_t palette[256]);
 

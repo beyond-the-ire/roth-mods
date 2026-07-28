@@ -1600,38 +1600,6 @@ int hwr_gl_init(void)
     return 1;
 }
 
-const uint32_t *hwr_gl_render_frame(uint32_t width, uint32_t height,
-                                    uint32_t color)
-{
-    GLfloat red;
-    GLfloat green;
-    GLfloat blue;
-
-    if (!g_initialized || !hwr_platform_make_current()) {
-        snprintf(g_error, sizeof g_error, "the OpenGL context could not be made current");
-        return NULL;
-    }
-    if ((g_fbo_width != width || g_fbo_height != height) &&
-        !hwr_create_framebuffer(width, height))
-        return NULL;
-
-    red = (GLfloat)((color >> 16) & 0xffu) / 255.0f;
-    green = (GLfloat)((color >> 8) & 0xffu) / 255.0f;
-    blue = (GLfloat)(color & 0xffu) / 255.0f;
-    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
-    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
-    g_gl.clear_color(red, green, blue, 1.0f);
-    g_gl.clear(GL_COLOR_BUFFER_BIT);
-
-    /* BGRA components with the reversed packed type put B in the low byte,
-     * producing numeric 0xAARRGGBB words on a little-endian host. Rows read back
-     * bottom-up (OpenGL origin); invisible for a uniform fill, but real scene
-     * rendering must flip the projection or the readback. */
-    g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
-                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
-    return g_pixels;
-}
-
 static void hwr_texture_2d_u8(GLuint *texture, GLsizei width, GLsizei height,
                               GLenum internal_format, GLenum format,
                               const void *pixels)
@@ -2785,6 +2753,43 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         g_verify_pending = 0;
         hwr_gl_scene_self_test(first_run);
     }
+    return g_pixels;
+}
+
+const uint32_t *hwr_gl_scene_resolve(const uint8_t palette_rgba[1024],
+                                     uint32_t width, uint32_t height)
+{
+    if (!g_initialized || !g_scene_uploaded || palette_rgba == NULL ||
+        width == 0 || height == 0 || g_fbo_width != width ||
+        g_fbo_height != height || g_pixels == NULL ||
+        !hwr_platform_make_current()) {
+        snprintf(g_error, sizeof g_error,
+                 "no resolvable palette-index target is present");
+        return NULL;
+    }
+    /* Nothing has drawn into the index attachment since the render that
+     * produced the standing image, so resolving it again through a different
+     * palette yields exactly what that render would have produced with this
+     * palette. */
+    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                          GL_RGBA, GL_UNSIGNED_BYTE, palette_rgba);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.use_program(g_resolve_program);
+    hwr_uniform_1i(g_resolve_program, "u_debug_vis", g_debug_vis);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
     return g_pixels;
 }
 

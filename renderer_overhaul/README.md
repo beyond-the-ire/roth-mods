@@ -26,7 +26,6 @@ one-frame hitch while the render targets are resized.
 
 - `enabled`: `1` or `0`. When disabled, every rendering call passes through unchanged.
 - `debug`: `1` prints map geometry and texture archive statistics; `0` keeps them quiet.
-- `solid_color`: fallback world color as six hexadecimal `RRGGBB` digits.
 - `internal_w`, `internal_h`: world render resolution. Zero follows the engine viewport for that
   dimension. Set both to the desired output resolution, such as `2560` and `1440`.
 - `window_mode`: `default`, `windowed`, or `borderless`. `default` leaves the host's selected

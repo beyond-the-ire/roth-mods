@@ -182,8 +182,6 @@ struct hwr_gl_scene_view {
 };
 
 int hwr_gl_init(void);
-const uint32_t *hwr_gl_render_frame(uint32_t width, uint32_t height,
-                                    uint32_t color);
 int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                         const uint8_t colormap[0x2000],
                         const uint8_t tint[0x2000],
@@ -203,6 +201,14 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
                                     size_t view_count,
                                     const uint8_t palette_rgba[1024],
                                     uint32_t width, uint32_t height);
+/* Re-resolve the palette-index attachment the last scene render left behind
+ * through a new palette and read the result back, without redrawing any
+ * geometry. Palette-level effects are engine state that keeps changing while
+ * the world stands still, so a held image follows them through this rather
+ * than through a pixel transform that cannot be undone. Returns NULL when no
+ * resolvable target of the requested size is present. */
+const uint32_t *hwr_gl_scene_resolve(const uint8_t palette_rgba[1024],
+                                     uint32_t width, uint32_t height);
 void hwr_gl_scene_clear(void);
 /* Hands over the pixels the palette-index target should start from instead of a
  * flat clear, in the same orientation as a scene readback. The next scene render

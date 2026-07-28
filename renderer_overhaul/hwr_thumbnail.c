@@ -81,8 +81,11 @@ int hwr_thumbnail_capture(const struct roth_api_v1 *api,
     engine = (const uint8_t *)(uintptr_t)src;
     blend = (const uint8_t *)(uintptr_t)lut;
     output = (uint8_t *)(uintptr_t)dst;
+    /* The thumbnail reduces the image that is actually on screen, so it shares
+     * the palette that image was presented through rather than rebuilding one
+     * from render-time state. */
     for (i = 0; i < 256u; i++)
-        palette[i] = hwr_composite_palette_argb(world, i);
+        palette[i] = hwr_composite_present_argb(i);
 
     output[0] = 2u;
     output[1] = 0u;

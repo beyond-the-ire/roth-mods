@@ -21,9 +21,6 @@ void hwr_settings_defaults(struct hwr_settings *settings)
         return;
     memset(settings, 0, sizeof *settings);
     settings->enabled = 1;
-    /* Shown only while the world is not renderable, such as during a map
-     * change. Black is unobtrusive there; a marker colour reads as a flash. */
-    settings->solid_color = 0x000000u;
     settings->window_mode = HWR_WINDOW_DEFAULT;
     settings->present_mode = HWR_PRESENT_FIFO;
     settings->pitch_mode = HWR_PITCH_HORIZON_SHIFT;
@@ -50,7 +47,6 @@ void hwr_settings_replace(const struct hwr_settings *settings)
     hwr_settings_set_enabled(settings->enabled);
     hwr_settings_set_debug(settings->debug);
     hwr_settings_set_shade_depth_scale(settings->shade_depth_scale);
-    hwr_settings_set_solid_color(settings->solid_color);
     hwr_settings_set_internal_size(
         settings->internal_w, settings->internal_h);
     hwr_settings_set_window_mode(settings->window_mode);
@@ -109,15 +105,6 @@ void hwr_settings_set_debug(int debug)
     if (g_settings.debug != debug) {
         g_settings.debug = debug;
         g_dirty |= HWR_CHANGE_DEBUG;
-    }
-}
-
-void hwr_settings_set_solid_color(uint32_t color)
-{
-    color &= 0x00ffffffu;
-    if (g_settings.solid_color != color) {
-        g_settings.solid_color = color;
-        g_dirty |= HWR_CHANGE_SOLID_COLOR;
     }
 }
 

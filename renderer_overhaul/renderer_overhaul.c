@@ -18,6 +18,7 @@
 #include "hwr_util.h"
 #include "hwr_input.h"
 #include "hwr_composite.h"
+#include "hwr_ownership.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -53,7 +54,6 @@ struct hwr_viewport {
 
 struct hwr_render_settings {
     int enabled;
-    uint32_t solid_color;
     uint32_t internal_w;
     uint32_t internal_h;
 };
@@ -64,7 +64,7 @@ static const struct roth_api_v1 *g_api;
  * plugin, so every submit/withdraw must use one consistent token or the channel reports a foreign
  * owner. The world pass owns the channel, so its api pointer is the canonical identity. */
 static const struct roth_api_v1 *g_channel_api;
-static struct hwr_render_settings g_render_settings = { 1, 0x000000u, 0, 0 };
+static struct hwr_render_settings g_render_settings = { 1, 0, 0 };
 static struct hwr_settings g_window_settings;
 static uint32_t g_window_pending;
 static uint32_t g_wrap_serial;
@@ -79,6 +79,16 @@ static uint32_t g_poll_throttle;
 static volatile sig_atomic_t g_world_render_active;
 static struct roth_world_frame_v1 g_last_frame;
 static int g_last_frame_valid;
+/* The descriptor's geometry outlives its pixels. Handing the screen back to an
+ * engine routine drops the image but not the canvas it was published on, so
+ * the frames that keep that canvas alive while the engine draws can be built
+ * without waiting for a new render. */
+static int g_last_frame_geometry_valid;
+/* Raised by any submission, cleared by the present that consumes it: the
+ * present seam only steps in for presents the render path did not already
+ * supply a frame for. */
+static int g_submitted_for_present;
+static struct hwr_ownership g_ownership;
 static uint32_t g_present_max_w;
 static uint32_t g_present_max_h;
 static int g_present_caps_checked;
@@ -244,8 +254,6 @@ static void hwr_render_settings_apply(uint32_t mask,
     (void)userdata;
     if (mask & HWR_CHANGE_ENABLED)
         g_render_settings.enabled = settings->enabled;
-    if (mask & HWR_CHANGE_SOLID_COLOR)
-        g_render_settings.solid_color = settings->solid_color;
     if (mask & HWR_CHANGE_INTERNAL_SIZE) {
         g_render_settings.internal_w = settings->internal_w;
         g_render_settings.internal_h = settings->internal_h;
@@ -467,11 +475,16 @@ static void hwr_apply_window_requests(const struct roth_api_v1 *api)
     g_window_pending = 0;
 }
 
+/* Stop compositing. The descriptor's geometry survives: an engine routine that
+ * takes the screen gives it back, and the canvas it is given back on has to be
+ * the one it was taken from. */
 static void hwr_withdraw_if_owned(const struct roth_api_v1 *api)
 {
     int32_t result;
     g_last_frame_valid = 0;
     g_gdv_palette_effect_active = 0;
+    g_ownership.grayscale_held = 0;
+    g_ownership.present_valid = 0;
     if (!g_channel_owned || api->present == NULL || g_channel_api == NULL)
         return;
     result = api->present->withdraw_world_frame(g_channel_api);
@@ -479,31 +492,195 @@ static void hwr_withdraw_if_owned(const struct roth_api_v1 *api)
         g_channel_owned = 0;
 }
 
-/* While a menu or dialog is up the engine freezes the world instead of repainting it, so the
- * last submitted frame must stay composited. The host drops a stale frame after a fixed number
- * of presents as crash protection; periodic re-submission of the identical frame keeps the
- * frozen backdrop visible. Real transitions (video-mode change, map load) withdraw instead. */
-static void hwr_resubmit_if_stalled(const struct roth_api_v1 *api)
+/* The original renderer is on screen and stays there until something proves it
+ * does not have to be. */
+static void hwr_enter_software(const struct roth_api_v1 *api,
+                               const char *reason)
 {
-    int32_t result;
-    if (!g_channel_owned || !g_last_frame_valid || api->present == NULL ||
-        g_channel_api == NULL)
-        return;
-    result = api->present->submit_world_frame(g_channel_api, &g_last_frame);
-    if (result == ROTH_ERR_NOT_OWNER) {
-        g_channel_owned = 0;
-        g_last_frame_valid = 0;
-    }
+    hwr_withdraw_if_owned(api);
+    g_last_frame_geometry_valid = 0;
+    hwr_ownership_enter(&g_ownership, HWR_OWNER_SOFTWARE, reason);
 }
 
 static void hwr_fail_gl(const struct roth_api_v1 *api)
 {
     g_gl_permanently_failed = 1;
-    hwr_withdraw_if_owned(api);
+    hwr_enter_software(api, "hardware rendering failed");
     if (!g_gl_error_logged) {
         fprintf(stderr, "[renderer_overhaul] OpenGL disabled: %s\n", hwr_gl_last_error());
         g_gl_error_logged = 1;
     }
+}
+
+/* The single point the present channel is fed from, so every published frame
+ * carries the same descriptor discipline. */
+static int hwr_submit_frame(const struct roth_api_v1 *api,
+                            struct roth_world_frame_v1 *frame)
+{
+    int32_t result;
+
+    if (api->present == NULL || g_channel_api == NULL)
+        return 0;
+    result = api->present->submit_world_frame(g_channel_api, frame);
+    if (result != ROTH_OK) {
+        if (!g_submit_error_logged) {
+            fprintf(stderr, "[renderer_overhaul] world frame submit failed: rc=%d (%ux%u viewport %d,%d %ux%u)\n",
+                    (int)result, frame->w, frame->h, frame->vx, frame->vy,
+                    frame->vw, frame->vh);
+            g_submit_error_logged = 1;
+        }
+        if (result == ROTH_ERR_NOT_OWNER) {
+            g_channel_owned = 0;
+            g_last_frame_valid = 0;
+        }
+        return 0;
+    }
+    g_channel_owned = 1;
+    return 1;
+}
+
+/* A wide source owns the whole canvas and the engine's own picture is centred
+ * over it; an equal-aspect source is composited straight into the viewport. */
+static uint64_t hwr_composite_mode_for(uint32_t width, uint32_t height,
+                                       const struct hwr_viewport *viewport)
+{
+    return (uint64_t)width * (uint64_t)viewport->height !=
+           (uint64_t)height * (uint64_t)viewport->width
+        ? ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS
+        : ROTH_COMPOSITE_ENGINE_COLORKEY_OVER_WORLD;
+}
+
+static void hwr_frame_viewport(const struct roth_world_frame_v1 *frame,
+                               struct hwr_viewport *viewport)
+{
+    viewport->x = frame->vx;
+    viewport->y = frame->vy;
+    viewport->width = frame->vw;
+    viewport->height = frame->vh;
+}
+
+/* Keep the canvas alive over a frame the engine is drawing itself. The whole
+ * viewport is handed to the engine layer -- no pixel of the original's own
+ * output is copied, replaced, or reinterpreted -- and only the area outside it
+ * comes from the mod: what the hardware renderer last drew there while the
+ * original is simply holding its last frame, black while a cutscene sequence
+ * owns the screen and the original has no surround at all.
+ *
+ * Built at the present seam and nowhere else: the plane that keeps the engine
+ * layer opaque is derived from the framebuffer, and only there is the
+ * framebuffer in the exact state the page flip is about to publish. */
+static int hwr_submit_engine_passthrough(const struct roth_api_v1 *api,
+                                         int hold_surround)
+{
+    struct roth_world_frame_v1 frame;
+    struct hwr_viewport viewport;
+    const uint32_t *pixels;
+
+    if (!g_ownership.hardware_established || !g_last_frame_geometry_valid ||
+        g_last_frame.w == 0 || g_last_frame.h == 0)
+        return 0;
+    if (hold_surround && g_last_frame_valid)
+        pixels = (const uint32_t *)g_last_frame.pixels;
+    else
+        pixels = hwr_ownership_blank_canvas(&g_ownership, g_last_frame.w,
+                                            g_last_frame.h);
+    if (pixels == NULL)
+        return 0;
+
+    hwr_frame_viewport(&g_last_frame, &viewport);
+    frame = g_last_frame;
+    frame.pixels = pixels;
+    frame.composite_mode =
+        hwr_composite_mode_for(frame.w, frame.h, &viewport);
+    if (!hwr_composite_engine_shadow(&g_composite, api, &frame))
+        return 0;
+    return hwr_submit_frame(api, &frame);
+}
+
+/* Palette-level effects are live engine state and the engine drives them
+ * whether or not the world is being redrawn, so a held image has to follow
+ * them. Resolving the standing palette-index image through a rebuilt palette
+ * reproduces exactly what a render with that palette would have produced, and
+ * needs no transform of the pixels that could not be undone. */
+static void hwr_refresh_held_palette(const struct roth_api_v1 *api)
+{
+    uint8_t palette[1024];
+    const uint32_t *pixels;
+    const uint8_t *lut = NULL;
+    int32_t level;
+
+    if (!g_last_frame_valid || !g_ownership.present_valid ||
+        g_gdv_palette_effect_active || g_composite.effect_active != 0)
+        return;
+    level = hwr_ownership_damage_level(api);
+    if (level == g_ownership.present_damage &&
+        g_ownership.grayscale_held == g_ownership.present_grayscale)
+        return;
+    if (g_ownership.grayscale_held) {
+        lut = hwr_ownership_grayscale_lut(api);
+        if (lut == NULL)
+            return;
+    }
+    if (hwr_world_refresh_lut_state(&g_world, api) != 0)
+        return;
+    hwr_composite_publish_palette(g_world.luts.palette, lut, level, palette);
+    pixels = hwr_gl_scene_resolve(palette, g_last_frame.w, g_last_frame.h);
+    if (pixels == NULL) {
+        /* Leave the published palette describing the pixels that are still
+         * standing, so everything reducing that image keeps agreeing with it. */
+        hwr_composite_publish_palette(
+            g_world.luts.palette,
+            g_ownership.present_grayscale ? hwr_ownership_grayscale_lut(api)
+                                          : NULL,
+            g_ownership.present_damage, NULL);
+        return;
+    }
+    g_last_frame.pixels = pixels;
+    g_ownership.present_damage = level;
+    g_ownership.present_grayscale = g_ownership.grayscale_held;
+}
+
+/* Every present the render path did not already supply a frame for. A world
+ * frame only reaches the screen paired with an engine page flip, and the host
+ * drops one that stops being refreshed, so the mod's publishing cadence has to
+ * be the engine's present cadence rather than a timer of its own. */
+static void hwr_present_seam(const struct roth_api_v1 *api)
+{
+    int supplied;
+
+    if (g_world_render_active)
+        return;
+    supplied = g_submitted_for_present;
+    g_submitted_for_present = 0;
+    if (supplied)
+        return;
+    if (!g_render_settings.enabled || g_gl_permanently_failed ||
+        api->present == NULL || g_channel_api == NULL ||
+        !g_last_frame_geometry_valid ||
+        g_ownership.state == HWR_OWNER_SOFTWARE ||
+        g_ownership.state == HWR_OWNER_ENGINE_SCREEN)
+        return;
+
+    /* A cutscene sequence draws its own screen and has no surround of its own,
+     * so the area outside it is black; an ordinary transition is the original
+     * leaving its last frame standing, so the area outside keeps what was
+     * there. */
+    if (hwr_ownership_engine_sequence(api)) {
+        if (hwr_submit_engine_passthrough(api, 0))
+            hwr_ownership_enter(&g_ownership, HWR_OWNER_PASSTHROUGH,
+                                "a cutscene sequence owns the screen");
+        return;
+    }
+    if (g_ownership.state == HWR_OWNER_PASSTHROUGH) {
+        hwr_submit_engine_passthrough(api, 1);
+        return;
+    }
+    if (!g_channel_owned || !g_last_frame_valid)
+        return;
+    hwr_refresh_held_palette(api);
+    if (hwr_submit_frame(api, &g_last_frame))
+        hwr_ownership_enter(&g_ownership, HWR_OWNER_FROZEN,
+                            "the world pass is idle");
 }
 
 /* The world-viewport rect in final framebuffer coordinates. Use the STABLE per-frame viewport
@@ -652,9 +829,10 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     const uint32_t *pixels;
     uint32_t render_width;
     uint32_t render_height;
-    int32_t result;
     int world_was_valid;
     int refresh_result;
+    int hardware_ready;
+    int submitted;
 
     hwr_frame_perf_begin(&frame_perf);
 
@@ -668,12 +846,12 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
 
     if (!g_render_settings.enabled || g_gl_permanently_failed) {
         roth_next_render_world_view_pass(chain, eax_record);
-        hwr_withdraw_if_owned(api);
+        hwr_enter_software(api, "hardware rendering is not in use");
         return;
     }
     if (api->game_ram->u8(VA_G_VIEW_SCALE_FLAGS) != 0) {
         roth_next_render_world_view_pass(chain, eax_record);
-        hwr_withdraw_if_owned(api);
+        hwr_enter_software(api, "scaled viewport mode");
         if (!g_scale_mode_logged) {
             fprintf(stderr, "[renderer_overhaul] stock rendering retained for scaled viewport modes\n");
             g_scale_mode_logged = 1;
@@ -690,8 +868,17 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
         return;
     }
 
-    if (g_compare_path[0] == 0)
-        g_suppress_active = 1;
+    /* Decided before the engine draws, never after: the only frame the mod may
+     * take away from the original renderer is one it already knows it can put
+     * a complete hardware scene in place of. A map change moves the geometry
+     * the snapshot points at and clears the render latch, and a pending reload
+     * or scene rebuild says the same thing from the mod's own side; any of
+     * them and the engine keeps this frame. */
+    hardware_ready = g_compare_path[0] == 0 && g_world.valid && g_scene.valid &&
+                     !g_scene_rebuild_pending && !g_map_reload_pending &&
+                     !hwr_ownership_world_stale(api, g_world.sector_section,
+                                                g_world.vertex_section);
+    g_suppress_active = hardware_ready;
     roth_next_render_world_view_pass(chain, eax_record);
     g_suppress_active = 0;
     hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_ENGINE_WALK);
@@ -705,7 +892,7 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
                     api->game_ram->u32(VA_G_SCREEN_HEIGHT));
             g_viewport_error_logged = 1;
         }
-        hwr_withdraw_if_owned(api);
+        hwr_enter_software(api, "the world viewport is unusable");
         return;
     }
     if (!hwr_gl_init()) {
@@ -738,12 +925,14 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     hwr_check_present_caps(api);
     if (g_present_caps_valid &&
         (render_width > g_present_max_w || render_height > g_present_max_h)) {
-        hwr_withdraw_if_owned(api);
+        hwr_enter_software(api, "the requested canvas exceeds the host limits");
         return;
     }
     if (g_last_frame_valid &&
-        (g_last_frame.w != render_width || g_last_frame.h != render_height))
+        (g_last_frame.w != render_width || g_last_frame.h != render_height)) {
         g_last_frame_valid = 0;
+        g_ownership.present_valid = 0;
+    }
     /* Safe point for a deferred map reload: nothing consumes g_world yet on this
      * dispatch, and (single game thread) no other dispatch's mesh build is in
      * flight, so re-snapshotting here cannot free geometry under
@@ -858,9 +1047,6 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
         }
         hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_PREPARE);
     }
-    if (g_compare_path[0] == 0 && pixels == NULL)
-        pixels = hwr_gl_render_frame(render_width, render_height,
-                                     g_render_settings.solid_color);
     hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_RENDER);
     if (g_compare_path[0] != 0) {
         /* Compare mode: the software world is on screen; pair its indices
@@ -924,11 +1110,24 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
                 }
             }
         }
-        hwr_withdraw_if_owned(api);
+        hwr_enter_software(api, "comparison capture");
         return;
     }
     if (pixels == NULL) {
-        hwr_fail_gl(api);
+        /* Nothing to publish. The engine drew this frame itself unless the
+         * pre-render decision said it would not have to, and that only fails
+         * when the hardware path itself broke -- the one case that goes back to
+         * the original renderer for good rather than papering over a frame.
+         * Otherwise the canvas is carried by the present seam, which sees the
+         * engine's finished frame instead of a half-drawn one. */
+        if (hardware_ready) {
+            hwr_fail_gl(api);
+            return;
+        }
+        hwr_ownership_enter(&g_ownership, HWR_OWNER_PASSTHROUGH,
+                            "the world is not renderable yet");
+        hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_FINALIZE);
+        hwr_frame_perf_finish(&frame_perf);
         return;
     }
 
@@ -944,10 +1143,7 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     frame.vw = viewport.width;
     frame.vh = viewport.height;
     frame.composite_mode =
-        (uint64_t)render_width * (uint64_t)viewport.height !=
-        (uint64_t)render_height * (uint64_t)viewport.width
-            ? ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS
-            : ROTH_COMPOSITE_ENGINE_COLORKEY_OVER_WORLD;
+        hwr_composite_mode_for(render_width, render_height, &viewport);
     frame.transparent_index = 0;
     frame.flags = 0;
     g_gdv_palette_effect_active = 0;
@@ -966,7 +1162,7 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
                         viewport.width, viewport.height);
                 g_sentinel_error_logged = 1;
             }
-            hwr_withdraw_if_owned(api);
+            hwr_enter_software(api, "no usable engine baseline");
             return;
         }
     }
@@ -979,7 +1175,7 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
         uint64_t submit_start = getenv("HWR_FRAME_PERF") != NULL
                               ? hwr_perf_now_ns() : 0;
         uint64_t now;
-        result = api->present->submit_world_frame(g_channel_api, &frame);
+        submitted = hwr_submit_frame(api, &frame);
         hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_SUBMIT);
         if (submit_start != 0) {
             now = hwr_perf_now_ns();
@@ -1004,22 +1200,20 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
             }
         }
     }
-    if (result == ROTH_OK) {
-        g_channel_owned = 1;
+    if (submitted) {
+        g_submitted_for_present = 1;
         g_last_frame = frame;
         g_last_frame_valid = 1;
+        g_last_frame_geometry_valid = 1;
+        g_ownership.hardware_established = 1;
+        g_ownership.grayscale_held = 0;
+        g_ownership.present_grayscale = 0;
+        g_ownership.present_damage = g_world.luts.damage_flash_level;
+        g_ownership.present_valid = 1;
+        hwr_ownership_enter(&g_ownership, HWR_OWNER_HARDWARE,
+                            "the world is renderable");
         if (g_dump_path[0] != 0 && ((g_dump_counter++) & 31u) == 0)
             hwr_dump_frame(pixels, render_width, render_height);
-    } else {
-        if (!g_submit_error_logged) {
-            fprintf(stderr, "[renderer_overhaul] world frame submit failed: rc=%d (%ux%u viewport %d,%d %ux%u)\n",
-                    (int)result, frame.w, frame.h, frame.vx, frame.vy, frame.vw, frame.vh);
-            g_submit_error_logged = 1;
-        }
-        if (result == ROTH_ERR_NOT_OWNER) {
-            g_channel_owned = 0;
-            g_last_frame_valid = 0;
-        }
     }
     hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_FINALIZE);
     hwr_frame_perf_finish(&frame_perf);
@@ -1111,33 +1305,31 @@ static void ROTH_CDECL hwr_capture_screen_thumbnail(
 static void ROTH_CDECL hwr_grayscale_background_view(
     struct roth_chain *chain, const struct roth_api_v1 *api)
 {
-    int32_t result;
+    const uint8_t *lut;
 
-    /* This builds the authentic engine LUT and remaps the baseline plus all
-     * already-drawn 8bpp chrome. The hardware world is transformed only after
-     * that succeeds, preserving the preceding color-thumbnail capture. */
+    /* This builds the authentic engine table and desaturates all already-drawn
+     * 8bpp chrome. The index baseline follows it so the two keep agreeing, and
+     * the held world image follows it through the presentation palette -- the
+     * same route its live palette effects take, so the two never have to be
+     * applied over one another. */
     roth_next_grayscale_background_view(chain);
-    if (!g_last_frame_valid || g_channel_api == NULL ||
-        api->present == NULL)
+    if (!g_render_settings.enabled || !g_last_frame_valid ||
+        g_channel_api == NULL || api->present == NULL ||
+        g_ownership.grayscale_held)
         return;
-    if (!hwr_composite_grayscale(
-            &g_composite, api, &g_last_frame, &g_world)) {
+    lut = hwr_ownership_grayscale_lut(api);
+    if (lut == NULL ||
+        !hwr_composite_grayscale_baseline(&g_composite, lut, &g_last_frame)) {
         /* The authentic call has already remapped the engine framebuffer.
          * Reveal that safe 8bpp fallback instead of leaving a color RGBA
          * frame underneath grayscale chrome. */
         hwr_withdraw_if_owned(api);
         return;
     }
-    result = api->present->submit_world_frame(g_channel_api, &g_last_frame);
-    if (result == ROTH_OK) {
-        g_channel_owned = 1;
-    } else {
-        if (result != ROTH_ERR_NOT_OWNER)
-            fprintf(stderr,
-                    "[renderer_overhaul] grayscale world submit failed: rc=%d\n",
-                    (int)result);
+    g_ownership.grayscale_held = 1;
+    hwr_refresh_held_palette(api);
+    if (!g_ownership.present_grayscale || !hwr_submit_frame(api, &g_last_frame))
         hwr_withdraw_if_owned(api);
-    }
 }
 
 /* The centered 4:3 engine layer and the wide world occupy the same physical
@@ -1164,12 +1356,23 @@ static uint32_t ROTH_CDECL hwr_render_world_view(
     return result;
 }
 
+/* Cursor mapping follows the canvas, not the image on it: the host maps the
+ * pointer across whatever canvas is being composited, and that keeps being the
+ * mod's while an engine screen is passed through it. Keying these on the
+ * published canvas rather than on holding a hardware image is what keeps the
+ * option lists between cutscenes clickable. */
+static int hwr_canvas_published(void)
+{
+    return g_render_settings.enabled && g_channel_owned &&
+           g_last_frame_geometry_valid;
+}
+
 static void ROTH_CDECL hwr_run_gameplay_frame(
     struct roth_chain *chain, const struct roth_api_v1 *api)
 {
     int centered;
 
-    if (!g_render_settings.enabled || !g_last_frame_valid) {
+    if (!hwr_canvas_published()) {
         roth_next_run_gameplay_frame(chain);
         return;
     }
@@ -1197,7 +1400,7 @@ static void ROTH_CDECL hwr_handle_cursor_click(
 {
     struct hwr_input_route route;
 
-    if (!g_render_settings.enabled || !g_last_frame_valid ||
+    if (!hwr_canvas_published() ||
         g_last_frame.composite_mode !=
             ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS ||
         !hwr_input_prepare_ui_route(
@@ -1223,7 +1426,7 @@ static void ROTH_CDECL hwr_draw_current_mouse_cursor_sprite(
 {
     struct hwr_input_route route;
 
-    if (!g_render_settings.enabled || !g_last_frame_valid ||
+    if (!hwr_canvas_published() ||
         g_last_frame.composite_mode !=
             ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS ||
         !hwr_input_prepare_ui_draw_route(
@@ -1242,27 +1445,45 @@ static void ROTH_CDECL hwr_draw_current_mouse_cursor_sprite(
 static int hwr_submit_gdv_brightness(
     const struct roth_api_v1 *api, uint32_t multiplier)
 {
-    int32_t result;
-
+    /* Only meaningful while the mod still holds an image: once an engine
+     * routine has taken the screen there is nothing of the mod's on it to
+     * fade. */
     if (!g_last_frame_valid || g_channel_api == NULL ||
-        api->present == NULL)
+        api->present == NULL ||
+        g_ownership.state == HWR_OWNER_ENGINE_SCREEN)
         return 0;
     if (!hwr_composite_apply_brightness(
             &g_composite, &g_last_frame, multiplier)) {
         hwr_withdraw_if_owned(api);
         return -1;
     }
-    result = api->present->submit_world_frame(g_channel_api, &g_last_frame);
-    if (result != ROTH_OK) {
-        if (result != ROTH_ERR_NOT_OWNER)
-            fprintf(stderr,
-                    "[renderer_overhaul] palette-effect submit failed: rc=%d\n",
-                    (int)result);
+    if (!hwr_submit_frame(api, &g_last_frame)) {
         hwr_withdraw_if_owned(api);
         return -1;
     }
-    g_channel_owned = 1;
     return 1;
+}
+
+/* Video playback publishes its own display surface instead of drawing into the
+ * engine framebuffer, so nothing in game memory describes what is on screen and
+ * the only correct answer is to stop compositing for its duration. Handing the
+ * screen back leaves the canvas description standing, so the sequence's own
+ * screen transitions are presented on the canvas they started from. */
+static uint32_t ROTH_CDECL hwr_play_gdv_cutscene(
+    struct roth_chain *chain, const struct roth_api_v1 *api,
+    uint32_t eax, uint32_t edx, uint32_t ebx, uint32_t ecx)
+{
+    uint32_t result;
+    int had_canvas = g_last_frame_geometry_valid;
+
+    hwr_ownership_enter(&g_ownership, HWR_OWNER_ENGINE_SCREEN,
+                        "video playback owns the display");
+    hwr_withdraw_if_owned(api);
+    result = roth_next_play_gdv_cutscene(chain, eax, edx, ebx, ecx);
+    hwr_ownership_enter(&g_ownership,
+                        had_canvas ? HWR_OWNER_PASSTHROUGH : HWR_OWNER_SOFTWARE,
+                        "video playback finished");
+    return result;
 }
 
 static void ROTH_CDECL hwr_gdv_clear_vga_palette(
@@ -1300,6 +1521,18 @@ static void ROTH_CDECL hwr_upload_palette_dac(
     g_gdv_palette_effect_active = 0;
 }
 
+/* The present entry: called immediately before every page flip, from every
+ * screen the engine drives, including the blocking screen-slide loops that no
+ * per-frame callback reaches. Running after the chain reads the framebuffer in
+ * its final state for this present, and the submission still lands before the
+ * flip that publishes it. */
+static void ROTH_CDECL hwr_flush_dirty_rects(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    roth_next_flush_dirty_rects(chain);
+    hwr_present_seam(api);
+}
+
 static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
 {
     const char *plugin_dir;
@@ -1322,6 +1555,7 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
             snprintf(g_obj_dump_path, sizeof g_obj_dump_path, "%s", obj_dump);
     }
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
+    hwr_ownership_init(&g_ownership);
     hwr_settings_init_defaults();
     if (hwr_settings_register_apply(hwr_render_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_data_settings_apply, NULL) != 0 ||
@@ -1344,8 +1578,10 @@ static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
     } else {
         if (g_watchdog_stall_count < UINT32_MAX)
             g_watchdog_stall_count++;
+        /* Backstop for the few page flips that are not preceded by the present
+         * entry; the state machine still decides what such a present carries. */
         if (g_watchdog_stall_count >= 2)
-            hwr_resubmit_if_stalled(api);
+            hwr_present_seam(api);
     }
 }
 
@@ -1362,10 +1598,10 @@ static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
     }
     if (g_poll_stall_count < UINT32_MAX)
         g_poll_stall_count++;
-    /* Menus poll the mouse while the frame pump may idle, so this seam also carries the
-     * frozen-frame re-submission; the throttle keeps the copied frames cheap. */
+    /* Same backstop as the frame pump: the present entry carries the ordinary
+     * cadence, and the throttle keeps this cheap where it does not. */
     if (g_poll_stall_count >= 4 && ((g_poll_throttle++) & 3u) == 0)
-        hwr_resubmit_if_stalled(api);
+        hwr_present_seam(api);
 }
 
 /* (Re)loads every mod-side map dependency: archives, geometry snapshot, colour
@@ -1505,9 +1741,15 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
      * int33 pump and can land while a world render (hwr_scene_build_mesh) is on
      * the stack, so an inline hwr_world_snapshot would free and reallocate
      * g_world's geometry under the running mesh builder -- a use-after-free.
-     * Withdraw the now-stale GL frame and defer the re-snapshot to the render
-     * dispatch's safe point, keeping only the newest generation. */
-    hwr_withdraw_if_owned(api);
+     * Defer the re-snapshot to the render dispatch's safe point, keeping only
+     * the newest generation.
+     *
+     * The published image is deliberately NOT taken down here. Loading a map
+     * touches no screen state at all in the original -- the last presented
+     * frame simply stands until the new map's first one is flipped -- so the
+     * transition is carried by leaving that frame standing and handing the
+     * viewport to the engine, not by taking the screen away. */
+    (void)api;
     g_map_reload_generation = event->generation;
     g_map_reload_pending = 1;
 }
@@ -1521,17 +1763,20 @@ static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
                 event->generation, event->pixel_w, event->pixel_h);
         logged = 1;
     }
-    hwr_withdraw_if_owned(api);
+    /* The canvas description itself is no longer valid, so this is the one
+     * event that gives the screen back completely. */
+    hwr_enter_software(api, "the video mode changed");
 }
 
 static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
-    hwr_withdraw_if_owned(api);
+    hwr_enter_software(api, "the renderer is unloading");
     hwr_map_data_clear(0);
     hwr_objects_clear(&g_objects);
     hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();
     hwr_composite_clear(&g_composite);
+    hwr_ownership_clear(&g_ownership);
     g_channel_api = NULL;
     g_api = NULL;
     g_plugin_dir[0] = 0;
@@ -1571,6 +1816,10 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
                               hwr_gdv_write_scaled_palette, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_upload_palette_dac,
                               hwr_upload_palette_dac, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_play_gdv_cutscene,
+                              hwr_play_gdv_cutscene, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_flush_dirty_rects,
+                              hwr_flush_dirty_rects, 0) != 0;
     if (failures != 0)
         fprintf(stderr, "[renderer_overhaul] %d override registration(s) failed\n", failures);
 }

@@ -31,31 +31,59 @@ static int hwr_arithmetic_shift_8(int value)
     return value >= 0 ? value / 256 : -((-value + 255) / 256);
 }
 
-uint32_t hwr_composite_palette_argb(const struct hwr_world *world,
-                                    unsigned index)
-{
-    int32_t counter = world->luts.damage_flash_level;
-    int fade = 0xff - (int)counter;
-    int r = world->luts.palette[index * 3u];
-    int g = world->luts.palette[index * 3u + 1u];
-    int b = world->luts.palette[index * 3u + 2u];
+/* The palette every consumer of the submitted world image shares: the renderer
+ * resolves through it, the index baseline is quantized against it, and the save
+ * thumbnail reduces through it. It is published rather than recomputed because
+ * palette-level effects are live engine state, and a held image outlives the
+ * render that produced it. */
+static uint32_t g_present_argb[256];
+static int g_present_valid;
 
+void hwr_composite_publish_palette(const uint8_t palette_rgb[768],
+                                   const uint8_t *grayscale_lut,
+                                   int32_t damage_level,
+                                   uint8_t rgba_out[1024])
+{
+    int fade = 0xff - (int)damage_level;
+    unsigned i;
+
+    if (palette_rgb == NULL)
+        return;
     /* upload_palette_dac (video_display.c:344-362) uploads the palette
      * untouched while the pain accumulator is zero, and otherwise collapses it
      * toward dark red with fade = 0xff - counter held at zero from below. The
      * accumulator runs to 0x164, so a heavy hit saturates the tint instead of
      * coming back out of it. */
-    if (counter != 0) {
-        if (fade < 0)
-            fade = 0;
-        r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
-        g = (g * fade) >> 8;
-        b = (b * fade) >> 8;
+    if (damage_level != 0 && fade < 0)
+        fade = 0;
+    for (i = 0; i < 256u; i++) {
+        unsigned source = grayscale_lut != NULL ? grayscale_lut[i] : i;
+        int r = palette_rgb[source * 3u];
+        int g = palette_rgb[source * 3u + 1u];
+        int b = palette_rgb[source * 3u + 2u];
+        if (damage_level != 0) {
+            r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
+            g = (g * fade) >> 8;
+            b = (b * fade) >> 8;
+        }
+        g_present_argb[i] = 0xff000000u |
+                            ((uint32_t)(uint8_t)(r << 2) << 16) |
+                            ((uint32_t)(uint8_t)(g << 2) << 8) |
+                            (uint32_t)(uint8_t)(b << 2);
+        if (rgba_out != NULL) {
+            rgba_out[i * 4u] = (uint8_t)(r << 2);
+            rgba_out[i * 4u + 1u] = (uint8_t)(g << 2);
+            rgba_out[i * 4u + 2u] = (uint8_t)(b << 2);
+            rgba_out[i * 4u + 3u] = 0xffu;
+        }
     }
-    return 0xff000000u |
-           ((uint32_t)(uint8_t)(r << 2) << 16) |
-           ((uint32_t)(uint8_t)(g << 2) << 8) |
-           (uint32_t)(uint8_t)(b << 2);
+    g_present_valid = 1;
+}
+
+uint32_t hwr_composite_present_argb(unsigned index)
+{
+    return g_present_valid && index < 256u ? g_present_argb[index]
+                                           : 0xff000000u;
 }
 
 uint8_t hwr_composite_palette_index(uint32_t pixel,
@@ -93,14 +121,13 @@ static uint32_t hwr_palette_hash_slot(uint32_t pixel)
     return ((pixel ^ (pixel >> 13)) * 2654435761u) & 511u;
 }
 
-static void hwr_palette_hash_build(struct hwr_palette_hash *map,
-                                   const struct hwr_world *world)
+static void hwr_palette_hash_build(struct hwr_palette_hash *map)
 {
     unsigned i;
     memset(map, 0, sizeof *map);
     for (i = 0; i < 256u; i++) {
         uint32_t slot;
-        map->palette[i] = hwr_composite_palette_argb(world, i);
+        map->palette[i] = hwr_composite_present_argb(i);
         slot = hwr_palette_hash_slot(map->palette[i]);
         while (map->slots[slot] != 0 &&
                map->palette[map->slots[slot] - 1u] != map->palette[i])
@@ -108,25 +135,6 @@ static void hwr_palette_hash_build(struct hwr_palette_hash *map,
         if (map->slots[slot] == 0)
             map->slots[slot] = (uint16_t)(i + 1u);
     }
-}
-
-static uint8_t hwr_palette_hash_index(const struct hwr_palette_hash *map,
-                                      uint32_t pixel)
-{
-    uint32_t slot;
-    uint32_t start;
-    pixel |= 0xff000000u;
-    slot = hwr_palette_hash_slot(pixel);
-    start = slot;
-    while (map->slots[slot] != 0) {
-        uint16_t value = map->slots[slot];
-        if (map->palette[value - 1u] == pixel)
-            return (uint8_t)(value - 1u);
-        slot = (slot + 1u) & 511u;
-        if (slot == start)
-            break;
-    }
-    return hwr_composite_palette_index(pixel, map->palette);
 }
 
 static uint32_t hwr_palette_cube_slot(uint32_t pixel)
@@ -354,7 +362,7 @@ int hwr_composite_prepare(struct hwr_composite *composite,
         composite->engine_source_y_capacity = frame->vh;
     }
     source = (const uint32_t *)frame->pixels;
-    hwr_palette_hash_build(&palette, world);
+    hwr_palette_hash_build(&palette);
     if (!hwr_palette_cube_build(composite, &palette))
         return 0;
     /* The mapping is separable: source X depends only on engine X and source Y
@@ -397,51 +405,73 @@ int hwr_composite_prepare(struct hwr_composite *composite,
     return 1;
 }
 
-int hwr_composite_grayscale(struct hwr_composite *composite,
-                            const struct roth_api_v1 *api,
-                            struct roth_world_frame_v1 *frame,
-                            const struct hwr_world *world)
+int hwr_composite_engine_shadow(struct hwr_composite *composite,
+                                const struct roth_api_v1 *api,
+                                struct roth_world_frame_v1 *frame)
 {
-    struct hwr_palette_hash palette;
-    const uint8_t *lut;
-    const uint32_t *source;
+    uintptr_t framebuffer;
+    uint32_t pitch;
+    uint32_t screen_height;
+    size_t required;
+    uint32_t y;
+    uint32_t x;
+
+    if (composite == NULL || api == NULL || api->game_ram == NULL ||
+        frame == NULL || frame->vx < 0 || frame->vy < 0 ||
+        frame->vw == 0 || frame->vh == 0)
+        return 0;
+    pitch = api->game_ram->u32(VA_G_SCREEN_PITCH);
+    screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
+    if (pitch == 0 || pitch > 4096u || screen_height == 0 ||
+        screen_height > 4096u ||
+        (uint32_t)frame->vx >= pitch ||
+        frame->vw > pitch - (uint32_t)frame->vx ||
+        (uint32_t)frame->vy >= screen_height ||
+        frame->vh > screen_height - (uint32_t)frame->vy)
+        return 0;
+    framebuffer = (uintptr_t)api->game_ram->u32(VA_G_FRAMEBUFFER_PTR);
+    if (framebuffer == 0)
+        return 0;
+
+    required = (size_t)frame->vw * frame->vh;
+    if (required > composite->engine_shadow_capacity) {
+        uint8_t *next = (uint8_t *)realloc(composite->engine_shadow, required);
+        if (next == NULL)
+            return 0;
+        composite->engine_shadow = next;
+        composite->engine_shadow_capacity = required;
+    }
+    /* Flipping a bit of each live index yields a plane no live pixel can match,
+     * whatever the engine has drawn, so the reveal test never fires and the
+     * engine layer stays opaque across the whole viewport. */
+    for (y = 0; y < frame->vh; y++) {
+        const uint8_t *row = (const uint8_t *)framebuffer +
+            (size_t)((uint32_t)frame->vy + y) * pitch + (uint32_t)frame->vx;
+        uint8_t *out = composite->engine_shadow + (size_t)y * frame->vw;
+        for (x = 0; x < frame->vw; x++)
+            out[x] = (uint8_t)(row[x] ^ 1u);
+    }
+    frame->engine_base_pixels = composite->engine_shadow;
+    frame->engine_base_pitch_bytes = frame->vw;
+    return 1;
+}
+
+int hwr_composite_grayscale_baseline(struct hwr_composite *composite,
+                                     const uint8_t lut[256],
+                                     const struct roth_world_frame_v1 *frame)
+{
     size_t pixels;
     size_t i;
 
-    if (composite == NULL || api == NULL || api->game_ram == NULL ||
-        frame == NULL || world == NULL || !world->valid || !world->luts.valid ||
-        frame->pixels == NULL || frame->engine_base_pixels == NULL)
+    if (composite == NULL || lut == NULL || frame == NULL ||
+        composite->engine_base == NULL ||
+        frame->engine_base_pixels != composite->engine_base)
         return 0;
-    if (composite->effect_active == 1 &&
-        frame->pixels == composite->effect_pixels)
-        return 1;
-    lut = (const uint8_t *)api->game_ram->to_ptr(VA_G_VIEW_GRAYSCALE_LUT);
-    if (lut == NULL)
-        return 0;
-    pixels = (size_t)frame->w * frame->h;
-    if (pixels > composite->effect_capacity) {
-        uint32_t *next = (uint32_t *)realloc(
-            composite->effect_pixels, pixels * sizeof(uint32_t));
-        if (next == NULL)
-            return 0;
-        composite->effect_pixels = next;
-        composite->effect_capacity = pixels;
-    }
-    hwr_palette_hash_build(&palette, world);
-    source = (const uint32_t *)frame->pixels;
-    for (i = 0; i < pixels; i++) {
-        uint8_t index = hwr_palette_hash_index(&palette, source[i]);
-        composite->effect_pixels[i] =
-            palette.palette[lut[index]];
-    }
     pixels = (size_t)frame->vw * frame->vh;
+    if (pixels > composite->engine_base_capacity)
+        return 0;
     for (i = 0; i < pixels; i++)
         composite->engine_base[i] = lut[composite->engine_base[i]];
-
-    frame->pixels = composite->effect_pixels;
-    frame->engine_base_pixels = composite->engine_base;
-    frame->engine_base_pitch_bytes = frame->vw;
-    composite->effect_active = 1;
     return 1;
 }
 
@@ -501,6 +531,7 @@ void hwr_composite_clear(struct hwr_composite *composite)
     if (composite == NULL)
         return;
     free(composite->engine_base);
+    free(composite->engine_shadow);
     free(composite->engine_source_x);
     free(composite->engine_source_y);
     free(composite->palette_cube);

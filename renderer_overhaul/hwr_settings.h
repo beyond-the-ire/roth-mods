@@ -28,7 +28,6 @@ enum hwr_render_mode {
 struct hwr_settings {
     int enabled;
     int debug;
-    uint32_t solid_color;
     uint32_t internal_w;
     uint32_t internal_h;
     enum hwr_window_mode window_mode;
@@ -46,7 +45,6 @@ struct hwr_settings {
 
 enum hwr_settings_change {
     HWR_CHANGE_ENABLED          = 1u << 0,
-    HWR_CHANGE_SOLID_COLOR      = 1u << 1,
     HWR_CHANGE_INTERNAL_SIZE    = 1u << 2,
     HWR_CHANGE_WINDOW_MODE      = 1u << 3,
     HWR_CHANGE_PRESENT_MODE     = 1u << 4,
@@ -73,7 +71,6 @@ void hwr_settings_apply_pending(void);
 void hwr_settings_set_enabled(int enabled);
 void hwr_settings_set_debug(int debug);
 void hwr_settings_set_shade_depth_scale(float scale);
-void hwr_settings_set_solid_color(uint32_t color);
 void hwr_settings_set_internal_size(uint32_t width, uint32_t height);
 void hwr_settings_set_window_mode(enum hwr_window_mode mode);
 void hwr_settings_set_present_mode(enum hwr_present_mode mode);
