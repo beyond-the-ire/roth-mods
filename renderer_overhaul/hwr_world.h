@@ -107,7 +107,10 @@ struct hwr_luts {
     uint8_t tint[0x2000];
     uint8_t glow[0x200];
     uint8_t blend[0x10000];
-    uint8_t damage_flash_level;
+    /* The pain accumulator is a signed dword the engine clamps to 0x164
+     * (apply_direct_damage_to_player, weapon_combat.c:34-38), so a heavy hit
+     * carries it far past a byte and the low byte alone reads as a light one. */
+    int32_t damage_flash_level;
     uint16_t shade_level;
     uint16_t tint_shade_level;
     /* Per-map solid-fill colour word (g_das_palette_remap_prefix, loaded from the

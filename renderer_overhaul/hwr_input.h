@@ -47,6 +47,14 @@ int hwr_input_prepare_ui_route(const struct roth_api_v1 *api,
                                uint32_t target_height,
                                int centered_engine_layer,
                                struct hwr_input_route *route);
+/* As above over a centred engine layer, except that a cursor outside that
+ * layer keeps its signed engine-local coordinate instead of being parked off
+ * screen: a draw that clamps for itself has to know which edge the cursor left
+ * by. */
+int hwr_input_prepare_ui_draw_route(const struct roth_api_v1 *api,
+                                    uint32_t target_width,
+                                    uint32_t target_height,
+                                    struct hwr_input_route *route);
 void hwr_input_set_hud_mouse(const struct roth_api_v1 *api,
                              const struct hwr_input_route *route);
 void hwr_input_set_world_mouse(const struct roth_api_v1 *api,

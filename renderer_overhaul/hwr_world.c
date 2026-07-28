@@ -662,7 +662,8 @@ int hwr_world_refresh_lut_state(struct hwr_world *world,
 {
     if (world == NULL || api == NULL || api->game_ram == NULL)
         return -1;
-    world->luts.damage_flash_level = api->game_ram->u8(VA_G_DAMAGE_FLASH_LEVEL);
+    world->luts.damage_flash_level =
+        (int32_t)api->game_ram->u32(VA_G_DAMAGE_FLASH_LEVEL);
     world->luts.shade_level = api->game_ram->u16(VA_G_SHADE_LEVEL);
     world->luts.tint_shade_level = api->game_ram->u16(VA_G_TINT_SHADE_LEVEL);
     world->luts.fill_index = api->game_ram->u16(VA_G_DAS_FILL_INDEX);

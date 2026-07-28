@@ -1210,6 +1210,32 @@ static void ROTH_CDECL hwr_handle_cursor_click(
     hwr_input_restore_world_cursor(api, &route);
 }
 
+/* The held inventory icon is drawn by the engine straight at the engine mouse
+ * (draw_current_mouse_cursor_sprite, blit_2d.c:1179-1210), so it lands in the
+ * 4:3 chrome layer while the published cursor lives in full-canvas space and
+ * the two separate horizontally. Localize the mouse for the draw the same way
+ * the hit test is localized. The coordinate stays unclamped on purpose: the
+ * engine pins the icon to its own screen edges (blit_2d.c:1188-1191), so a
+ * cursor out in a wing leaves the icon at the near border rather than the far
+ * one. */
+static void ROTH_CDECL hwr_draw_current_mouse_cursor_sprite(
+    struct roth_chain *chain, const struct roth_api_v1 *api)
+{
+    struct hwr_input_route route;
+
+    if (!g_render_settings.enabled || !g_last_frame_valid ||
+        g_last_frame.composite_mode !=
+            ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS ||
+        !hwr_input_prepare_ui_draw_route(
+            api, g_last_frame.w, g_last_frame.h, &route)) {
+        roth_next_draw_current_mouse_cursor_sprite(chain);
+        return;
+    }
+    hwr_input_set_hud_mouse(api, &route);
+    roth_next_draw_current_mouse_cursor_sprite(chain);
+    hwr_input_restore_world_cursor(api, &route);
+}
+
 /* Apply the exact brightness multiplier the GDV fade has just written to the
  * VGA palette. Returns one when a frame was submitted, zero when no hardware
  * frame is active, and minus one after falling back to authentic 8bpp. */
@@ -1457,8 +1483,9 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         fprintf(stderr, "  archives: map_entries=%u shared_entries=%u (referenced entries decode on scene upload)\n",
                 (unsigned)g_map_archive.entry_count,
                 (unsigned)g_shared_archive.entry_count);
-        fprintf(stderr, "  color tables: palette=768 colormap=8192 tint=8192 glow=512 blend=65536 damage=%u shade=%u/%u\n",
-                g_world.luts.damage_flash_level, g_world.luts.shade_level,
+        fprintf(stderr, "  color tables: palette=768 colormap=8192 tint=8192 glow=512 blend=65536 damage=%ld shade=%u/%u\n",
+                (long)g_world.luts.damage_flash_level,
+                g_world.luts.shade_level,
                 g_world.luts.tint_shade_level);
     }
     g_luts_recheck_pending = 1;
@@ -1523,6 +1550,9 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
                               hwr_run_gameplay_frame, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_handle_cursor_click,
                               hwr_handle_cursor_click, 0) != 0;
+    failures += roth_override(registrar,
+                              ROTH_FN_draw_current_mouse_cursor_sprite,
+                              hwr_draw_current_mouse_cursor_sprite, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_draw_world_surface_spans,
                               hwr_draw_world_surface_spans, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_draw_scaled_sprite_spans,

@@ -34,14 +34,24 @@ static int hwr_arithmetic_shift_8(int value)
 uint32_t hwr_composite_palette_argb(const struct hwr_world *world,
                                     unsigned index)
 {
-    int fade = 0xff - world->luts.damage_flash_level;
+    int32_t counter = world->luts.damage_flash_level;
+    int fade = 0xff - (int)counter;
     int r = world->luts.palette[index * 3u];
     int g = world->luts.palette[index * 3u + 1u];
     int b = world->luts.palette[index * 3u + 2u];
 
-    r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
-    g = (g * fade) >> 8;
-    b = (b * fade) >> 8;
+    /* upload_palette_dac (video_display.c:344-362) uploads the palette
+     * untouched while the pain accumulator is zero, and otherwise collapses it
+     * toward dark red with fade = 0xff - counter held at zero from below. The
+     * accumulator runs to 0x164, so a heavy hit saturates the tint instead of
+     * coming back out of it. */
+    if (counter != 0) {
+        if (fade < 0)
+            fade = 0;
+        r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
+        g = (g * fade) >> 8;
+        b = (b * fade) >> 8;
+    }
     return 0xff000000u |
            ((uint32_t)(uint8_t)(r << 2) << 16) |
            ((uint32_t)(uint8_t)(g << 2) << 8) |

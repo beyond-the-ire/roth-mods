@@ -33,9 +33,15 @@
 #define HWR_SECTOR_CEILING_FLIP_X (1u << 10)
 #define HWR_SECTOR_CEILING_FLIP_Y (1u << 11)
 
+/* World coordinates are modular int16: the only place one becomes linear is the
+ * view transform's 16-bit add (renderer.c:6767-6770,
+ * transform_map_vertices_to_view), which the vertex shader mirrors.  A sector
+ * loop may therefore be authored across the wrap, so triangulation runs on
+ * coordinates unwrapped into a wider type; casting a component back to int16
+ * recovers the authored word exactly. */
 struct hwr_point {
-    int16_t x;
-    int16_t y;
+    int32_t x;
+    int32_t y;
 };
 
 struct hwr_scene_texture_stats {
@@ -548,6 +554,8 @@ static int hwr_emit_doors(struct hwr_scene_mesh *mesh,
             uint8_t a = endpoint_a[fi];
             uint8_t b = endpoint_b[fi];
             uint16_t extent = face->extent;
+            int32_t leaf_height = (int16_t)face->vertical_extent;
+            int16_t top_z;
             float row[4];
             float column[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
             float row_scale = 1.0f;
@@ -555,8 +563,28 @@ static int hwr_emit_doors(struct hwr_scene_mesh *mesh,
             if (face->texture_id >= 0 &&
                 (uint16_t)face->texture_id == world->world_span_colorkey)
                 continue;
-            if (sector->ceiling_z <= sector->floor_z)
+            /* A door leaf is not the opening it fills. The engine authors one
+             * height word per door at spawn -- the owner sector's ceiling minus
+             * floor, or -(texture_map_override * 4) when the reference corner
+             * carries TRANSPARENT together with TRANSPARENT_FIXED_SIZE
+             * (setup_door_swing_geometry, doors.c:534-545) -- and stamps it
+             * into all four of the leaf's quad points (doors.c:566-575). The
+             * leaf then draws through the object-mesh pipeline, whose vertex
+             * height is that point word plus the base height the caller passes
+             * (project_sprite_to_render_queue, render_world.c:645-652); for a
+             * door that base is the owner sector's FLOOR taken relative to the
+             * eye (renderer.c:6440-6446). The mirrored lower points keep the
+             * pool-init zero (doors.c:140-176), so the leaf stands ON the floor
+             * and reaches floor + height -- which is exactly the ceiling for
+             * every door that took the default. The same word is also the
+             * leaf's vertical mapping extent (doors.c:278 read back at
+             * renderer.c:13117), so a shortened leaf keeps a texture that spans
+             * it end to end and the fit below needs no rescale. A leaf with no
+             * positive height has nothing to draw. */
+            if (leaf_height <= 0)
                 continue;
+            top_z = (int16_t)((uint16_t)sector->floor_z +
+                              (uint16_t)leaf_height);
             if (extent == 0)
                 extent = hwr_wall_length(
                     door->corner_x[a], door->corner_y[a],
@@ -605,13 +633,13 @@ static int hwr_emit_doors(struct hwr_scene_mesh *mesh,
                 surface->flags |= HWR_SURFACE_MASKED;
             v = mesh->vertices + mesh->vertex_count;
             hwr_set_vertex(&v[0], door->corner_x[a], door->corner_y[a],
-                           sector->ceiling_z, row[0], column[0]);
+                           top_z, row[0], column[0]);
             hwr_set_vertex(&v[1], door->corner_x[b], door->corner_y[b],
-                           sector->ceiling_z, row[1], column[1]);
+                           top_z, row[1], column[1]);
             hwr_set_vertex(&v[2], door->corner_x[b], door->corner_y[b],
                            sector->floor_z, row[2], column[2]);
             hwr_set_vertex(&v[3], door->corner_x[a], door->corner_y[a],
-                           sector->ceiling_z, row[0], column[0]);
+                           top_z, row[0], column[0]);
             hwr_set_vertex(&v[4], door->corner_x[b], door->corner_y[b],
                            sector->floor_z, row[2], column[2]);
             hwr_set_vertex(&v[5], door->corner_x[a], door->corner_y[a],
@@ -800,11 +828,21 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
         order[2] = triangles[i * 3u + (face_down ? 1u : 2u)];
         for (k = 0; k < 3; k++) {
             const struct hwr_point *point = &points[order[k]];
-            hwr_set_vertex(&vertices[i * 3u + k], point->x, point->y, z, 0.0f, 0.0f);
+            hwr_set_vertex(&vertices[i * 3u + k],
+                           (int16_t)(uint16_t)point->x,
+                           (int16_t)(uint16_t)point->y, z, 0.0f, 0.0f);
         }
     }
     mesh->vertex_count += count;
     return 0;
+}
+
+/* Signed distance between two authored world coordinates. The world->view
+ * transform is a 16-bit add (renderer.c:6767-6770), so a difference that
+ * overflows the word is the short way round, not a map-sized span. */
+static int32_t hwr_wrap16(int32_t value)
+{
+    return (int32_t)(int16_t)(uint16_t)value;
 }
 
 static int hwr_build_sector_flats(struct hwr_scene_mesh *mesh,
@@ -814,33 +852,66 @@ static int hwr_build_sector_flats(struct hwr_scene_mesh *mesh,
 {
     struct hwr_point *points;
     uint16_t *triangles;
-    size_t count = sector->wall_count;
+    size_t wall_count = sector->wall_count;
+    size_t count;
     size_t i;
     int result = 0;
-    if (count < 3)
+    if (wall_count < 3)
         goto degenerate;
-    points = (struct hwr_point *)malloc(count * sizeof *points);
-    triangles = (uint16_t *)malloc((count - 2u) * 3u * sizeof *triangles);
+    points = (struct hwr_point *)malloc(wall_count * sizeof *points);
+    triangles = (uint16_t *)malloc((wall_count - 2u) * 3u * sizeof *triangles);
     if (points == NULL || triangles == NULL) {
         free(points);
         free(triangles);
         return hwr_mesh_fail(mesh, "out of memory triangulating sector %u",
                              (unsigned)sector_index);
     }
-    for (i = 0; i < count; i++) {
+    /* Walk the loop by wrapped edge deltas so a loop authored across the
+     * coordinate wrap becomes a simple polygon in linear space. The emitted
+     * vertices are cast back to the authored words, so only the triangulation
+     * sees the unwrapped run. */
+    for (i = 0; i < wall_count; i++) {
         const struct hwr_wall *wall = &world->walls[sector->first_wall + i];
         const struct hwr_wall *next = &world->walls[
-            sector->first_wall + (i + 1u) % count];
+            sector->first_wall + (i + 1u) % wall_count];
         const struct hwr_vertex *vertex = &world->vertices[wall->vertex_a_index];
         if (wall->vertex_b_index != next->vertex_a_index) {
             free(points);
             free(triangles);
             goto degenerate;
         }
-        points[i].x = vertex->world_x;
-        points[i].y = vertex->world_y;
+        if (i == 0) {
+            points[0].x = vertex->world_x;
+            points[0].y = vertex->world_y;
+        } else {
+            const struct hwr_vertex *previous = &world->vertices[
+                world->walls[sector->first_wall + i - 1u].vertex_a_index];
+            points[i].x = points[i - 1u].x +
+                hwr_wrap16((int32_t)vertex->world_x -
+                           (int32_t)previous->world_x);
+            points[i].y = points[i - 1u].y +
+                hwr_wrap16((int32_t)vertex->world_y -
+                           (int32_t)previous->world_y);
+        }
     }
-    if (hwr_triangulate(points, count, triangles) != 0) {
+    /* A moving sector parks its shared vertices exactly on a neighbour's own
+     * vertices when it reaches a travel endpoint, which leaves consecutive
+     * loop points coincident for as long as it waits there. The engine has no
+     * polygon-validity test: a coincident pair is simply a zero-length edge in
+     * its span walk and the sector keeps drawing. Compact those points away
+     * rather than rejecting the loop; only a loop left with fewer than three
+     * distinct points has genuinely no area. */
+    count = 0;
+    for (i = 0; i < wall_count; i++) {
+        if (count != 0 && points[i].x == points[count - 1u].x &&
+            points[i].y == points[count - 1u].y)
+            continue;
+        points[count++] = points[i];
+    }
+    while (count > 1u && points[0].x == points[count - 1u].x &&
+           points[0].y == points[count - 1u].y)
+        count--;
+    if (count < 3u || hwr_triangulate(points, count, triangles) != 0) {
         free(points);
         free(triangles);
         goto degenerate;
@@ -4054,15 +4125,25 @@ static int hwr_arithmetic_shift_8(int value)
 
 static void hwr_build_palette(const struct hwr_world *world, uint8_t rgba[1024])
 {
-    int fade = 0xff - world->luts.damage_flash_level;
+    int32_t counter = world->luts.damage_flash_level;
+    int fade = 0xff - (int)counter;
     unsigned i;
+    /* upload_palette_dac (video_display.c:344-362) uploads the palette
+     * untouched while the pain accumulator is zero, and otherwise collapses it
+     * toward dark red with fade = 0xff - counter held at zero from below. The
+     * accumulator runs to 0x164, so a heavy hit saturates the tint instead of
+     * coming back out of it. */
+    if (counter != 0 && fade < 0)
+        fade = 0;
     for (i = 0; i < 256; i++) {
         int r = world->luts.palette[i * 3u];
         int g = world->luts.palette[i * 3u + 1u];
         int b = world->luts.palette[i * 3u + 2u];
-        r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
-        g = (g * fade) >> 8;
-        b = (b * fade) >> 8;
+        if (counter != 0) {
+            r = hwr_arithmetic_shift_8((r - 0x2d) * fade) + 0x2d;
+            g = (g * fade) >> 8;
+            b = (b * fade) >> 8;
+        }
         rgba[i * 4u] = (uint8_t)(r << 2);
         rgba[i * 4u + 1u] = (uint8_t)(g << 2);
         rgba[i * 4u + 2u] = (uint8_t)(b << 2);

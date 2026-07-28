@@ -51,11 +51,15 @@ static uint16_t hwr_pick_focal(uint16_t target_focal,
     return (uint16_t)scaled;
 }
 
-int hwr_input_prepare_ui_route(const struct roth_api_v1 *api,
-                               uint32_t target_width,
-                               uint32_t target_height,
-                               int centered_engine_layer,
-                               struct hwr_input_route *route)
+/* park_off_layer picks what a cursor outside the centred engine layer becomes:
+ * the off-screen sentinel a hit test wants, or the plain signed engine-local
+ * coordinate a draw wants. */
+static int hwr_input_prepare_ui_route_ex(const struct roth_api_v1 *api,
+                                         uint32_t target_width,
+                                         uint32_t target_height,
+                                         int centered_engine_layer,
+                                         int park_off_layer,
+                                         struct hwr_input_route *route)
 {
     uint32_t screen_width;
     uint32_t screen_height;
@@ -101,10 +105,11 @@ int hwr_input_prepare_ui_route(const struct roth_api_v1 *api,
         engine_height = screen_height * scale;
         engine_left = ((double)target_width - engine_width) * 0.5;
         engine_top = ((double)target_height - engine_height) * 0.5;
-        if (canvas_x >= engine_left &&
-            canvas_x < engine_left + engine_width &&
-            canvas_y >= engine_top &&
-            canvas_y < engine_top + engine_height) {
+        if (!park_off_layer ||
+            (canvas_x >= engine_left &&
+             canvas_x < engine_left + engine_width &&
+             canvas_y >= engine_top &&
+             canvas_y < engine_top + engine_height)) {
             route->hud_x = hwr_round_i32(
                 (canvas_x - engine_left) * screen_width / engine_width);
             route->hud_y = hwr_round_i32(
@@ -118,6 +123,25 @@ int hwr_input_prepare_ui_route(const struct roth_api_v1 *api,
     }
     route->active = 1;
     return 1;
+}
+
+int hwr_input_prepare_ui_route(const struct roth_api_v1 *api,
+                               uint32_t target_width,
+                               uint32_t target_height,
+                               int centered_engine_layer,
+                               struct hwr_input_route *route)
+{
+    return hwr_input_prepare_ui_route_ex(
+        api, target_width, target_height, centered_engine_layer, 1, route);
+}
+
+int hwr_input_prepare_ui_draw_route(const struct roth_api_v1 *api,
+                                    uint32_t target_width,
+                                    uint32_t target_height,
+                                    struct hwr_input_route *route)
+{
+    return hwr_input_prepare_ui_route_ex(
+        api, target_width, target_height, 1, 0, route);
 }
 
 int hwr_input_prepare_route(const struct roth_api_v1 *api,
