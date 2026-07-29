@@ -18,6 +18,7 @@
 #include "hwr_util.h"
 #include "hwr_input.h"
 #include "hwr_composite.h"
+#include "hwr_chrome.h"
 #include "hwr_ownership.h"
 
 #include <signal.h>
@@ -138,6 +139,9 @@ static struct hwr_das_archive g_shared_archive;
 static struct hwr_scene g_scene;
 static struct hwr_backdrop g_backdrop;
 static struct hwr_composite g_composite;
+/* The rects the engine covers with window chrome, so the submitted baseline can
+ * be made unmatchable inside them and an opaque window stays opaque. */
+static struct hwr_chrome g_chrome;
 /* Raised when the backdrop still owes the index target its starting pixels. */
 static int g_backdrop_seed_pending;
 static int g_backdrop_error_logged;
@@ -550,6 +554,26 @@ static int hwr_submit_frame(const struct roth_api_v1 *api,
     return 1;
 }
 
+/* Submit with the window rects closed. The plane the engine framebuffer was
+ * seeded from stays exactly what it was -- only the copy handed to the present
+ * channel carries the stamp -- so everything else that reads the baseline (the
+ * grayscale remap, the save thumbnail) keeps seeing the plane that describes
+ * the world. Only the colour-bearing baseline is stamped; the whole-viewport
+ * unmatchable plane the engine-owned frames carry is already opaque everywhere
+ * and has nothing to close. */
+static int hwr_submit_frame_closed(const struct roth_api_v1 *api,
+                                   struct roth_world_frame_v1 *frame)
+{
+    struct roth_world_frame_v1 closed;
+
+    if (frame->engine_base_pixels != g_composite.engine_base)
+        return hwr_submit_frame(api, frame);
+    closed = *frame;
+    closed.engine_base_pixels =
+        hwr_chrome_baseline(&g_chrome, api, frame, g_composite.engine_base);
+    return hwr_submit_frame(api, &closed);
+}
+
 /* A wide source owns the whole canvas and the engine's own picture is centred
  * over it; an equal-aspect source is composited straight into the viewport. */
 static uint64_t hwr_composite_mode_for(uint32_t width, uint32_t height,
@@ -651,6 +675,31 @@ static void hwr_refresh_held_palette(const struct roth_api_v1 *api)
     g_ownership.present_grayscale = g_ownership.grayscale_held;
 }
 
+/* The world pass publishes its baseline before the engine draws the chrome for
+ * the same page, so a window standing over the world is not in the plane the
+ * host compares against. The present entry runs with the framebuffer in the
+ * state the page about to be published holds, which is where the rects can be
+ * closed exactly -- so republish the same image from here, and only when a
+ * window really needs closing, since republishing copies the frame again. */
+static void hwr_close_windows_on_published_frame(const struct roth_api_v1 *api)
+{
+    struct roth_world_frame_v1 frame;
+    const uint8_t *plane;
+
+    if (!g_render_settings.enabled || g_gl_permanently_failed ||
+        api->present == NULL || g_channel_api == NULL || !g_channel_owned ||
+        !g_last_frame_valid || g_ownership.state != HWR_OWNER_HARDWARE ||
+        g_last_frame.engine_base_pixels != g_composite.engine_base)
+        return;
+    plane = hwr_chrome_baseline(&g_chrome, api, &g_last_frame,
+                                g_composite.engine_base);
+    if (plane == g_composite.engine_base)
+        return;
+    frame = g_last_frame;
+    frame.engine_base_pixels = plane;
+    hwr_submit_frame(api, &frame);
+}
+
 /* Every present the render path did not already supply a frame for. A world
  * frame only reaches the screen paired with an engine page flip, and the host
  * drops one that stops being refreshed, so the mod's publishing cadence has to
@@ -663,8 +712,10 @@ static void hwr_present_seam(const struct roth_api_v1 *api)
         return;
     supplied = g_submitted_for_present;
     g_submitted_for_present = 0;
-    if (supplied)
+    if (supplied) {
+        hwr_close_windows_on_published_frame(api);
         return;
+    }
     if (!g_render_settings.enabled || g_gl_permanently_failed ||
         api->present == NULL || g_channel_api == NULL ||
         !g_last_frame_geometry_valid ||
@@ -689,7 +740,7 @@ static void hwr_present_seam(const struct roth_api_v1 *api)
     if (!g_channel_owned || !g_last_frame_valid)
         return;
     hwr_refresh_held_palette(api);
-    if (hwr_submit_frame(api, &g_last_frame))
+    if (hwr_submit_frame_closed(api, &g_last_frame))
         hwr_ownership_enter(&g_ownership, HWR_OWNER_FROZEN,
                             "the world pass is idle");
 }
@@ -1229,6 +1280,10 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
         uint64_t submit_start = getenv("HWR_FRAME_PERF") != NULL
                               ? hwr_perf_now_ns() : 0;
         uint64_t now;
+        /* Deliberately the plain submit: the baseline has just been written
+         * into the framebuffer, so the two agree everywhere and there is no
+         * chrome yet to tell apart. Windows standing over this frame are
+         * closed at the present entry, where the page is finished. */
         submitted = hwr_submit_frame(api, &frame);
         hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_SUBMIT);
         if (submit_start != 0) {
@@ -1491,6 +1546,65 @@ static void ROTH_CDECL hwr_draw_current_mouse_cursor_sprite(
     hwr_input_set_hud_mouse(api, &route);
     roth_next_draw_current_mouse_cursor_sprite(chain);
     hwr_input_restore_world_cursor(api, &route);
+}
+
+/* The engine's save-under seam. Every window saves the pixels it is about to
+ * cover before it covers them, and the rect it saves is the window plus its
+ * four-pixel drop shadow (menu_hud_ui.c:1435/1464, dialogue_ui.c:1378,
+ * inventory.c:1882) -- so this is the announcement of exactly where the engine
+ * is opaque, taken from the engine itself rather than guessed at. */
+static uint32_t ROTH_CDECL hwr_save_framebuffer_region(
+    struct roth_chain *chain, const struct roth_api_v1 *api,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t *cf_out)
+{
+    uint32_t handle =
+        roth_next_save_framebuffer_region(chain, x, y, width, height, cf_out);
+    hwr_chrome_record(&g_chrome, api, handle, x, y, width, height);
+    return handle;
+}
+
+/* Re-capturing what is under a window is the engine's way of drawing it again
+ * over fresh content (menu_hud_ui.c:270). */
+static uint32_t *ROTH_CDECL hwr_blit_save_region(
+    struct roth_chain *chain, const struct roth_api_v1 *api, uint32_t *pp)
+{
+    uint32_t *result = roth_next_blit_save_region(chain, pp);
+    (void)api;
+    hwr_chrome_cover(&g_chrome, (uint32_t)(uintptr_t)pp);
+    return result;
+}
+
+/* Putting the saved pixels back makes the region world again, so it stops being
+ * closed from here (renderer.c:1414). */
+static void ROTH_CDECL hwr_blit_descriptor_rows(
+    struct roth_chain *chain, const struct roth_api_v1 *api, uint32_t eax)
+{
+    (void)api;
+    roth_next_blit_descriptor_rows(chain, eax);
+    hwr_chrome_uncover(&g_chrome, eax);
+}
+
+/* Freeing the save-under block retires the handle for good; the pool zeroes the
+ * slot as it goes (renderer.c:10440-10448). */
+static uint32_t ROTH_CDECL hwr_pool_free_handle(
+    struct roth_chain *chain, const struct roth_api_v1 *api,
+    uint32_t *pool, uint32_t *handle)
+{
+    uint32_t result = roth_next_pool_free_handle(chain, pool, handle);
+    (void)api;
+    hwr_chrome_release(&g_chrome, (uint32_t)(uintptr_t)handle);
+    return result;
+}
+
+/* The window-frame draw. Watching it is what keeps a standing window closed
+ * across the open/close zoom, which restores its own save-under after every
+ * step and then draws the next frame from the same handle. */
+static void ROTH_CDECL hwr_draw_popup_shadow_border_smc(
+    struct roth_chain *chain, const struct roth_api_v1 *api,
+    int32_t x, int32_t y, int32_t width, int32_t height)
+{
+    roth_next_draw_popup_shadow_border_smc(chain, x, y, width, height);
+    hwr_chrome_cover_draw(&g_chrome, api, x, y, width, height);
 }
 
 /* Apply the exact brightness multiplier the GDV fade has just written to the
@@ -1758,6 +1872,10 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
                g_map_open_basename[0] != 0 &&
                strcmp(map_name, g_map_open_basename) == 0;
     hwr_map_data_clear(keep_shared, keep_map);
+    /* A load rebuilds what the save-under blocks are carved out of, and no
+     * window survives one anyway. Forgetting the rects only ever costs the
+     * closing of a window still standing; it can never hide world. */
+    hwr_chrome_reset(&g_chrome);
     hwr_perf_phase("clear");
     g_scene_rebuild_pending = 1;
     g_scene_error_logged = 0;
@@ -1907,7 +2025,9 @@ static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
         logged = 1;
     }
     /* The canvas description itself is no longer valid, so this is the one
-     * event that gives the screen back completely. */
+     * event that gives the screen back completely. The window rects describe
+     * framebuffer positions in the mode that is going away. */
+    hwr_chrome_reset(&g_chrome);
     hwr_enter_software(api, "the video mode changed");
 }
 
@@ -1919,6 +2039,7 @@ static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
     hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();
     hwr_composite_clear(&g_composite);
+    hwr_chrome_clear(&g_chrome);
     hwr_ownership_clear(&g_ownership);
     g_channel_api = NULL;
     g_api = NULL;
@@ -1965,6 +2086,16 @@ static void ROTH_CDECL hwr_on_register_overrides(const struct roth_api_v1 *api,
                               hwr_flush_dirty_rects, 0) != 0;
     failures += roth_override(registrar, ROTH_FN_load_backdrop_raw,
                               hwr_load_backdrop_raw, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_save_framebuffer_region,
+                              hwr_save_framebuffer_region, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_blit_save_region,
+                              hwr_blit_save_region, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_blit_descriptor_rows,
+                              hwr_blit_descriptor_rows, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_pool_free_handle,
+                              hwr_pool_free_handle, 0) != 0;
+    failures += roth_override(registrar, ROTH_FN_draw_popup_shadow_border_smc,
+                              hwr_draw_popup_shadow_border_smc, 0) != 0;
     if (failures != 0)
         fprintf(stderr, "[renderer_overhaul] %d override registration(s) failed\n", failures);
 }
