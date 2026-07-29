@@ -1717,6 +1717,11 @@ static void ROTH_CDECL hwr_flush_dirty_rects(
 {
     roth_next_flush_dirty_rects(chain);
     hwr_present_seam(api);
+    /* The window regions that came through this present still covered belong to
+     * windows that are standing, not to widgets that put their pixels back
+     * before the page is published. Only the former can be closed by what they
+     * painted rather than by what their pixels happen to equal. */
+    hwr_chrome_settle(&g_chrome);
 }
 
 static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)

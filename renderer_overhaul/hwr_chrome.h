@@ -50,7 +50,17 @@ struct hwr_chrome_rect {
     uint32_t y;
     uint32_t w;
     uint32_t h;
+    /* The save-under block's own row stride and row count, i.e. the rect BEFORE
+     * it was clipped to the screen. They identify the block (its header carries
+     * both) and give the stride of the saved pixels. */
+    uint32_t stride;
+    uint32_t rows;
     int covered;
+    /* Set once the rect has come through a whole present still covered. A rect
+     * whose pixels are put back mid-frame clears it again and never sets it,
+     * which is what keeps the "what the window painted" test off the widgets
+     * that restore themselves before the page is published. */
+    int settled;
 };
 
 struct hwr_chrome {
@@ -86,11 +96,20 @@ void hwr_chrome_cover_draw(struct hwr_chrome *chrome,
                            const struct roth_api_v1 *api, int32_t x, int32_t y,
                            int32_t width, int32_t height);
 
-/* The saved pixels have been put back: the rect is world again. */
+/* The saved pixels have been put back: the rect is world again, and it also
+ * stops being a rect whose painted pixels can be trusted -- what is in front of
+ * the save-under now IS the save-under. */
 void hwr_chrome_uncover(struct hwr_chrome *chrome, uint32_t handle);
 
 /* The save-under block has been freed; the handle means nothing from here. */
 void hwr_chrome_release(struct hwr_chrome *chrome, uint32_t handle);
+
+/* One present has finished with these rects still covered. A rect that comes
+ * through a present covered is a window that is standing rather than one that
+ * is put back before the page is published, and only a standing window's
+ * painted pixels can be trusted between frames. Call once per engine present,
+ * from the present entry, after the frame for it has been submitted. */
+void hwr_chrome_settle(struct hwr_chrome *chrome);
 
 /* Forget every rect. Dropping a rect only ever costs the old leak inside a
  * window that is still standing -- it can never leave world hidden -- so this
@@ -101,16 +120,33 @@ void hwr_chrome_clear(struct hwr_chrome *chrome);
 
 /* The baseline to submit for this frame.
  *
- * Returns base unchanged when nothing needs closing -- no rect, or no pixel
- * inside one where the live framebuffer and the baseline agree -- and otherwise
- * an internal copy in which exactly those agreeing pixels carry a flipped low
- * bit. That value is provably unequal to the live pixel it was derived from,
- * because it was derived from it, so the reveal test cannot fire there.
+ * Returns base unchanged when nothing needs closing, and otherwise an internal
+ * copy in which the pixels that must not reveal carry a token half a palette
+ * away from the live pixel. That token is derived from the live pixel, so it is
+ * provably unequal to it and the reveal test cannot fire there; the distance is
+ * what keeps it unequal to the NEXT value the same chrome takes, since chrome
+ * that repaints itself steps along a shading ramp between neighbouring indices.
  *
- * Only the agreeing pixels are touched, and that is deliberate: a pixel the
- * chrome already differs from is left describing the world, so a window whose
- * pixels are put back before the page is published reveals its world again with
- * no help from the rect set.
+ * Two pixels are closed inside a covered rect:
+ *
+ *   1. any pixel where the live framebuffer and the baseline AGREE. This is the
+ *      only test a rect gets on the frame it is recorded, and the only test a
+ *      rect ever gets if it is the kind that puts its pixels back before the
+ *      page is published -- which is what lets such a widget reveal its world
+ *      again with no help from the rect set.
+ *   2. once the rect has settled, any pixel the window has actually PAINTED,
+ *      i.e. where the live framebuffer differs from the pixels the engine saved
+ *      from underneath it. The save-under block is the engine's own record of
+ *      what was there before (blit_2d.c:1655-1685: {framebuffer pointer, row
+ *      stride, row count} then the rows), so this asks the engine which pixels
+ *      it covered instead of inferring it from their values.
+ *
+ * Test 1 alone is a statement about the values in front of it at one instant,
+ * and chrome that REPAINTS ITSELF every frame with different values -- the
+ * inventory grid's highlighted cell is redrawn each frame through a 32-step
+ * ramp -- is only protected for the instant it was measured. Test 2 is a
+ * statement about which pixels the window owns, which does not change while the
+ * window stands, so animated chrome stays closed across its whole animation.
  *
  * Call with the framebuffer in the state the page about to be published holds,
  * i.e. from the present entry. Anywhere else the comparison is against pixels

@@ -133,7 +133,14 @@ void hwr_chrome_record(struct hwr_chrome *chrome, const struct roth_api_v1 *api,
     rect->y = y;
     rect->w = right - left;
     rect->h = bottom - y;
+    /* What the save routine really captured, before the screen clipped it: the
+     * block's header carries exactly these two numbers. */
+    rect->stride = ((x + width + 3u) & ~3u) - left;
+    rect->rows = height;
     rect->covered = 1;
+    /* A fresh save is a fresh region; it has to earn the painted-pixel test the
+     * same way any other rect does. */
+    rect->settled = 0;
 }
 
 void hwr_chrome_cover(struct hwr_chrome *chrome, uint32_t handle)
@@ -187,8 +194,10 @@ void hwr_chrome_uncover(struct hwr_chrome *chrome, uint32_t handle)
 {
     struct hwr_chrome_rect *rect = chrome != NULL
                                  ? hwr_chrome_find(chrome, handle) : NULL;
-    if (rect != NULL)
+    if (rect != NULL) {
         rect->covered = 0;
+        rect->settled = 0;
+    }
 }
 
 void hwr_chrome_release(struct hwr_chrome *chrome, uint32_t handle)
@@ -202,6 +211,16 @@ void hwr_chrome_release(struct hwr_chrome *chrome, uint32_t handle)
             return;
         }
     }
+}
+
+void hwr_chrome_settle(struct hwr_chrome *chrome)
+{
+    unsigned i;
+    if (chrome == NULL)
+        return;
+    for (i = 0; i < chrome->count; i++)
+        if (chrome->rects[i].covered)
+            chrome->rects[i].settled = 1;
 }
 
 void hwr_chrome_reset(struct hwr_chrome *chrome)
@@ -221,12 +240,62 @@ void hwr_chrome_clear(struct hwr_chrome *chrome)
     chrome->overflow_logged = 0;
 }
 
+/* The pixels the engine saved from under this rect, or NULL when the block
+ * cannot be identified with certainty.
+ *
+ * The save routine writes a three-dword header in front of the rows: the
+ * framebuffer address the rect was taken from, the dword-aligned row stride,
+ * and the row count (blit_2d.c:1670-1673). All three are checked against the
+ * rect as it was recorded, so a handle whose block has since been reallocated
+ * to something else, a block the pool has moved, or a rect the screen geometry
+ * has shifted under all resolve to nothing -- and a rect with no saved rows
+ * simply keeps the value test on its own, which is the safe direction. The
+ * block is re-resolved through the handle slot on every use, never cached,
+ * because the pool relocates its chunks. */
+static const uint8_t *hwr_chrome_saved_rows(const struct roth_api_v1 *api,
+                                            const struct hwr_chrome_rect *rect,
+                                            uint32_t framebuffer,
+                                            uint32_t pitch)
+{
+    uintptr_t arena;
+    uint32_t ram_size;
+    uint32_t handle_offset;
+    uint32_t chunk;
+    uint32_t chunk_offset;
+    uint64_t span;
+
+    if (rect->stride == 0 || rect->rows == 0 ||
+        rect->w > rect->stride || rect->h > rect->rows)
+        return NULL;
+    arena = (uintptr_t)api->game_ram->to_ptr(0);
+    ram_size = api->game_ram->size();
+    if (arena == 0 || ram_size < 4u || (uintptr_t)rect->handle < arena)
+        return NULL;
+    handle_offset = (uint32_t)((uintptr_t)rect->handle - arena);
+    if (handle_offset > ram_size - 4u)
+        return NULL;
+    chunk = api->game_ram->u32(handle_offset);
+    if (chunk == 0 || (uintptr_t)chunk < arena)
+        return NULL;
+    chunk_offset = (uint32_t)((uintptr_t)chunk - arena);
+    span = 0xcu + (uint64_t)rect->stride * rect->rows;
+    if (chunk_offset > ram_size || span > (uint64_t)(ram_size - chunk_offset))
+        return NULL;
+    if (api->game_ram->u32(chunk_offset + 4u) != rect->stride ||
+        api->game_ram->u32(chunk_offset + 8u) != rect->rows ||
+        api->game_ram->u32(chunk_offset) !=
+            framebuffer + rect->x + rect->y * pitch)
+        return NULL;
+    return (const uint8_t *)api->game_ram->to_ptr(chunk_offset + 0xcu);
+}
+
 const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
                                    const struct roth_api_v1 *api,
                                    const struct roth_world_frame_v1 *frame,
                                    const uint8_t *base)
 {
     const uint8_t *framebuffer;
+    uint32_t framebuffer_address;
     uint8_t *plane = NULL;
     uint32_t pitch;
     uint32_t screen_height;
@@ -252,8 +321,8 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
     /* The engine's linear back buffer lives outside the accessor's range and
      * both the engine and the host present path address it through this stored
      * pointer, exactly as the baseline seed does. */
-    framebuffer = (const uint8_t *)(uintptr_t)
-        api->game_ram->u32(VA_G_FRAMEBUFFER_PTR);
+    framebuffer_address = api->game_ram->u32(VA_G_FRAMEBUFFER_PTR);
+    framebuffer = (const uint8_t *)(uintptr_t)framebuffer_address;
     if (framebuffer == NULL)
         return base;
     base_pitch = frame->engine_base_pitch_bytes != 0
@@ -265,6 +334,7 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
     hwr_chrome_sweep(chrome, api);
     for (i = 0; i < chrome->count; i++) {
         const struct hwr_chrome_rect *rect = &chrome->rects[i];
+        const uint8_t *saved;
         uint32_t left;
         uint32_t top;
         uint32_t right;
@@ -273,6 +343,13 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
 
         if (!rect->covered)
             continue;
+        /* Only a window that has stood through a present is asked what it
+         * painted; on its first present, and for anything that puts its pixels
+         * back before the page is published, the value test carries the rect on
+         * its own exactly as it did before. */
+        saved = rect->settled
+              ? hwr_chrome_saved_rows(api, rect, framebuffer_address, pitch)
+              : NULL;
         left = rect->x > (uint32_t)frame->vx ? rect->x : (uint32_t)frame->vx;
         top = rect->y > (uint32_t)frame->vy ? rect->y : (uint32_t)frame->vy;
         right = rect->x + rect->w;
@@ -285,11 +362,19 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
             continue;
         for (y = top; y < bottom; y++) {
             const uint8_t *live = framebuffer + (size_t)y * pitch;
+            const uint8_t *under = saved != NULL
+                                 ? saved + (size_t)(y - rect->y) * rect->stride
+                                 : NULL;
             size_t row = (size_t)(y - (uint32_t)frame->vy) * base_pitch;
             uint32_t x;
             for (x = left; x < right; x++) {
                 size_t index = row + (x - (uint32_t)frame->vx);
-                if (live[x] != base[index])
+                /* Closed if the value would reveal, or if the window has
+                 * painted this pixel over what the engine saved from under it
+                 * -- the second test is what holds while the chrome repaints
+                 * itself with different values every frame. */
+                if (live[x] != base[index] &&
+                    (under == NULL || live[x] == under[x - rect->x]))
                     continue;
                 if (plane == NULL) {
                     if (required > chrome->plane_capacity) {
@@ -303,8 +388,13 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
                     memcpy(chrome->plane, base, required);
                     plane = chrome->plane;
                 }
-                /* Derived from the live pixel, so it cannot equal it. */
-                plane[index] = (uint8_t)(live[x] ^ 1u);
+                /* Derived from the live pixel, so it cannot equal it, and half
+                 * the palette away from it, so it cannot equal the NEXT value
+                 * the same chrome takes either: chrome that repaints itself
+                 * walks a shading ramp, whose steps are neighbouring indices,
+                 * and a token one index away from this frame's value is exactly
+                 * what the next frame's value tends to be. */
+                plane[index] = (uint8_t)(live[x] ^ 0x80u);
             }
         }
     }
