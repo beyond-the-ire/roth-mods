@@ -1,6 +1,5 @@
 #include "hwr_billboards.h"
 
-#include "hwr_perf.h"
 #include "hwr_sprites.h"
 
 #include <stdlib.h>
@@ -552,41 +551,77 @@ static int hwr_bb_pack_shadow(struct hwr_billboards *bb,
     return 0;
 }
 
-int hwr_billboards_pack(struct hwr_billboards *bb,
-                        struct hwr_das_archive *map_archive,
-                        struct hwr_das_archive *shared_archive,
-                        const struct hwr_objects *objects,
-                        const struct roth_api_v1 *api,
-                        uint8_t **bytes, size_t *size, size_t *capacity)
+void hwr_billboards_bind(struct hwr_billboards *bb,
+                         struct hwr_das_archive *map_archive,
+                         struct hwr_das_archive *shared_archive)
+{
+    if (bb == NULL)
+        return;
+    bb->map_archive = map_archive;
+    bb->shared_archive = shared_archive;
+}
+
+int hwr_billboards_pack_shared(struct hwr_billboards *bb,
+                               struct hwr_das_archive *shared_archive,
+                               uint8_t **bytes, size_t *size, size_t *capacity)
+{
+    if (bb == NULL)
+        return -1;
+    free(bb->shared_dir);
+    free(bb->children);
+    bb->shared_dir = NULL;
+    bb->shared_dir_count = 0;
+    bb->children = NULL;
+    bb->child_count = 0;
+    bb->child_capacity = 0;
+    bb->shared_child_count = 0;
+    bb->shared_archive = shared_archive;
+    bb->built = 0;
+    if (!hwr_billboards_enabled())
+        return 0;                                     /* kill switch: nothing packed */
+    /* The shared (ADEMO) DAS holds the game-wide sprite set from its start and
+     * is never closure-scoped, so game-wide effect sprites are always present. */
+    if (hwr_bb_pack_archive(bb, shared_archive, 0,
+                            &bb->shared_dir, &bb->shared_dir_count,
+                            NULL, bytes, size, capacity) != 0)
+        return hwr_bb_fail(bb, "out of memory packing shared sprite atlas");
+    bb->shared_child_count = bb->child_count;
+    return 0;
+}
+
+int hwr_billboards_pack_map(struct hwr_billboards *bb,
+                            struct hwr_das_archive *map_archive,
+                            const struct hwr_objects *objects,
+                            const struct roth_api_v1 *api,
+                            uint8_t **bytes, size_t *size, size_t *capacity)
 {
     struct hwr_bb_closure closure;
     memset(&closure, 0, sizeof closure);
     if (bb == NULL)
         return -1;
     free(bb->map_dir);
-    free(bb->shared_dir);
-    free(bb->children);
     bb->map_dir = NULL;
-    bb->shared_dir = NULL;
-    bb->children = NULL;
-    bb->child_count = 0;
-    bb->child_capacity = 0;
     bb->map_dir_count = 0;
-    bb->shared_dir_count = 0;
-    bb->map_archive = map_archive;
-    bb->shared_archive = shared_archive;
+    /* Drop the previous map DAS's children; the shared half in front of them
+     * stays exactly as it was packed. */
+    if (bb->child_count > bb->shared_child_count)
+        bb->child_count = bb->shared_child_count;
+    /* The ground shadow comes from engine memory rather than a DAS, so it is
+     * packed with this half: it then has no way to outlive the run of texels it
+     * sits in, and a rebuild retries it if the engine had not staged the record
+     * the first time. */
     memset(&bb->shadow, 0, sizeof bb->shadow);
+    bb->map_archive = map_archive;
     bb->built = 0;
     if (!hwr_billboards_enabled())
-        return 0;                                         /* kill switch: no atlas */
+        return 0;                                     /* kill switch: nothing packed */
     /* When the closure policy is on, scope the map tail to the reachable set;
-     * on any failure fall back to whole-archive packing (fail-safe). */
+     * on any failure fall back to whole-DAS packing (fail-safe). */
     if (hwr_billboards_closure_enabled() &&
-        hwr_bb_closure_build(&closure, map_archive, shared_archive, objects, api) != 0)
-        memset(&closure, 0, sizeof closure);              /* fall back to whole-archive */
-    /* Map object graphics occupy the archive tail from the id bias; the shared
-     * (ADEMO) archive holds the game-wide sprite set from its start. The map
-     * half is closure-filtered; the shared half is always packed whole. */
+        hwr_bb_closure_build(&closure, map_archive, bb->shared_archive, objects,
+                             api) != 0)
+        memset(&closure, 0, sizeof closure);           /* fall back to whole-DAS */
+    /* Map object graphics occupy the DAS tail from the id bias. */
     if (hwr_bb_pack_archive(bb, map_archive, HWR_SPRITE_ID_BIAS,
                             &bb->map_dir, &bb->map_dir_count,
                             &closure, bytes, size, capacity) != 0) {
@@ -594,12 +629,6 @@ int hwr_billboards_pack(struct hwr_billboards *bb,
         return hwr_bb_fail(bb, "out of memory packing map sprite atlas");
     }
     hwr_bb_closure_free(&closure);
-    hwr_perf_phase("bb-map");
-    if (hwr_bb_pack_archive(bb, shared_archive, 0,
-                            &bb->shared_dir, &bb->shared_dir_count,
-                            NULL, bytes, size, capacity) != 0)
-        return hwr_bb_fail(bb, "out of memory packing shared sprite atlas");
-    hwr_perf_phase("bb-shared");
     if (hwr_bb_pack_shadow(bb, api, bytes, size, capacity) != 0)
         return hwr_bb_fail(bb, "out of memory packing the ground shadow");
     bb->built = 1;

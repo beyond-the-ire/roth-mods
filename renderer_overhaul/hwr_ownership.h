@@ -72,6 +72,14 @@ int hwr_ownership_world_stale(const struct roth_api_v1 *api,
                               const void *sector_section,
                               const void *vertex_section);
 
+/* True when the engine has staged a map since the last world render.  The map
+ * loader clears the render-active latch and the world pass raises it again as
+ * its first statement, so a zero read taken BEFORE the original pass runs marks
+ * the first render of a newly staged map -- exactly once per load, on the
+ * dispatch that has to act on it.  Same latch hwr_ownership_world_stale folds
+ * into staleness, read on its own so a load can be answered as well as noticed. */
+int hwr_ownership_map_staged(const struct roth_api_v1 *api);
+
 /* True while a cutscene/fullscreen-image sequence holds the screen: the engine
  * has a backed-up gameplay screen or the overlay latch is up.  These are the
  * states whose transitions are the screen slides, and whose surround is black

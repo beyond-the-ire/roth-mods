@@ -62,10 +62,14 @@ struct hwr_billboards {
     size_t shared_dir_count;
     struct hwr_das_archive *map_archive;
     struct hwr_das_archive *shared_archive;
-    /* Shared table of packed grouped-children; slots index into it. */
+    /* Shared table of packed grouped-children; slots index into it. The shared
+     * DAS's children occupy the first shared_child_count entries and the map
+     * DAS's follow, so a map change rewinds the table to that mark instead of
+     * rebuilding both halves. */
     struct hwr_bb_child *children;
     size_t child_count;
     size_t child_capacity;
+    size_t shared_child_count;
     /* The engine's ground-shadow: a 7x32 translucent oval from the obj1 default
      * texture record (VA 0x29e5c), packed once at map load. The emitter draws it
      * as a camera-facing translucent billboard under each object whose map record
@@ -124,16 +128,31 @@ int hwr_billboards_floor_exception_enabled(void);
 void hwr_billboards_init(struct hwr_billboards *bb);
 void hwr_billboards_clear(struct hwr_billboards *bb);
 
-/* Builds the per-map sprite atlas and appends its pixels to the texel store the
- * caller is assembling (the same buffer the world textures were packed into).
- * A no-op that leaves the store untouched when the layer is disabled. Returns 0
- * on success, -1 with bb->error set on allocation failure. */
-int hwr_billboards_pack(struct hwr_billboards *bb,
-                        struct hwr_das_archive *map_archive,
-                        struct hwr_das_archive *shared_archive,
-                        const struct hwr_objects *objects,
-                        const struct roth_api_v1 *api,
-                        uint8_t **bytes, size_t *size, size_t *capacity);
+/* Records which DAS files the packed directories describe. The emitter matches
+ * a resolved sprite's DAS against these, so directories carried across a
+ * transition have to be pointed at the DAS files that are open now. */
+void hwr_billboards_bind(struct hwr_billboards *bb,
+                         struct hwr_das_archive *map_archive,
+                         struct hwr_das_archive *shared_archive);
+
+/* Packs the shared DAS's whole sprite set, appending the pixels to the texel
+ * store the caller is assembling and recording the shared child mark. This half
+ * is invariant for the life of the process: one shared DAS serves every map. A
+ * no-op leaving the store untouched when the layer is disabled. Returns 0 on
+ * success, -1 with bb->error set on failure. */
+int hwr_billboards_pack_shared(struct hwr_billboards *bb,
+                               struct hwr_das_archive *shared_archive,
+                               uint8_t **bytes, size_t *size, size_t *capacity);
+
+/* Packs the map DAS's object-graphic tail and the ground shadow, rewinding the
+ * child table to the shared mark first so it can be called again for a
+ * different map DAS over a retained shared half. Returns 0 on success, -1 on
+ * failure. */
+int hwr_billboards_pack_map(struct hwr_billboards *bb,
+                            struct hwr_das_archive *map_archive,
+                            const struct hwr_objects *objects,
+                            const struct roth_api_v1 *api,
+                            uint8_t **bytes, size_t *size, size_t *capacity);
 
 /* HWR_ATLAS_CLOSURE=1 opts into map-archive sprite closure: only map sprites the
  * loaded map's object set can resolve to are packed, instead of the whole map

@@ -513,6 +513,16 @@ static int hwr_mesh_scan_archive(struct hwr_meshes *meshes,
     return 0;
 }
 
+void hwr_meshes_bind(struct hwr_meshes *meshes,
+                     struct hwr_das_archive *map_archive,
+                     struct hwr_das_archive *shared_archive)
+{
+    if (meshes == NULL)
+        return;
+    meshes->map_archive = map_archive;
+    meshes->shared_archive = shared_archive;
+}
+
 int hwr_meshes_pack(struct hwr_meshes *meshes,
                     struct hwr_das_archive *map_archive,
                     struct hwr_das_archive *shared_archive,

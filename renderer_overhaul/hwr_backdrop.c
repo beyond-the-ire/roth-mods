@@ -236,7 +236,7 @@ static uint32_t hwr_backdrop_row_table(uint32_t source_height, uint32_t screen_h
     return row;
 }
 
-int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
+int hwr_backdrop_seed_indices(const struct hwr_backdrop *backdrop,
                               uint32_t screen_width, uint32_t screen_height,
                               uint32_t view_x, uint32_t view_y,
                               uint32_t view_width, uint32_t view_height,
@@ -246,7 +246,13 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
     uint16_t *columns;
     uint32_t *rows;
     uint8_t *view;
+    uint32_t *art_columns;
+    uint32_t art_width;
+    uint32_t art_x;
     uint32_t filled;
+    uint32_t previous_row;
+    const uint8_t *previous_art;
+    uint32_t x;
     uint32_t y;
 
     if (backdrop == NULL || !backdrop->valid || backdrop->pixels == NULL || out == NULL)
@@ -264,13 +270,27 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
         screen_height > HWR_BACKDROP_MAX_DIMENSION)
         return -1;
 
+    /* The world target carries the viewport's vertical framing over its whole
+     * height, so the original view occupies a centred rectangle whose width
+     * keeps the viewport's proportions at that vertical scale. A target no
+     * wider than that rectangle simply uses all of it. */
+    art_width = (uint32_t)(((uint64_t)view_width * output_height +
+                            view_height / 2u) / view_height);
+    if (art_width == 0)
+        art_width = 1;
+    if (art_width > output_width)
+        art_width = output_width;
+    art_x = (output_width - art_width) / 2u;
+
     columns = (uint16_t *)malloc(sizeof *columns * view_width);
     rows = (uint32_t *)malloc(sizeof *rows * screen_height);
     view = (uint8_t *)malloc((size_t)view_width * view_height);
-    if (columns == NULL || rows == NULL || view == NULL) {
+    art_columns = (uint32_t *)malloc(sizeof *art_columns * art_width);
+    if (columns == NULL || rows == NULL || view == NULL || art_columns == NULL) {
         free(columns);
         free(rows);
         free(view);
+        free(art_columns);
         return -1;
     }
     hwr_backdrop_column_table(backdrop->width, screen_width, view_x, view_width, columns);
@@ -280,7 +300,6 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
         uint8_t *destination = view + (size_t)y * view_width;
         uint32_t screen_row = view_y + y;
         const uint8_t *source;
-        uint32_t x;
         if (screen_row >= filled) {
             memset(destination, 0, view_width);
             continue;
@@ -289,18 +308,35 @@ int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
         for (x = 0; x < view_width; x++)
             destination[x] = source[columns[x]];
     }
+
+    /* Everything the art does not cover is black: the original paints its
+     * backdrop across its own screen and nowhere else, so view area the target
+     * gains beyond that screen starts from nothing rather than from stretched
+     * art. Sampling tables are built once and the rows a magnified source row
+     * repeats are copied rather than resampled. */
+    memset(out, 0, (size_t)output_width * output_height);
+    for (x = 0; x < art_width; x++)
+        art_columns[x] = (uint32_t)(((uint64_t)x * view_width) / art_width);
+    previous_row = UINT32_MAX;
+    previous_art = NULL;
     for (y = 0; y < output_height; y++) {
-        const uint8_t *source = view +
-            (size_t)(((uint64_t)y * view_height) / output_height) *
-            view_width;
-        uint8_t *destination = out + (size_t)y * output_width;
-        uint32_t x;
-        for (x = 0; x < output_width; x++)
-            destination[x] =
-                source[((uint64_t)x * view_width) / output_width];
+        uint32_t source_row =
+            (uint32_t)(((uint64_t)y * view_height) / output_height);
+        uint8_t *destination = out + (size_t)y * output_width + art_x;
+        const uint8_t *source;
+        if (source_row == previous_row && previous_art != NULL) {
+            memcpy(destination, previous_art, art_width);
+            continue;
+        }
+        source = view + (size_t)source_row * view_width;
+        for (x = 0; x < art_width; x++)
+            destination[x] = source[art_columns[x]];
+        previous_row = source_row;
+        previous_art = destination;
     }
     free(columns);
     free(rows);
     free(view);
+    free(art_columns);
     return 0;
 }

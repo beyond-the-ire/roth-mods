@@ -29,10 +29,15 @@ void hwr_backdrop_clear(struct hwr_backdrop *backdrop);
 
 const char *hwr_backdrop_error(const struct hwr_backdrop *backdrop);
 
-/* Scales the decoded image to the engine screen, extracts the engine viewport,
- * then nearest-scales that rectangle to the requested output dimensions.
+/* Scales the decoded image to the engine screen and extracts the engine
+ * viewport, then lays that rectangle onto the render target where the engine's
+ * own view sits: the world target keeps the viewport's vertical framing over
+ * its whole height and widens sideways, so the art occupies a centred rectangle
+ * of the viewport's own proportions and everything beyond it -- view area the
+ * original never had, and therefore never painted a backdrop over -- is filled
+ * with black. The art is never stretched to the target's aspect.
  * Returns 0 on success. Rows the engine would leave untouched are index 0. */
-int hwr_backdrop_view_indices(const struct hwr_backdrop *backdrop,
+int hwr_backdrop_seed_indices(const struct hwr_backdrop *backdrop,
                               uint32_t screen_width, uint32_t screen_height,
                               uint32_t view_x, uint32_t view_y,
                               uint32_t view_width, uint32_t view_height,

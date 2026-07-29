@@ -173,6 +173,11 @@ static int g_index_target_dirty = 1;
 static uint8_t *g_index_seed;
 static uint32_t g_index_seed_width;
 static uint32_t g_index_seed_height;
+/* Whether the holding buffer currently carries a seed waiting to be laid down.
+ * The buffer itself outlives each seed, because the canvas size does not change
+ * between them and re-taking canvas-sized storage at every map change, return
+ * to gameplay, and inventory close is pure churn. */
+static int g_index_seed_ready;
 static GLuint g_index_texture;
 /* Second colour attachment of the index FBO: per-pixel owner-floor identity of
  * the opaque winner (FLOOR_TAG | (floor_z & 0xffff) for a flat floor, else 0),
@@ -207,7 +212,15 @@ static int g_scene_uploaded;
  * is gone" from "the data is intact but sampling it fails". */
 static uint8_t g_verify_colormap[0x2000];
 static uint32_t g_verify_store_hash;
+/* Set only while the recorded hash still describes the whole store. A store
+ * whose tail has been rewritten in place no longer has one, and says so rather
+ * than reporting a mismatch it caused itself. */
+static int g_verify_store_hash_valid;
 static size_t g_verify_store_size;
+/* Bytes the texture-store buffer object was allocated with. The used length is
+ * g_verify_store_size; the difference is headroom that a per-map tail is
+ * written into without disturbing anything before it. */
+static size_t g_store_reserve;
 static int g_verify_probe_offset;
 static uint8_t g_verify_probe_texel;
 static uint8_t g_verify_first_texel;
@@ -1467,6 +1480,9 @@ static void hwr_destroy_scene_objects(void)
     hwr_delete_texture(&g_blend_texture);
     hwr_delete_texture(&g_palette_texture);
     g_scene_uploaded = 0;
+    g_store_reserve = 0;
+    g_verify_store_size = 0;
+    g_verify_store_hash_valid = 0;
 }
 
 static void hwr_destroy_framebuffer(void)
@@ -1666,6 +1682,7 @@ static int hwr_gl_store_verify_enabled(void)
 }
 
 int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
+                        size_t reserve, size_t prefix_size,
                         const uint8_t colormap[0x2000],
                         const uint8_t tint[0x2000],
                         const uint8_t glow[0x200],
@@ -1677,14 +1694,34 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
         snprintf(g_error, sizeof g_error, "scene texture upload inputs are invalid");
         return 0;
     }
+    if (reserve < texture_size)
+        reserve = texture_size;
+    if (reserve > (size_t)PTRDIFF_MAX)
+        reserve = texture_size;
+    if (prefix_size > texture_size)
+        prefix_size = 0;
     hwr_destroy_scene_objects();
     if (!hwr_gl_ensure_programs())
         return 0;
+    {
+        /* The headroom is only worth having if the driver will hold it: never
+         * ask a buffer texture for more texels than it can address. */
+        GLint max_texels = 0;
+        g_gl.get_integer_v(GL_MAX_TEXTURE_BUFFER_SIZE, &max_texels);
+        if (max_texels > 0 && reserve > (size_t)max_texels)
+            reserve = texture_size > (size_t)max_texels ? texture_size
+                                                        : (size_t)max_texels;
+    }
 
     g_gl.gen_buffers(1, &g_texture_buffer);
     g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
-    g_gl.buffer_data(GL_TEXTURE_BUFFER, (GLsizeiptr)texture_size,
-                     texture_bytes, GL_STATIC_DRAW);
+    /* Allocate the headroom, then write the bytes that exist: a later map's
+     * tail is written into the slack rather than replacing the whole store. */
+    g_gl.buffer_data(GL_TEXTURE_BUFFER, (GLsizeiptr)reserve, NULL,
+                     GL_STATIC_DRAW);
+    g_gl.buffer_sub_data(GL_TEXTURE_BUFFER, 0, (GLsizeiptr)texture_size,
+                         texture_bytes);
+    g_store_reserve = reserve;
     g_gl.gen_textures(1, &g_texture_buffer_texture);
     g_gl.bind_texture(GL_TEXTURE_BUFFER, g_texture_buffer_texture);
     g_gl.tex_buffer(GL_TEXTURE_BUFFER, GL_R8UI, g_texture_buffer);
@@ -1774,9 +1811,13 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     memcpy(g_verify_colormap, colormap, sizeof g_verify_colormap);
     g_verify_store_hash = hwr_gl_store_verify_enabled()
                         ? hwr_hash_bytes(texture_bytes, texture_size) : 0;
+    g_verify_store_hash_valid = 1;
     g_verify_store_size = texture_size;
-    g_verify_probe_offset = (int)(texture_size / 2u);
-    g_verify_probe_texel = texture_bytes[texture_size / 2u];
+    /* Probe a byte inside the run that outlives a map change, so the recurring
+     * check keeps a fixed reference across tail rewrites. */
+    g_verify_probe_offset = (int)((prefix_size != 0 ? prefix_size
+                                                    : texture_size) / 2u);
+    g_verify_probe_texel = texture_bytes[(size_t)g_verify_probe_offset];
     g_verify_first_texel = texture_bytes[0];
     g_verify_last_texel = texture_bytes[texture_size - 1u];
     g_verify_pending = 1;
@@ -1795,6 +1836,66 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     }
 
     g_scene_uploaded = 1;
+    return 1;
+}
+
+size_t hwr_gl_scene_store_reserve(void)
+{
+    return g_scene_uploaded && g_texture_buffer != 0 ? g_store_reserve : 0;
+}
+
+int hwr_gl_scene_update_store(size_t offset, const uint8_t *bytes, size_t size,
+                              const uint8_t colormap[0x2000],
+                              const uint8_t tint[0x2000],
+                              const uint8_t glow[0x200],
+                              const uint8_t blend[0x10000])
+{
+    if (!g_initialized || !g_scene_uploaded || g_texture_buffer == 0 ||
+        g_texture_buffer_texture == 0 || bytes == NULL || size == 0 ||
+        colormap == NULL || tint == NULL || glow == NULL || blend == NULL ||
+        offset > g_store_reserve || size > g_store_reserve - offset ||
+        size > (size_t)PTRDIFF_MAX || !hwr_platform_make_current()) {
+        snprintf(g_error, sizeof g_error,
+                 "no resident texture store can take this map's texels");
+        return 0;
+    }
+    g_gl.bind_buffer(GL_TEXTURE_BUFFER, g_texture_buffer);
+    g_gl.buffer_sub_data(GL_TEXTURE_BUFFER, (GLintptr)offset,
+                         (GLsizeiptr)size, bytes);
+    /* The colour tables are per map and small; they are simply replaced. */
+    hwr_delete_texture(&g_colormap_texture);
+    hwr_delete_texture(&g_tint_texture);
+    hwr_delete_texture(&g_glow_texture);
+    hwr_delete_texture(&g_blend_texture);
+    g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+    hwr_texture_2d_u8(&g_colormap_texture, 256, 32, GL_R8UI,
+                      GL_RED_INTEGER, colormap);
+    hwr_texture_2d_u8(&g_tint_texture, 256, 32, GL_R8UI,
+                      GL_RED_INTEGER, tint);
+    hwr_texture_2d_u8(&g_glow_texture, 256, 2, GL_R8UI,
+                      GL_RED_INTEGER, glow);
+    hwr_texture_2d_u8(&g_blend_texture, 256, 256, GL_R8UI,
+                      GL_RED_INTEGER, blend);
+    memcpy(g_verify_colormap, colormap, sizeof g_verify_colormap);
+    /* The store's used length now ends with this tail. The probe sits in the
+     * untouched prefix and keeps its recorded value; the whole-store hash
+     * cannot be maintained without the prefix bytes, so it is retired rather
+     * than left describing a store that no longer matches it. */
+    g_verify_store_size = offset + size;
+    g_verify_last_texel = bytes[size - 1u];
+    if ((size_t)g_verify_probe_offset >= offset &&
+        (size_t)g_verify_probe_offset - offset < size)
+        g_verify_probe_texel = bytes[(size_t)g_verify_probe_offset - offset];
+    if (offset == 0)
+        g_verify_first_texel = bytes[0];
+    g_verify_store_hash = 0;
+    g_verify_store_hash_valid = 0;
+    g_verify_pending = 1;
+    g_verify_last_status = -1;
+    fprintf(stderr, "[renderer_overhaul] texture store %u bytes "
+            "(%u kept, %u rewritten at %u)\n",
+            (unsigned)g_verify_store_size, (unsigned)offset,
+            (unsigned)size, (unsigned)offset);
     return 1;
 }
 
@@ -1895,6 +1996,11 @@ static void hwr_gl_scene_self_test(int first_run)
          * below still run every self-test. Treat the store bit as satisfied so
          * the status line does not report a spurious mismatch. */
         store_ok = 1;
+    } else if (!g_verify_store_hash_valid) {
+        /* The store's tail was rewritten in place, so there is no whole-store
+         * hash to compare against. The probe/colormap/sampler checks below
+         * still run; HWR_DAS_PERSIST=0 restores whole-store hashing. */
+        store_ok = 1;
     } else if (first_run) {
         /* Reading the whole store back stalls the pipeline for a visible
          * fraction of a second, so it runs only on the frame after an
@@ -1994,14 +2100,23 @@ int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t heigh
     if (indices == NULL || width == 0 || height == 0 ||
         plane / width != height || plane > (size_t)INT32_MAX)
         return 0;
-    copy = (uint8_t *)malloc(plane);
-    if (copy == NULL)
-        return 0;
+    /* Re-seeding at the same size is the common case (a map change, a return to
+     * gameplay, an inventory close), so the holding buffer is kept rather than
+     * released and re-taken every time. */
+    if (g_index_seed != NULL && g_index_seed_width == width &&
+        g_index_seed_height == height) {
+        copy = g_index_seed;
+    } else {
+        copy = (uint8_t *)malloc(plane);
+        if (copy == NULL)
+            return 0;
+        free(g_index_seed);
+    }
     memcpy(copy, indices, plane);
-    free(g_index_seed);
     g_index_seed = copy;
     g_index_seed_width = width;
     g_index_seed_height = height;
+    g_index_seed_ready = 1;
     /* The target is only rewritten on a dirty frame, so ask for one. */
     g_index_target_dirty = 1;
     return 1;
@@ -2016,7 +2131,7 @@ void hwr_gl_invalidate_index_target(void)
  * later frames persist into those pixels rather than replacing them. */
 static int hwr_consume_index_seed(uint32_t width, uint32_t height)
 {
-    if (g_index_seed == NULL || g_index_texture == 0 ||
+    if (!g_index_seed_ready || g_index_seed == NULL || g_index_texture == 0 ||
         g_index_seed_width != width || g_index_seed_height != height)
         return 0;
     g_gl.active_texture(GL_TEXTURE0);
@@ -2024,10 +2139,7 @@ static int hwr_consume_index_seed(uint32_t width, uint32_t height)
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height,
                           GL_RED_INTEGER, GL_UNSIGNED_BYTE, g_index_seed);
-    free(g_index_seed);
-    g_index_seed = NULL;
-    g_index_seed_width = 0;
-    g_index_seed_height = 0;
+    g_index_seed_ready = 0;
     return 1;
 }
 
@@ -2938,6 +3050,7 @@ void hwr_gl_shutdown(void)
     g_index_seed = NULL;
     g_index_seed_width = 0;
     g_index_seed_height = 0;
+    g_index_seed_ready = 0;
     g_initialized = 0;
     memset(&g_gl, 0, sizeof g_gl);
 }

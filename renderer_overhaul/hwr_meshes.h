@@ -111,6 +111,14 @@ int hwr_meshes_pack(struct hwr_meshes *meshes,
                     struct hwr_das_archive *shared_archive,
                     uint8_t **bytes, size_t *size, size_t *capacity);
 
+/* Re-points a directory carried across a transition at the DAS files that are
+ * open now. A mesh face may name a texture in either DAS (ids below the shared
+ * bias resolve against the map DAS, which is why the whole mesh directory is
+ * rebuilt whenever either DAS changes), so both pointers are restored. */
+void hwr_meshes_bind(struct hwr_meshes *meshes,
+                     struct hwr_das_archive *map_archive,
+                     struct hwr_das_archive *shared_archive);
+
 int hwr_meshes_emit(struct hwr_meshes *meshes,
                     const struct hwr_objects *objects,
                     const struct hwr_world *world,

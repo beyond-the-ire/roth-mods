@@ -112,14 +112,12 @@ static int g_luts_recheck_pending;
 static int g_scene_error_logged;
 static int g_selfheal_retry;
 static uint32_t g_selfheal_tick;
-/* A map-load event only records a pending reload here; the geometry re-snapshot
- * runs at the render-dispatch safe point (see hwr_render_world_view_pass), never
- * inline from the event, so g_world's arrays can never be freed/reallocated
- * while hwr_scene_build_mesh is walking them.  Several events before the next
- * dispatch coalesce to the newest generation (an older staged map is superseded
- * by the newest load). */
+/* A map load only records a pending reload here; the geometry re-snapshot runs
+ * at the render-dispatch safe point (see hwr_render_world_view_pass), never
+ * inline from a notification, so g_world's arrays can never be freed or
+ * reallocated while hwr_scene_build_mesh is walking them.  Several loads before
+ * the next dispatch coalesce into one reload of whatever is staged then. */
 static int g_map_reload_pending;
-static uint32_t g_map_reload_generation;
 /* Development aid: HWR_DUMP_FRAME=<path.ppm> periodically writes the submitted
  * world frame (atomically, via rename) for offline comparison against the
  * original renderer's output. */
@@ -155,13 +153,33 @@ static int g_billboard_stats_pending;
  * list (atomically, via rename) for offline inspection. */
 static char g_obj_dump_path[2600];
 static uint32_t g_obj_dump_counter;
-/* Shared-archive (ADEMO) persistence. The shared DAS is byte-identical on every
- * map, so when a transition keeps the same shared basename the archive is left
- * open and decoded rather than torn down, re-opened, and re-decoded. Holds the
- * basename of the currently open shared archive (empty when none is open). */
+/* DAS-file persistence. The shared DAS is the same file for the whole game, and
+ * the map DAS is shared by every map that names it -- the engine itself skips
+ * its own DAS swap when the basename is unchanged -- so a transition that keeps
+ * a basename leaves that file open and decoded rather than tearing it down,
+ * re-opening it, and decoding it all over again. These hold the basenames of
+ * the DAS files currently open (empty when none is). */
 static char g_shared_open_basename[81];
+static char g_map_open_basename[81];
+/* The mod's own count of map loads. The engine clears its render-active latch
+ * when it stages a map and raises it again at the top of the world pass, so the
+ * render wrap sees exactly one zero per load and counts it here; the reload
+ * that answers a given count runs once. Also the identity the timing report
+ * labels a build with, so a build per transition is what the log shows. */
+static uint32_t g_map_epoch;
+static uint32_t g_map_epoch_loaded;
+/* The host's map notification arrives from the frame pump, a tick after the
+ * engine staged the map, so the render boundary above has normally answered it
+ * already. It is kept as a backstop and consumed at the same safe point. */
+static int g_map_event_pending;
+/* Shared-DAS pre-warm: the decode is pure file + CPU work with no dependency on
+ * a map, so it is done a little at a time while the menu owns the screen rather
+ * than all at once inside the first transition. */
+static int g_shared_prewarm_done;
+static size_t g_shared_prewarm_cursor;
 
 static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generation);
+static void hwr_prewarm_shared_das(const struct roth_api_v1 *api);
 
 static void hwr_dump_frame(const uint32_t *pixels, uint32_t width, uint32_t height)
 {
@@ -269,28 +287,21 @@ static void hwr_data_settings_apply(uint32_t mask,
         g_debug_enabled = settings->debug;
 }
 
-/* HWR_ATLAS_PERSIST=0 forces the shared archive + shared sprite atlas to be
- * rebuilt on every map transition (the pre-persistence behaviour). */
-static int hwr_atlas_persist_enabled(void)
-{
-    static int state = -1;
-    if (state < 0) {
-        const char *setting = getenv("HWR_ATLAS_PERSIST");
-        state = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return state;
-}
-
-static void hwr_map_data_clear(int keep_shared)
+static void hwr_map_data_clear(int keep_shared, int keep_map)
 {
     hwr_objects_clear(&g_objects);
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     memset(&g_sprite_census, 0, sizeof g_sprite_census);
     hwr_world_clear(&g_world);
-    hwr_das_close(&g_map_archive);
-    /* The shared archive is closed only when it is not being carried across the
-     * transition; keeping it open preserves its decoded payloads (which the
-     * per-frame sprite emitter re-dereferences) and its packed atlas. */
+    /* A DAS file is closed only when it is not being carried across the
+     * transition; keeping it open preserves its decoded payloads -- which the
+     * per-frame sprite emitter re-dereferences and the mesh scan would
+     * otherwise read and decode all over again -- and lets everything packed
+     * out of it stay in the texture store. */
+    if (!keep_map) {
+        hwr_das_close(&g_map_archive);
+        g_map_open_basename[0] = 0;
+    }
     if (!keep_shared) {
         hwr_das_close(&g_shared_archive);
         g_shared_open_basename[0] = 0;
@@ -743,30 +754,41 @@ static int hwr_fill_sentinel(const struct roth_api_v1 *api,
 
 /* Hands the index target the slice of the backdrop the viewport sits on, so the
  * first world frame is drawn over that art instead of over a flat colour. The
- * engine scales the image across the whole screen, so the slice depends on where
- * the viewport falls within it. */
+ * engine scales the image across the whole screen, so the slice depends on
+ * where the viewport falls within it, and the slice is laid down at the
+ * viewport's own proportions with black beyond it: the original painted a
+ * backdrop over its screen and nowhere else, so view area the target gains
+ * beyond that screen has no backdrop to show. */
 static void hwr_submit_backdrop_seed(const struct roth_api_v1 *api,
                                      const struct hwr_viewport *viewport,
                                      uint32_t output_width,
                                      uint32_t output_height)
 {
+    /* Re-seeding happens at every map change, every return to gameplay, and
+     * every inventory close, always at the canvas size, so the working buffer
+     * is grown once and kept. */
+    static uint8_t *indices;
+    static size_t indices_bytes;
     uint32_t screen_width = api->game_ram->u32(VA_G_SCREEN_PITCH);
     uint32_t screen_height = api->game_ram->u32(VA_G_SCREEN_HEIGHT);
     size_t plane = (size_t)output_width * output_height;
-    uint8_t *indices;
 
     g_backdrop_seed_pending = 0;
-    if (!g_backdrop.valid || screen_width == 0 || screen_height == 0)
+    if (!g_backdrop.valid || screen_width == 0 || screen_height == 0 ||
+        plane == 0 || plane / output_width != output_height)
         return;
-    indices = (uint8_t *)malloc(plane);
-    if (indices == NULL)
-        return;
-    if (hwr_backdrop_view_indices(&g_backdrop, screen_width, screen_height,
+    if (plane > indices_bytes) {
+        uint8_t *grown = (uint8_t *)realloc(indices, plane);
+        if (grown == NULL)
+            return;
+        indices = grown;
+        indices_bytes = plane;
+    }
+    if (hwr_backdrop_seed_indices(&g_backdrop, screen_width, screen_height,
                                   (uint32_t)viewport->x, (uint32_t)viewport->y,
                                   viewport->width, viewport->height,
                                   output_width, output_height, indices) == 0)
         hwr_gl_set_index_seed(indices, output_width, output_height);
-    free(indices);
 }
 
 static void hwr_check_present_caps(const struct roth_api_v1 *api)
@@ -842,6 +864,17 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     hwr_settings_apply_pending();
     hwr_apply_window_requests(api);
     g_wrap_serial++;
+    /* THE LOAD BOUNDARY, read before the original renderer runs. The map loader
+     * clears the engine's render-active latch and this very pass raises it
+     * again as its first statement, so a zero here means the engine has staged
+     * a map since the mod last drew, and it means it exactly once. Recording it
+     * on this dispatch is what lets one transition cost one rebuild: the host's
+     * own map notification arrives a tick later, by which time this has already
+     * answered it. */
+    if (hwr_ownership_map_staged(api)) {
+        g_map_epoch++;
+        g_map_reload_pending = 1;
+    }
     hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_PREFLIGHT);
 
     if (!g_render_settings.enabled || g_gl_permanently_failed) {
@@ -939,13 +972,28 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
      * hwr_scene_build_mesh.  It runs before the refresh/render below, so the
      * first frame after a load still renders the new map -- or fails closed
      * through the same invalid-snapshot path as an inline reload would have. */
+    if (g_map_event_pending) {
+        g_map_event_pending = 0;
+        /* The notification says a map was staged; the boundary above says which
+         * dispatch that was. It only has work of its own when the snapshot
+         * demonstrably does not describe the geometry the engine is about to
+         * draw -- the same proof the self-heal path below acts on. */
+        if (!g_map_reload_pending &&
+            hwr_ownership_world_stale(api, g_world.sector_section,
+                                      g_world.vertex_section)) {
+            g_map_epoch++;
+            g_map_reload_pending = 1;
+        }
+    }
     if (g_map_reload_pending) {
         g_map_reload_pending = 0;
-        hwr_reload_map_data(api, g_map_reload_generation);
+        hwr_reload_map_data(api, g_map_epoch);
+        g_map_epoch_loaded = g_map_epoch;
     }
     if (g_backdrop_seed_pending)
         hwr_submit_backdrop_seed(api, &viewport,
                                  render_width, render_height);
+    hwr_perf_phase("seed");
     world_was_valid = g_world.valid;
     refresh_result = g_world.valid ? hwr_world_refresh(&g_world, api) : -1;
     if (refresh_result >= 0 &&
@@ -974,9 +1022,15 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
                 g_scene_rebuild_pending = 1;
             }
         }
+        hwr_perf_phase("refresh");
         if (g_scene_rebuild_pending) {
             int rebuild_result;
             unsigned upload_errors;
+            /* A rebuild that no map load asked for -- a texture id first seen
+             * during play -- reports its cost the same way a transition does,
+             * instead of being the one blocking rebuild nothing measures. */
+            if (!hwr_perf_active())
+                hwr_perf_begin(g_map_epoch);
             /* The host's timer signal may interrupt driver calls mid-upload and
              * leave textures silently empty; keep it out of the one-time scene
              * upload, and verify the driver reported no errors afterwards. */
@@ -1589,6 +1643,7 @@ static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
         return;
     hwr_settings_apply_pending();
     hwr_apply_window_requests(api);
+    hwr_prewarm_shared_das(api);
 
     if (g_wrap_serial != g_watchdog_serial) {
         g_watchdog_serial = g_wrap_serial;
@@ -1601,6 +1656,53 @@ static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
         if (g_watchdog_stall_count >= 2)
             hwr_present_seam(api);
     }
+}
+
+/* Opens the shared DAS and decodes a little of it per tick, before any map has
+ * been loaded. Its name comes from the configuration and is settled from
+ * startup, its contents do not depend on which map is coming, and decoding is
+ * idempotent with the map load's own walk -- so the work that would otherwise
+ * land inside the first transition is done while the menu owns the screen
+ * instead. Runs on the game thread with no render in flight, and stops for good
+ * once the whole file is decoded or the name cannot be resolved. */
+static void hwr_prewarm_shared_das(const struct roth_api_v1 *api)
+{
+    /* Entries decoded per tick: enough to finish during a menu, small enough
+     * that a tick never shows the cost. */
+    enum { HWR_PREWARM_BATCH = 24 };
+    size_t limit;
+
+    if (g_shared_prewarm_done || g_plugin_dir[0] == 0 ||
+        !hwr_das_persist_enabled() || !g_objects_enabled ||
+        g_map_epoch_loaded != 0 || g_map_reload_pending || g_map_event_pending)
+        return;
+    if (g_shared_archive.entries == NULL) {
+        char shared_name[81];
+        char root[2600];
+        char shared_path[2600];
+        if (hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
+            g_shared_prewarm_done = 1;
+            return;
+        }
+        snprintf(root, sizeof root, "%s", g_plugin_dir);
+        if (hwr_parent_path(root) != 0 || hwr_parent_path(root) != 0 ||
+            hwr_find_archive_path(root, shared_name, shared_path,
+                                  sizeof shared_path) != 0 ||
+            hwr_das_open(&g_shared_archive, shared_path) != 0) {
+            g_shared_prewarm_done = 1;
+            return;
+        }
+        snprintf(g_shared_open_basename, sizeof g_shared_open_basename, "%s",
+                 shared_name);
+        g_shared_prewarm_cursor = 0;
+    }
+    limit = g_shared_prewarm_cursor + HWR_PREWARM_BATCH;
+    if (limit > g_shared_archive.entry_count)
+        limit = g_shared_archive.entry_count;
+    while (g_shared_prewarm_cursor < limit)
+        hwr_das_decode(&g_shared_archive, g_shared_prewarm_cursor++);
+    if (g_shared_prewarm_cursor >= g_shared_archive.entry_count)
+        g_shared_prewarm_done = 1;
 }
 
 static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
@@ -1635,22 +1737,27 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     char shared_path[2600];
     char failure[256];
     int keep_shared = 0;
+    int keep_map = 0;
 
     hwr_perf_begin(generation);
     hwr_settings_apply_pending();
     failure[0] = 0;
-    /* Read the archive names before any teardown so the shared-archive
-     * persistence decision can be taken while the old archive is still open. */
+    /* Read the DAS names before any teardown, so the persistence decision can
+     * be taken while the files that answer it are still open. */
     if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
         hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
-        snprintf(failure, sizeof failure, "archive name is unavailable");
+        snprintf(failure, sizeof failure, "DAS name is unavailable");
         goto failed;
     }
-    keep_shared = hwr_atlas_persist_enabled() &&
+    keep_shared = hwr_das_persist_enabled() &&
                   g_shared_archive.entries != NULL &&
                   g_shared_open_basename[0] != 0 &&
                   strcmp(shared_name, g_shared_open_basename) == 0;
-    hwr_map_data_clear(keep_shared);
+    keep_map = hwr_das_persist_enabled() &&
+               g_map_archive.entries != NULL &&
+               g_map_open_basename[0] != 0 &&
+               strcmp(map_name, g_map_open_basename) == 0;
+    hwr_map_data_clear(keep_shared, keep_map);
     hwr_perf_phase("clear");
     g_scene_rebuild_pending = 1;
     g_scene_error_logged = 0;
@@ -1669,8 +1776,11 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         snprintf(failure, sizeof failure, "plugin directory has no game-root parent");
         goto failed;
     }
-    if (hwr_find_archive_path(root, map_name, map_path, sizeof map_path) != 0 ||
-        hwr_find_archive_path(root, shared_name, shared_path, sizeof shared_path) != 0) {
+    if ((!keep_map &&
+         hwr_find_archive_path(root, map_name, map_path, sizeof map_path) != 0) ||
+        (!keep_shared &&
+         hwr_find_archive_path(root, shared_name, shared_path,
+                               sizeof shared_path) != 0)) {
         snprintf(failure, sizeof failure, "cannot resolve DAS files '%s' and '%s'", map_name,
                  shared_name);
         goto failed;
@@ -1696,13 +1806,17 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     }
     g_backdrop_seed_pending = g_backdrop.valid;
 
-    if (hwr_das_open(&g_map_archive, map_path) != 0) {
-        snprintf(failure, sizeof failure, "map DAS: %.220s", hwr_das_error(&g_map_archive));
-        goto failed;
+    /* A DAS being carried across the transition is already open with the
+     * matching basename; only a fresh (or changed) one is (re)opened here. */
+    if (!keep_map) {
+        if (hwr_das_open(&g_map_archive, map_path) != 0) {
+            snprintf(failure, sizeof failure, "map DAS: %.220s",
+                     hwr_das_error(&g_map_archive));
+            goto failed;
+        }
+        snprintf(g_map_open_basename, sizeof g_map_open_basename, "%s",
+                 map_name);
     }
-    /* When the shared archive is being carried across the transition it is
-     * already open with the matching basename; only a fresh (or changed) shared
-     * archive is (re)opened here. */
     if (!keep_shared) {
         if (hwr_das_open(&g_shared_archive, shared_path) != 0) {
             snprintf(failure, sizeof failure, "shared DAS: %.217s",
@@ -1728,6 +1842,9 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
      * with the scene upload's own lazy decode. */
     memset(&g_sprite_census, 0, sizeof g_sprite_census);
     if (g_objects_enabled) {
+        /* A DAS carried across the transition still holds every payload it
+         * decoded last time, so this walk only tallies them; it decodes just
+         * the entries the previous map's texture pack released. */
         hwr_sprites_predecode(&g_shared_archive, 0, &g_sprite_census);
         hwr_perf_phase("predecode-shared");
         hwr_sprites_predecode(&g_map_archive, HWR_SPRITE_ID_BIAS, &g_sprite_census);
@@ -1753,8 +1870,11 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
 failed:
     fprintf(stderr, "[renderer_overhaul] map data unavailable (gen=%u): %s\n",
             generation, failure);
-    hwr_map_data_clear(0);
+    hwr_map_data_clear(0, 0);
     g_scene_rebuild_pending = 1;
+    /* Nothing is loaded and the load boundary that asked for this has been
+     * consumed, so arm the slow retry rather than wait for the next one. */
+    g_selfheal_retry = 1;
 }
 
 static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
@@ -1773,8 +1893,8 @@ static void ROTH_CDECL hwr_on_map_loaded(const struct roth_api_v1 *api,
      * transition is carried by leaving that frame standing and handing the
      * viewport to the engine, not by taking the screen away. */
     (void)api;
-    g_map_reload_generation = event->generation;
-    g_map_reload_pending = 1;
+    (void)event;
+    g_map_event_pending = 1;
 }
 
 static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
@@ -1794,7 +1914,7 @@ static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
 static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
     hwr_enter_software(api, "the renderer is unloading");
-    hwr_map_data_clear(0);
+    hwr_map_data_clear(0, 0);
     hwr_objects_clear(&g_objects);
     hwr_scene_clear(&g_scene);
     hwr_gl_shutdown();

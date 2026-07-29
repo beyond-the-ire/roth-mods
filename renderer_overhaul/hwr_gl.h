@@ -208,11 +208,31 @@ struct hwr_gl_scene_view {
 };
 
 int hwr_gl_init(void);
+/* Creates the texture store and every GL object drawn through it. `reserve` is
+ * the buffer size to allocate (at least texture_size); the slack past
+ * texture_size is room for a later per-map block to be written straight into
+ * the resident buffer. `prefix_size` is the length of the leading run that
+ * outlives a map change -- the store self-test anchors its probe inside that
+ * run, so the probe keeps describing bytes no suffix write can have moved.
+ * Pass 0 for a store with no reusable prefix. */
 int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
+                        size_t reserve, size_t prefix_size,
                         const uint8_t colormap[0x2000],
                         const uint8_t tint[0x2000],
                         const uint8_t glow[0x200],
                         const uint8_t blend[0x10000]);
+/* Writes a new tail into the resident texture store, leaving the prefix -- and
+ * every GL object built around it -- exactly as uploaded, and refreshes the
+ * per-map colour tables. `offset` is where the tail begins; offset + size must
+ * fit the reserve the store was created with. Returns 0 when no resident store
+ * can take the write, in which case the caller falls back to a full upload. */
+int hwr_gl_scene_update_store(size_t offset, const uint8_t *bytes, size_t size,
+                              const uint8_t colormap[0x2000],
+                              const uint8_t tint[0x2000],
+                              const uint8_t glow[0x200],
+                              const uint8_t blend[0x10000]);
+/* Bytes the resident texture store can hold, or 0 when there is none. */
+size_t hwr_gl_scene_store_reserve(void);
 /* Rewrites a run of the uploaded texture store in place, for textures whose
  * pixels change over time. Returns 0 when the store is not ready to be
  * rewritten yet, in which case the caller should try again next frame. */

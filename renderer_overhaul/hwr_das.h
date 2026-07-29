@@ -51,6 +51,13 @@ struct hwr_das_entry {
 struct hwr_das_archive {
     FILE *file;
     char *path;
+    /* Identity of this open DAS file, unique for the life of the process: it
+     * changes if and only if this object is (re)opened, which is exactly when
+     * the bytes behind it may have become a different file.  Anything packed
+     * out of a DAS records the serial it was packed from, so "may I keep what I
+     * packed last time?" is one integer compare against the DAS that is open
+     * right now -- never a filename, never a guess. */
+    uint32_t open_serial;
     uint16_t version;
     uint16_t fat_size;
     uint32_t fat_offset;

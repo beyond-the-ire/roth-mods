@@ -93,6 +93,12 @@ int hwr_ownership_world_stale(const struct roth_api_v1 *api,
                vertex_section;
 }
 
+int hwr_ownership_map_staged(const struct roth_api_v1 *api)
+{
+    return api != NULL && api->game_ram != NULL &&
+           api->game_ram->u8(VA_G_RENDER_ACTIVE) == 0;
+}
+
 int hwr_ownership_engine_sequence(const struct roth_api_v1 *api)
 {
     if (api == NULL || api->game_ram == NULL)

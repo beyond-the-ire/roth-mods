@@ -8,12 +8,63 @@
 
 #include "hwr_gl.h"
 
+#include "hwr_util.h"
 #include "hwr_visibility.h"
 
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* THE TEXTURE STORE'S THREE BLOCKS.
+ *
+ * Every texel the world renderer samples lives in one linear GPU buffer, and
+ * every directory entry that addresses it is a byte offset into that buffer.
+ * What changes when the player walks through a door is only a small part of it:
+ *
+ *   S  the shared DAS's sprite set. One shared DAS serves the whole game (the
+ *      engine names it once, from the configuration, and never swaps it), so
+ *      these bytes are settled for the life of the process.
+ *   M  the object meshes of both DAS files, the map DAS's object-graphic tail,
+ *      and the ground shadow. Every map that names the same map DAS shares
+ *      them -- which is most
+ *      warps, because the engine itself skips its DAS swap when the basename is
+ *      unchanged (map_load.c:1058-1080). The meshes sit here rather than in S
+ *      because a mesh face may name a texture in EITHER DAS: ids below the
+ *      shared bias resolve against the map DAS, so a shared mesh can carry
+ *      map-DAS texels and cannot outlive a map-DAS change.
+ *   V  this map's own world textures and its sky. The only genuinely per-map
+ *      bytes, and the store's suffix, so they are written into the resident
+ *      buffer rather than replacing it.
+ *
+ * The identity each block is kept on is the DAS file object it was packed from
+ * (hwr_das_archive::open_serial), not a name: the serial changes if and only if
+ * that DAS was re-opened, which is the only way its bytes can have become a
+ * different file. */
+static uint32_t g_store_shared_serial;
+static uint32_t g_store_map_serial;
+static int g_store_closure;
+static size_t g_store_shared_size;   /* |S| */
+static size_t g_store_prefix_size;   /* |S| + |M| */
+static int g_store_resident;
+
+/* Headroom the store buffer is created with, so a later map's V block is
+ * written into it instead of forcing a new one. The largest V any retail map
+ * produces is under 7 MB; a store that would overflow this falls back to a full
+ * upload rather than growing in place. */
+#define HWR_STORE_SLACK (16u * 1024u * 1024u)
+/* Initial room for the V block in the CPU run being packed. */
+#define HWR_STORE_RUN_HINT (8u * 1024u * 1024u)
+
+void hwr_scene_store_forget(void)
+{
+    g_store_shared_serial = 0;
+    g_store_map_serial = 0;
+    g_store_closure = 0;
+    g_store_shared_size = 0;
+    g_store_prefix_size = 0;
+    g_store_resident = 0;
+}
 
 /* Ordinary world-wall winner tag, shared with hwr_billboards.c and the geometry
  * shader. The low bits identify the owning sector; the high class bit keeps it
@@ -1252,16 +1303,31 @@ static void hwr_scene_animations_clear(struct hwr_scene *scene)
     scene->animation_count = 0;
 }
 
-void hwr_scene_clear(struct hwr_scene *scene)
+/* Tears the scene down. `keep_store` retains everything the resident texture
+ * store describes -- the GL objects built around it and the mesh/sprite
+ * directories whose offsets address it -- because the bytes they point at are
+ * still in the buffer. Everything derived from THIS map (the world mesh, the
+ * per-map texture table, animations, streams, visibility) always goes. */
+static void hwr_scene_clear_keeping(struct hwr_scene *scene, int keep_store)
 {
+    struct hwr_meshes kept_meshes;
+    struct hwr_billboards kept_billboards;
     size_t i;
     if (scene == NULL)
         return;
-    hwr_gl_scene_clear();
+    if (keep_store) {
+        kept_meshes = scene->object_meshes;
+        kept_billboards = scene->billboards;
+    } else {
+        memset(&kept_meshes, 0, sizeof kept_meshes);
+        memset(&kept_billboards, 0, sizeof kept_billboards);
+        hwr_gl_scene_clear();
+        hwr_scene_store_forget();
+        hwr_meshes_clear(&scene->object_meshes);
+        hwr_billboards_clear(&scene->billboards);
+    }
     hwr_scene_mesh_clear(&scene->mesh);
     hwr_scene_animations_clear(scene);
-    hwr_meshes_clear(&scene->object_meshes);
-    hwr_billboards_clear(&scene->billboards);
     free(scene->stream_vertices);
     free(scene->translucent_runs);
     free(scene->translucent_run_flags);
@@ -1276,6 +1342,15 @@ void hwr_scene_clear(struct hwr_scene *scene)
         free(scene->reflections[i].run_flags);
     }
     memset(scene, 0, sizeof *scene);
+    if (keep_store) {
+        scene->object_meshes = kept_meshes;
+        scene->billboards = kept_billboards;
+    }
+}
+
+void hwr_scene_clear(struct hwr_scene *scene)
+{
+    hwr_scene_clear_keeping(scene, 0);
 }
 
 const char *hwr_scene_error(const struct hwr_scene *scene)
@@ -1480,33 +1555,127 @@ static size_t hwr_scene_animation_bytes(const struct hwr_scene *scene)
     return bytes;
 }
 
-static int hwr_upload_referenced_textures(struct hwr_scene *scene,
-                                           const struct hwr_world *world,
-                                           struct hwr_das_archive *map_archive,
-                                           struct hwr_das_archive *shared_archive,
-                                           const struct hwr_objects *objects,
-                                           const struct roth_api_v1 *api,
-                                           int debug)
+/* HWR_VERIFY_STORE hashes the whole store at upload and reads it back to
+ * compare. A store whose tail is rewritten in place has no such hash, so while
+ * that self-test is on, every rebuild packs and uploads the whole store and the
+ * check keeps its exact meaning. */
+static int hwr_scene_store_verify_forces_full(void)
+{
+    static int state = -1;
+    if (state < 0) {
+        const char *setting = getenv("HWR_VERIFY_STORE");
+        state = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    return state;
+}
+
+/* The shared block may be kept when it is resident, persistence is on, and the
+ * shared DAS still open is the very file object it was packed from. */
+static int hwr_scene_keep_shared_block(const struct hwr_das_archive *shared)
+{
+    return g_store_resident && hwr_das_persist_enabled() &&
+           !hwr_scene_store_verify_forces_full() &&
+           hwr_gl_scene_store_reserve() != 0 &&
+           shared != NULL && shared->entries != NULL &&
+           shared->open_serial != 0 &&
+           shared->open_serial == g_store_shared_serial;
+}
+
+/* The map block additionally needs the sprite-closure policy to be the one it
+ * was packed under: a closure scopes the map sprite tail to one map's reachable
+ * set, which is not a property of the DAS file. */
+static int hwr_scene_keep_map_block(const struct hwr_das_archive *map)
+{
+    return map != NULL && map->entries != NULL && map->open_serial != 0 &&
+           map->open_serial == g_store_map_serial &&
+           hwr_billboards_closure_enabled() == g_store_closure;
+}
+
+/* Starts a pack run whose first byte occupies store offset `base`. The bytes in
+ * front of `base` are the resident prefix: they are not held here and never
+ * written, so the run is addressed by absolute store offset and every directory
+ * entry a packer records is a store offset, exactly as it is when the whole
+ * store is packed at once. */
+static int hwr_store_run_begin(uint8_t **bytes, size_t *size, size_t *capacity,
+                               size_t base)
+{
+    uint8_t *buffer;
+    if (base > SIZE_MAX - HWR_STORE_RUN_HINT)
+        return -1;
+    buffer = (uint8_t *)malloc(base + HWR_STORE_RUN_HINT);
+    if (buffer == NULL)
+        return -1;
+    *bytes = buffer;
+    *size = base;
+    *capacity = base + HWR_STORE_RUN_HINT;
+    return 0;
+}
+
+static int hwr_pack_and_upload_store(struct hwr_scene *scene,
+                                     const struct hwr_world *world,
+                                     struct hwr_das_archive *map_archive,
+                                     struct hwr_das_archive *shared_archive,
+                                     const struct hwr_objects *objects,
+                                     const struct roth_api_v1 *api,
+                                     int debug, int keep_shared, int keep_map,
+                                     int *out_retry)
 {
     uint8_t *bytes = NULL;
     size_t size = 0;
     size_t capacity = 0;
+    size_t base;
+    size_t shared_size;
+    size_t prefix_size;
     uint8_t zero = 0;
     uint16_t logical;
     int has_sky = 0;
     size_t surface_index;
     struct hwr_scene_texture_stats stats;
     memset(&stats, 0, sizeof stats);
-    if (hwr_append_bytes(&bytes, &size, &capacity, &zero, 1) != 0)
+    *out_retry = 0;
+    hwr_scene_animations_clear(scene);
+    base = keep_map ? g_store_prefix_size
+                    : (keep_shared ? g_store_shared_size : 0);
+    if (hwr_store_run_begin(&bytes, &size, &capacity, base) != 0)
         return hwr_scene_fail(scene, "out of memory creating texture buffer");
-    /* Copy mesh geometry and append its face dependencies before world texture
-     * packing can release any overlapping decoded archive entry. */
-    if (hwr_meshes_pack(&scene->object_meshes, map_archive, shared_archive,
-                        &bytes, &size, &capacity) != 0) {
-        free(bytes);
-        return hwr_scene_fail(scene, "%s",
-                              hwr_meshes_error(&scene->object_meshes));
+    if (!keep_shared) {
+        /* Offset zero is a known zero texel, so every "nothing here" reference
+         * lands on a defined byte. */
+        if (hwr_append_bytes(&bytes, &size, &capacity, &zero, 1) != 0) {
+            free(bytes);
+            return hwr_scene_fail(scene, "out of memory creating texture buffer");
+        }
+        if (hwr_billboards_pack_shared(&scene->billboards, shared_archive,
+                                       &bytes, &size, &capacity) != 0) {
+            free(bytes);
+            return hwr_scene_fail(scene, "%s", scene->billboards.error);
+        }
     }
+    /* Every block reports its own phase whether or not it had to be produced,
+     * so one timing line reads the same as the next and a block that cost
+     * nothing says so with a zero instead of an absence. */
+    hwr_perf_phase("bb-shared");
+    shared_size = keep_shared ? g_store_shared_size : size;
+    if (!keep_map) {
+        /* Copy mesh geometry and append its face dependencies before world
+         * texture packing can release any overlapping decoded DAS entry. */
+        if (hwr_meshes_pack(&scene->object_meshes, map_archive, shared_archive,
+                            &bytes, &size, &capacity) != 0) {
+            free(bytes);
+            return hwr_scene_fail(scene, "%s",
+                                  hwr_meshes_error(&scene->object_meshes));
+        }
+        hwr_perf_phase("obj-meshes");
+        if (hwr_billboards_pack_map(&scene->billboards, map_archive, objects,
+                                    api, &bytes, &size, &capacity) != 0) {
+            free(bytes);
+            return hwr_scene_fail(scene, "%s", scene->billboards.error);
+        }
+    } else {
+        hwr_perf_phase("obj-meshes");
+    }
+    hwr_perf_phase("bb-map");
+    prefix_size = keep_map ? g_store_prefix_size : size;
     memset(scene->textures, 0, sizeof scene->textures);
     scene->sky_valid = 0;
     for (surface_index = 0; surface_index < scene->mesh.surface_count;
@@ -1742,27 +1911,74 @@ static int hwr_upload_referenced_textures(struct hwr_scene *scene,
                 (unsigned)scene->object_meshes.material_count,
                 (unsigned)scene->object_meshes.stat_invalid, (unsigned)size);
     hwr_perf_phase("world-atlas");
-    /* Pack the sprite atlas into the SAME texel store, after the world textures,
-     * so a billboard vertex references a byte offset exactly as a wall vertex
-     * does. Appending leaves every world texture offset unchanged. */
-    if (hwr_billboards_pack(&scene->billboards, map_archive, shared_archive,
-                            objects, api, &bytes, &size, &capacity) != 0) {
-        free(bytes);
-        return hwr_scene_fail(scene, "%s", scene->billboards.error);
-    }
     if (debug)
         fprintf(stderr, "[renderer_overhaul] billboard atlas: map slots=%u shared slots=%u store=%u bytes\n",
                 (unsigned)scene->billboards.map_dir_count,
                 (unsigned)scene->billboards.shared_dir_count, (unsigned)size);
-    if (!hwr_gl_scene_upload(bytes, size, world->luts.colormap, world->luts.tint,
-                             world->luts.glow, world->luts.blend)) {
+    if (base != 0) {
+        /* A map that packs no texels of its own would leave nothing to write;
+         * one pad byte keeps the write well formed and the store's length
+         * honest. */
+        if (size == base &&
+            hwr_append_bytes(&bytes, &size, &capacity, &zero, 1) != 0) {
+            free(bytes);
+            return hwr_scene_fail(scene, "out of memory closing the texture store");
+        }
+        /* Only this map's block is new; the rest of the store is already where
+         * the directories say it is. */
+        if (!hwr_gl_scene_update_store(base, bytes + base, size - base,
+                                       world->luts.colormap, world->luts.tint,
+                                       world->luts.glow, world->luts.blend)) {
+            /* This map's block outgrew the store's headroom (or the store went
+             * away): ask the caller to pack the whole thing instead. */
+            free(bytes);
+            hwr_scene_store_forget();
+            *out_retry = 1;
+            return -1;
+        }
+    } else if (!hwr_gl_scene_upload(bytes, size, size + HWR_STORE_SLACK,
+                                    prefix_size, world->luts.colormap,
+                                    world->luts.tint, world->luts.glow,
+                                    world->luts.blend)) {
         free(bytes);
+        hwr_scene_store_forget();
         return hwr_scene_fail(scene, "%s", hwr_gl_last_error());
     }
     hwr_perf_phase("upload");
     free(bytes);
+    g_store_shared_serial = shared_archive != NULL ? shared_archive->open_serial : 0;
+    g_store_map_serial = map_archive != NULL ? map_archive->open_serial : 0;
+    g_store_closure = hwr_billboards_closure_enabled();
+    g_store_shared_size = shared_size;
+    g_store_prefix_size = prefix_size;
+    g_store_resident = 1;
     scene->uploaded = 1;
     return 0;
+}
+
+/* Packs this map's texels into the store and gets them onto the GPU, keeping
+ * whatever the resident store already holds that this map can still use. The
+ * one way that can fail without the store being broken is a per-map block too
+ * large for the headroom, and the answer to that is to build the whole store
+ * once more. */
+static int hwr_upload_referenced_textures(struct hwr_scene *scene,
+                                          const struct hwr_world *world,
+                                          struct hwr_das_archive *map_archive,
+                                          struct hwr_das_archive *shared_archive,
+                                          const struct hwr_objects *objects,
+                                          const struct roth_api_v1 *api,
+                                          int debug, int keep_shared,
+                                          int keep_map)
+{
+    int retry = 0;
+    int result = hwr_pack_and_upload_store(scene, world, map_archive,
+                                           shared_archive, objects, api, debug,
+                                           keep_shared, keep_map, &retry);
+    if (result == 0 || !retry)
+        return result;
+    fprintf(stderr, "[renderer_overhaul] this map's texels do not fit the resident store; rebuilding all of it\n");
+    return hwr_pack_and_upload_store(scene, world, map_archive, shared_archive,
+                                     objects, api, debug, 0, 0, &retry);
 }
 
 int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
@@ -1771,21 +1987,34 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
                       const struct hwr_objects *objects,
                       const struct roth_api_v1 *api, int debug)
 {
+    int keep_shared;
+    int keep_map;
     if (scene == NULL)
         return -1;
-    /* Close out the interval between the reload and this rebuild (per-frame
-     * world refresh + object enumeration that ran on the build dispatch) so it
-     * is not folded into the mesh number. A no-op outside a timing session. */
+    /* Close out the interval between the reload and this rebuild (whatever ran
+     * on the build dispatch before it) so it is not folded into the mesh
+     * number. A no-op outside a timing session. */
     hwr_perf_phase("dispatch-gap");
-    hwr_scene_clear(scene);
-    hwr_billboards_init(&scene->billboards);
+    /* Decided before the teardown, because it decides how much of the teardown
+     * there is: what the resident store still holds is what does not have to be
+     * produced again. */
+    keep_shared = hwr_scene_keep_shared_block(shared_archive);
+    keep_map = keep_shared && hwr_scene_keep_map_block(map_archive);
+    hwr_scene_clear_keeping(scene, keep_shared);
+    if (!keep_shared)
+        hwr_billboards_init(&scene->billboards);
+    /* Directories carried across a transition still describe the same texels,
+     * but they have to name the DAS objects that are open now. */
+    hwr_billboards_bind(&scene->billboards, map_archive, shared_archive);
+    hwr_meshes_bind(&scene->object_meshes, map_archive, shared_archive);
     scene->map_archive = map_archive;
     scene->shared_archive = shared_archive;
     if (hwr_scene_build_mesh(&scene->mesh, world, debug) != 0)
         return hwr_scene_fail(scene, "%s", scene->mesh.error);
     hwr_perf_phase("mesh");
     if (hwr_upload_referenced_textures(scene, world, map_archive,
-                                       shared_archive, objects, api, debug) != 0)
+                                       shared_archive, objects, api, debug,
+                                       keep_shared, keep_map) != 0)
         return -1;
     hwr_perf_report();
     scene->valid = 1;

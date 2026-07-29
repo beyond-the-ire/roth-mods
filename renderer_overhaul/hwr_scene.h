@@ -306,6 +306,10 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  uint32_t source_width,
                                  uint32_t source_height);
 void hwr_scene_clear(struct hwr_scene *scene);
+/* Drops the record of what the resident texture store holds, so the next
+ * rebuild packs and uploads all of it. Called whenever anything the store was
+ * packed from stops being trustworthy. */
+void hwr_scene_store_forget(void);
 const char *hwr_scene_error(const struct hwr_scene *scene);
 
 #endif

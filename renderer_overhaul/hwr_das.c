@@ -27,6 +27,10 @@
 #define HWR_DAS_ANIM_TABLE 0x10u
 #define HWR_DAS_DELTA_TABLE 0x12u
 
+/* Hands out archive->open_serial. Starts at one so a zeroed archive object can
+ * never compare equal to an open one. */
+static uint32_t g_das_open_serial;
+
 static uint16_t hwr_read_u16(const uint8_t *bytes)
 {
     return (uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
@@ -459,6 +463,9 @@ static int hwr_das_finish_open(struct hwr_das_archive *archive, FILE *file,
     }
     archive->file = file;
     archive->owns_file = owns_file;
+    /* Stamp the identity last, so only a fully opened DAS ever carries a serial
+     * anything else may key on. */
+    archive->open_serial = ++g_das_open_serial;
     return 0;
 }
 
