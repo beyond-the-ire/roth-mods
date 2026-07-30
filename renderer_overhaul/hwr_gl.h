@@ -161,6 +161,14 @@ struct hwr_gl_camera {
     uint16_t source_height;
     int16_t shade_origin_x;
     int16_t shade_origin_y;
+    /* The candle origin in the engine's own screen window. The scaled pair
+     * above drives the shader's per-fragment radial, which evaluates at each
+     * fragment and so carries no window scale into its answer; the CPU corner
+     * law samples at the drawn area's BOUNDARY, so it has to measure in the
+     * window the engine defined the law in or its radial arm grows with the
+     * target aspect. */
+    int16_t source_shade_origin_x;
+    int16_t source_shade_origin_y;
     uint8_t shade_level;
     uint8_t tint_shade_level;
     uint8_t global_light_bias;

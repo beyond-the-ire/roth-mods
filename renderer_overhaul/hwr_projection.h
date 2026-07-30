@@ -20,6 +20,15 @@ double hwr_projection_map_x(const struct hwr_gl_camera *camera,
 int64_t hwr_projection_map_x_fixed(const struct hwr_gl_camera *camera,
                                    int32_t source_x);
 
+/* The inverse of the retarget: one target framebuffer coordinate expressed in
+ * the engine projection's own screen space, exactly (no integer rounding), so a
+ * law defined on the engine's window can be evaluated against the drawn area's
+ * boundary without the boundary moving with the target aspect. */
+double hwr_projection_source_x(const struct hwr_gl_camera *camera,
+                               double target_x);
+double hwr_projection_source_y(const struct hwr_gl_camera *camera,
+                               double target_y);
+
 /* Returns the target framebuffer edges expressed in the engine projection's
  * screen-X coordinates. A wider target therefore produces bounds outside the
  * original [0, source_width) interval, which the portal walk can traverse

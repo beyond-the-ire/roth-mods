@@ -2520,29 +2520,117 @@ static double hwr_vertex_view_depth(const struct hwr_mesh_vertex *vertex,
     return sine * (double)dy - cosine * (double)dx;
 }
 
+/* The candle law is stated once, in the engine's own screen window: the radial
+ * scales are 0x40000/focal, the origin is a pixel position in that window, and
+ * the corner the law is sampled at is where the drawn polygon meets that
+ * window's edge.  Rendering the same view into a taller framebuffer rescales
+ * all three together and nothing moves; rendering it into a WIDER one does not.
+ * The frame's side edges then sit further out in angle, so a corner pushed onto
+ * them measures a longer radial arm than any corner the engine can produce --
+ * proportionally to the aspect change, several shade rows at ultrawide, enough
+ * to saturate every corner of a near-player surface and take it to the
+ * whole-polygon fill.  Anchoring the corner law to the engine's window (the
+ * projection that places the corner, the window the corner is held inside, the
+ * origin, and the radial scales, all together) makes it answer the same thing
+ * at every target size and shape.
+ *
+ * Only the CPU corner law needs this.  The shader's per-fragment radial arm
+ * evaluates at the fragment's own position, where the window scale divides out
+ * of the answer and no boundary enters, so it stays on the scaled terms.  So do
+ * the flat texel walk and span state, which are properties of the framebuffer
+ * being drawn.
+ *
+ * HWR_SHADE_SOURCE_ANCHOR=0 restores the target-window terms. */
+static int hwr_shade_source_anchor_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_SHADE_SOURCE_ANCHOR");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+/* The screen window the candle corner law is evaluated in: a projection, the
+ * candle origin, and the pixel rectangle a corner is held inside. */
+struct hwr_shade_window {
+    uint16_t focal_x;
+    uint16_t focal_y;
+    int32_t center_x;
+    int32_t horizon;
+    int16_t origin_x;
+    int16_t origin_y;
+    uint32_t width;
+    uint32_t height;
+};
+
+static void hwr_shade_window_init(struct hwr_shade_window *window,
+                                  const struct hwr_gl_camera *camera,
+                                  uint32_t width, uint32_t height)
+{
+    if (hwr_shade_source_anchor_enabled() && camera->source_focal_x != 0 &&
+        camera->source_focal_y != 0 && camera->source_width != 0 &&
+        camera->source_height != 0) {
+        window->focal_x = camera->source_focal_x;
+        window->focal_y = camera->source_focal_y;
+        window->center_x = camera->source_center_x;
+        window->horizon = camera->source_horizon;
+        window->origin_x = camera->source_shade_origin_x;
+        window->origin_y = camera->source_shade_origin_y;
+        window->width = camera->source_width;
+        window->height = camera->source_height;
+        return;
+    }
+    window->focal_x = camera->focal_x;
+    window->focal_y = camera->focal_y;
+    window->center_x = camera->center_x;
+    window->horizon = camera->horizon;
+    window->origin_x = camera->shade_origin_x;
+    window->origin_y = camera->shade_origin_y;
+    window->width = width;
+    window->height = height;
+}
+
+/* Holds a projected corner inside the window the law is defined in. Inert on
+ * every corner the engine could itself produce; in the extra view area a wider
+ * target opens up it continues the shade at the value the engine's own frame-
+ * edge corner carried, which is bounded where an unclamped arm is not. */
+static void hwr_shade_window_clamp(const struct hwr_shade_window *window,
+                                   int *screen_x, int *screen_y)
+{
+    if (*screen_x < 0)
+        *screen_x = 0;
+    else if (window->width != 0 && *screen_x >= (int)window->width)
+        *screen_x = (int)window->width - 1;
+    if (*screen_y < 0)
+        *screen_y = 0;
+    else if (window->height != 0 && *screen_y >= (int)window->height)
+        *screen_y = (int)window->height - 1;
+}
+
 /* The candle radial edge term shared by walls and flats: the Chebyshev distance
  * from the jittered shade origin (0x90990/0x90992, the flickering light
  * position) to the projected point, in the engine's 16-bit shade domain, plus
- * the view-depth word.  screen_x/screen_y are the projected, viewport-clamped
- * pixel coordinates; depth is the clamped view-depth word. */
+ * the view-depth word.  screen_x/screen_y are the projected pixel coordinates
+ * inside the window; depth is the clamped view-depth word. */
 static uint16_t hwr_shade_edge_term(int screen_x, int screen_y,
-                                    const struct hwr_gl_camera *camera,
+                                    const struct hwr_shade_window *window,
                                     int depth)
 {
-    uint16_t scale_x = camera->focal_x != 0
-        ? (uint16_t)(0x40000u / camera->focal_x) : 0;
-    uint16_t scale_y = camera->focal_y != 0
-        ? (uint16_t)(0x40000u / camera->focal_y) : 0;
+    uint16_t scale_x = window->focal_x != 0
+        ? (uint16_t)(0x40000u / window->focal_x) : 0;
+    uint16_t scale_y = window->focal_y != 0
+        ? (uint16_t)(0x40000u / window->focal_y) : 0;
     int16_t delta;
     uint16_t magnitude;
     uint16_t distance_x;
     uint16_t distance_y;
     uint16_t projected;
 
-    delta = (int16_t)((uint16_t)screen_x - (uint16_t)camera->shade_origin_x);
+    delta = (int16_t)((uint16_t)screen_x - (uint16_t)window->origin_x);
     magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
     distance_x = (uint16_t)(((uint32_t)magnitude * scale_x) >> 8);
-    delta = (int16_t)((uint16_t)screen_y - (uint16_t)camera->shade_origin_y);
+    delta = (int16_t)((uint16_t)screen_y - (uint16_t)window->origin_y);
     magnitude = (uint16_t)(delta < 0 ? -(int)delta : (int)delta);
     distance_y = (uint16_t)(((uint32_t)magnitude * scale_y) >> 8);
     projected = distance_y > distance_x ? distance_y : distance_x;
@@ -2558,6 +2646,7 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
 {
     double view_x;
     double depth_f = hwr_vertex_view_depth(vertex, camera, &view_x);
+    struct hwr_shade_window window;
     int depth;
     int screen_x;
     int screen_y;
@@ -2569,28 +2658,25 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
     int level = camera->tint_shade_level;
     int shade;
 
+    hwr_shade_window_init(&window, camera, width, height);
     if (depth_f < 16.0)
         depth_f = 16.0;
     depth = (int)(depth_f * (camera->shade_depth_scale > 0.0f
                           ? camera->shade_depth_scale : 1.0f));
     if (depth < 16)
         depth = 16;
-    screen_x = (int)(view_x * (double)camera->focal_x / depth_f) +
-               camera->center_x;
+    /* A point-blank wall projects both of its endpoints far outside the frame,
+     * so the clamp below is what actually decides this word: it is the frame
+     * edge's radial arm, and holding it in the engine's window is what keeps a
+     * wide target from reading several rows darker there and solid-filling a
+     * wall the engine draws textured. */
+    screen_x = (int)(view_x * (double)window.focal_x / depth_f) +
+               window.center_x;
     screen_y = (int)(((double)camera->eye_z - (double)bottom_z) *
-                     (double)camera->focal_y / depth_f) + camera->horizon;
-    if (screen_y < 0)
-        screen_y = 0;
-    else if (height != 0 && screen_y >= (int)height)
-        screen_y = (int)height - 1;
-    if (width != 0) {
-        if (screen_x < 0)
-            screen_x = 0;
-        else if (screen_x >= (int)width)
-            screen_x = (int)width - 1;
-    }
+                     (double)window.focal_y / depth_f) + window.horizon;
+    hwr_shade_window_clamp(&window, &screen_x, &screen_y);
 
-    projected = hwr_shade_edge_term(screen_x, screen_y, camera, depth);
+    projected = hwr_shade_edge_term(screen_x, screen_y, &window, depth);
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
@@ -2714,8 +2800,11 @@ static int hwr_wall_tint_clip_adjust(const struct hwr_mesh_surface *surface,
     return adjust;
 }
 
+/* The flat plane's own screen row, in whichever window the caller works in: the
+ * shade law wants the engine's, the span state wants the framebuffer's. */
 static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
                               const struct hwr_gl_camera *camera,
+                              uint16_t focal_y, int32_t horizon,
                               uint32_t height)
 {
     int32_t dx = (int16_t)((uint16_t)vertex->x +
@@ -2728,8 +2817,8 @@ static int hwr_flat_project_y(const struct hwr_mesh_vertex *vertex,
     if (depth < 0x1000)
         depth = 0x1000;
     projected = (int64_t)(camera->eye_z - vertex->z) *
-                ((int64_t)camera->focal_y << 8);
-    y = (int)(projected / depth) + camera->horizon;
+                ((int64_t)focal_y << 8);
+    y = (int)(projected / depth) + horizon;
     if (y < 0)
         return 0;
     if (height != 0 && y >= (int)height)
@@ -2812,9 +2901,10 @@ static uint16_t hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
 {
     double view_x;
     double depth_f = hwr_vertex_view_depth(vertex, camera, &view_x);
+    struct hwr_shade_window window;
     int depth;
     int screen_x;
-    int screen_y = hwr_flat_project_y(vertex, camera, height);
+    int screen_y;
     uint16_t projected;
     uint8_t light = surface->light;
     int axv;
@@ -2822,22 +2912,20 @@ static uint16_t hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
     int level = camera->tint_shade_level;
     int shade;
 
+    hwr_shade_window_init(&window, camera, width, height);
+    screen_y = hwr_flat_project_y(vertex, camera, window.focal_y,
+                                  window.horizon, window.height);
     if (depth_f < 16.0)
         depth_f = 16.0;
     depth = (int)(depth_f * (camera->shade_depth_scale > 0.0f
                           ? camera->shade_depth_scale : 1.0f));
     if (depth < 16)
         depth = 16;
-    screen_x = (int)(view_x * (double)camera->focal_x / depth_f) +
-               camera->center_x;
-    if (width != 0) {
-        if (screen_x < 0)
-            screen_x = 0;
-        else if (screen_x >= (int)width)
-            screen_x = (int)width - 1;
-    }
+    screen_x = (int)(view_x * (double)window.focal_x / depth_f) +
+               window.center_x;
+    hwr_shade_window_clamp(&window, &screen_x, &screen_y);
 
-    projected = hwr_shade_edge_term(screen_x, screen_y, camera, depth);
+    projected = hwr_shade_edge_term(screen_x, screen_y, &window, depth);
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
@@ -2886,8 +2974,12 @@ static void hwr_flat_span_state(const struct hwr_scene_mesh *mesh,
     size_t i;
 
     for (i = 0; i < surface->vertex_count; i++) {
+        /* The span state drives the texel walk on the framebuffer being drawn,
+         * so it stays on the target projection whatever window the shade law
+         * is anchored to. */
         int y = hwr_flat_project_y(
-            &mesh->vertices[surface->first_vertex + i], camera, height);
+            &mesh->vertices[surface->first_vertex + i], camera,
+            camera->focal_y, camera->horizon, height);
         if (y < min_y)
             min_y = y;
         if (y > max_y)
@@ -3495,7 +3587,13 @@ enum hwr_flat_plane {
 /* The affine world->view terms of one flat surface.  The view transform is a
  * 16-bit add, so the loop's first point is wrapped once and every other point is
  * carried from it by its linear delta: that keeps a loop authored across the
- * coordinate wrap a single un-torn polygon to clip. */
+ * coordinate wrap a single un-torn polygon to clip.
+ *
+ * The projection here is the shade window's, so the clip boundaries and the
+ * corner words it produces are both stated in the window the candle law is
+ * defined in.  The drawn area is expressed in the same coordinates by mapping
+ * the framebuffer's edges through the projection, so anchoring the law does not
+ * move a single covered pixel. */
 struct hwr_flat_view {
     double sine;
     double cosine;
@@ -3511,6 +3609,7 @@ struct hwr_flat_view {
     double plane;
     double depth_scale;
     int x_flip;
+    struct hwr_shade_window window;
 };
 
 static void hwr_flat_view_point(const struct hwr_flat_view *view,
@@ -3644,10 +3743,14 @@ static int hwr_flat_clip_loop(const struct hwr_flat_view *view,
 }
 
 /* The candle shade word at one clipped corner: the same law as the mesh-corner
- * form, evaluated at a point that now lies ON the drawn surface, so the viewport
- * clamps that stood in for the clip are gone.  The bright end returns row 1, the
- * floor the engine's projector uses on this branch (renderer.c: `dx <= 0` ->
- * mode |= 4, return 0x100), never row 0. */
+ * form, evaluated at a point that now lies ON the drawn surface.  The clamp is
+ * back, and it is the one thing that could not be dropped: it is what holds a
+ * corner of the extra view area a wider target opens up at the arm the engine's
+ * own frame-edge corner carried, instead of letting it run out past anything the
+ * engine can produce.  Inside the engine's window it never fires, so the law
+ * there is the law.  The bright end returns row 1, the floor the engine's
+ * projector uses on this branch (renderer.c: `dx <= 0` -> mode |= 4, return
+ * 0x100), never row 0. */
 static uint16_t hwr_flat_clipped_shade_word(
     const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera,
@@ -3673,7 +3776,8 @@ static uint16_t hwr_flat_clipped_shade_word(
         depth = 16;
     screen_x = (int)(view_x * view->focal_x / depth_f) + (int)view->center_x;
     screen_y = (int)(view->plane / depth_f) + (int)view->horizon;
-    projected = hwr_shade_edge_term(screen_x, screen_y, camera, depth);
+    hwr_shade_window_clamp(&view->window, &screen_x, &screen_y);
+    projected = hwr_shade_edge_term(screen_x, screen_y, &view->window, depth);
 
     if (light != 0)
         light = (uint8_t)(light + camera->global_light_bias);
@@ -3745,16 +3849,18 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
     uint16_t fan[(HWR_FLAT_CLIP_MAX - 2) * 3];
     struct hwr_point rounded[HWR_FLAT_CLIP_MAX];
     double bounds[5];
+    double fill_bounds[5];
     const struct hwr_point *loop =
         mesh->loop_points + surface->first_loop_point;
     size_t count = surface->loop_point_count;
     int16_t plane_z = mesh->vertices[surface->first_vertex].z;
-    double band_lo = 0.0;
-    double band_hi = (double)width;
+    double band_lo;
+    double band_hi;
     size_t out = 0;
     int n;
     int triangles;
     int k;
+    int outside_window = 0;
     int all_saturated = 1;
     int shaded = surface->light != 0;
 
@@ -3770,31 +3876,54 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
                                     (uint16_t)camera->view_offset_x);
     view.base_y = (double)(int16_t)((uint16_t)(int32_t)loop[0].y +
                                     (uint16_t)camera->view_offset_y);
-    view.focal_x = (double)camera->focal_x;
-    view.focal_y = (double)camera->focal_y;
-    view.center_x = (double)camera->center_x;
-    view.horizon = (double)camera->horizon;
+    hwr_shade_window_init(&view.window, camera, width, height);
+    view.focal_x = (double)view.window.focal_x;
+    view.focal_y = (double)view.window.focal_y;
+    view.center_x = (double)view.window.center_x;
+    view.horizon = (double)view.window.horizon;
     view.plane = ((double)camera->eye_z - (double)plane_z) *
-                 (double)camera->focal_y;
+                 (double)view.window.focal_y;
     view.depth_scale = camera->shade_depth_scale > 0.0f
         ? (double)camera->shade_depth_scale : 1.0;
     view.x_flip = camera->x_flip != 0;
 
+    /* The drawn area, expressed in the window the clip works in. Mapping the
+     * framebuffer's own edges through the projection keeps coverage exactly
+     * where it was -- a corner still lands on the frame edge, it is just
+     * measured in engine columns and rows. */
+    if (view.window.focal_x == camera->focal_x &&
+        view.window.center_x == camera->center_x) {
+        band_lo = 0.0;
+        band_hi = (double)width;
+        bounds[HWR_FLAT_PLANE_TOP] = 0.0;
+        bounds[HWR_FLAT_PLANE_BOTTOM] = (double)height;
+    } else {
+        band_lo = hwr_projection_source_x(camera, 0.0);
+        band_hi = hwr_projection_source_x(camera, (double)width);
+        bounds[HWR_FLAT_PLANE_TOP] = hwr_projection_source_y(camera, 0.0);
+        bounds[HWR_FLAT_PLANE_BOTTOM] =
+            hwr_projection_source_y(camera, (double)height);
+    }
+
     /* Where the surface carries a portal column band, that band IS the engine's
      * side bound for this chain entry, so the corners land on the doorway edge
-     * rather than the frame edge. The band arrives in the same coordinates the
-     * fragment gate uses. */
+     * rather than the frame edge. A primary view's band is already stated in
+     * engine columns; a reflected view's is in framebuffer columns, so each is
+     * brought into the clip's own coordinates. */
     if (clip_right > clip_left) {
-        double lo;
-        double hi;
-        if (camera->reflected) {
-            lo = (double)clip_left;
-            hi = (double)clip_right;
-        } else {
+        double lo = (double)clip_left;
+        double hi = (double)clip_right;
+        int band_is_source = !camera->reflected;
+        int clip_is_source = view.window.focal_x != camera->focal_x ||
+                             view.window.center_x != camera->center_x;
+        if (band_is_source && !clip_is_source) {
             lo = (double)hwr_projection_map_x_fixed(camera, clip_left) /
                  65536.0;
             hi = (double)hwr_projection_map_x_fixed(camera, clip_right) /
                  65536.0;
+        } else if (!band_is_source && clip_is_source) {
+            lo = hwr_projection_source_x(camera, lo);
+            hi = hwr_projection_source_x(camera, hi);
         }
         if (lo > band_lo)
             band_lo = lo;
@@ -3806,8 +3935,30 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
     bounds[HWR_FLAT_PLANE_NEAR] = 0.0;
     bounds[HWR_FLAT_PLANE_LEFT] = band_lo;
     bounds[HWR_FLAT_PLANE_RIGHT] = band_hi;
-    bounds[HWR_FLAT_PLANE_TOP] = 0.0;
-    bounds[HWR_FLAT_PLANE_BOTTOM] = (double)height;
+
+    /* The whole-polygon fill is the engine's decision about the engine's own
+     * corner set, so it is taken on the loop clipped to the engine's window --
+     * never on the corners of the extra view area, whose words are the held
+     * frame-edge value rather than a sample the engine ever takes. Where the
+     * drawn area already sits inside that window the two clips coincide and the
+     * emitted corners answer it directly. */
+    memcpy(fill_bounds, bounds, sizeof fill_bounds);
+    if (bounds[HWR_FLAT_PLANE_LEFT] < 0.0) {
+        fill_bounds[HWR_FLAT_PLANE_LEFT] = 0.0;
+        outside_window = 1;
+    }
+    if (bounds[HWR_FLAT_PLANE_RIGHT] > (double)view.window.width) {
+        fill_bounds[HWR_FLAT_PLANE_RIGHT] = (double)view.window.width;
+        outside_window = 1;
+    }
+    if (bounds[HWR_FLAT_PLANE_TOP] < 0.0) {
+        fill_bounds[HWR_FLAT_PLANE_TOP] = 0.0;
+        outside_window = 1;
+    }
+    if (bounds[HWR_FLAT_PLANE_BOTTOM] > (double)view.window.height) {
+        fill_bounds[HWR_FLAT_PLANE_BOTTOM] = (double)view.window.height;
+        outside_window = 1;
+    }
 
     n = hwr_flat_clip_loop(&view, loop, count, bounds, poly);
     if (n < 0)
@@ -3860,7 +4011,23 @@ emit:
     /* The engine ORs one mode bit per projected corner and takes its untextured
      * fill only when every corner saturated the ramp (mode == 2 exactly); one
      * unsaturated corner sets the textured bit and the whole polygon keeps its
-     * texels. */
+     * texels.  Where the drawn area reaches past the engine's window, re-take
+     * the corner set on that window: the emitted corners out in the extra area
+     * carry a held edge value, not a sample the engine makes, and neither
+     * forcing nor blocking the fill with one would be its decision. */
+    if (fill_ok && shaded && out != 0 && outside_window) {
+        struct hwr_clip_pt fill_poly[HWR_FLAT_CLIP_MAX];
+        int m = hwr_flat_clip_loop(&view, loop, count, fill_bounds, fill_poly);
+        all_saturated = m >= 3;
+        for (k = 0; k < m; k++) {
+            if (hwr_flat_clipped_shade_word(surface, camera, &view,
+                                            fill_poly[k].x, fill_poly[k].y) !=
+                (uint16_t)(31u << 8)) {
+                all_saturated = 0;
+                break;
+            }
+        }
+    }
     if (fill_ok && shaded && all_saturated && out != 0) {
         size_t f;
         for (f = 0; f < out; f++)

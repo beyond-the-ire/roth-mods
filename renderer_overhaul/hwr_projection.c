@@ -47,6 +47,8 @@ int hwr_projection_scale_camera(struct hwr_gl_camera *camera,
     camera->source_focal_y = camera->focal_y;
     camera->source_center_x = camera->center_x;
     camera->source_horizon = camera->horizon;
+    camera->source_shade_origin_x = camera->shade_origin_x;
+    camera->source_shade_origin_y = camera->shade_origin_y;
 
     /* fov_deg is the horizontal FOV at the engine's native aspect. Keeping
      * that reference stable makes 0 mean exact stock projection, while a wide
@@ -118,6 +120,26 @@ int64_t hwr_projection_map_x_fixed(const struct hwr_gl_camera *camera,
     return (int64_t)camera->center_x * 65536 +
            (delta * camera->focal_x * 65536) /
                camera->source_focal_x;
+}
+
+double hwr_projection_source_x(const struct hwr_gl_camera *camera,
+                               double target_x)
+{
+    if (camera == NULL || camera->focal_x == 0)
+        return target_x;
+    return (double)camera->source_center_x +
+           (target_x - (double)camera->center_x) *
+           (double)camera->source_focal_x / (double)camera->focal_x;
+}
+
+double hwr_projection_source_y(const struct hwr_gl_camera *camera,
+                               double target_y)
+{
+    if (camera == NULL || camera->focal_y == 0)
+        return target_y;
+    return (double)camera->source_horizon +
+           (target_y - (double)camera->horizon) *
+           (double)camera->source_focal_y / (double)camera->focal_y;
 }
 
 int hwr_projection_source_x_bounds(const struct hwr_gl_camera *camera,
