@@ -653,8 +653,9 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=6) in uvec4 a_light_material;\n"
     "layout(location=7) in uint a_wall_shade_endpoint;\n"
     "layout(location=15) in uint a_wall_shade_top;\n"
-    "layout(location=13) in uint a_wall_tint_adjust;\n"
-    "layout(location=14) in uint a_flat_taint;\n"
+    /* .x = the tinted-wall depth-bias adjust, .y = the legacy flat escape. */
+    "layout(location=13) in uvec2 a_tint_adjust_taint;\n"
+    "layout(location=14) in vec2 a_pos_frac;\n"
     "layout(location=8) in uvec4 a_flat_span;\n"
     "layout(location=9) in uvec4 a_wall_source;\n"
     "layout(location=10) in uvec4 a_wall_rows;\n"
@@ -691,10 +692,14 @@ static const char g_geometry_vertex_shader[] =
     "void main() {\n"
     "  int dx=wrap16(a_pos.x+u_view_offset.x);\n"
     "  int dy=wrap16(a_pos.y+u_view_offset.y);\n"
+    /* The world->view transform is a 16-bit add, so the wrap runs on the whole
+     * units and the sub-unit remainder is added afterwards.  It is zero for
+     * every vertex authored on a world coordinate, leaving those unchanged. */
+    "  float wx=float(dx)+a_pos_frac.x, wy=float(dy)+a_pos_frac.y;\n"
     "  float s=u_basis.x, c=u_basis.y;\n"
-    "  float vx=s*float(dx)+c*float(dy);\n"
+    "  float vx=s*wx+c*wy;\n"
     "  if (u_x_flip != 0) vx=-vx;\n"
-    "  float depth=s*float(dy)-c*float(dx);\n"
+    "  float depth=s*wy-c*wx;\n"
     "  float zr=float(u_eye_z-a_pos.z);\n"  /* the engine's vertical span term is (eye - z) */
     "  float clip_x=(2.0*u_focal.x/u_viewport.x)*vx+"
     "(2.0*u_center.x/u_viewport.x-1.0)*depth;\n"
@@ -717,8 +722,8 @@ static const char g_geometry_vertex_shader[] =
     "  v_wall_vertical=a_wall_vertical;\n"
     "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
     "  v_wall_shade_top=float(a_wall_shade_top);\n"
-    "  v_wall_tint_adjust=a_wall_tint_adjust;\n"
-    "  v_flat_taint=a_flat_taint;\n"
+    "  v_wall_tint_adjust=a_tint_adjust_taint.x;\n"
+    "  v_flat_taint=a_tint_adjust_taint.y;\n"
     "}\n";
 
 static const char g_geometry_fragment_shader[] =
@@ -989,27 +994,30 @@ static const char g_geometry_fragment_shader[] =
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; int r;\n"
     "  if (flat_surface) {\n"
     "    if (tinted) {\n"
-    /* The engine evaluates the flat shade only at the projected polygon vertices
-     * and interpolates it linearly in screen space: read the CPU-computed per-
-     * vertex row carried by the noperspective wall endpoint varying (stored for
-     * flats in the wall high-byte format) and truncate it per fragment; flats
-     * clamp to 0..31.  The per-vertex word carries the engine's 8-bit sub-row
-     * fraction in its low byte, so flooring the interpolated word per fragment
-     * lands a band boundary at the engine's sub-pixel height instead of snapping
-     * to the whole row.
-     * A triangle straddling the near plane has a vertex whose flat-shade
-     * projection is garbage (clamped near the shade origin -> a spurious BRIGHT
-     * row that interpolates across the triangle).  The engine never samples a row
-     * there (it near-clips the polygon first), so when v_flat_taint marks such a
-     * triangle, fall through to the per-pixel radial below. Direct-mapped mesh
-     * flats also use the radial because they do not carry the world's
-     * preprojected endpoint word. */
+    /* The engine evaluates the flat shade ONLY at the corners of the polygon it
+     * rasterises -- the sector loop after it has been clipped to the drawn area
+     * -- and interpolates linearly in screen space between them.  Read the
+     * CPU-computed per-corner row carried by the noperspective wall endpoint
+     * varying (stored for flats in the wall high-byte format) and truncate it
+     * per fragment; flats clamp to 0..31.  The per-corner word carries the
+     * engine's 8-bit sub-row fraction in its low byte, so flooring the
+     * interpolated word per fragment lands a band boundary at the engine's
+     * sub-pixel height instead of snapping to the whole row.
+     *
+     * Evaluating the same law PER FRAGMENT instead is not a refinement of this,
+     * it is a different surface: the law is convex where it is not clamped, so a
+     * chord between two corner samples runs ABOVE it everywhere in between, and
+     * the per-fragment field is uniformly brighter by however much unsampled
+     * interior the polygon has.  Sampling the corner set the engine samples --
+     * no denser, no sparser -- is the whole point.
+     *
+     * The per-fragment radial below survives only for the restore switch and for
+     * direct-mapped mesh flats, which carry no preprojected corner word. */
     "      if (v_flat_taint==0u &&"
     " (v_flat_span.w & 0x80000000u)==0u)"
     " return clamp(int(floor(v_wall_shade_endpoint/256.0)),0,31);\n"
-    /* The per-pixel radial for tainted (near-clipped-corner) triangles.  The edge
-     * term measures from the jittered shade origin (the light position); the
-     * jitter is the flicker. */
+    /* The per-fragment radial.  The edge term measures from the jittered shade
+     * origin (the light position); the jitter is the flicker. */
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
     "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
@@ -1197,11 +1205,12 @@ static const char g_geometry_fragment_shader[] =
     "    out_index=u_debug_vis==1 ? 255u : stexel;\n"
     "    return;\n"
     "  }\n"
-    /* An all-corners-saturated tinted wall block (flagged on the wall-wrap
-     * attribute bit 3) skips texel sampling and shading entirely and outputs the
-     * map fill index, exactly like the engine's counter==4 fast path.  Only in
+    /* An all-corners-saturated tinted block (flagged on the wall-wrap attribute
+     * bit 3) skips texel sampling and shading entirely and outputs the map fill
+     * index, exactly like the engine's fast path -- which the engine takes for a
+     * whole floor or ceiling polygon as readily as for a wall block.  Only in
      * normal rendering -- every debug_vis mode falls through so texel, offset,
-     * material and shade-row attribution keep working on these walls. */
+     * material and shade-row attribution keep working on these surfaces. */
     "  if (u_debug_vis==0 &&"
     " (v_light_material.w & 8u)!=0u) {\n"
     "    out_index=uint(u_fill_index) & 255u;\n"
@@ -1764,12 +1773,15 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(7);
     g_gl.vertex_attrib_i_pointer(7, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint));
+    /* wall_tint_adjust and flat_taint are adjacent bytes, so one two-component
+     * attribute carries both and leaves slot 14 for the position remainder --
+     * the format stays inside the sixteen guaranteed vertex attributes. */
     g_gl.enable_vertex_attrib_array(13);
-    g_gl.vertex_attrib_i_pointer(13, 1, GL_UNSIGNED_BYTE, (GLsizei)stride,
+    g_gl.vertex_attrib_i_pointer(13, 2, GL_UNSIGNED_BYTE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_tint_adjust));
     g_gl.enable_vertex_attrib_array(14);
-    g_gl.vertex_attrib_i_pointer(14, 1, GL_UNSIGNED_BYTE, (GLsizei)stride,
-        (const void *)offsetof(struct hwr_gl_vertex, flat_taint));
+    g_gl.vertex_attrib_pointer(14, 2, GL_FLOAT, GL_FALSE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, pos_frac_x));
     g_gl.enable_vertex_attrib_array(15);
     g_gl.vertex_attrib_i_pointer(15, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint_top));

@@ -85,17 +85,6 @@ void hwr_scene_store_forget(void)
 #define HWR_SECTOR_CEILING_FLIP_X (1u << 10)
 #define HWR_SECTOR_CEILING_FLIP_Y (1u << 11)
 
-/* World coordinates are modular int16: the only place one becomes linear is the
- * view transform's 16-bit add (renderer.c:6767-6770,
- * transform_map_vertices_to_view), which the vertex shader mirrors.  A sector
- * loop may therefore be authored across the wrap, so triangulation runs on
- * coordinates unwrapped into a wider type; casting a component back to int16
- * recovers the authored word exactly. */
-struct hwr_point {
-    int32_t x;
-    int32_t y;
-};
-
 struct hwr_scene_texture_stats {
     size_t plain;
     size_t grouped;
@@ -135,6 +124,7 @@ void hwr_scene_mesh_clear(struct hwr_scene_mesh *mesh)
         return;
     free(mesh->vertices);
     free(mesh->surfaces);
+    free(mesh->loop_points);
     free(mesh->cut_scratch);
     memset(mesh, 0, sizeof *mesh);
 }
@@ -183,6 +173,41 @@ static int hwr_reserve_vertices(struct hwr_scene_mesh *mesh, size_t extra)
         return hwr_mesh_fail(mesh, "out of memory growing mesh vertices");
     mesh->vertices = vertices;
     mesh->vertex_capacity = capacity;
+    return 0;
+}
+
+/* Appends one flat's sector loop to the mesh-wide loop store and records the
+ * run on the surface. The store grows exactly like the vertex store. */
+static int hwr_store_surface_loop(struct hwr_scene_mesh *mesh,
+                                  struct hwr_mesh_surface *surface,
+                                  const struct hwr_point *points, size_t count)
+{
+    size_t capacity;
+    if (count == 0)
+        return 0;
+    if (count > SIZE_MAX - mesh->loop_point_count)
+        return hwr_mesh_fail(mesh, "mesh loop point count overflow");
+    if (mesh->loop_point_count + count > mesh->loop_point_capacity) {
+        struct hwr_point *grown;
+        capacity = mesh->loop_point_capacity != 0
+            ? mesh->loop_point_capacity : 2048u;
+        while (capacity < mesh->loop_point_count + count) {
+            if (capacity > SIZE_MAX / 2u)
+                return hwr_mesh_fail(mesh, "mesh loop point capacity overflow");
+            capacity *= 2u;
+        }
+        grown = (struct hwr_point *)realloc(mesh->loop_points,
+                                            capacity * sizeof *grown);
+        if (grown == NULL)
+            return hwr_mesh_fail(mesh, "out of memory growing sector loops");
+        mesh->loop_points = grown;
+        mesh->loop_point_capacity = capacity;
+    }
+    memcpy(mesh->loop_points + mesh->loop_point_count, points,
+           count * sizeof *points);
+    surface->first_loop_point = mesh->loop_point_count;
+    surface->loop_point_count = count;
+    mesh->loop_point_count += count;
     return 0;
 }
 
@@ -851,6 +876,22 @@ static int hwr_triangulate(const struct hwr_point *points, size_t count,
  * mid-platform surfaces: one that sits at or through the flat of its own sector
  * loses to that flat again. Follows the owner-surface exception switch, since
  * this reuses that pass and its identity buffer. */
+/* HWR_FLAT_VERTEX_LAW=0 restores the previous tinted-flat treatment: the whole
+ * unclipped sector loop is emitted, a triangle with a corner outside the drawn
+ * area is marked so the shader evaluates the candle radial per fragment, no flat
+ * takes the whole-polygon solid fill, the bright end of the corner word floors
+ * at row 0, and the fill index stays unset. It is the A/B for the corner-set
+ * law and touches nothing else. */
+static int hwr_flat_vertex_law_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_FLAT_VERTEX_LAW");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
 static int hwr_slab_exception_enabled(void)
 {
     static int enabled = -1;
@@ -922,6 +963,10 @@ static int hwr_emit_flat(struct hwr_scene_mesh *mesh, const struct hwr_world *wo
         return -1;
     hwr_flat_identities(world, sector, sector_index, kind,
                         &surface->owner_identity, &surface->exception_identity);
+    /* The loop, not just its triangulation: the per-frame emit clips the
+     * polygon the engine shades the corners of. */
+    if (hwr_store_surface_loop(mesh, surface, points, triangle_count + 2u) != 0)
+        return -1;
     surface->sector_index = sector_index;
     surface->aux = aux;
     surface->scale = scale;
@@ -2066,6 +2111,12 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->shade_origin_y = (int16_t)api->game_ram->u16(VA_G_SHADE_ORIGIN_Y);
     camera->shade_level = (uint8_t)world->luts.shade_level;
     camera->tint_shade_level = (uint8_t)world->luts.tint_shade_level;
+    /* The colour a saturated block is filled with is the map's own, loaded from
+     * the DAS file right after the palette; the engine's fast path takes its low
+     * byte. Left unset this was zero, so every solid fill came out as palette
+     * index 0 rather than the map's far-darkness colour. */
+    if (hwr_flat_vertex_law_enabled())
+        camera->solid_fill_index = (uint8_t)world->luts.fill_index;
     camera->global_light_bias = api->game_ram->u8(VA_G_GLOBAL_LIGHT_BIAS);
     camera->glow_phase = api->game_ram->u8(VA_G_GLOW_PHASE);
     {
@@ -2747,9 +2798,13 @@ static int hwr_flat_triangle_needs_radial(const struct hwr_scene_mesh *mesh,
  * The law is the same edge/depth structure as the wall endpoint word: the screen
  * column and the 16-bit view-depth word come from the shared projection, but the
  * screen row is the flat plane's own projection (hwr_flat_project_y, on the
- * vertex's plane height) and the clamps are the FLAT clamps -- row<=0 -> 0
- * (BRIGHT; the flat driver floors at 0, unlike the wall's floor of 1) and
- * row>=0x1f -> 31, with no per-face clip scale. */
+ * vertex's plane height) and the clamps are the FLAT clamps -- row<=0 -> row 1
+ * (the projector's own floor on this branch; the restore switch keeps the old
+ * row 0) and row>=0x1f -> 31, with no per-face clip scale.
+ *
+ * This is the MESH-corner form, kept for the restore switch and for the rare
+ * loop the view clip cannot fit; a clipped flat uses the corner form above,
+ * which needs no viewport clamps because its corners are already inside. */
 static uint16_t hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
                                     const struct hwr_mesh_vertex *vertex,
                                     const struct hwr_gl_camera *camera,
@@ -2796,7 +2851,7 @@ static uint16_t hwr_flat_shade_endpoint(const struct hwr_mesh_surface *surface,
     shade = (int16_t)(shade - bias);
     shade = (int16_t)(shade - (int16_t)camera->flat_edge_bias);
     if (shade <= 0)
-        return 0;
+        return hwr_flat_vertex_law_enabled() ? 0x0100u : 0u;
     if (shade >= 31)
         return (uint16_t)(31u << 8);
     /* Compose the engine's 8-bit sub-row fraction the same way the wall corner
@@ -3399,15 +3454,451 @@ static size_t hwr_emit_wall_segmented(const struct hwr_scene_mesh *mesh,
     return out;
 }
 
+/* ======================================================================
+ * Tinted flats: the engine's corner set
+ *
+ * The engine shades a floor or ceiling ONLY at the corners of the polygon it
+ * rasterises, and that polygon is the sector loop AFTER it has been clipped to
+ * the drawn area (rasterize_floorceil_polygon projects the loop, then runs
+ * Sutherland-Hodgman against the view bounds and emits a corner wherever the
+ * loop leaves them); the interior is a screen-linear interpolation of those
+ * corner values.  So a floor the player stands on carries corner samples ON the
+ * bottom edge of the frame, at the player's feet, and on the side edges --
+ * exactly where the sector's own corners are not.
+ *
+ * The clip is done here in WORLD space, which is both cheaper and equivalent:
+ * the projection of a straight world edge is a straight screen edge, so the
+ * crossing found on either side is the same point.  A flat is planar in Z,
+ * which makes all five half-spaces (near depth, the two side edges, the two
+ * horizontal edges) AFFINE in world (x,y) -- the frame's top and bottom become
+ * plain depth bounds -- so one linear clipper handles the lot and the surviving
+ * corners keep their world position for the texture mapping, the span state and
+ * the surface identities.
+ * ====================================================================== */
+
+/* A convex loop gains at most one point per half-space; a concave one can gain
+ * a point per crossing, so the working buffer carries real headroom and any run
+ * that would still exceed it falls back to the unclipped emit -- which is what
+ * that surface had before. The retail maps' longest sector loop is well under
+ * the input cap. */
+#define HWR_FLAT_LOOP_MAX 48
+#define HWR_FLAT_CLIP_MAX 128
+
+enum hwr_flat_plane {
+    HWR_FLAT_PLANE_NEAR = 0,
+    HWR_FLAT_PLANE_LEFT,
+    HWR_FLAT_PLANE_RIGHT,
+    HWR_FLAT_PLANE_TOP,
+    HWR_FLAT_PLANE_BOTTOM
+};
+
+/* The affine world->view terms of one flat surface.  The view transform is a
+ * 16-bit add, so the loop's first point is wrapped once and every other point is
+ * carried from it by its linear delta: that keeps a loop authored across the
+ * coordinate wrap a single un-torn polygon to clip. */
+struct hwr_flat_view {
+    double sine;
+    double cosine;
+    double base_x;      /* view-space delta of the anchor point */
+    double base_y;
+    double anchor_x;    /* the anchor's own (unwrapped) world coordinates */
+    double anchor_y;
+    double focal_x;
+    double focal_y;
+    double center_x;
+    double horizon;
+    /* (eye_z - plane_z) * focal_y: the numerator of the surface's screen row. */
+    double plane;
+    double depth_scale;
+    int x_flip;
+};
+
+static void hwr_flat_view_point(const struct hwr_flat_view *view,
+                                double px, double py,
+                                double *view_x, double *depth)
+{
+    double dx = view->base_x + (px - view->anchor_x);
+    double dy = view->base_y + (py - view->anchor_y);
+    *view_x = view->sine * dx + view->cosine * dy;
+    *depth = view->sine * dy - view->cosine * dx;
+}
+
+/* Signed distance to one clip half-space, positive inside.  Every form is
+ * multiplied through by the (positive, past the near plane) depth, which is what
+ * makes it affine in world (x,y) and the crossing an exact linear interpolation.
+ * The near plane is clipped FIRST so the others may assume depth > 0. */
+static double hwr_flat_clip_distance(const struct hwr_flat_view *view,
+                                     enum hwr_flat_plane plane, double bound,
+                                     double px, double py)
+{
+    double view_x;
+    double depth;
+    double sx;
+    hwr_flat_view_point(view, px, py, &view_x, &depth);
+    sx = (view->x_flip ? -view_x : view_x) * view->focal_x;
+    switch (plane) {
+    case HWR_FLAT_PLANE_NEAR:
+        return depth - 16.0;
+    case HWR_FLAT_PLANE_LEFT:
+        return sx - (bound - view->center_x) * depth;
+    case HWR_FLAT_PLANE_RIGHT:
+        return (bound - view->center_x) * depth - sx;
+    case HWR_FLAT_PLANE_TOP:
+        return view->plane - (bound - view->horizon) * depth;
+    default:
+        return (bound - view->horizon) * depth - view->plane;
+    }
+}
+
+/* Bounded Sutherland-Hodgman against one half-space: keeps the dist>=0 side and
+ * inserts the exact crossings.  Returns -1 rather than writing past `capacity`,
+ * which a concave loop crossing the same line repeatedly could otherwise do. */
+static int hwr_flat_clip_halfplane(const struct hwr_clip_pt *in, int n,
+                                   const double *dist, struct hwr_clip_pt *out,
+                                   int capacity)
+{
+    int i;
+    int m = 0;
+    for (i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        int in_i = dist[i] >= 0.0;
+        int in_j = dist[j] >= 0.0;
+        if (in_i) {
+            if (m >= capacity)
+                return -1;
+            out[m++] = in[i];
+        }
+        if (in_i != in_j) {
+            double t = dist[i] / (dist[i] - dist[j]);
+            if (m >= capacity)
+                return -1;
+            out[m].x = in[i].x + t * (in[j].x - in[i].x);
+            out[m].y = in[i].y + t * (in[j].y - in[i].y);
+            out[m].z = 0.0;
+            m++;
+        }
+    }
+    return m;
+}
+
+/* Clips the loop against the five half-spaces and compacts the coincident
+ * points a crossing exactly on a boundary leaves behind (a repeated corner is
+ * the same sample twice, and the ear-clip below rejects a loop carrying one).
+ * Returns the surviving point count, 0 when the polygon is wholly outside, or
+ * -1 when the working buffer would overflow and the caller should fall back. */
+static int hwr_flat_clip_loop(const struct hwr_flat_view *view,
+                              const struct hwr_point *loop, size_t count,
+                              const double *bounds,
+                              struct hwr_clip_pt *out)
+{
+    struct hwr_clip_pt work[HWR_FLAT_CLIP_MAX];
+    double dist[HWR_FLAT_CLIP_MAX];
+    int n = 0;
+    int plane;
+    int kept;
+    int i;
+    if (count < 3u || count > HWR_FLAT_LOOP_MAX)
+        return -1;
+    for (i = 0; (size_t)i < count; i++) {
+        work[n].x = (double)loop[i].x;
+        work[n].y = (double)loop[i].y;
+        work[n].z = 0.0;
+        n++;
+    }
+    for (plane = 0; plane < 5; plane++) {
+        int c;
+        int m;
+        for (c = 0; c < n; c++)
+            dist[c] = hwr_flat_clip_distance(
+                view, (enum hwr_flat_plane)plane, bounds[plane],
+                work[c].x, work[c].y);
+        m = hwr_flat_clip_halfplane(work, n, dist, out, HWR_FLAT_CLIP_MAX);
+        if (m < 0)
+            return -1;
+        if (m < 3)
+            return 0;
+        memcpy(work, out, (size_t)m * sizeof work[0]);
+        n = m;
+    }
+    kept = 0;
+    for (i = 0; i < n; i++) {
+        double dx;
+        double dy;
+        if (kept != 0) {
+            dx = work[i].x - out[kept - 1].x;
+            dy = work[i].y - out[kept - 1].y;
+            if (dx > -1e-6 && dx < 1e-6 && dy > -1e-6 && dy < 1e-6)
+                continue;
+        }
+        out[kept++] = work[i];
+    }
+    while (kept > 1) {
+        double dx = out[0].x - out[kept - 1].x;
+        double dy = out[0].y - out[kept - 1].y;
+        if (dx > -1e-6 && dx < 1e-6 && dy > -1e-6 && dy < 1e-6)
+            kept--;
+        else
+            break;
+    }
+    return kept >= 3 ? kept : 0;
+}
+
+/* The candle shade word at one clipped corner: the same law as the mesh-corner
+ * form, evaluated at a point that now lies ON the drawn surface, so the viewport
+ * clamps that stood in for the clip are gone.  The bright end returns row 1, the
+ * floor the engine's projector uses on this branch (renderer.c: `dx <= 0` ->
+ * mode |= 4, return 0x100), never row 0. */
+static uint16_t hwr_flat_clipped_shade_word(
+    const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera,
+    const struct hwr_flat_view *view, double px, double py)
+{
+    double view_x;
+    double depth_f;
+    int depth;
+    int screen_x;
+    int screen_y;
+    uint16_t projected;
+    uint8_t light = surface->light;
+    int axv;
+    int bias;
+    int level = camera->tint_shade_level;
+    int shade;
+
+    hwr_flat_view_point(view, px, py, &view_x, &depth_f);
+    if (depth_f < 16.0)
+        depth_f = 16.0;
+    depth = (int)(depth_f * view->depth_scale);
+    if (depth < 16)
+        depth = 16;
+    screen_x = (int)(view_x * view->focal_x / depth_f) + (int)view->center_x;
+    screen_y = (int)(view->plane / depth_f) + (int)view->horizon;
+    projected = hwr_shade_edge_term(screen_x, screen_y, camera, depth);
+
+    if (light != 0)
+        light = (uint8_t)(light + camera->global_light_bias);
+    if (light == 0)
+        return 0;
+    axv = (int)light - 128;
+    bias = 8 + axv;
+    shade = (int)(projected >> (5 + level));
+    shade = (int16_t)(shade - bias);
+    shade = (int16_t)(shade - (int16_t)camera->flat_edge_bias);
+    if (shade <= 0)
+        return 0x0100u;
+    if (shade >= 31)
+        return (uint16_t)(31u << 8);
+    return (uint16_t)(((uint16_t)(uint8_t)shade << 8) |
+        (uint8_t)((uint8_t)projected << (3 - level)));
+}
+
+/* A fan from an existing corner is the closest triangulation to the engine's
+ * scanline scheme, and it is valid whenever the clipped polygon is convex --
+ * which the clip makes it, unless the sector loop itself was concave.  Report
+ * that so the concave remainder can keep the ear-clip. */
+static int hwr_flat_polygon_convex(const struct hwr_clip_pt *poly, int n)
+{
+    int sign = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        const struct hwr_clip_pt *a = &poly[i];
+        const struct hwr_clip_pt *b = &poly[(i + 1) % n];
+        const struct hwr_clip_pt *c = &poly[(i + 2) % n];
+        double cross = (b->x - a->x) * (c->y - b->y) -
+                       (b->y - a->y) * (c->x - b->x);
+        int s = cross > 0.0 ? 1 : (cross < 0.0 ? -1 : 0);
+        if (s == 0)
+            continue;
+        if (sign == 0)
+            sign = s;
+        else if (sign != s)
+            return 0;
+    }
+    return 1;
+}
+
+/* Whole part of a double, rounding toward negative infinity, without pulling in
+ * libm (this translation unit links no float runtime symbol). */
+static double hwr_floor_double(double v)
+{
+    double whole = (double)(int32_t)v;
+    return whole > v ? whole - 1.0 : whole;
+}
+
+/* Emits one tinted flat as its view-clipped polygon.  Every attribute other
+ * than the position and the corner shade word is a property of the surface, so
+ * it rides in from `tmpl` unchanged; the position carries a sub-unit remainder
+ * because a clipped corner sits between authored world units.  Returns the
+ * emitted vertex count (0 when the polygon is wholly outside the view), or
+ * SIZE_MAX when this surface cannot be clipped and the caller should emit it
+ * whole. */
+static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
+                                    const struct hwr_mesh_surface *surface,
+                                    const struct hwr_gl_camera *camera,
+                                    uint32_t width, uint32_t height,
+                                    int clip_left, int clip_right, int fill_ok,
+                                    const struct hwr_gl_vertex *tmpl,
+                                    struct hwr_gl_vertex *dst)
+{
+    struct hwr_flat_view view;
+    struct hwr_clip_pt poly[HWR_FLAT_CLIP_MAX];
+    uint16_t fan[(HWR_FLAT_CLIP_MAX - 2) * 3];
+    struct hwr_point rounded[HWR_FLAT_CLIP_MAX];
+    double bounds[5];
+    const struct hwr_point *loop =
+        mesh->loop_points + surface->first_loop_point;
+    size_t count = surface->loop_point_count;
+    int16_t plane_z = mesh->vertices[surface->first_vertex].z;
+    double band_lo = 0.0;
+    double band_hi = (double)width;
+    size_t out = 0;
+    int n;
+    int triangles;
+    int k;
+    int all_saturated = 1;
+    int shaded = surface->light != 0;
+
+    if (count < 3u || count > HWR_FLAT_LOOP_MAX || width == 0 || height == 0 ||
+        camera->focal_x == 0 || camera->focal_y == 0)
+        return SIZE_MAX;
+
+    view.sine = (double)camera->yaw_sin / 16384.0;
+    view.cosine = (double)camera->yaw_cos / 16384.0;
+    view.anchor_x = (double)loop[0].x;
+    view.anchor_y = (double)loop[0].y;
+    view.base_x = (double)(int16_t)((uint16_t)(int32_t)loop[0].x +
+                                    (uint16_t)camera->view_offset_x);
+    view.base_y = (double)(int16_t)((uint16_t)(int32_t)loop[0].y +
+                                    (uint16_t)camera->view_offset_y);
+    view.focal_x = (double)camera->focal_x;
+    view.focal_y = (double)camera->focal_y;
+    view.center_x = (double)camera->center_x;
+    view.horizon = (double)camera->horizon;
+    view.plane = ((double)camera->eye_z - (double)plane_z) *
+                 (double)camera->focal_y;
+    view.depth_scale = camera->shade_depth_scale > 0.0f
+        ? (double)camera->shade_depth_scale : 1.0;
+    view.x_flip = camera->x_flip != 0;
+
+    /* Where the surface carries a portal column band, that band IS the engine's
+     * side bound for this chain entry, so the corners land on the doorway edge
+     * rather than the frame edge. The band arrives in the same coordinates the
+     * fragment gate uses. */
+    if (clip_right > clip_left) {
+        double lo;
+        double hi;
+        if (camera->reflected) {
+            lo = (double)clip_left;
+            hi = (double)clip_right;
+        } else {
+            lo = (double)hwr_projection_map_x_fixed(camera, clip_left) /
+                 65536.0;
+            hi = (double)hwr_projection_map_x_fixed(camera, clip_right) /
+                 65536.0;
+        }
+        if (lo > band_lo)
+            band_lo = lo;
+        if (hi < band_hi)
+            band_hi = hi;
+        if (band_lo >= band_hi)
+            return 0;
+    }
+    bounds[HWR_FLAT_PLANE_NEAR] = 0.0;
+    bounds[HWR_FLAT_PLANE_LEFT] = band_lo;
+    bounds[HWR_FLAT_PLANE_RIGHT] = band_hi;
+    bounds[HWR_FLAT_PLANE_TOP] = 0.0;
+    bounds[HWR_FLAT_PLANE_BOTTOM] = (double)height;
+
+    n = hwr_flat_clip_loop(&view, loop, count, bounds, poly);
+    if (n < 0)
+        return SIZE_MAX;
+    if (n < 3)
+        return 0;
+    /* The reserved room is the loop plus one corner per half-space. A concave
+     * loop that crossed a boundary repeatedly can beat that; emit it whole
+     * rather than overrun. */
+    if ((size_t)n > count + 5u)
+        return SIZE_MAX;
+
+    triangles = n - 2;
+    if (!hwr_flat_polygon_convex(poly, n)) {
+        /* A concave sector loop can survive the clip concave, where a fan would
+         * paint outside the polygon; ear-clip those. The corner SET is the same
+         * either way, which is what the shade law depends on. */
+        for (k = 0; k < n; k++) {
+            rounded[k].x = (int32_t)(poly[k].x >= 0.0 ? poly[k].x + 0.5
+                                                      : poly[k].x - 0.5);
+            rounded[k].y = (int32_t)(poly[k].y >= 0.0 ? poly[k].y + 0.5
+                                                      : poly[k].y - 0.5);
+        }
+        if (hwr_triangulate(rounded, (size_t)n, fan) == 0)
+            goto emit;
+    }
+    for (k = 1; k + 1 < n; k++) {
+        fan[(k - 1) * 3] = 0;
+        fan[(k - 1) * 3 + 1] = (uint16_t)k;
+        fan[(k - 1) * 3 + 2] = (uint16_t)(k + 1);
+    }
+
+emit:
+    for (k = 0; k < triangles * 3; k++) {
+        const struct hwr_clip_pt *p = &poly[fan[k]];
+        struct hwr_gl_vertex *o = &dst[out++];
+        double fx = hwr_floor_double(p->x);
+        double fy = hwr_floor_double(p->y);
+        *o = *tmpl;
+        o->x = (int16_t)(uint16_t)(int32_t)fx;
+        o->y = (int16_t)(uint16_t)(int32_t)fy;
+        o->z = plane_z;
+        o->pos_frac_x = (float)(p->x - fx);
+        o->pos_frac_y = (float)(p->y - fy);
+        o->wall_shade_endpoint =
+            hwr_flat_clipped_shade_word(surface, camera, &view, p->x, p->y);
+        if (o->wall_shade_endpoint != (uint16_t)(31u << 8))
+            all_saturated = 0;
+    }
+    /* The engine ORs one mode bit per projected corner and takes its untextured
+     * fill only when every corner saturated the ramp (mode == 2 exactly); one
+     * unsaturated corner sets the textured bit and the whole polygon keeps its
+     * texels. */
+    if (fill_ok && shaded && all_saturated && out != 0) {
+        size_t f;
+        for (f = 0; f < out; f++)
+            dst[f].wall_wrap_flags |= HWR_GL_WALL_SOLID_FILL;
+    }
+    return out;
+}
+
+/* Does this surface take the per-frame view-clipped flat emit? */
+static int hwr_flat_uses_clipped_emit(const struct hwr_mesh_surface *surface)
+{
+    return hwr_flat_vertex_law_enabled() &&
+           (surface->flags & HWR_SURFACE_FLAT) != 0 &&
+           (surface->flags & HWR_SURFACE_DIRECT) == 0 &&
+           (surface->flags & HWR_SURFACE_SKY_CAP) == 0 &&
+           (surface->sector_flags & 2u) != 0 &&
+           surface->loop_point_count >= 3u &&
+           surface->loop_point_count <= HWR_FLAT_LOOP_MAX;
+}
+
 /* Worst-case streamed vertex count for a surface, so hwr_prepare_stream can
- * pre-size the stream buffer before the (possibly expanding) staging pass.  Only
- * tinted walls expand (along-length sub-quads); flats and sky caps are 1:1. */
+ * pre-size the stream buffer before the (possibly expanding) staging pass.
+ * Tinted walls expand into along-length sub-quads and tinted flats into their
+ * view-clipped loop; everything else is 1:1. */
 static size_t hwr_surface_reserve(const struct hwr_mesh_surface *surface)
 {
     if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0)
         return surface->vertex_count;
-    if ((surface->flags & HWR_SURFACE_FLAT) != 0)
-        return surface->vertex_count;
+    if ((surface->flags & HWR_SURFACE_FLAT) != 0) {
+        size_t clipped;
+        if (!hwr_flat_uses_clipped_emit(surface))
+            return surface->vertex_count;
+        /* Five half-spaces, so at most five corners more than the loop; the
+         * clipper refuses anything longer and the surface is emitted whole. */
+        clipped = (surface->loop_point_count + 3u) * 3u;
+        return clipped > surface->vertex_count ? clipped
+                                               : surface->vertex_count;
+    }
     if (surface->kind == HWR_SURFACE_DOOR)
         return surface->vertex_count;
     /* Band-triangle vertices sit only at the two wall ends (t==0 or t==1), never
@@ -3424,6 +3915,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                                       const struct hwr_mesh_surface *surface,
                                       const struct hwr_gl_camera *camera,
                                       uint32_t width, uint32_t height,
+                                      int clip_left, int clip_right,
                                       struct hwr_gl_vertex *destination)
 {
     uint16_t logical = (uint16_t)surface->texture_id;
@@ -3530,12 +4022,15 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
         solid_blend = 0;
         fill_ok = 0;
     }
-    if ((surface->flags & HWR_SURFACE_FLAT) != 0)
+    if ((surface->flags & HWR_SURFACE_FLAT) != 0) {
+        /* Deliberately on the WHOLE loop, not the clipped one: the span state
+         * drives the texel walk, whose mapping is settled work, and the flat
+         * projection already clamps its scanline range to the frame. */
         hwr_flat_span_state(&scene->mesh, surface, camera, height,
                             flat_square256 && !flat_transparent,
                             &flat_guard, &flat_guard_step,
                             &flat_guard_origin_y);
-    else if (surface->kind != HWR_SURFACE_DOOR) {
+    } else if (surface->kind != HWR_SURFACE_DOOR) {
         /* Stock paints fixed-orientation secondary surfaces after all world
          * faces in their owner sector. Publish that sector on ordinary walls so
          * the guarded billboard redraw can reproduce the painter overlap
@@ -3547,6 +4042,43 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                             texture_width, texture_height, &wall_span);
         wall_tint_adjust =
             hwr_wall_tint_clip_adjust(surface, &scene->mesh, camera);
+    }
+    /* A tinted flat is emitted as its VIEW-CLIPPED loop, so its corners -- the
+     * only places the candle law is sampled -- sit where the engine's are.
+     * Everything but the position and that corner word is a property of the
+     * surface, so it is staged once here and copied to every emitted corner. */
+    if (!mirror_solid && hwr_flat_uses_clipped_emit(surface)) {
+        struct hwr_gl_vertex tmpl;
+        size_t emitted;
+        memset(&tmpl, 0, sizeof tmpl);
+        if (logical < 0x1600u) {
+            tmpl.texture_offset = scene->textures[logical].offset;
+            tmpl.texture_width = texture_width;
+            tmpl.texture_height = texture_height;
+        }
+        tmpl.pan_u = surface->pan_u;
+        tmpl.pan_v = surface->pan_v;
+        tmpl.aux = surface->aux;
+        tmpl.scale = surface->scale;
+        tmpl.sector_flags = surface->sector_flags;
+        tmpl.light = surface->light;
+        tmpl.material_flags = flags;
+        tmpl.direct_index = direct_index;
+        tmpl.flat_guard = flat_guard;
+        tmpl.flat_guard_step = flat_guard_step;
+        tmpl.flat_guard_origin_y = flat_guard_origin_y;
+        tmpl.flat_mapping_flags = surface->mapping_flags;
+        /* A flat has no wall-column state, so that attribute pair carries the
+         * two owner identities instead. */
+        tmpl.wall_source_numerator = surface->owner_identity;
+        tmpl.wall_source_denominator = surface->exception_identity;
+        emitted = hwr_emit_flat_clipped(&scene->mesh, surface, camera,
+                                        width, height, clip_left, clip_right,
+                                        fill_ok, &tmpl, destination);
+        if (emitted != SIZE_MAX)
+            return emitted;
+        /* Fell through: this loop cannot be clipped within the reserved room,
+         * so it is emitted whole exactly as it was before. */
     }
     /* Solid-fill: a receding tinted wall is emitted as several along-length
      * sub-quads, each carrying its own wd_project corner words, so the shader's
@@ -3875,7 +4407,8 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                                    struct hwr_gl_vertex *destination)
 {
     size_t count = hwr_copy_gpu_surface_raw(
-        scene, surface, camera, width, height, destination);
+        scene, surface, camera, width, height, clip_left, clip_right,
+        destination);
     hwr_apply_frame_clip(destination, count, camera, clip_left, clip_right);
     return count;
 }

@@ -62,6 +62,16 @@ struct hwr_mesh_vertex {
     float wall_top;
 };
 
+/* World coordinates are modular int16: the only place one becomes linear is the
+ * view transform's 16-bit add (renderer.c, transform_map_vertices_to_view),
+ * which the vertex shader mirrors.  A sector loop may therefore be authored
+ * across the wrap, so loop points are held unwrapped into a wider type; casting
+ * a component back to int16 recovers the authored word exactly. */
+struct hwr_point {
+    int32_t x;
+    int32_t y;
+};
+
 struct hwr_mesh_surface {
     size_t first_vertex;
     size_t vertex_count;
@@ -94,6 +104,11 @@ struct hwr_mesh_surface {
      * else, which is what keeps the default identity in place. */
     uint32_t owner_identity;
     uint32_t exception_identity;
+    /* A flat's own sector loop, kept beside its triangulation so the per-frame
+     * emit can clip the POLYGON (which is what the engine shades the corners of)
+     * rather than the triangles it was cut into. Zero-length on walls. */
+    size_t first_loop_point;
+    size_t loop_point_count;
 };
 
 #define HWR_REFLECTION_MAX 16u
@@ -133,6 +148,10 @@ struct hwr_scene_reflection {
 struct hwr_scene_mesh {
     struct hwr_mesh_vertex *vertices;
     struct hwr_mesh_surface *surfaces;
+    /* Sector loops, one run per flat surface (see hwr_mesh_surface). */
+    struct hwr_point *loop_points;
+    size_t loop_point_count;
+    size_t loop_point_capacity;
     size_t vertex_count;
     size_t vertex_capacity;
     size_t surface_count;
