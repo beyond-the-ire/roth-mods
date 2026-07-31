@@ -45,6 +45,17 @@ enum hwr_gl_wall_wrap_flags {
  * identity during its normal depth-tested pass. */
 #define HWR_GL_WALL_OWNER_OVERLAY (1u << 7)
 
+/* wall_span_valid is a two-bit mask, because the two things the wall column
+ * state feeds are validated independently.  A wall edge that crosses the near
+ * plane is clipped there and projected at the crossing point, which yields the
+ * screen span and the endpoint rows the shade walk needs -- but its along-wall
+ * texture seed no longer starts at the face's authored end, so the texel
+ * accumulators stay unseeded and that wall keeps the interpolated sampler. */
+enum hwr_gl_wall_span_flags {
+    HWR_GL_WALL_SPAN_TEXELS = 1u << 0,
+    HWR_GL_WALL_SPAN_SHADE  = 1u << 1
+};
+
 /* High bits of flat_mapping_flags are available to non-flat geometry. Mesh
  * faces use perspective-correct wall_s/wall_top as direct atlas coordinates,
  * bypassing the wall-column and world-plane mapping drivers. */

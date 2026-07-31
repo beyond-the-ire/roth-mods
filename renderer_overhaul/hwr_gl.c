@@ -919,8 +919,10 @@ static const char g_geometry_fragment_shader[] =
     "    }\n"
     "  } else {\n"
     /* Wall texture coordinates come from the original integer column
-     * accumulators. The staged state is consumed before each advance. */
-    "    if (v_wall_span.w==0u) {\n"
+     * accumulators. The staged state is consumed before each advance. Bit 0 of
+     * the span word is what says those accumulators carry the face's authored
+     * start; a near-plane-clipped edge validates the shade walk only. */
+    "    if ((v_wall_span.w & 1u)==0u) {\n"
     "      float wall_s=max(v_wall.x-0.5*dFdx(v_wall.x),0.0);\n"
     "      int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
     "      if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
@@ -1054,7 +1056,7 @@ static const char g_geometry_fragment_shader[] =
      * shade row.  That is the engine's seed24 + k*q >> 16 DDA in floating point:
      * row = floor(V/256).  A degenerate-span wall (no valid column DDA) falls to
      * the per-pixel radial below. */
-    "    if (v_wall_span.w!=0u) {\n"
+    "    if ((v_wall_span.w & 2u)!=0u) {\n"
     "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
     "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
     "      uint ba=v_wall_rows.y+v_wall_rows.w*uint(scol);\n"
