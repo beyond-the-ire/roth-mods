@@ -4426,7 +4426,9 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
                                     const struct hwr_mesh_surface *surface,
                                     const struct hwr_gl_camera *camera,
                                     uint32_t width, uint32_t height,
-                                    int clip_left, int clip_right, int fill_ok,
+                                    int clip_left, int clip_right,
+                                    int chord_left, int chord_right,
+                                    int fill_ok,
                                     const struct hwr_gl_vertex *tmpl,
                                     struct hwr_gl_vertex *dst)
 {
@@ -4496,7 +4498,16 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
      * side bound for this chain entry, so the corners land on the doorway edge
      * rather than the frame edge. A primary view's band is already stated in
      * engine columns; a reflected view's is in framebuffer columns, so each is
-     * brought into the clip's own coordinates. */
+     * brought into the clip's own coordinates.
+     *
+     * The corner window can differ from the covered band: a band that lies
+     * outside the engine's own columns carries the window it was SPLIT FROM
+     * here, so its corners -- and the chord between them -- stay the ones that
+     * window states, while the covered columns stay the band's. */
+    if (chord_right > chord_left) {
+        clip_left = chord_left;
+        clip_right = chord_right;
+    }
     if (clip_right > clip_left) {
         double lo = (double)clip_left;
         double hi = (double)clip_right;
@@ -4879,8 +4890,12 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
          * two owner identities instead. */
         tmpl.wall_source_numerator = surface->owner_identity;
         tmpl.wall_source_denominator = surface->exception_identity;
+        /* A flat carries no wall column state, so the wall bound pair carries
+         * the corner window for this emission instead (zero = the band states
+         * its own corners). */
         emitted = hwr_emit_flat_clipped(&scene->mesh, surface, camera,
                                         width, height, clip_left, clip_right,
+                                        bound_left, bound_right,
                                         fill_ok, &tmpl, destination);
         if (emitted != SIZE_MAX)
             return emitted;
@@ -5691,13 +5706,17 @@ static const struct hwr_sector_xspan *hwr_flat_sector_window(
          ? window : NULL;
 }
 
-static unsigned hwr_flat_window_add(int16_t *lo, int16_t *hi, unsigned n,
-                                    int left, int right)
+static unsigned hwr_flat_window_add(int16_t *lo, int16_t *hi,
+                                    int16_t *chord_lo, int16_t *chord_hi,
+                                    unsigned n, int left, int right,
+                                    int chord_l, int chord_r)
 {
     if (left >= right || n >= HWR_FLAT_WINDOW_MAX)
         return n;
     lo[n] = (int16_t)left;
     hi[n] = (int16_t)right;
+    chord_lo[n] = (int16_t)chord_l;
+    chord_hi[n] = (int16_t)chord_r;
     return n + 1u;
 }
 
@@ -5714,7 +5733,8 @@ static unsigned hwr_flat_window_set(const struct hwr_scene *scene,
                                     const struct hwr_mesh_surface *surface,
                                     const struct hwr_gl_camera *camera,
                                     const struct hwr_sector_xspan *cover,
-                                    int16_t *lo, int16_t *hi)
+                                    int16_t *lo, int16_t *hi,
+                                    int16_t *chord_lo, int16_t *chord_hi)
 {
     const struct hwr_sector_xspan *set =
         hwr_flat_sector_window(scene, surface, camera);
@@ -5725,7 +5745,8 @@ static unsigned hwr_flat_window_set(const struct hwr_scene *scene,
         return 0;
     if (cover == NULL) {
         for (w = 0; w < set->count; w++)
-            n = hwr_flat_window_add(lo, hi, n, set->lo[w], set->hi[w]);
+            n = hwr_flat_window_add(lo, hi, chord_lo, chord_hi, n,
+                                    set->lo[w], set->hi[w], 0, 0);
         return n;
     }
     if (source_width <= 0 ||
@@ -5752,18 +5773,30 @@ static unsigned hwr_flat_window_set(const struct hwr_scene *scene,
              * polygon as a function of the target's aspect. */
             int l = set->lo[w] > inner_left ? set->lo[w] : inner_left;
             int r = set->hi[w] < inner_right ? set->hi[w] : inner_right;
-            n = hwr_flat_window_add(lo, hi, n, l, r);
+            n = hwr_flat_window_add(lo, hi, chord_lo, chord_hi, n, l, r, 0, 0);
         }
         /* The columns a widened target opened outside the original's frame are
          * their own bands: no visit of the original states a window out there,
          * and their corners are held at the arm the engine's own frame-edge
          * corner carried (hwr_shade_window_clamp), which is bounded where an
-         * unheld arm is not. */
+         * unheld arm is not.
+         *
+         * Each covers its own columns but is CORNERED on the window it was
+         * split from, which is why it carries that window.  A per-visit band
+         * is an engine-sourced bound, and such a bound may state a corner set
+         * only for the columns the engine itself drew: cornering a wing band
+         * on ITSELF re-states the chord over area no visit ever reached, and a
+         * slice whose every corner holds the saturated frame-edge word comes
+         * out uniformly dark where the unsplit window's chord ran through it.
+         * Widening may ADD content; it may never take away what the unwidened
+         * renderer drew out there. */
         if (left < 0)
-            n = hwr_flat_window_add(lo, hi, n, left, right < 0 ? right : 0);
+            n = hwr_flat_window_add(lo, hi, chord_lo, chord_hi, n,
+                                    left, right < 0 ? right : 0, left, right);
         if (right > source_width)
             n = hwr_flat_window_add(
-                lo, hi, n, left > source_width ? left : source_width, right);
+                lo, hi, chord_lo, chord_hi, n,
+                left > source_width ? left : source_width, right, left, right);
     }
     return n;
 }
@@ -5853,8 +5886,11 @@ static size_t hwr_surface_window_count(
         hwr_surface_windows(scene, surface, camera);
     int16_t flat_lo[HWR_FLAT_WINDOW_MAX];
     int16_t flat_hi[HWR_FLAT_WINDOW_MAX];
+    int16_t flat_chord_lo[HWR_FLAT_WINDOW_MAX];
+    int16_t flat_chord_hi[HWR_FLAT_WINDOW_MAX];
     unsigned flats =
-        hwr_flat_window_set(scene, surface, camera, span, flat_lo, flat_hi);
+        hwr_flat_window_set(scene, surface, camera, span, flat_lo, flat_hi,
+                            flat_chord_lo, flat_chord_hi);
     /* A flat visited through several windows is emitted once per window, the
      * same expansion a wall takes, and the reservation is the caller's product
      * of this count with the surface's own worst-case emit. */
@@ -5880,8 +5916,11 @@ static size_t hwr_copy_gpu_surface_windows(
         hwr_wall_sector_window(scene, surface, camera);
     int16_t flat_lo[HWR_FLAT_WINDOW_MAX];
     int16_t flat_hi[HWR_FLAT_WINDOW_MAX];
+    int16_t flat_chord_lo[HWR_FLAT_WINDOW_MAX];
+    int16_t flat_chord_hi[HWR_FLAT_WINDOW_MAX];
     unsigned flats =
-        hwr_flat_window_set(scene, surface, camera, span, flat_lo, flat_hi);
+        hwr_flat_window_set(scene, surface, camera, span, flat_lo, flat_hi,
+                            flat_chord_lo, flat_chord_hi);
     int bound_left = 0;
     int bound_right = 0;
     size_t emitted = 0;
@@ -5896,7 +5935,8 @@ static size_t hwr_copy_gpu_surface_windows(
         for (i = 0; i < flats; i++)
             emitted += hwr_copy_gpu_surface(
                 scene, surface, camera, width, height,
-                flat_lo[i], flat_hi[i], 0, 0, destination + emitted);
+                flat_lo[i], flat_hi[i], flat_chord_lo[i], flat_chord_hi[i],
+                destination + emitted);
         return emitted;
     }
     if (span == NULL) {
