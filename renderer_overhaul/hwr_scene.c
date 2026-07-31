@@ -5768,6 +5768,83 @@ static unsigned hwr_flat_window_set(const struct hwr_scene *scene,
     return n;
 }
 
+/* An engine-sourced chain window describes ONLY the columns the engine itself
+ * drew.  At a target wider than the engine's own frame the stored sector window
+ * can cover engine columns and wing columns in a SINGLE interval: the wing
+ * windows and the full central interval touch at the source edges, and the
+ * window store fuses intervals that touch (hwr_scene_span_add_gap merges on
+ * `lo <= hi[i] + gap` and the two share the boundary column, so no gap setting
+ * keeps them apart).  Anchoring that fused interval at an engine window then
+ * lets an engine clip cut away wing columns the engine never spoke about, and
+ * the wall simply stops being drawn out there.
+ *
+ * That is the additive rule broken: a widened frustum may ADD content, it may
+ * never remove what the unwidened renderer drew.  Splitting the interval at the
+ * source boundary settles it exactly the way the rest of the widened path
+ * already settles it -- hwr_prepare_wide_sector_windows restores a full central
+ * interval alongside its own wing windows, and hwr_flat_window_set states a
+ * centre band alongside its own wing bands.  The engine-column band keeps the
+ * per-visit ramp; each wing band keeps the frame-anchored treatment it had
+ * before that ramp existed.  The bands' union IS the window, so no column
+ * changes hands and coverage is unchanged.
+ *
+ * A window that lies wholly inside the engine's columns, or wholly outside
+ * them, yields one band and is emitted exactly as before. */
+#define HWR_WALL_BAND_MAX 3u
+
+static unsigned hwr_wall_window_bands(int left, int right, int source_width,
+                                      int lo[HWR_WALL_BAND_MAX],
+                                      int hi[HWR_WALL_BAND_MAX],
+                                      unsigned char engine[HWR_WALL_BAND_MAX])
+{
+    unsigned n = 0;
+    int centre_lo = left > 0 ? left : 0;
+    int centre_hi = right < source_width ? right : source_width;
+    if (left < 0) {
+        lo[n] = left;
+        hi[n] = right < 0 ? right : 0;
+        engine[n] = 0;
+        n++;
+    }
+    if (centre_lo < centre_hi) {
+        lo[n] = centre_lo;
+        hi[n] = centre_hi;
+        engine[n] = 1;
+        n++;
+    }
+    if (right > source_width) {
+        lo[n] = left > source_width ? left : source_width;
+        hi[n] = right;
+        engine[n] = 0;
+        n++;
+    }
+    return n;
+}
+
+/* The band expansion above, counted for the reservation.  Only a surface that
+ * can actually take an engine bound is split, so every other surface reserves
+ * and emits exactly what it did before. */
+static size_t hwr_wall_window_band_count(const struct hwr_sector_xspan *span,
+                                         const struct hwr_sector_xspan *anchor,
+                                         const struct hwr_gl_camera *camera)
+{
+    size_t total = 0;
+    unsigned i;
+    if (anchor == NULL || camera->reflected)
+        return span->count;
+    for (i = 0; i < span->count; i++) {
+        int lo[HWR_WALL_BAND_MAX];
+        int hi[HWR_WALL_BAND_MAX];
+        unsigned char engine[HWR_WALL_BAND_MAX];
+        if (span->lo[i] >= span->hi[i])
+            continue;
+        total += hwr_wall_window_bands(span->lo[i], span->hi[i],
+                                       (int)camera->source_width,
+                                       lo, hi, engine);
+    }
+    return total != 0 ? total : 1u;
+}
+
 static size_t hwr_surface_window_count(
     const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera)
@@ -5784,7 +5861,8 @@ static size_t hwr_surface_window_count(
     if (flats != 0)
         return flats;
     if (span != NULL)
-        return span->count;
+        return hwr_wall_window_band_count(
+            span, hwr_wall_sector_window(scene, surface, camera), camera);
     /* A wall whose sector stock re-visits through several windows is emitted
      * once per window; one window, or none, stays a single quad. */
     span = hwr_wall_sector_window(scene, surface, camera);
@@ -5871,15 +5949,42 @@ static size_t hwr_copy_gpu_surface_windows(
         /* This emission already carries a window of its own -- a door's, or a
          * widened frustum's.  The ramp still belongs to the engine-window visit
          * those columns are drawn under, which keeps the law stated in the
-         * engine's projection and so identical at every target aspect. */
-        bound_left = 0;
-        bound_right = 0;
-        if (!camera->reflected)
-            (void)hwr_wall_anchor_window(anchor, left, right,
-                                         &bound_left, &bound_right);
-        emitted += hwr_copy_gpu_surface(
-            scene, surface, camera, width, height, left, right,
-            bound_left, bound_right, destination + emitted);
+         * engine's projection and so identical at every target aspect.
+         *
+         * Only the band of this window that lies in the engine's own columns
+         * may take that ramp: an engine window says nothing about a wing
+         * column, so letting it clip one would delete geometry the widened
+         * frustum admitted.  Wing bands are emitted on the frame bound. */
+        if (anchor == NULL || camera->reflected) {
+            bound_left = 0;
+            bound_right = 0;
+            if (!camera->reflected)
+                (void)hwr_wall_anchor_window(anchor, left, right,
+                                             &bound_left, &bound_right);
+            emitted += hwr_copy_gpu_surface(
+                scene, surface, camera, width, height, left, right,
+                bound_left, bound_right, destination + emitted);
+        } else {
+            int band_lo[HWR_WALL_BAND_MAX];
+            int band_hi[HWR_WALL_BAND_MAX];
+            unsigned char band_engine[HWR_WALL_BAND_MAX];
+            unsigned bands = hwr_wall_window_bands(
+                left, right, (int)camera->source_width,
+                band_lo, band_hi, band_engine);
+            unsigned b;
+            for (b = 0; b < bands; b++) {
+                bound_left = 0;
+                bound_right = 0;
+                if (band_engine[b] != 0)
+                    (void)hwr_wall_anchor_window(anchor, band_lo[b],
+                                                 band_hi[b], &bound_left,
+                                                 &bound_right);
+                emitted += hwr_copy_gpu_surface(
+                    scene, surface, camera, width, height,
+                    band_lo[b], band_hi[b], bound_left, bound_right,
+                    destination + emitted);
+            }
+        }
     }
     return emitted;
 }
