@@ -4128,6 +4128,268 @@ static uint16_t hwr_flat_clipped_shade_word(
         (uint8_t)((uint8_t)projected << (3 - level)));
 }
 
+/* HWR_FLAT_SCANLINE_SLABS=0 restores the single fan from the clipped polygon's
+ * first corner.
+ *
+ * The original draws a flat one screen row at a time: it steps the polygon's two
+ * edge chains down the rows (renderer.c:3872-3903) and interpolates across the
+ * span between them (renderer.c:12981-12990), so its interior is linear along
+ * HORIZONTAL CHORDS.  A fan is linear along the rays from its apex instead, and
+ * the two separate exactly as those rays leave the horizontal -- which is a
+ * property of where the apex sits, so no choice of apex reproduces chords.
+ *
+ * Cutting the polygon into horizontal slabs at every distinct corner row states
+ * the original's own decomposition directly.  Along a polygon edge the value the
+ * original carries IS linear in the screen row -- that is what its edge DDA is --
+ * so a slab-boundary corner takes exactly the word the original's edge chain
+ * carries there, by construction rather than by fit.  A slab holds no corner
+ * strictly inside it, so a convex polygon's slab is a trapezoid whose horizontal
+ * top and bottom edges both schemes already agree on; all that is left is the
+ * trapezoid's own bilinear twist, which its diagonal splits.
+ *
+ * The decomposition reads projected POSITIONS only.  No value is compared and
+ * nothing is fitted per frame, so a still camera produces the same slabs every
+ * frame however the candle jitters. */
+static int hwr_flat_scanline_slabs_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_FLAT_SCANLINE_SLABS");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+/* One point of an emitted flat triangle: where it sits in the world, the screen
+ * row it projects to, and the word the original's edge chain carries there.  The
+ * word stays a double while the decomposition runs so that a point cut from an
+ * already-cut edge still reads the uncut edge's own line. */
+struct hwr_flat_pt {
+    double x;
+    double y;
+    double row;
+    double word;
+};
+
+/* The clip adds at most one corner per half-space, and the emit refuses a loop
+ * that beat that.  So there are at most loop+4 slabs, each a trapezoid = two
+ * triangles: that is the room hwr_surface_reserve promises and the room the
+ * emit refuses to pass. */
+#define HWR_FLAT_POLY_MAX (HWR_FLAT_LOOP_MAX + 5)
+#define HWR_FLAT_SLAB_PTS (HWR_FLAT_POLY_MAX + 2)
+
+/* Two corners this close in screen rows bound no slab between them, and each is
+ * held ON the cut the other states.  Far below a pixel, far above the rounding
+ * width that separates two corners the view clip put on the same boundary. */
+#define HWR_FLAT_ROW_EPS 1e-6
+
+static size_t hwr_flat_clipped_reserve(size_t loop_points, int slabs)
+{
+    return slabs ? (loop_points + 4u) * 6u : (loop_points + 3u) * 3u;
+}
+
+/* The screen row a point of this surface projects to.  A flat's row is a
+ * function of its depth alone, so a horizontal cut is a straight line in the
+ * world and the framebuffer sees the same line the shade window does: the two
+ * projections differ by a scale and an offset on each axis, which maps
+ * horizontals to horizontals and keeps a screen-linear value screen-linear. */
+static double hwr_flat_point_row(const struct hwr_flat_view *view,
+                                 double px, double py)
+{
+    double view_x;
+    double depth;
+    hwr_flat_view_point(view, px, py, &view_x, &depth);
+    if (depth < 16.0)
+        depth = 16.0;
+    return view->plane / depth + view->horizon;
+}
+
+/* The rows the polygon is cut at: its corner rows, ascending, with corners that
+ * share a row contributing one cut.  Returns the count. */
+static int hwr_flat_slab_cuts(const double *row, int n, double *out)
+{
+    int m = 0;
+    int kept = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        double r = row[i];
+        int j = m++;
+        while (j > 0 && out[j - 1] > r) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = r;
+    }
+    for (i = 0; i < m; i++) {
+        if (kept != 0 && out[i] - out[kept - 1] < HWR_FLAT_ROW_EPS)
+            continue;
+        out[kept++] = out[i];
+    }
+    return kept;
+}
+
+/* Keeps the side of one horizontal cut that a slab lives on, inserting the exact
+ * crossing.  The crossing's POSITION comes from the same depth-multiplied
+ * distance the view clip uses, so it lands exactly on the cut; its WORD comes
+ * from the crossing's screen ROW, because the row is the parameter the original's
+ * edge chain walks.  Splitting the edge on its world parameter instead would
+ * carry a different value, and it is the whole point of this pass that it does
+ * not.  Returns the point count, or -1 rather than writing past `capacity`. */
+static int hwr_flat_slab_cut(const struct hwr_flat_view *view,
+                             enum hwr_flat_plane plane, double bound,
+                             const struct hwr_flat_pt *in, int n,
+                             struct hwr_flat_pt *out, int capacity)
+{
+    double dist[HWR_FLAT_SLAB_PTS];
+    int m = 0;
+    int i;
+    if (n > HWR_FLAT_SLAB_PTS)
+        return -1;
+    for (i = 0; i < n; i++) {
+        /* A corner sharing this cut's row IS on the cut.  Two corners the view
+         * clip left on one boundary can differ by a rounding width in the row
+         * they project to; without this the lower one is clipped away and a
+         * crossing computed across that rounding width -- a value read off a
+         * zero-length span -- takes its place. */
+        if (in[i].row > bound - HWR_FLAT_ROW_EPS &&
+            in[i].row < bound + HWR_FLAT_ROW_EPS) {
+            dist[i] = 0.0;
+            continue;
+        }
+        dist[i] = hwr_flat_clip_distance(view, plane, bound, in[i].x, in[i].y);
+    }
+    for (i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        int in_i = dist[i] >= 0.0;
+        int in_j = dist[j] >= 0.0;
+        if (in_i) {
+            if (m >= capacity)
+                return -1;
+            out[m++] = in[i];
+        }
+        if (in_i != in_j) {
+            double t = dist[i] / (dist[i] - dist[j]);
+            double span = in[j].row - in[i].row;
+            /* An edge lying along the cut has no row to interpolate on; it also
+             * has both ends on the cut, so either end is the same value. */
+            double s = (span > 1e-12 || span < -1e-12)
+                     ? (bound - in[i].row) / span : 0.0;
+            if (s < 0.0)
+                s = 0.0;
+            if (s > 1.0)
+                s = 1.0;
+            if (m >= capacity)
+                return -1;
+            out[m].x = in[i].x + t * (in[j].x - in[i].x);
+            out[m].y = in[i].y + t * (in[j].y - in[i].y);
+            out[m].row = bound;
+            out[m].word = in[i].word + s * (in[j].word - in[i].word);
+            m++;
+        }
+    }
+    return m;
+}
+
+/* Drops the coincident points a crossing exactly on a corner leaves behind, so a
+ * trapezoid stays a trapezoid and the triangle count stays inside the reserve. */
+static int hwr_flat_slab_compact(struct hwr_flat_pt *p, int n)
+{
+    int kept = 0;
+    int i;
+    for (i = 0; i < n; i++) {
+        if (kept != 0) {
+            double dx = p[i].x - p[kept - 1].x;
+            double dy = p[i].y - p[kept - 1].y;
+            if (dx > -1e-6 && dx < 1e-6 && dy > -1e-6 && dy < 1e-6)
+                continue;
+        }
+        p[kept++] = p[i];
+    }
+    while (kept > 1) {
+        double dx = p[0].x - p[kept - 1].x;
+        double dy = p[0].y - p[kept - 1].y;
+        if (dx > -1e-6 && dx < 1e-6 && dy > -1e-6 && dy < 1e-6)
+            kept--;
+        else
+            break;
+    }
+    return kept;
+}
+
+/* One emitted triangle corner.  The word is rounded to the vertex format's
+ * 16 bits here and nowhere earlier, so a corner of the polygon itself still
+ * carries the exact word the law returned for it. */
+static void hwr_flat_store_vertex(struct hwr_gl_vertex *o,
+                                  const struct hwr_gl_vertex *tmpl,
+                                  int16_t plane_z, const struct hwr_flat_pt *p)
+{
+    double fx = hwr_floor_double(p->x);
+    double fy = hwr_floor_double(p->y);
+    double w = p->word + 0.5;
+    *o = *tmpl;
+    o->x = (int16_t)(uint16_t)(int32_t)fx;
+    o->y = (int16_t)(uint16_t)(int32_t)fy;
+    o->z = plane_z;
+    o->pos_frac_x = (float)(p->x - fx);
+    o->pos_frac_y = (float)(p->y - fy);
+    if (w < 0.0)
+        w = 0.0;
+    if (w > 65535.0)
+        w = 65535.0;
+    o->wall_shade_endpoint = (uint16_t)w;
+}
+
+/* Emits the polygon as horizontal slabs.  Returns the emitted vertex count, or
+ * SIZE_MAX when the decomposition would not fit the reserved room and the caller
+ * should fall back to the fan it had. */
+static size_t hwr_flat_emit_slabs(const struct hwr_flat_view *view,
+                                  const struct hwr_flat_pt *base, int n,
+                                  size_t limit,
+                                  const struct hwr_gl_vertex *tmpl,
+                                  int16_t plane_z, struct hwr_gl_vertex *dst)
+{
+    double cuts[HWR_FLAT_POLY_MAX];
+    double rows[HWR_FLAT_POLY_MAX];
+    struct hwr_flat_pt work[HWR_FLAT_SLAB_PTS];
+    struct hwr_flat_pt slab[HWR_FLAT_SLAB_PTS];
+    size_t out = 0;
+    int m;
+    int s;
+    int i;
+
+    if (n < 3 || n > HWR_FLAT_POLY_MAX)
+        return SIZE_MAX;
+    for (i = 0; i < n; i++)
+        rows[i] = base[i].row;
+    m = hwr_flat_slab_cuts(rows, n, cuts);
+    /* Every corner on one row: the polygon covers no rows at all, and there is
+     * no slab to state.  Leave it to the fan, which is what drew it before. */
+    if (m < 2)
+        return SIZE_MAX;
+    for (s = 0; s + 1 < m; s++) {
+        int a = hwr_flat_slab_cut(view, HWR_FLAT_PLANE_TOP, cuts[s],
+                                  base, n, work, HWR_FLAT_SLAB_PTS);
+        int b;
+        if (a < 3)
+            continue;
+        b = hwr_flat_slab_cut(view, HWR_FLAT_PLANE_BOTTOM, cuts[s + 1],
+                              work, a, slab, HWR_FLAT_SLAB_PTS);
+        if (b < 3)
+            continue;
+        b = hwr_flat_slab_compact(slab, b);
+        if (b < 3)
+            continue;
+        if ((size_t)(b - 2) * 3u > limit - out)
+            return SIZE_MAX;
+        for (i = 1; i + 1 < b; i++) {
+            hwr_flat_store_vertex(&dst[out++], tmpl, plane_z, &slab[0]);
+            hwr_flat_store_vertex(&dst[out++], tmpl, plane_z, &slab[i]);
+            hwr_flat_store_vertex(&dst[out++], tmpl, plane_z, &slab[i + 1]);
+        }
+    }
+    return out == 0 ? SIZE_MAX : out;
+}
+
 /* A fan from an existing corner is the closest triangulation to the engine's
  * scanline scheme, and it is valid whenever the clipped polygon is convex --
  * which the clip makes it, unless the sector loop itself was concave.  Report
@@ -4170,6 +4432,7 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
 {
     struct hwr_flat_view view;
     struct hwr_clip_pt poly[HWR_FLAT_CLIP_MAX];
+    struct hwr_flat_pt base[HWR_FLAT_POLY_MAX];
     uint16_t fan[(HWR_FLAT_CLIP_MAX - 2) * 3];
     struct hwr_point rounded[HWR_FLAT_CLIP_MAX];
     double bounds[5];
@@ -4292,10 +4555,21 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
     /* The reserved room is the loop plus one corner per half-space. A concave
      * loop that crossed a boundary repeatedly can beat that; emit it whole
      * rather than overrun. */
-    if ((size_t)n > count + 5u)
+    if ((size_t)n > count + 5u || n > HWR_FLAT_POLY_MAX)
         return SIZE_MAX;
 
     triangles = n - 2;
+    /* The corner words are the samples the original's edge chains start from, so
+     * they are taken once per corner and the decomposition INTERPOLATES them.
+     * Re-evaluating the law at a cut would sample the surface more densely than
+     * the original does, which is a different surface, not a finer one. */
+    for (k = 0; k < n; k++) {
+        base[k].x = poly[k].x;
+        base[k].y = poly[k].y;
+        base[k].row = hwr_flat_point_row(&view, poly[k].x, poly[k].y);
+        base[k].word = (double)hwr_flat_clipped_shade_word(
+            surface, camera, &view, poly[k].x, poly[k].y);
+    }
     if (!hwr_flat_polygon_convex(poly, n)) {
         /* A concave sector loop can survive the clip concave, where a fan would
          * paint outside the polygon; ear-clip those. The corner SET is the same
@@ -4308,6 +4582,13 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
         }
         if (hwr_triangulate(rounded, (size_t)n, fan) == 0)
             goto emit;
+    } else if (hwr_flat_scanline_slabs_enabled()) {
+        out = hwr_flat_emit_slabs(&view, base, n,
+                                  hwr_flat_clipped_reserve(count, 1),
+                                  tmpl, plane_z, dst);
+        if (out != SIZE_MAX)
+            goto saturation;
+        out = 0;
     }
     for (k = 1; k + 1 < n; k++) {
         fan[(k - 1) * 3] = 0;
@@ -4316,21 +4597,15 @@ static size_t hwr_emit_flat_clipped(const struct hwr_scene_mesh *mesh,
     }
 
 emit:
-    for (k = 0; k < triangles * 3; k++) {
-        const struct hwr_clip_pt *p = &poly[fan[k]];
-        struct hwr_gl_vertex *o = &dst[out++];
-        double fx = hwr_floor_double(p->x);
-        double fy = hwr_floor_double(p->y);
-        *o = *tmpl;
-        o->x = (int16_t)(uint16_t)(int32_t)fx;
-        o->y = (int16_t)(uint16_t)(int32_t)fy;
-        o->z = plane_z;
-        o->pos_frac_x = (float)(p->x - fx);
-        o->pos_frac_y = (float)(p->y - fy);
-        o->wall_shade_endpoint =
-            hwr_flat_clipped_shade_word(surface, camera, &view, p->x, p->y);
-        if (o->wall_shade_endpoint != (uint16_t)(31u << 8))
+    for (k = 0; k < triangles * 3; k++)
+        hwr_flat_store_vertex(&dst[out++], tmpl, plane_z, &base[fan[k]]);
+
+saturation:
+    for (k = 0; (size_t)k < out; k++) {
+        if (dst[k].wall_shade_endpoint != (uint16_t)(31u << 8)) {
             all_saturated = 0;
+            break;
+        }
     }
     /* The engine ORs one mode bit per projected corner and takes its untextured
      * fill only when every corner saturated the ramp (mode == 2 exactly); one
@@ -4385,8 +4660,11 @@ static size_t hwr_surface_reserve(const struct hwr_mesh_surface *surface)
         if (!hwr_flat_uses_clipped_emit(surface))
             return surface->vertex_count;
         /* Five half-spaces, so at most five corners more than the loop; the
-         * clipper refuses anything longer and the surface is emitted whole. */
-        clipped = (surface->loop_point_count + 3u) * 3u;
+         * clipper refuses anything longer and the surface is emitted whole.
+         * Horizontal slabs turn each of those corners into a cut, so the room
+         * is stated once for both states. */
+        clipped = hwr_flat_clipped_reserve(
+            surface->loop_point_count, hwr_flat_scanline_slabs_enabled());
         return clipped > surface->vertex_count ? clipped
                                                : surface->vertex_count;
     }
