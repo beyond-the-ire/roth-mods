@@ -5327,12 +5327,137 @@ static const struct hwr_sector_xspan *hwr_surface_windows(
     return span;
 }
 
+/* The original clips EVERY floor and ceiling polygon to the column window of
+ * the chain visit it is drawing under -- the flat spans are emitted inside that
+ * per-link loop (renderer.c:9215, 9235) and the polygon rasteriser clips them to
+ * the pair the link loaded (renderer.c:4144-4157 -> 4103-4107) -- so a sector
+ * reached through a doorway has its flats cornered on the doorway's columns and
+ * a sector reached twice has two corner sets.  The mod clipped a flat to the
+ * drawn frame instead, which on a big sector seen through a narrow portal states
+ * the shading chord over a far longer baseline than the original ever does.
+ * HWR_FLAT_PORTAL_WINDOW=0 restores the frame-clipped flat. */
+static int hwr_flat_portal_window_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_FLAT_PORTAL_WINDOW");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+/* The sibling of hwr_wall_sector_window for flats: the same per-visit set out of
+ * the same ordered draw list, offered only to the surfaces that take the
+ * view-clipped emit, since that emit is what turns a window into a corner set. */
+static const struct hwr_sector_xspan *hwr_flat_sector_window(
+    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
+    const struct hwr_gl_camera *camera)
+{
+    const struct hwr_sector_xspan *window;
+    if (!scene->sector_portal_valid || camera->reflected ||
+        scene->sector_spans == NULL || !hwr_flat_portal_window_enabled())
+        return NULL;
+    if (!hwr_flat_uses_clipped_emit(surface) ||
+        surface->kind == HWR_SURFACE_DOOR ||
+        surface->sector_index >= scene->sector_span_count)
+        return NULL;
+    window = &scene->sector_spans[surface->sector_index];
+    return window->count != 0 && window->count <= HWR_WALL_WINDOW_MAX
+         ? window : NULL;
+}
+
+/* The most bands one flat is re-emitted under: the sector's own visits plus the
+ * two intervals a widened target opens outside the original's frame. A surface
+ * that would need more keeps the single band it has today. */
+#define HWR_FLAT_WINDOW_MAX (HWR_WALL_WINDOW_MAX + 4u)
+
+static unsigned hwr_flat_window_add(int16_t *lo, int16_t *hi, unsigned n,
+                                    int left, int right)
+{
+    if (left >= right || n >= HWR_FLAT_WINDOW_MAX)
+        return n;
+    lo[n] = (int16_t)left;
+    hi[n] = (int16_t)right;
+    return n + 1u;
+}
+
+/* The column bands one flat is emitted under.  Unlike a wall, a flat's band is
+ * not only the region it covers: it is the band its corners -- the only places
+ * the candle law is sampled -- are clipped to, so the band and the visit cannot
+ * be carried separately and a flat drawn under a chain visit is emitted under
+ * that visit's window.  Where a widened target has opened columns the original
+ * never drew, those keep the band the widening gave them: no visit of the
+ * original states a window out there, so there is nothing to anchor them to.
+ * Returns 0 when this surface takes no per-visit split and the caller's existing
+ * path stands unchanged. */
+static unsigned hwr_flat_window_set(const struct hwr_scene *scene,
+                                    const struct hwr_mesh_surface *surface,
+                                    const struct hwr_gl_camera *camera,
+                                    const struct hwr_sector_xspan *cover,
+                                    int16_t *lo, int16_t *hi)
+{
+    const struct hwr_sector_xspan *set =
+        hwr_flat_sector_window(scene, surface, camera);
+    int source_width = (int)camera->source_width;
+    unsigned n = 0;
+    unsigned i, w;
+    if (set == NULL)
+        return 0;
+    if (cover == NULL) {
+        for (w = 0; w < set->count; w++)
+            n = hwr_flat_window_add(lo, hi, n, set->lo[w], set->hi[w]);
+        return n;
+    }
+    if (source_width <= 0 ||
+        (unsigned)cover->count * (set->count + 2u) > HWR_FLAT_WINDOW_MAX)
+        return 0;
+    for (i = 0; i < cover->count; i++) {
+        int left = cover->lo[i];
+        int right = cover->hi[i];
+        int reaches_left = 0;
+        int reaches_right = 0;
+        if (left >= right)
+            continue;
+        for (w = 0; w < set->count; w++) {
+            /* A visit whose window already runs to the original's own frame
+             * edge is not gated there, so the widened columns past that edge
+             * belong to it and stay in its band: cutting them off would state a
+             * corner the original never places.  Only a genuinely interior edge
+             * -- a doorway -- cuts. */
+            int l = set->lo[w] <= 0
+                  ? left : (set->lo[w] > left ? set->lo[w] : left);
+            int r = set->hi[w] >= source_width
+                  ? right : (set->hi[w] < right ? set->hi[w] : right);
+            reaches_left |= set->lo[w] <= 0;
+            reaches_right |= set->hi[w] >= source_width;
+            n = hwr_flat_window_add(lo, hi, n, l, r);
+        }
+        /* Columns outside the original's frame that no visit reaches keep the
+         * band the widening gave them: nothing over there is anchored. */
+        if (!reaches_left && left < 0)
+            n = hwr_flat_window_add(lo, hi, n, left, right < 0 ? right : 0);
+        if (!reaches_right && right > source_width)
+            n = hwr_flat_window_add(
+                lo, hi, n, left > source_width ? left : source_width, right);
+    }
+    return n;
+}
+
 static size_t hwr_surface_window_count(
     const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera)
 {
     const struct hwr_sector_xspan *span =
         hwr_surface_windows(scene, surface, camera);
+    int16_t flat_lo[HWR_FLAT_WINDOW_MAX];
+    int16_t flat_hi[HWR_FLAT_WINDOW_MAX];
+    unsigned flats =
+        hwr_flat_window_set(scene, surface, camera, span, flat_lo, flat_hi);
+    /* A flat visited through several windows is emitted once per window, the
+     * same expansion a wall takes, and the reservation is the caller's product
+     * of this count with the surface's own worst-case emit. */
+    if (flats != 0)
+        return flats;
     if (span != NULL)
         return span->count;
     /* A wall whose sector stock re-visits through several windows is emitted
@@ -5350,10 +5475,27 @@ static size_t hwr_copy_gpu_surface_windows(
         hwr_surface_windows(scene, surface, camera);
     const struct hwr_sector_xspan *anchor =
         hwr_wall_sector_window(scene, surface, camera);
+    int16_t flat_lo[HWR_FLAT_WINDOW_MAX];
+    int16_t flat_hi[HWR_FLAT_WINDOW_MAX];
+    unsigned flats =
+        hwr_flat_window_set(scene, surface, camera, span, flat_lo, flat_hi);
     int bound_left = 0;
     int bound_right = 0;
     size_t emitted = 0;
     unsigned i;
+    if (flats != 0) {
+        /* One emission per chain visit.  clip_left/clip_right are exactly what
+         * the flat emit needs: they become the side bounds its loop is clipped
+         * to, so the corners land on the doorway edge the original's own clip
+         * puts them on, and the whole-polygon fill follows on the same set.  A
+         * flat carries no wall column state, so the wall bound pair stays at
+         * the frame and nothing on that path can move. */
+        for (i = 0; i < flats; i++)
+            emitted += hwr_copy_gpu_surface(
+                scene, surface, camera, width, height,
+                flat_lo[i], flat_hi[i], 0, 0, destination + emitted);
+        return emitted;
+    }
     if (span == NULL) {
         /* The wall's shading ramp is anchored at the bounds of the visit it is
          * drawn under, and one quad carries exactly one ramp.  A sector reached
