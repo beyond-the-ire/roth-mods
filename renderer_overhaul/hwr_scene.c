@@ -4635,12 +4635,48 @@ saturation:
     return out;
 }
 
-/* Does this surface take the per-frame view-clipped flat emit? */
+/* HWR_FLAT_SOLID_CORNERS=0 restores the previous treatment of a solid-colour
+ * flat: it is kept off the view-clipped emit, so it carries the whole sector
+ * loop and its clipped-corner triangles fall to the per-fragment radial. It is
+ * the A/B for the corner-set family below and touches nothing else. */
+static int hwr_flat_solid_corners_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("HWR_FLAT_SOLID_CORNERS");
+        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return enabled;
+}
+
+/* Does this surface take the per-frame view-clipped flat emit?
+ *
+ * A solid-colour (palette-index) flat belongs here exactly as much as a
+ * textured one.  The span driver's mode ladder splits the two families on the
+ * TEXTURED bit of the surface mode word and then, in BOTH halves, takes the
+ * same tinted branch: it raises the same textured-shade flag and calls the same
+ * edge-walker (renderer.c:3298-3312 untextured / 3319-3333 textured; in the
+ * shipped bytes `movb $1,[g_render_textured_flag]` then `call
+ * rasterize_floorceil_polygon` at the untextured 0x3967b/0x39682 and the
+ * textured 0x3977a/0x39781).  That edge-walker VIEW-CLIPS the polygon and
+ * evaluates the candle word at each clipped corner, gated on that one flag
+ * (renderer.c:3660-3667; `cmpb $0,[g_render_textured_flag]` at 0x3b888).  The
+ * families differ only in which writer consumes the resulting ramp -- the
+ * solid-fill gradient for an untextured flat, a texel mapper for a textured one
+ * -- never in where the law is SAMPLED.
+ *
+ * Excluding a solid-colour flat here left it on the whole unclipped sector
+ * loop, whose corners fall outside the frustum, so every one of its triangles
+ * tripped the clipped-corner escape and fell to the per-fragment radial.  That
+ * radial is the convex law itself, while the original carries the CHORD between
+ * its clipped corners, which runs above it: the surface comes out uniformly
+ * bright, by the same +20..+29 rows that escape was added to remove. */
 static int hwr_flat_uses_clipped_emit(const struct hwr_mesh_surface *surface)
 {
     return hwr_flat_vertex_law_enabled() &&
            (surface->flags & HWR_SURFACE_FLAT) != 0 &&
-           (surface->flags & HWR_SURFACE_DIRECT) == 0 &&
+           (hwr_flat_solid_corners_enabled() ||
+            (surface->flags & HWR_SURFACE_DIRECT) == 0) &&
            (surface->flags & HWR_SURFACE_SKY_CAP) == 0 &&
            (surface->sector_flags & 2u) != 0 &&
            surface->loop_point_count >= 3u &&
@@ -5627,6 +5663,11 @@ static int hwr_flat_portal_window_enabled(void)
 /* The sibling of hwr_wall_sector_window for flats: the same per-visit set out of
  * the same ordered draw list, offered only to the surfaces that take the
  * view-clipped emit, since that emit is what turns a window into a corner set. */
+/* The most bands one flat is re-emitted under: the sector's own visits plus the
+ * two intervals a widened target opens outside the original's frame. A surface
+ * that would need more keeps the single band it has today. */
+#define HWR_FLAT_WINDOW_MAX (HWR_WALL_WINDOW_MAX + 4u)
+
 static const struct hwr_sector_xspan *hwr_flat_sector_window(
     const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera)
@@ -5640,14 +5681,15 @@ static const struct hwr_sector_xspan *hwr_flat_sector_window(
         surface->sector_index >= scene->sector_span_count)
         return NULL;
     window = &scene->sector_spans[surface->sector_index];
-    return window->count != 0 && window->count <= HWR_WALL_WINDOW_MAX
+    /* Sized by the flat emit's OWN reservation, not by the wall's visit cap.
+     * The original emits a flat once per chain link, with no cap and no merge
+     * (renderer.c:9175-9253 -- the emission sits inside `while (chain != 0)`),
+     * so the only bound that belongs here is the room the two emit sites
+     * actually reserve, which is HWR_FLAT_WINDOW_MAX. Gating on the smaller
+     * wall cap refused four visits' worth of reservation already allocated. */
+    return window->count != 0 && window->count <= HWR_FLAT_WINDOW_MAX
          ? window : NULL;
 }
-
-/* The most bands one flat is re-emitted under: the sector's own visits plus the
- * two intervals a widened target opens outside the original's frame. A surface
- * that would need more keeps the single band it has today. */
-#define HWR_FLAT_WINDOW_MAX (HWR_WALL_WINDOW_MAX + 4u)
 
 static unsigned hwr_flat_window_add(int16_t *lo, int16_t *hi, unsigned n,
                                     int left, int right)
@@ -5692,29 +5734,34 @@ static unsigned hwr_flat_window_set(const struct hwr_scene *scene,
     for (i = 0; i < cover->count; i++) {
         int left = cover->lo[i];
         int right = cover->hi[i];
-        int reaches_left = 0;
-        int reaches_right = 0;
+        /* The engine's own frame, in its own columns: a visit's band never
+         * leaves it. */
+        int inner_left = left > 0 ? left : 0;
+        int inner_right = right < source_width ? right : source_width;
         if (left >= right)
             continue;
         for (w = 0; w < set->count; w++) {
-            /* A visit whose window already runs to the original's own frame
-             * edge is not gated there, so the widened columns past that edge
-             * belong to it and stay in its band: cutting them off would state a
-             * corner the original never places.  Only a genuinely interior edge
-             * -- a doorway -- cuts. */
-            int l = set->lo[w] <= 0
-                  ? left : (set->lo[w] > left ? set->lo[w] : left);
-            int r = set->hi[w] >= source_width
-                  ? right : (set->hi[w] < right ? set->hi[w] : right);
-            reaches_left |= set->lo[w] <= 0;
-            reaches_right |= set->hi[w] >= source_width;
+            /* This band becomes the side bounds the corner law is clipped to
+             * (hwr_emit_flat_clipped), and that law is stated in the ENGINE's
+             * screen window -- so the band a visit contributes is the window
+             * the original clipped that visit to, held inside the engine's
+             * frame at every target size and shape.  Letting a visit that runs
+             * to the frame edge swallow the widened columns instead moved the
+             * corner the original DOES place at that edge out into the extra
+             * view area, which re-stated the shading chord across the whole
+             * polygon as a function of the target's aspect. */
+            int l = set->lo[w] > inner_left ? set->lo[w] : inner_left;
+            int r = set->hi[w] < inner_right ? set->hi[w] : inner_right;
             n = hwr_flat_window_add(lo, hi, n, l, r);
         }
-        /* Columns outside the original's frame that no visit reaches keep the
-         * band the widening gave them: nothing over there is anchored. */
-        if (!reaches_left && left < 0)
+        /* The columns a widened target opened outside the original's frame are
+         * their own bands: no visit of the original states a window out there,
+         * and their corners are held at the arm the engine's own frame-edge
+         * corner carried (hwr_shade_window_clamp), which is bounded where an
+         * unheld arm is not. */
+        if (left < 0)
             n = hwr_flat_window_add(lo, hi, n, left, right < 0 ? right : 0);
-        if (!reaches_right && right > source_width)
+        if (right > source_width)
             n = hwr_flat_window_add(
                 lo, hi, n, left > source_width ? left : source_width, right);
     }
