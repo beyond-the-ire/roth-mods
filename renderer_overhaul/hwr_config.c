@@ -1,13 +1,11 @@
 #include "hwr_config.h"
 
+#include "hwr_schema.h"
 #include "hwr_settings.h"
-#include "hwr_util.h"
 
 #include <ctype.h>
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define HWR_CONFIG_POLL_FRAMES 30u
@@ -33,135 +31,22 @@ static char *hwr_trim(char *text)
     return text;
 }
 
-static int hwr_parse_u32(const char *text, int base, uint32_t maximum,
-                         uint32_t *value)
-{
-    char *end;
-    unsigned long parsed;
-
-    errno = 0;
-    parsed = strtoul(text, &end, base);
-    while (*end != 0 && isspace((unsigned char)*end))
-        end++;
-    if (errno != 0 || end == text || *end != 0 || parsed > maximum)
-        return 0;
-    *value = (uint32_t)parsed;
-    return 1;
-}
-
-static int hwr_parse_bool(const char *text, int *value)
-{
-    if (hwr_ascii_equal_ci(text, "1") || hwr_ascii_equal_ci(text, "true") ||
-        hwr_ascii_equal_ci(text, "yes") || hwr_ascii_equal_ci(text, "on")) {
-        *value = 1;
-        return 1;
-    }
-    if (hwr_ascii_equal_ci(text, "0") || hwr_ascii_equal_ci(text, "false") ||
-        hwr_ascii_equal_ci(text, "no") || hwr_ascii_equal_ci(text, "off")) {
-        *value = 0;
-        return 1;
-    }
-    return 0;
-}
-
-static int hwr_parse_float(const char *text, float maximum, float *value)
-{
-    char *end;
-    double parsed;
-
-    errno = 0;
-    parsed = strtod(text, &end);
-    while (*end != 0 && isspace((unsigned char)*end))
-        end++;
-    if (errno != 0 || end == text || *end != 0 ||
-        parsed < 0.0 || parsed > maximum)
-        return 0;
-    *value = (float)parsed;
-    return 1;
-}
-
+/* One key=value pair against the schema: 1 accepted, 0 invalid value,
+ * -1 unknown key. Every bound, token, and transform comes from the table, so
+ * the file and the settings overlay can only ever agree. */
 static int hwr_apply_config_value(struct hwr_settings *settings,
                                   const char *key, const char *value)
 {
-    uint32_t number;
-    int boolean;
-    float real;
+    const struct hwr_setting_desc *desc = hwr_schema_find(key);
+    union hwr_value parsed;
 
-    if (hwr_ascii_equal_ci(key, "enabled")) {
-        if (!hwr_parse_bool(value, &boolean))
-            return 0;
-        settings->enabled = boolean;
-    } else if (hwr_ascii_equal_ci(key, "debug")) {
-        if (!hwr_parse_bool(value, &boolean))
-            return 0;
-        settings->debug = boolean;
-    } else if (hwr_ascii_equal_ci(key, "solid_color")) {
-        /* Retired: there is no manufactured world frame to colour any more.
-         * The key is still accepted so an existing configuration file keeps
-         * loading as a whole. */
-        if (!hwr_parse_u32(value, 16, 0x00ffffffu, &number))
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "internal_w")) {
-        if (!hwr_parse_u32(value, 10, 16384u, &number))
-            return 0;
-        settings->internal_w = number;
-    } else if (hwr_ascii_equal_ci(key, "internal_h")) {
-        if (!hwr_parse_u32(value, 10, 16384u, &number))
-            return 0;
-        settings->internal_h = number;
-    } else if (hwr_ascii_equal_ci(key, "window_mode")) {
-        if (hwr_ascii_equal_ci(value, "default"))
-            settings->window_mode = HWR_WINDOW_DEFAULT;
-        else if (hwr_ascii_equal_ci(value, "windowed"))
-            settings->window_mode = HWR_WINDOW_WINDOWED;
-        else if (hwr_ascii_equal_ci(value, "borderless"))
-            settings->window_mode = HWR_WINDOW_BORDERLESS;
-        else
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "present_mode")) {
-        if (hwr_ascii_equal_ci(value, "fifo"))
-            settings->present_mode = HWR_PRESENT_FIFO;
-        else if (hwr_ascii_equal_ci(value, "immediate"))
-            settings->present_mode = HWR_PRESENT_IMMEDIATE;
-        else if (hwr_ascii_equal_ci(value, "adaptive"))
-            settings->present_mode = HWR_PRESENT_ADAPTIVE;
-        else
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "min_present_interval_us")) {
-        if (!hwr_parse_u32(value, 10, 10000000u, &number))
-            return 0;
-        settings->min_present_interval_us = number;
-    } else if (hwr_ascii_equal_ci(key, "fps_cap")) {
-        if (!hwr_parse_u32(value, 10, 1000000u, &number))
-            return 0;
-        settings->min_present_interval_us =
-            number == 0 ? 0 : 1000000u / number;
-    } else if (hwr_ascii_equal_ci(key, "shade_depth_scale")) {
-        if (!hwr_parse_float(value, 4096.0f, &real) || real <= 0.0f)
-            return 0;
-        settings->shade_depth_scale = real;
-    } else if (hwr_ascii_equal_ci(key, "fov_deg")) {
-        if (!hwr_parse_float(value, 170.0f, &real) ||
-            (real != 0.0f && real < 30.0f))
-            return 0;
-        settings->fov_deg = real;
-    } else if (hwr_ascii_equal_ci(key, "pitch_mode")) {
-        if (hwr_ascii_equal_ci(value, "horizon_shift"))
-            settings->pitch_mode = HWR_PITCH_HORIZON_SHIFT;
-        else if (hwr_ascii_equal_ci(value, "true_rotation"))
-            settings->pitch_mode = HWR_PITCH_TRUE_ROTATION;
-        else
-            return 0;
-    } else if (hwr_ascii_equal_ci(key, "render_mode")) {
-        if (hwr_ascii_equal_ci(value, "authentic"))
-            settings->render_mode = HWR_RENDER_AUTHENTIC;
-        else if (hwr_ascii_equal_ci(value, "enhanced"))
-            settings->render_mode = HWR_RENDER_ENHANCED;
-        else
-            return 0;
-    } else {
+    if (desc == NULL)
         return -1;
-    }
+    if (!hwr_schema_parse(desc, value, &parsed, NULL, 0))
+        return 0;
+    /* A retired key is parsed for its file's sake and then discarded. */
+    if (desc->exposure != HWR_EXP_RETIRED)
+        hwr_schema_set(settings, desc, parsed);
     return 1;
 }
 
@@ -247,11 +132,13 @@ static int hwr_config_read(struct hwr_settings *settings,
                         g_config.path, line_number, key);
             valid = 0;
         } else if (result < 0) {
+            /* An unknown key costs its own line and nothing else: a file
+             * written by a later build must not take every setting it shares
+             * with this one down with it. */
             if (report_errors)
                 fprintf(stderr,
-                        "[renderer_overhaul] %s:%u: unknown setting '%s'\n",
+                        "[renderer_overhaul] %s:%u: unknown setting '%s'; ignored\n",
                         g_config.path, line_number, key);
-            valid = 0;
         }
     }
     if (ferror(file))

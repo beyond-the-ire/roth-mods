@@ -41,6 +41,9 @@ struct hwr_settings {
     float fov_deg;
     enum hwr_pitch_mode pitch_mode;
     enum hwr_render_mode render_mode;
+
+    /* Set-1 make scancode of the key that opens the settings overlay. */
+    uint32_t overlay_key;
 };
 
 enum hwr_settings_change {
@@ -78,5 +81,6 @@ void hwr_settings_set_min_present_interval_us(uint32_t interval_us);
 void hwr_settings_set_fov_deg(float fov_deg);
 void hwr_settings_set_pitch_mode(enum hwr_pitch_mode mode);
 void hwr_settings_set_render_mode(enum hwr_render_mode mode);
+void hwr_settings_set_overlay_key(uint32_t scancode);
 
 #endif

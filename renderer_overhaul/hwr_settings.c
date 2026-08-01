@@ -1,7 +1,8 @@
 #include "hwr_settings.h"
 
+#include "hwr_schema.h"
+
 #include <stddef.h>
-#include <string.h>
 
 #define HWR_MAX_APPLY_HOOKS 8u
 
@@ -19,13 +20,7 @@ void hwr_settings_defaults(struct hwr_settings *settings)
 {
     if (settings == NULL)
         return;
-    memset(settings, 0, sizeof *settings);
-    settings->enabled = 1;
-    settings->window_mode = HWR_WINDOW_DEFAULT;
-    settings->present_mode = HWR_PRESENT_FIFO;
-    settings->pitch_mode = HWR_PITCH_HORIZON_SHIFT;
-    settings->render_mode = HWR_RENDER_AUTHENTIC;
-    settings->shade_depth_scale = 1.0f;
+    hwr_schema_defaults(settings);
 }
 
 void hwr_settings_init_defaults(void)
@@ -56,6 +51,7 @@ void hwr_settings_replace(const struct hwr_settings *settings)
     hwr_settings_set_fov_deg(settings->fov_deg);
     hwr_settings_set_pitch_mode(settings->pitch_mode);
     hwr_settings_set_render_mode(settings->render_mode);
+    hwr_settings_set_overlay_key(settings->overlay_key);
 }
 
 int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata)
@@ -165,4 +161,11 @@ void hwr_settings_set_render_mode(enum hwr_render_mode mode)
         g_settings.render_mode = mode;
         g_dirty |= HWR_CHANGE_RENDER_MODE;
     }
+}
+
+/* The settings overlay reads its key straight from the store when it handles a
+ * scancode, so there is no apply hook and no change bit to raise. */
+void hwr_settings_set_overlay_key(uint32_t scancode)
+{
+    g_settings.overlay_key = scancode;
 }

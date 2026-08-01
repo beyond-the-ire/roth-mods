@@ -1,13 +1,13 @@
 ROTH_SDK ?= ../../ROTH.C/sdk
 
-SOURCES := renderer_overhaul.c hwr_settings.c hwr_gl.c hwr_world.c hwr_das.c hwr_scene.c \
-           hwr_backdrop.c hwr_visibility.c hwr_sprites.c hwr_objects.c hwr_billboards.c \
-           hwr_meshes.c hwr_perf.c hwr_config.c hwr_thumbnail.c hwr_util.c \
+SOURCES := renderer_overhaul.c hwr_settings.c hwr_schema.c hwr_gl.c hwr_world.c hwr_das.c \
+           hwr_scene.c hwr_backdrop.c hwr_visibility.c hwr_sprites.c hwr_objects.c \
+           hwr_billboards.c hwr_meshes.c hwr_perf.c hwr_config.c hwr_thumbnail.c hwr_util.c \
            hwr_projection.c hwr_input.c hwr_composite.c hwr_chrome.c \
            hwr_ownership.c
-HEADERS := hwr_settings.h hwr_gl.h hwr_world.h hwr_das.h hwr_scene.h hwr_backdrop.h \
-           hwr_visibility.h hwr_sprites.h hwr_objects.h hwr_billboards.h hwr_perf.h \
-           hwr_meshes.h hwr_config.h hwr_thumbnail.h hwr_util.h hwr_projection.h \
+HEADERS := hwr_settings.h hwr_schema.h hwr_gl.h hwr_world.h hwr_das.h hwr_scene.h \
+           hwr_backdrop.h hwr_visibility.h hwr_sprites.h hwr_objects.h hwr_billboards.h \
+           hwr_perf.h hwr_meshes.h hwr_config.h hwr_thumbnail.h hwr_util.h hwr_projection.h \
            hwr_input.h hwr_composite.h hwr_chrome.h hwr_ownership.h \
            $(ROTH_SDK)/include/roth_sdk.h \
            $(ROTH_SDK)/include/roth_sdk_overrides.h
