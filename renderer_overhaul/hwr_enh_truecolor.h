@@ -28,4 +28,25 @@ int hwr_enh_truecolor_register(void);
  * the settings table, which asks before showing a row at all. */
 int hwr_truecolor_format_offered(void);
 
+/* The settings panel's live preview of the picture dials.
+ *
+ * A dial is worth seeing while it is being moved, so the panel hands its draft
+ * over on every pump and this module draws the world image with the draft's
+ * brightness and contrast instead of the ones in force. Nothing is written: the
+ * store still holds what is in force, the file is still what Apply writes, and
+ * the panel closing -- by Cancel, by throwing the draft away, or by the panel
+ * coming down for any other reason -- puts the picture back on its own.
+ *
+ * Only the picture dials are previewed. Everything else takes effect when it is
+ * applied, which is what the panel has always promised.
+ *
+ * Both calls run on the game thread, where the panel runs. They allocate
+ * nothing and touch no GL object: they raise the foundation's change bit, and
+ * the settings pump applies it at the render boundary, which is the only place
+ * a program is linked or an attachment is created.
+ */
+struct hwr_settings;
+void hwr_truecolor_preview(const struct hwr_settings *draft);
+void hwr_truecolor_preview_clear(void);
+
 #endif

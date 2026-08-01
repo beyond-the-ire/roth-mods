@@ -238,7 +238,7 @@ static int g_truecolor_active;
 static int g_truecolor_failed;
 static int g_truecolor_logged;
 /* What the settings layer last asked for. */
-static struct hwr_gl_truecolor g_truecolor_want = { 0, 1, 1.0f,
+static struct hwr_gl_truecolor g_truecolor_want = { 0, 1, 1.0f, 1.0f,
                                                     HWR_GL_COLOR_AUTO };
 /* The colour format in use, and the ones this driver has refused. */
 static enum hwr_gl_color_format g_truecolor_format = HWR_GL_COLOR_AUTO;
@@ -1196,6 +1196,7 @@ static const char g_geometry_fragment_body[] =
     "uniform sampler2D u_palette;\n"
     "uniform vec3 u_gain;\n"
     "uniform vec3 u_add;\n"
+    "uniform float u_contrast;\n"
     "uniform int u_light_neutral;\n"
     /* The unlit texel of the ordinary tail. Every other class is unlit in the
      * original and stays unlit here, and says so by leaving this unset. */
@@ -1206,7 +1207,17 @@ static const char g_geometry_fragment_body[] =
     "  if (u_light_neutral!=0) { out_color=lit; return; }\n"
     "  uint albedo_index=g_albedo_index<256u ? g_albedo_index : index;\n"
     "  vec3 albedo=texelFetch(u_palette,ivec2(int(albedo_index),0),0).rgb;\n"
-    "  out_color=vec4(lit.rgb*u_gain+albedo*u_add,lit.a);\n"
+    "  vec3 shaded=lit.rgb*u_gain+albedo*u_add;\n"
+    /* The picture's contrast: a pivot around mid grey, after everything that
+     * decides how much light a surface got. The comparison is uniform across
+     * the draw and it is what keeps one exactly one -- taking half away and
+     * putting it back does not always round to the colour it started from, and
+     * a dial at its original must not move a single byte. */
+    "  if (u_contrast!=1.0) shaded=(shaded-0.5)*u_contrast+0.5;\n"
+    /* Below black has no meaning in this space and would poison any later term
+     * that adds to it. The top is left to the target's own range, which is the
+     * headroom the floating-point format exists for. */
+    "  out_color=vec4(max(shaded,0.0),lit.a);\n"
     "}\n"
     "#endif\n"
     "void main() {\n"
@@ -2401,6 +2412,13 @@ static void hwr_uniform_2i(GLuint program, const char *name, GLint x, GLint y)
         g_gl.uniform_2i(location, x, y);
 }
 
+static void hwr_uniform_1f(GLuint program, const char *name, GLfloat value)
+{
+    GLint location = g_gl.get_uniform_location(program, name);
+    if (location >= 0)
+        g_gl.uniform_1f(location, value);
+}
+
 static void hwr_uniform_2f(GLuint program, const char *name, GLfloat x, GLfloat y)
 {
     GLint location = g_gl.get_uniform_location(program, name);
@@ -2833,12 +2851,18 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
          * byte it started from, so it would leave the instrument reporting a
          * clean run. This one moves every channel from 51 up. */
         GLfloat gain = g_truecolor_break ? 0.99f : g_truecolor_want.gain;
+        /* The self-test detunes the gain and nothing else, so what it proves
+         * stays what it proved when it was written. */
+        GLfloat contrast = g_truecolor_break ? 1.0f : g_truecolor_want.contrast;
         int neutral = g_truecolor_break ? 0 : g_truecolor_want.neutral;
         if (gain <= 0.0f)
             gain = 1.0f;
+        if (contrast <= 0.0f)
+            contrast = 1.0f;
         hwr_set_sampler(program, "u_palette", 8);
         hwr_uniform_3f(program, "u_gain", gain, gain, gain);
         hwr_uniform_3f(program, "u_add", 0.0f, 0.0f, 0.0f);
+        hwr_uniform_1f(program, "u_contrast", contrast);
         hwr_uniform_1i(program, "u_light_neutral", neutral);
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off

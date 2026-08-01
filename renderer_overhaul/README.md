@@ -66,6 +66,8 @@ line. Applying the settings rewrites the file with its own comments and ordering
 - `fov_deg`: horizontal FOV at the original 4:3 aspect, from 30 through 170 degrees. Zero preserves
   the original projection. Wider output aspects automatically gain horizontal view area.
 - `overlay_key`: which key opens the settings screen, by name, such as `f12` or `f9`.
+- `world_brightness`, `world_contrast`: the picture settings, from 0.5 through 1.5 each. One is the
+  original picture for both.
 
 A resolution change can cause a one-frame hitch while the render targets are resized.
 
@@ -82,6 +84,24 @@ classification, text, menus, the HUD, and the cursor. At wide aspects the authen
 is centered without stretching while the world fills the configured canvas; gameplay picking uses
 the matching wide projection, and engine-only menus retain their original coordinate system.
 
-The individually configurable visual enhancements are still planned, so the Enhancements section
-of the settings screen is empty in this build. Authentic rendering is what the mod produces with
-every enhancement off, so there is no separate rendering mode to select.
+Authentic rendering is what the mod produces with every enhancement off, so there is no separate
+rendering mode to select.
+
+## Enhancements
+
+The Enhancements section of the settings screen holds the settings that change how the world looks
+rather than how much of it is drawn. Each one is off by its own value, and everything at that value
+is the original picture exactly, to the byte.
+
+**Brightness** and **Contrast** are the picture settings. Brightness scales the world image and
+contrast opens or closes it around mid grey, both in full colour rather than through the original
+thirty-two-step shading ladder, so a brighter room keeps the colours it was authored in instead of
+stepping through the palette. They apply to the 3D world only: the interface, the HUD, the
+inventory and the menus keep their own appearance whatever the picture settings say. One is the
+original for both, and returning both to one puts the original picture back exactly.
+
+Moving either setting shows its effect straight away, while the settings screen is still open, so
+a picture can be judged against the room it is in. **Cancel**, or leaving the screen without
+applying, puts the picture back with the draft; **Apply** keeps it.
+
+The picture settings are one choice for the whole game and are not per-map.

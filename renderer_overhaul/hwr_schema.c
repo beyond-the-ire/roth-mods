@@ -450,6 +450,55 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "World gain",
         .help = "Uniform brightness of the world image. One is the original."
     },
+    {
+        /* The picture dials, and the first enhancements a player is offered.
+         * Both are global on purpose: they say what a screen wants, not what a
+         * map is, so they carry no HWR_SF_MAP_OVERRIDE and the look file never
+         * reaches them. Each is its own dependent of the foundation, so moving
+         * one away from one asks for colour and moving both back to one returns
+         * the world image to the authentic picture, exactly. */
+        .key = "world_brightness",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, world_brightness),
+        .flags = HWR_SF_RESTART_FREE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.5f },
+        .max = { .f = 1.5f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "truecolor_force",
+        .label = "Brightness",
+        .help = "Brightness of the world image. One is the original picture, "
+                "and the interface, the inventory and the menus keep theirs "
+                "either way."
+    },
+    {
+        .key = "world_contrast",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, world_contrast),
+        .flags = HWR_SF_RESTART_FREE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.5f },
+        .max = { .f = 1.5f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "truecolor_force",
+        .label = "Contrast",
+        .help = "Contrast of the world image, taken around mid grey and after "
+                "the brightness. One is the original picture."
+    },
     /* Reported state. These rows hold no value of their own and no key: each
      * one asks the renderer or the host what is actually happening and answers
      * in words, which is what makes the System section a table walk like every

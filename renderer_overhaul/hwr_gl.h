@@ -241,7 +241,14 @@ struct hwr_gl_truecolor {
      * early-out and the colour beside each index is exactly the colour that
      * index resolves to. */
     int neutral;
+    /* Every multiplicative dial in one number: the bring-up gain and the
+     * picture's brightness are the same operation on the same colour, so the
+     * settings layer hands over their product rather than making the shader
+     * carry two uniforms that do one thing. */
     float gain;
+    /* The picture's contrast, a pivot around mid grey applied after the gain.
+     * One leaves the colour where the gain put it. */
+    float contrast;
     enum hwr_gl_color_format format;
 };
 

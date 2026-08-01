@@ -1,6 +1,7 @@
 #include "hwr_overlay.h"
 
 #include "hwr_config.h"
+#include "hwr_enh_truecolor.h"
 #include "hwr_look.h"
 #include "hwr_overlay_draw.h"
 #include "hwr_perf.h"
@@ -695,6 +696,30 @@ static void hwr_overlay_step_enum(const struct hwr_setting_desc *desc,
     hwr_overlay_set_value(desc, value);
 }
 
+/* A step is added rather than counted, and a step such as five hundredths is
+ * not a number a float holds: ten steps up and ten back land a hair off where
+ * they started, which the panel then has to print in full. For an enhancement
+ * it is worse than untidy -- a dial that reads as its original without being it
+ * is an enhancement that cannot be turned off. Landing back on the grid the
+ * steps describe fixes both, and a value typed off that grid keeps its offset
+ * because only a value already within a hundredth of a step is moved. */
+static void hwr_overlay_snap_step(const struct hwr_setting_desc *desc,
+                                  float *value, float step)
+{
+    double anchor = (double)desc->original.f;
+    double steps = ((double)*value - anchor) / (double)step;
+    double whole;
+    double drift;
+
+    if (!(steps > -1.0e6 && steps < 1.0e6))
+        return;
+    whole = steps >= 0.0 ? (double)(long)(steps + 0.5)
+                         : -(double)(long)(0.5 - steps);
+    drift = steps - whole;
+    if (drift > -0.01 && drift < 0.01)
+        *value = (float)(anchor + whole * (double)step);
+}
+
 static void hwr_overlay_step_number(const struct hwr_setting_desc *desc,
                                     int direction, int page, int extreme)
 {
@@ -722,6 +747,7 @@ static void hwr_overlay_step_number(const struct hwr_setting_desc *desc,
             value.f = desc->min.f;
         } else {
             value.f += (float)direction * step;
+            hwr_overlay_snap_step(desc, &value.f, step);
             if (value.f < desc->min.f)
                 value.f = (desc->flags & HWR_SF_ZERO_IS_AUTO) != 0
                         ? 0.0f : desc->min.f;
@@ -2035,6 +2061,10 @@ static void hwr_overlay_close(void)
     g_buttons_prev = 0;
     g_panel_w = 0;
     g_panel_h = 0;
+    /* The picture goes back to the settings in force with the panel: a preview
+     * is what the draft looks like, and there is no draft once the panel is
+     * down. */
+    hwr_truecolor_preview_clear();
     hwr_overlay_ring_reset();
     hwr_overlay_draw_set_cursor(0, 0, 0);
     hwr_overlay_draw_withdraw();
@@ -2241,6 +2271,11 @@ void hwr_overlay_pump(const struct roth_api_v1 *api,
     }
     g_buttons_prev = g_buttons;
 
+    /* The picture dials as the draft has them, after everything this pump did
+     * to it, so moving one is seen in the world image while it is being moved.
+     * Cancel puts the draft back and the next pump puts the picture back with
+     * it; Apply is still what writes the file. */
+    hwr_truecolor_preview(&g_draft);
     hwr_overlay_update_modal();
     if (g_redraw) {
         /* The same treatment the keys get: a click that changed the section --

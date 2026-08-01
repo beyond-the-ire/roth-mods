@@ -59,6 +59,12 @@ struct hwr_settings {
     /* Uniform gain on the world image, and the foundation's first dependent.
      * One means authentic and takes the neutral early-out. */
     float world_gain;
+    /* The picture dials: brightness multiplies the lit colour, contrast pivots
+     * what is left around mid grey. They are one global choice about a screen
+     * rather than a property of a map, so no per-map override reaches them, and
+     * both at one is the authentic picture exactly. */
+    float world_brightness;
+    float world_contrast;
 };
 
 enum hwr_settings_change {
