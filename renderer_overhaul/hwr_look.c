@@ -77,16 +77,25 @@ static char *hwr_look_trim(char *text)
     return text;
 }
 
-/* The archive basename without its extension, which is how a map names itself
- * in this file. */
+/* A map's name reduced to what it is matched on: no directory and no
+ * extension, whichever side it came from. Both the section names in the file
+ * and the name the engine holds go through here, so STUDY1, study1.raw and
+ * m\STUDY1.RAW are one map however either side spells it. */
 static void hwr_look_map_name(char *out, size_t out_size, const char *name)
 {
+    const char *base;
+    const char *cursor;
     size_t i;
 
     out[0] = 0;
     if (name == NULL)
         return;
-    snprintf(out, out_size, "%s", name);
+    base = name;
+    for (cursor = name; *cursor != 0; cursor++) {
+        if (*cursor == '/' || *cursor == '\\' || *cursor == ':')
+            base = cursor + 1;
+    }
+    snprintf(out, out_size, "%s", base);
     for (i = 0; out[i] != 0; i++) {
         if (out[i] == '.') {
             out[i] = 0;
@@ -467,11 +476,11 @@ void hwr_look_drain_request(void)
     hwr_look_select_map(g_look_map[0] != 0 ? g_look_map : NULL);
 }
 
-void hwr_look_select_map(const char *archive_basename)
+void hwr_look_select_map(const char *map_name)
 {
     struct hwr_look_values next;
 
-    hwr_look_map_name(g_look_map, HWR_LOOK_NAME, archive_basename);
+    hwr_look_map_name(g_look_map, HWR_LOOK_NAME, map_name);
     hwr_look_compose(&g_look, g_look_map, &next);
     hwr_look_publish(&next);
 }

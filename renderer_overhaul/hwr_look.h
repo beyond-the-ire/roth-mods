@@ -11,8 +11,12 @@
  *                       settings registry already holds, so an absent file
  *                       means "no overrides" rather than "defaults"
  *   [profile.<name>]    a reusable named block a map can select
- *   [map.<DAS name>]    one map's own keys, matched on the archive basename
- *                       case-insensitively with the extension stripped
+ *   [map.<map name>]    one map's own keys, matched on the name of the map's
+ *                       own file -- STUDY1, STUDY2 -- case-insensitively, with
+ *                       any directory and any extension stripped from both
+ *                       sides. Maps sharing a texture archive are still
+ *                       different maps here, which is what makes a look a
+ *                       map's own.
  *
  * Precedence, lowest to highest: the registry value, the global look, the
  * profile a map selects, the map's own keys. A map nobody listed gets the
@@ -38,7 +42,7 @@ void hwr_look_drain_request(void);
 /* Chooses the map whose overrides are in force. NULL or an unknown name leaves
  * the global look standing. Raises the change bits of every row whose effective
  * value moved, so the next pump applies them. */
-void hwr_look_select_map(const char *archive_basename);
+void hwr_look_select_map(const char *map_name);
 /* The value a row is worth right now: its override where the current map has
  * one, and the store's own value everywhere else. */
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,

@@ -48,6 +48,13 @@
 #define VA_G_LINE_DOUBLING_FLAG        0x90cbdu
 #define VA_G_MAP_DAS_NAME              0x7023cu
 #define VA_G_SHARED_DAS_NAME           0x702dcu
+/* The map's own file name, which is the only thing that says which map is
+ * loaded: one texture archive serves as many as twenty-nine maps, so the
+ * archive name cannot stand in for it. The engine writes the incoming map's
+ * name here before the geometry it names is read, hands this very buffer to the
+ * loader as the file to open, and builds the map's own state file from the same
+ * string. */
+#define VA_G_MAP_RAW_NAME              0x701ecu
 #define VA_G_GDV_PALETTE_MODE          0x91de6u
 #define VA_G_MOUSE_X                   0x707b3u
 #define VA_G_MOUSE_Y                   0x707b7u
@@ -127,6 +134,9 @@ static int g_debug_enabled;
 static int g_scene_rebuild_pending;
 static int g_luts_recheck_pending;
 static int g_scene_error_logged;
+/* Said once: a name the mod cannot read is a standing condition, and it would
+ * otherwise be said again at every map load for the rest of the session. */
+static int g_map_name_error_logged;
 static int g_selfheal_retry;
 static uint32_t g_selfheal_tick;
 /* A map load only records a pending reload here; the geometry re-snapshot runs
@@ -330,8 +340,11 @@ static void hwr_map_data_clear(int keep_shared, int keep_map)
     }
 }
 
-static int hwr_read_archive_basename(const struct roth_api_v1 *api,
-                                     uint32_t address, char name[81])
+/* One of the engine's file-name buffers, reduced to the name itself. The names
+ * it keeps are written with the directory they live in, and that directory is
+ * not part of what a name identifies. */
+static int hwr_read_basename(const struct roth_api_v1 *api,
+                             uint32_t address, char name[81])
 {
     char *base;
     char *cursor;
@@ -347,6 +360,26 @@ static int hwr_read_archive_basename(const struct roth_api_v1 *api,
         return -1;
     if (base != name)
         memmove(name, base, strlen(base) + 1u);
+    return 0;
+}
+
+/* The name of the map being drawn, which is what a look file names a map by.
+ * The buffer it comes from is scratch the engine also uses for other file
+ * names, so a name that is not a plain file name is refused rather than matched
+ * against: an unrecognized map costs its own overrides, a wrong one would put
+ * another map's look on the screen. */
+static int hwr_read_map_basename(const struct roth_api_v1 *api, char name[81])
+{
+    const char *cursor;
+
+    if (hwr_read_basename(api, VA_G_MAP_RAW_NAME, name) != 0)
+        return -1;
+    for (cursor = name; *cursor != 0; cursor++) {
+        unsigned char character = (unsigned char)*cursor;
+
+        if (character <= 0x20u || character >= 0x7fu)
+            return -1;
+    }
     return 0;
 }
 
@@ -2006,7 +2039,7 @@ static void hwr_prewarm_shared_das(const struct roth_api_v1 *api)
         char shared_name[81];
         char root[2600];
         char shared_path[2600];
-        if (hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
+        if (hwr_read_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
             g_shared_prewarm_done = 1;
             return;
         }
@@ -2079,6 +2112,7 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
 {
     char map_name[81];
     char shared_name[81];
+    char look_name[81];
     char root[2600];
     char map_path[2600];
     char shared_path[2600];
@@ -2091,8 +2125,8 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     failure[0] = 0;
     /* Read the DAS names before any teardown, so the persistence decision can
      * be taken while the files that answer it are still open. */
-    if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
-        hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
+    if (hwr_read_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
+        hwr_read_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
         snprintf(failure, sizeof failure, "DAS name is unavailable");
         hwr_look_select_map(NULL);
         hwr_settings_apply_pending();
@@ -2100,8 +2134,20 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     }
     /* The map-change safe point is where the look file's per-map overrides come
      * into force, so a previous map's overrides can never survive into the next
-     * one: the layer is recomposed from scratch for the map being loaded. */
-    hwr_look_select_map(map_name);
+     * one: the layer is recomposed from scratch for the map being loaded. The
+     * map is named by its own file, never by the archive it shares with as many
+     * as twenty-eight others. Where that name cannot be trusted the global look
+     * stands alone, which is what an unlisted map gets anyway. */
+    if (hwr_read_map_basename(api, look_name) == 0) {
+        hwr_look_select_map(look_name);
+    } else {
+        hwr_look_select_map(NULL);
+        if (!g_map_name_error_logged) {
+            fprintf(stderr, "[renderer_overhaul] the map name is unreadable; "
+                            "per-map look overrides are not in force\n");
+            g_map_name_error_logged = 1;
+        }
+    }
     hwr_settings_apply_pending();
     keep_shared = hwr_das_persist_enabled() &&
                   g_shared_archive.entries != NULL &&
