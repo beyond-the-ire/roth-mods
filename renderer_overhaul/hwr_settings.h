@@ -20,6 +20,16 @@ enum hwr_pitch_mode {
     HWR_PITCH_TRUE_ROTATION
 };
 
+/* Storage the true-colour world image is kept in. Eight bits per channel is
+ * exact for the authentic picture and is what auto selects; the floating-point
+ * format is headroom a later lighting term can ask for, and is offered only
+ * where the driver proves it round-trips. */
+enum hwr_truecolor_format {
+    HWR_TRUECOLOR_FORMAT_AUTO = 0,
+    HWR_TRUECOLOR_FORMAT_RGBA8,
+    HWR_TRUECOLOR_FORMAT_RGBA16F
+};
+
 struct hwr_settings {
     int enabled;
     int debug;
@@ -39,6 +49,16 @@ struct hwr_settings {
 
     /* Set-1 make scancode of the key that opens the settings overlay. */
     uint32_t overlay_key;
+
+    /* The true-colour foundation. It is not a setting anybody chooses: it is
+     * required whenever a dependent enhancement contributes, and this switch
+     * only forces it on so that its picture can be verified against the
+     * authentic one. */
+    int truecolor_force;
+    enum hwr_truecolor_format truecolor_format;
+    /* Uniform gain on the world image, and the foundation's first dependent.
+     * One means authentic and takes the neutral early-out. */
+    float world_gain;
 };
 
 enum hwr_settings_change {
@@ -50,7 +70,8 @@ enum hwr_settings_change {
     HWR_CHANGE_FOV              = 1u << 6,
     HWR_CHANGE_PITCH_MODE       = 1u << 7,
     HWR_CHANGE_DEBUG            = 1u << 9,
-    HWR_CHANGE_SHADE_SCALE      = 1u << 10
+    HWR_CHANGE_SHADE_SCALE      = 1u << 10,
+    HWR_CHANGE_TRUECOLOR        = 1u << 11
 };
 
 typedef void (*hwr_settings_apply_fn)(uint32_t mask,
@@ -63,6 +84,10 @@ const struct hwr_settings *hwr_settings_get(void);
 void hwr_settings_replace(const struct hwr_settings *settings);
 int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata);
 void hwr_settings_apply_pending(void);
+/* Raises change bits without a value in the store having moved. The look layer
+ * needs it: a map's overrides change what a row is worth without changing the
+ * global value the store keeps. */
+void hwr_settings_mark_changed(uint32_t bits);
 
 void hwr_settings_set_enabled(int enabled);
 void hwr_settings_set_debug(int debug);

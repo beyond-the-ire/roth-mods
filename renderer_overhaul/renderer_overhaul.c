@@ -19,6 +19,8 @@
 #include "hwr_input.h"
 #include "hwr_composite.h"
 #include "hwr_chrome.h"
+#include "hwr_enh_truecolor.h"
+#include "hwr_look.h"
 #include "hwr_ownership.h"
 #include "hwr_overlay.h"
 #include "hwr_sysinfo.h"
@@ -514,6 +516,10 @@ static void hwr_apply_window_requests(const struct roth_api_v1 *api)
 static void hwr_settings_pump(const struct roth_api_v1 *api)
 {
     hwr_config_drain_request();
+    /* The look file is the second writer into the same store, so it is read at
+     * the same safe point and its overrides are in force before the hooks that
+     * consume them run. */
+    hwr_look_drain_request();
     hwr_settings_apply_pending();
     hwr_apply_window_requests(api);
 }
@@ -668,6 +674,8 @@ static int hwr_submit_engine_passthrough(const struct roth_api_v1 *api,
 static void hwr_refresh_held_palette(const struct roth_api_v1 *api)
 {
     uint8_t palette[1024];
+    uint8_t base_palette[1024];
+    struct hwr_gl_palette published;
     const uint32_t *pixels;
     const uint8_t *lut = NULL;
     int32_t level;
@@ -687,7 +695,19 @@ static void hwr_refresh_held_palette(const struct roth_api_v1 *api)
     if (hwr_world_refresh_lut_state(&g_world, api) != 0)
         return;
     hwr_composite_publish_palette(g_world.luts.palette, lut, level, palette);
-    pixels = hwr_gl_scene_resolve(palette, g_last_frame.w, g_last_frame.h);
+    memset(&published, 0, sizeof published);
+    published.rgba = palette;
+    published.damage_level = level;
+    published.grayscale = lut != NULL;
+    /* The colour-space twin needs the untinted palette to compose against, and
+     * it can only stand in for the engine's desaturation while that table is
+     * the one the engine's own rule produces from this palette. Where it is
+     * not, the palette-index resolve reproduces the table by construction. */
+    if (lut == NULL || hwr_composite_grayscale_reproducible(lut)) {
+        hwr_composite_base_rgba(base_palette);
+        published.base_rgba = base_palette;
+    }
+    pixels = hwr_gl_scene_resolve(&published, g_last_frame.w, g_last_frame.h);
     if (pixels == NULL) {
         /* Leave the published palette describing the pixels that are still
          * standing, so everything reducing that image keeps agreeing with it. */
@@ -972,6 +992,7 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     /* File I/O and settings application belong at this non-reentrant render
      * boundary, not in the timer-driven per-frame callback. */
     hwr_config_poll();
+    hwr_look_poll();
     hwr_settings_pump(api);
     g_wrap_serial++;
     /* THE LOAD BOUNDARY, read before the original renderer runs. The map loader
@@ -1311,6 +1332,10 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     frame.transparent_index = 0;
     frame.flags = 0;
     g_gdv_palette_effect_active = 0;
+    /* A true-colour canvas can hold a colour the palette has no entry for, so
+     * the baseline is quantized through the filled cube rather than through the
+     * exact-match read the authentic canvas has always used. */
+    hwr_composite_set_enhanced(&g_composite, hwr_gl_truecolor_active());
     if (!hwr_composite_prepare(&g_composite, api, &frame, &g_world)) {
         /* ABI 0.6 hosts and exceptional allocation/mapping failures retain the
          * original index-0 colorkey path as a fail-safe. */
@@ -1465,7 +1490,8 @@ static void ROTH_CDECL hwr_capture_screen_thumbnail(
     uint32_t dst, uint32_t src, uint32_t lut)
 {
     if (g_last_frame_valid &&
-        hwr_thumbnail_capture(api, &g_last_frame, &g_world, dst, src, lut))
+        hwr_thumbnail_capture(&g_composite, api, &g_last_frame, &g_world, dst,
+                              src, lut))
         return;
     roth_next_capture_screen_thumbnail(chain, dst, src, lut);
 }
@@ -1893,12 +1919,21 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     hwr_ownership_init(&g_ownership);
     hwr_settings_init_defaults();
+    /* A hook that never registers is a subsystem that silently never applies,
+     * and one of these decides what the world is drawn with -- so a failure
+     * here hands the screen back to the original renderer rather than running
+     * with a setting nothing carries out. */
     if (hwr_settings_register_apply(hwr_render_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_data_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_gl_settings_apply, NULL) != 0 ||
-        hwr_settings_register_apply(hwr_window_settings_apply, NULL) != 0)
-        fprintf(stderr, "[renderer_overhaul] settings apply-hook registration failed\n");
+        hwr_settings_register_apply(hwr_window_settings_apply, NULL) != 0 ||
+        hwr_enh_truecolor_register() != 0) {
+        fprintf(stderr, "[renderer_overhaul] settings apply-hook registration"
+                        " failed; the original renderer keeps the screen\n");
+        g_gl_permanently_failed = 1;
+    }
     hwr_config_load(g_plugin_dir);
+    hwr_look_load(g_plugin_dir);
     hwr_overlay_init();
 }
 
@@ -2059,8 +2094,15 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     if (hwr_read_archive_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
         hwr_read_archive_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
         snprintf(failure, sizeof failure, "DAS name is unavailable");
+        hwr_look_select_map(NULL);
+        hwr_settings_apply_pending();
         goto failed;
     }
+    /* The map-change safe point is where the look file's per-map overrides come
+     * into force, so a previous map's overrides can never survive into the next
+     * one: the layer is recomposed from scratch for the map being loaded. */
+    hwr_look_select_map(map_name);
+    hwr_settings_apply_pending();
     keep_shared = hwr_das_persist_enabled() &&
                   g_shared_archive.entries != NULL &&
                   g_shared_open_basename[0] != 0 &&

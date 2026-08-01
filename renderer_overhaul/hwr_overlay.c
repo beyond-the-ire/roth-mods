@@ -1,6 +1,7 @@
 #include "hwr_overlay.h"
 
 #include "hwr_config.h"
+#include "hwr_look.h"
 #include "hwr_overlay_draw.h"
 #include "hwr_perf.h"
 #include "hwr_schema.h"
@@ -439,13 +440,19 @@ static int hwr_overlay_row_enabled(const struct hwr_setting_desc *desc)
 {
     const struct hwr_setting_desc *parent;
     union hwr_value value;
+    int parent_index;
 
     if (desc->available != NULL && !desc->available())
         return 0;
-    if (desc->depends_on < 0)
+    parent_index = hwr_schema_depends_on(desc);
+    if (parent_index < 0)
         return 1;
-    parent = hwr_schema_at((size_t)desc->depends_on);
-    if (parent == NULL)
+    parent = hwr_schema_at((size_t)parent_index);
+    /* A row can only be held back by something the player can see and turn on.
+     * Naming a parent nobody is shown -- the true-colour foundation, which is
+     * derived state rather than a choice -- says where a row belongs, not that
+     * it is unavailable. */
+    if (parent == NULL || parent->exposure != HWR_EXP_CONSUMER)
         return 1;
     value = hwr_schema_get(&g_draft, parent);
     switch (parent->type) {
@@ -1185,8 +1192,10 @@ static void hwr_overlay_run_action(int action)
         return;
     case HWR_ACTION_RELOAD:
         /* The one road from the file into the settings, asked for by hand
-         * instead of by a save. */
+         * instead of by a save. The look file is read again with it: they are
+         * two halves of what is on disk. */
         hwr_config_request_reload();
+        hwr_look_request_reload();
         g_await_reload = 1;
         hwr_overlay_status("Reading the settings file.", 0);
         return;

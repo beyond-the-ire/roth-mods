@@ -11,14 +11,15 @@
  * reducing the frame. Every engine palette index, including zero, is opaque
  * when it differs from the untouched baseline. */
 static uint8_t hwr_thumbnail_composite_sample(
+    struct hwr_composite *composite,
     const struct roth_api_v1 *api,
     const struct roth_world_frame_v1 *frame,
     const uint32_t *world_pixels, uint32_t world_x, uint32_t world_y,
-    const uint32_t palette[256], const uint8_t *engine, uint32_t engine_pitch,
+    const uint8_t *engine, uint32_t engine_pitch,
     uint32_t viewport_x, uint32_t viewport_y)
 {
-    uint8_t world = hwr_composite_palette_index(
-        world_pixels[(size_t)world_y * frame->w + world_x], palette);
+    uint8_t world = hwr_composite_quantize(
+        composite, world_pixels[(size_t)world_y * frame->w + world_x]);
     uint32_t engine_x;
     uint32_t engine_y;
     uint8_t chrome;
@@ -40,7 +41,8 @@ static uint8_t hwr_thumbnail_composite_sample(
     return chrome == (uint8_t)frame->transparent_index ? world : chrome;
 }
 
-int hwr_thumbnail_capture(const struct roth_api_v1 *api,
+int hwr_thumbnail_capture(struct hwr_composite *composite,
+                          const struct roth_api_v1 *api,
                           const struct roth_world_frame_v1 *frame,
                           const struct hwr_world *world,
                           uint32_t dst, uint32_t src, uint32_t lut)
@@ -49,7 +51,6 @@ int hwr_thumbnail_capture(const struct roth_api_v1 *api,
     const uint8_t *engine;
     const uint8_t *blend;
     uint8_t *output;
-    uint32_t palette[256];
     uint32_t pitch;
     uint32_t screen_height;
     uint32_t viewport_x;
@@ -58,9 +59,9 @@ int hwr_thumbnail_capture(const struct roth_api_v1 *api,
     uint32_t vstep;
     uint32_t yacc = 0;
     uint32_t y;
-    unsigned i;
 
-    if (api == NULL || api->game_ram == NULL || frame == NULL ||
+    if (composite == NULL || api == NULL || api->game_ram == NULL ||
+        frame == NULL ||
         world == NULL || !world->valid || !world->luts.valid ||
         frame->pixels == NULL || frame->w < 2u || frame->h < 2u ||
         frame->vx < 0 || frame->vy < 0 || frame->vw == 0 || frame->vh == 0 ||
@@ -82,10 +83,9 @@ int hwr_thumbnail_capture(const struct roth_api_v1 *api,
     blend = (const uint8_t *)(uintptr_t)lut;
     output = (uint8_t *)(uintptr_t)dst;
     /* The thumbnail reduces the image that is actually on screen, so it shares
-     * the palette that image was presented through rather than rebuilding one
-     * from render-time state. */
-    for (i = 0; i < 256u; i++)
-        palette[i] = hwr_composite_present_argb(i);
+     * the quantizer and the palette that image was presented through rather
+     * than rebuilding either from render-time state. */
+    hwr_composite_quantize_begin(composite);
 
     output[0] = 2u;
     output[1] = 0u;
@@ -117,18 +117,16 @@ int hwr_thumbnail_capture(const struct roth_api_v1 *api,
             if (source_x >= frame->w - 1u)
                 source_x = frame->w - 2u;
             i00 = hwr_thumbnail_composite_sample(
-                api, frame, source, source_x, source_y, palette, engine, pitch,
-                viewport_x, viewport_y);
+                composite, api, frame, source, source_x, source_y, engine,
+                pitch, viewport_x, viewport_y);
             i01 = hwr_thumbnail_composite_sample(
-                api, frame, source, source_x + 1u, source_y, palette, engine,
-                pitch,
-                viewport_x, viewport_y);
+                composite, api, frame, source, source_x + 1u, source_y, engine,
+                pitch, viewport_x, viewport_y);
             i10 = hwr_thumbnail_composite_sample(
-                api, frame, source, source_x, source_y + 1u, palette, engine,
-                pitch,
-                viewport_x, viewport_y);
+                composite, api, frame, source, source_x, source_y + 1u, engine,
+                pitch, viewport_x, viewport_y);
             i11 = hwr_thumbnail_composite_sample(
-                api, frame, source, source_x + 1u, source_y + 1u, palette,
+                composite, api, frame, source, source_x + 1u, source_y + 1u,
                 engine, pitch, viewport_x, viewport_y);
             top_mix = blend[(uint32_t)i01 << 8 | i00];
             bottom_mix = blend[(uint32_t)i11 << 8 | i10];

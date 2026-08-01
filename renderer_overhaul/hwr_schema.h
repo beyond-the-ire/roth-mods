@@ -97,6 +97,11 @@ struct hwr_setting_desc {
     const struct hwr_enum_value *values;
     size_t value_count;
     int depends_on;                 /* index of the enabling row, or -1 */
+    /* The same relationship named by cfg key and resolved at run time, which is
+     * how a row says it belongs to something that sits wherever the table
+     * happens to put it -- the true-colour foundation, for one. It wins over
+     * the index above when both are given. */
+    const char *depends_on_key;
     enum hwr_widget widget;
     const char *label;
     const char *help;
@@ -112,6 +117,14 @@ struct hwr_setting_desc {
 size_t hwr_schema_count(void);
 const struct hwr_setting_desc *hwr_schema_at(size_t index);
 const struct hwr_setting_desc *hwr_schema_find(const char *key);
+/* The table position of a row, or -1 when the row is not from this table. */
+int hwr_schema_index_of(const struct hwr_setting_desc *desc);
+/* The row this one hangs off, however it named it, or -1 when it stands alone. */
+int hwr_schema_depends_on(const struct hwr_setting_desc *desc);
+/* Whether a value is the one the Original preset holds for its row, which is
+ * what "neutral" means for every row the authentic picture depends on. */
+int hwr_schema_is_original(const struct hwr_setting_desc *desc,
+                           union hwr_value value);
 
 /* Text to value. Returns 1 when the text is a valid value for the row, and 0
  * with an optional message otherwise. A successful parse is always in range. */

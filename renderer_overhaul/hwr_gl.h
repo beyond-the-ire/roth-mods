@@ -224,6 +224,49 @@ struct hwr_gl_scene_view {
     int32_t clip_right;
 };
 
+/* Where the true-colour world image is kept. Eight bits per channel is exact
+ * for the authentic picture; the floating-point format is headroom, offered
+ * only where the driver proves the attachment completes. */
+enum hwr_gl_color_format {
+    HWR_GL_COLOR_AUTO = 0,
+    HWR_GL_COLOR_RGBA8,
+    HWR_GL_COLOR_RGBA16F
+};
+
+/* What the settings layer has worked out about the true-colour foundation. */
+struct hwr_gl_truecolor {
+    /* The foundation has to exist: a dependent enhancement is asking for it. */
+    int required;
+    /* Nothing is moving the picture yet, so the composition takes its neutral
+     * early-out and the colour beside each index is exactly the colour that
+     * index resolves to. */
+    int neutral;
+    float gain;
+    enum hwr_gl_color_format format;
+};
+
+/* The palette a frame is presented through, and the palette-level effects the
+ * engine is running over it.
+ *
+ * The authentic path resolves the palette-index target through `rgba`, which
+ * already carries every effect -- that is how the effects have always reached
+ * the world image. The true-colour path composes in the UNTINTED palette and
+ * applies the effects to the colour afterwards, because a lighting term has to
+ * be evaluated against the colours the map authored rather than against a
+ * damage flash, and because the index plane the host composition contract needs
+ * stays keyed on one palette while a flash changes the DAC every frame.
+ *
+ * base_rgba may be NULL, which says the effects in force cannot be reproduced
+ * in colour space; the authentic resolve then stands, exactly as before. */
+struct hwr_gl_palette {
+    const uint8_t *rgba;       /* 1024 bytes: the palette with effects applied */
+    const uint8_t *base_rgba;  /* 1024 bytes: the same palette without them */
+    /* The engine's pain accumulator, zero when no damage flash is in force. */
+    int32_t damage_level;
+    /* Non-zero while the inventory's desaturation is held over the image. */
+    int32_t grayscale;
+};
+
 int hwr_gl_init(void);
 /* Creates the texture store and every GL object drawn through it. `reserve` is
  * the buffer size to allocate (at least texture_size); the slack past
@@ -262,7 +305,7 @@ int hwr_gl_scene_update_texels(uint32_t offset, const uint8_t *bytes,
  * and readback occur once around the whole ordered sequence. */
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
                                     size_t view_count,
-                                    const uint8_t palette_rgba[1024],
+                                    const struct hwr_gl_palette *palette,
                                     uint32_t width, uint32_t height);
 /* Re-resolve the palette-index attachment the last scene render left behind
  * through a new palette and read the result back, without redrawing any
@@ -270,8 +313,20 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
  * the world stands still, so a held image follows them through this rather
  * than through a pixel transform that cannot be undone. Returns NULL when no
  * resolvable target of the requested size is present. */
-const uint32_t *hwr_gl_scene_resolve(const uint8_t palette_rgba[1024],
+const uint32_t *hwr_gl_scene_resolve(const struct hwr_gl_palette *palette,
                                      uint32_t width, uint32_t height);
+/* Publishes what the settings layer has worked out about the foundation. The
+ * objects it needs come into existence on the first frame that asks for them
+ * and go on the first frame that does not, so nothing is allocated, linked, or
+ * released from a settings hook. */
+void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state);
+/* Whether the last frame drew through the true-colour program, which is what
+ * decides whether the submitted canvas can hold a colour the palette has no
+ * entry for. */
+int hwr_gl_truecolor_active(void);
+/* Whether a colour format can be used here. Auto and eight-bit are always
+ * available; a format the driver has refused is not. */
+int hwr_gl_color_format_available(enum hwr_gl_color_format format);
 void hwr_gl_scene_clear(void);
 /* Hands over the pixels the palette-index target should start from instead of a
  * flat clear, in the same orientation as a scene readback. The next scene render

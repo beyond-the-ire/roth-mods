@@ -5318,11 +5318,22 @@ static int hwr_prepare_stream(struct hwr_scene *scene,
 
 /* A freshly drawn world carries no held palette effect: the desaturated
  * inventory background belongs to an image the engine has already stopped
- * redrawing, so it can only exist on a held frame. */
-static void hwr_build_palette(const struct hwr_world *world, uint8_t rgba[1024])
+ * redrawing, so it can only exist on a held frame. The damage flash is live
+ * state and does reach a frame being drawn, so it travels with the palette
+ * rather than being applied to it: the true-colour path composes in the
+ * untinted colours and lands the flash on the result. */
+static void hwr_build_palette(const struct hwr_world *world,
+                              uint8_t rgba[1024], uint8_t base_rgba[1024],
+                              struct hwr_gl_palette *palette)
 {
     hwr_composite_publish_palette(world->luts.palette, NULL,
                                   world->luts.damage_flash_level, rgba);
+    hwr_composite_base_rgba(base_rgba);
+    memset(palette, 0, sizeof *palette);
+    palette->rgba = rgba;
+    palette->base_rgba = base_rgba;
+    palette->damage_level = world->luts.damage_flash_level;
+    palette->grayscale = 0;
 }
 
 /* Steps a delta animation's countdown, byte for byte as the engine steps it.
@@ -5788,6 +5799,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     struct hwr_gl_camera camera;
     struct hwr_gl_scene_view views[HWR_REFLECTION_MAX + 1u];
     uint8_t palette[1024];
+    uint8_t base_palette[1024];
+    struct hwr_gl_palette published;
     size_t sky_count;
     size_t mirror_depth_count;
     size_t opaque_count;
@@ -6034,6 +6047,6 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     views[view_count].camera = camera;
     view_count++;
 
-    hwr_build_palette(world, palette);
-    return hwr_gl_scene_render(views, view_count, palette, width, height);
+    hwr_build_palette(world, palette, base_palette, &published);
+    return hwr_gl_scene_render(views, view_count, &published, width, height);
 }

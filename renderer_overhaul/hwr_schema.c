@@ -1,5 +1,6 @@
 #include "hwr_schema.h"
 
+#include "hwr_enh_truecolor.h"
 #include "hwr_sysinfo.h"
 #include "hwr_util.h"
 
@@ -19,6 +20,8 @@ _Static_assert(sizeof(enum hwr_present_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_pitch_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
+_Static_assert(sizeof(enum hwr_truecolor_format) == sizeof(int32_t),
+               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -37,6 +40,12 @@ static const struct hwr_enum_value HWR_PRESENT_MODE_VALUES[] = {
 static const struct hwr_enum_value HWR_PITCH_MODE_VALUES[] = {
     { "horizon_shift", HWR_PITCH_HORIZON_SHIFT, "Authentic horizon shift" },
     { "true_rotation", HWR_PITCH_TRUE_ROTATION, "True rotation" }
+};
+
+static const struct hwr_enum_value HWR_TRUECOLOR_FORMAT_VALUES[] = {
+    { "auto",    HWR_TRUECOLOR_FORMAT_AUTO,    "Automatic" },
+    { "rgba8",   HWR_TRUECOLOR_FORMAT_RGBA8,   "Eight bits per channel" },
+    { "rgba16f", HWR_TRUECOLOR_FORMAT_RGBA16F, "Sixteen-bit floating point" }
 };
 
 /* Retired, and kept only so that a configuration file written for an earlier
@@ -375,6 +384,72 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "Solid color",
         .help = "the world frame it coloured is drawn from the map itself now"
     },
+    {
+        /* The true-colour foundation is derived state, not a choice: it is
+         * required whenever a dependent enhancement contributes and off
+         * otherwise, so it has no consumer row and appears in no menu. This one
+         * forces it on with everything neutral, which is how its picture is
+         * held against the authentic one. */
+        .key = "truecolor_force",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, truecolor_force),
+        .flags = HWR_SF_RESTART_FREE,
+        .def = { .b = 0 },
+        .original = { .b = 0 },
+        .depends_on = -1,
+        .label = "Force true colour",
+        .help = "Keep the world image in colour even with nothing asking for "
+                "it. With everything neutral the picture is unchanged."
+    },
+    {
+        .key = "truecolor_format",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, truecolor_format),
+        .flags = HWR_SF_RESTART_FREE,
+        .def = { .e = HWR_TRUECOLOR_FORMAT_AUTO },
+        .original = { .e = HWR_TRUECOLOR_FORMAT_AUTO },
+        .values = HWR_TRUECOLOR_FORMAT_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_TRUECOLOR_FORMAT_VALUES),
+        /* Deliberately not a dependent: choosing where the colour is kept must
+         * never be what brings the colour into existence. */
+        .depends_on = -1,
+        .available = hwr_truecolor_format_offered,
+        .label = "True-colour storage",
+        .help = "How the colour world image is stored. Automatic uses eight "
+                "bits per channel, which is exact for the authentic picture."
+    },
+    {
+        /* The foundation's first dependent, and the smallest one: at one it is
+         * the neutral early-out and the picture is the authentic picture; at
+         * anything else it asks for the foundation and darkens or brightens the
+         * world in colour, without the thirty-two-step ladder. */
+        .key = "world_gain",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, world_gain),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.05f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "truecolor_force",
+        .label = "World gain",
+        .help = "Uniform brightness of the world image. One is the original."
+    },
     /* Reported state. These rows hold no value of their own and no key: each
      * one asks the renderer or the host what is actually happening and answers
      * in words, which is what makes the System section a table walk like every
@@ -557,6 +632,47 @@ const struct hwr_setting_desc *hwr_schema_find(const char *key)
             return &HWR_SCHEMA[i];
     }
     return NULL;
+}
+
+int hwr_schema_index_of(const struct hwr_setting_desc *desc)
+{
+    size_t i;
+
+    if (desc == NULL)
+        return -1;
+    for (i = 0; i < HWR_COUNT_OF(HWR_SCHEMA); i++) {
+        if (&HWR_SCHEMA[i] == desc)
+            return (int)i;
+    }
+    return -1;
+}
+
+int hwr_schema_depends_on(const struct hwr_setting_desc *desc)
+{
+    if (desc == NULL)
+        return -1;
+    if (desc->depends_on_key != NULL)
+        return hwr_schema_index_of(hwr_schema_find(desc->depends_on_key));
+    return desc->depends_on;
+}
+
+int hwr_schema_is_original(const struct hwr_setting_desc *desc,
+                           union hwr_value value)
+{
+    if (desc == NULL)
+        return 1;
+    switch (desc->type) {
+    case HWR_VT_BOOL:
+        return (value.b != 0) == (desc->original.b != 0);
+    case HWR_VT_U32:
+    case HWR_VT_COLOR:
+        return value.u == desc->original.u;
+    case HWR_VT_F32:
+        return value.f == desc->original.f;
+    case HWR_VT_ENUM:
+        return value.e == desc->original.e;
+    }
+    return 1;
 }
 
 static void hwr_schema_error(char *err, size_t err_size, const char *format,

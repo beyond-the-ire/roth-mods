@@ -51,6 +51,12 @@
 #ifndef GL_MAX_TEXTURE_BUFFER_SIZE
 #define GL_MAX_TEXTURE_BUFFER_SIZE 0x8c2b
 #endif
+#ifndef GL_RGBA16F
+#define GL_RGBA16F 0x881a
+#endif
+#ifndef GL_HALF_FLOAT
+#define GL_HALF_FLOAT 0x140b
+#endif
 
 typedef GLenum (APIENTRY *hwr_gl_get_error_fn)(void);
 typedef const GLubyte *(APIENTRY *hwr_gl_get_string_fn)(GLenum);
@@ -218,6 +224,12 @@ static GLuint g_truecolor_program;
 static GLuint g_truecolor_resolve_program;
 static GLuint g_index_restore_program;
 static GLuint g_color_texture;
+/* The palette WITHOUT the engine's palette-level effects. The enhanced program
+ * composes in it and the enhanced resolve applies the effects to the colour
+ * afterwards, so the colours a map authored are what a lighting term is
+ * evaluated against and the index plane stays keyed on one palette while a
+ * damage flash changes the DAC every frame. */
+static GLuint g_base_palette_texture;
 /* Cached HWR_TRUECOLOR gate; -1 until first read. */
 static int g_truecolor_env = -1;
 /* Raised while this frame renders through the enhanced program. */
@@ -225,6 +237,22 @@ static int g_truecolor_active;
 /* Set once the foundation has failed to come up, so it is never retried. */
 static int g_truecolor_failed;
 static int g_truecolor_logged;
+/* What the settings layer last asked for. */
+static struct hwr_gl_truecolor g_truecolor_want = { 0, 1, 1.0f,
+                                                    HWR_GL_COLOR_AUTO };
+/* The colour format in use, and the ones this driver has refused. */
+static enum hwr_gl_color_format g_truecolor_format = HWR_GL_COLOR_AUTO;
+static int g_truecolor_refused_rgba16f;
+/* The palette-level effects this frame's resolve has to reproduce: the damage
+ * flash's per-channel fade (negative while none is in force) and the inventory
+ * desaturation. */
+static int g_effect_fade = -1;
+static int g_effect_grayscale;
+/* The untinted palette as it was last uploaded, so the few pixels the sampling
+ * self-test writes straight into the index plane can be given the colour they
+ * resolve to without a pass that would have to sample the plane it writes. */
+static uint8_t g_base_palette_bytes[1024];
+static int g_base_palette_valid;
 /* The acceptance instrument: HWR_TRUECOLOR_COMPARE=<path-prefix> renders the
  * frame's view set twice -- once through the authentic program, once through
  * the enhanced one -- from identical state, and counts differing canvas pixels.
@@ -1422,15 +1450,57 @@ static const char g_resolve_fragment_shader[] =
     "  out_color=texelFetch(u_palette,ivec2(int(i),0),0); }\n";
 
 /* The true-colour resolve. The geometry pass has already written the colour the
- * palette index resolves to, so this is a copy; the palette-level effects join
- * it later. Debug visualisations are index planes by definition and keep the
- * authentic resolve above. */
+ * palette index resolves to, so with no effect in force this is a copy. The
+ * engine's two palette-level effects reach the world image here instead of
+ * through the palette the world was composed in.
+ *
+ * Both are authored on the six-bit value the DAC is loaded with, and both are
+ * reproduced on that value here, so a colour that IS a palette colour comes out
+ * as exactly the byte the authentic resolve produces -- which is what the
+ * acceptance instrument measures. A colour that is not one is quantized to six
+ * bits by the same arithmetic, which is what the hardware did to it anyway
+ * while the effect was running.
+ *
+ * Debug visualisations are index planes by definition and keep the authentic
+ * resolve above. */
 static const char g_truecolor_resolve_fragment_shader[] =
     "#version 330 core\n"
     "layout(location=0) out vec4 out_color;\n"
     "uniform sampler2D u_source;\n"
-    "void main()"
-    " { out_color=texelFetch(u_source,ivec2(gl_FragCoord.xy),0); }\n";
+    /* The untinted palette: the desaturation ramp is entries 0x40..0x4f of it. */
+    "uniform sampler2D u_palette;\n"
+    "uniform int u_damage_fade;\n"
+    "uniform int u_grayscale;\n"
+    /* The eight-bit value the colour stands for. The clamp is for a colour a
+     * later term has taken outside the displayable range in a floating-point
+     * target; it changes nothing for one that is inside it. */
+    "int byte_of(float v) { return clamp(int(v*255.0+0.5),0,255); }\n"
+    /* The engine takes its damage-flash product down by a signed shift of eight,
+     * which rounds toward negative infinity; integer division rounds toward
+     * zero, so the negative case is spelled out. */
+    "int shift8(int v) { return v>=0 ? v/256 : -((-v+255)/256); }\n"
+    "void main() {\n"
+    "  vec4 texel=texelFetch(u_source,ivec2(gl_FragCoord.xy),0);\n"
+    "  if (u_damage_fade<0 && u_grayscale==0) { out_color=texel; return; }\n"
+    "  int r6=byte_of(texel.r)>>2;\n"
+    "  int g6=byte_of(texel.g)>>2;\n"
+    "  int b6=byte_of(texel.b)>>2;\n"
+    /* The inventory desaturation: the engine's green-weighted luminance of the
+     * six-bit entry, read off the same sixteen-entry ramp it remaps into. */
+    "  if (u_grayscale!=0) {\n"
+    "    int lum=((r6*4+b6+g6*8)*0x500)>>16;\n"
+    "    vec4 grey=texelFetch(u_palette,ivec2(0x4f-lum,0),0);\n"
+    "    r6=byte_of(grey.r)>>2; g6=byte_of(grey.g)>>2; b6=byte_of(grey.b)>>2;\n"
+    "  }\n"
+    /* The damage flash, per channel, collapsing toward dark red. */
+    "  if (u_damage_fade>=0) {\n"
+    "    r6=shift8((r6-0x2d)*u_damage_fade)+0x2d;\n"
+    "    g6=(g6*u_damage_fade)/256;\n"
+    "    b6=(b6*u_damage_fade)/256;\n"
+    "  }\n"
+    "  out_color=vec4(float((r6<<2)&255)/255.0,float((g6<<2)&255)/255.0,\n"
+    "                 float((b6<<2)&255)/255.0,texel.a);\n"
+    "}\n";
 
 /* Writes a palette-index plane back into the index target. Only the acceptance
  * instrument uses it: it restores the frame's starting index target between the
@@ -1619,6 +1689,8 @@ static void hwr_destroy_scene_objects(void)
     hwr_delete_texture(&g_glow_texture);
     hwr_delete_texture(&g_blend_texture);
     hwr_delete_texture(&g_palette_texture);
+    /* The untinted palette goes with it and comes back with the foundation. */
+    hwr_delete_texture(&g_base_palette_texture);
     g_scene_uploaded = 0;
     g_store_reserve = 0;
     g_verify_store_size = 0;
@@ -1819,6 +1891,81 @@ static int hwr_truecolor_env(void)
     return g_truecolor_env;
 }
 
+void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
+{
+    if (state == NULL)
+        return;
+    g_truecolor_want = *state;
+}
+
+int hwr_gl_truecolor_active(void)
+{
+    return g_truecolor_active;
+}
+
+int hwr_gl_color_format_available(enum hwr_gl_color_format format)
+{
+    if (format == HWR_GL_COLOR_RGBA16F)
+        return !g_truecolor_refused_rgba16f;
+    return 1;
+}
+
+/* Attaches a colour target of the asked-for format and reports whether the
+ * framebuffer took it. Automatic is eight bits per channel: it is exact for the
+ * authentic picture, and headroom is something a later term asks for by name. */
+static int hwr_truecolor_attach(uint32_t width, uint32_t height,
+                                enum hwr_gl_color_format format)
+{
+    GLenum internal_format = GL_RGBA8;
+    GLenum type = GL_UNSIGNED_BYTE;
+
+    if (format == HWR_GL_COLOR_RGBA16F) {
+        internal_format = GL_RGBA16F;
+        type = GL_HALF_FLOAT;
+    }
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.gen_textures(1, &g_color_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_gl.tex_image_2d(GL_TEXTURE_2D, 0, (GLint)internal_format, (GLsizei)width,
+                      (GLsizei)height, 0, GL_RGBA, type, NULL);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                                GL_TEXTURE_2D, g_color_texture, 0);
+    if (g_gl.check_framebuffer_status(GL_FRAMEBUFFER) ==
+        GL_FRAMEBUFFER_COMPLETE && hwr_gl_drain_errors() == 0)
+        return 1;
+    g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                                GL_TEXTURE_2D, 0, 0);
+    hwr_delete_texture(&g_color_texture);
+    return 0;
+}
+
+/* Gives back everything the foundation owns, on the first frame nothing is
+ * asking for it any more. The authentic path then runs the instruction stream
+ * it has always run, with no colour attachment in existence. */
+static void hwr_truecolor_release(void)
+{
+    if (g_color_texture != 0 && g_index_fbo != 0) {
+        g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                                    GL_TEXTURE_2D, 0, 0);
+    }
+    hwr_delete_texture(&g_color_texture);
+    hwr_delete_texture(&g_base_palette_texture);
+    if (g_truecolor_program != 0)
+        g_gl.delete_program(g_truecolor_program);
+    if (g_truecolor_resolve_program != 0)
+        g_gl.delete_program(g_truecolor_resolve_program);
+    g_truecolor_program = 0;
+    g_truecolor_resolve_program = 0;
+    g_truecolor_format = HWR_GL_COLOR_AUTO;
+    g_truecolor_logged = 0;
+}
+
 /* Links the enhanced program and creates the colour attachment on the first
  * frame the foundation is required, and reports whether the foundation is
  * usable. A failure is permanent for the process and leaves the authentic path
@@ -1860,35 +2007,49 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
         }
         g_gl.use_program(g_truecolor_resolve_program);
         hwr_set_sampler(g_truecolor_resolve_program, "u_source", 0);
+        hwr_set_sampler(g_truecolor_resolve_program, "u_palette", 1);
         g_gl.use_program(0);
     }
+    if (g_base_palette_texture == 0) {
+        g_gl.active_texture(GL_TEXTURE0);
+        hwr_texture_2d_u8(&g_base_palette_texture, 256, 1, GL_RGBA8, GL_RGBA,
+                          NULL);
+        g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    }
     if (g_color_texture == 0) {
+        enum hwr_gl_color_format wanted = g_truecolor_want.format;
+
         if (g_index_fbo == 0 || width != g_fbo_width || height != g_fbo_height)
             return 0;
         g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
-        /* Create it on unit 0 rather than on whichever unit the previous frame
-         * happened to leave selected, and hand that unit back cleared. */
-        g_gl.active_texture(GL_TEXTURE0);
-        hwr_texture_2d_u8(&g_color_texture, (GLsizei)width, (GLsizei)height,
-                          GL_RGBA8, GL_RGBA, NULL);
-        g_gl.bind_texture(GL_TEXTURE_2D, 0);
-        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
-                                    GL_TEXTURE_2D, g_color_texture, 0);
-        if (g_gl.check_framebuffer_status(GL_FRAMEBUFFER) !=
-            GL_FRAMEBUFFER_COMPLETE) {
-            snprintf(g_error, sizeof g_error,
-                     "the true-colour attachment leaves the framebuffer"
-                     " incomplete");
-            fprintf(stderr, "[renderer_overhaul] %s\n", g_error);
-            g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
-                                        GL_TEXTURE_2D, 0, 0);
-            hwr_delete_texture(&g_color_texture);
-            g_truecolor_failed = 1;
-            return 0;
+        hwr_gl_drain_errors();
+        if (wanted == HWR_GL_COLOR_AUTO)
+            wanted = HWR_GL_COLOR_RGBA8;
+        if (!hwr_truecolor_attach(width, height, wanted)) {
+            if (wanted == HWR_GL_COLOR_RGBA16F) {
+                fprintf(stderr, "[renderer_overhaul] this driver will not take "
+                                "a floating-point world image; using eight bits"
+                                " per channel\n");
+                g_truecolor_refused_rgba16f = 1;
+                wanted = HWR_GL_COLOR_RGBA8;
+            }
+            if (!hwr_truecolor_attach(width, height, wanted)) {
+                snprintf(g_error, sizeof g_error,
+                         "the true-colour attachment leaves the framebuffer"
+                         " incomplete");
+                fprintf(stderr, "[renderer_overhaul] %s\n", g_error);
+                g_truecolor_failed = 1;
+                return 0;
+            }
         }
+        g_truecolor_format = wanted;
         if (!g_truecolor_logged) {
+            unsigned channel_bytes = wanted == HWR_GL_COLOR_RGBA16F ? 8u : 4u;
             fprintf(stderr, "[renderer_overhaul] true-colour foundation active"
-                            " (%ux%u RGBA8)\n", width, height);
+                            " (%ux%u %s, %luKB)\n", width, height,
+                    wanted == HWR_GL_COLOR_RGBA16F ? "RGBA16F" : "RGBA8",
+                    (unsigned long)(((uint64_t)width * height * channel_bytes)
+                                    / 1024u));
             g_truecolor_logged = 1;
         }
     }
@@ -2186,10 +2347,10 @@ static void hwr_bind_scene_textures(void)
         g_gl.bind_texture(targets[i], textures[i]);
     }
     /* The world pass spends units 0-7; the enhanced program resolves its own
-     * emitted index through the palette on unit 8. */
+     * emitted index through the untinted palette on unit 8. */
     if (g_truecolor_active) {
         g_gl.active_texture(GL_TEXTURE0 + 8);
-        g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
     }
     /* The final pass of the previous frame leaves the index framebuffer's
      * color attachment bound to unit 0's two-dimensional slot. Sampling
@@ -2311,6 +2472,13 @@ static void hwr_gl_scene_self_test(int first_run)
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, 4, 1);
     g_gl.disable(GL_DEPTH_TEST);
+    {
+        /* The probe writes the palette index and nothing else, so it says so:
+         * a draw-buffer set left over from the world pass would otherwise leave
+         * the attachments it does not write holding undefined pixels. */
+        static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
+        g_gl.draw_buffers(1, index_only);
+    }
     g_gl.use_program(g_probe_program);
     hwr_uniform_1i(g_probe_program, "u_offset", g_verify_probe_offset);
     hwr_uniform_1i(g_probe_program, "u_last",
@@ -2329,6 +2497,30 @@ static void hwr_gl_scene_self_test(int first_run)
                probe_read[1] == expected_colormap &&
                probe_read[2] == g_verify_first_texel &&
                probe_read[3] == g_verify_last_texel;
+    /* The probe has just written four pixels of the palette-index plane that no
+     * geometry drew. Give the colour plane the colours those indices resolve
+     * to, so everything that reads one plane against the other -- the held-frame
+     * re-resolve above all -- keeps seeing two planes that describe the same
+     * picture. */
+    if (g_truecolor_active && g_color_texture != 0 && g_base_palette_valid) {
+        uint8_t probe_color[4 * 4];
+        int i;
+
+        for (i = 0; i < 4; i++) {
+            const uint8_t *entry = g_base_palette_bytes + probe_read[i] * 4u;
+
+            probe_color[i * 4] = entry[0];
+            probe_color[i * 4 + 1] = entry[1];
+            probe_color[i * 4 + 2] = entry[2];
+            probe_color[i * 4 + 3] = entry[3];
+        }
+        g_gl.active_texture(GL_TEXTURE0);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);
+        g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
+        g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 4, 1, GL_RGBA,
+                              GL_UNSIGNED_BYTE, probe_color);
+        g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    }
 
     {
         /* The world pass depends on the geometry program's sampler uniforms
@@ -2629,19 +2821,25 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     hwr_set_sampler(program, "u_stale", 6);
     hwr_set_sampler(program, "u_floor_id", 7);
     if (g_truecolor_active) {
-        /* The foundation ships neutral: with the early-out taken, the colour
+        /* With every dependent neutral the early-out is taken and the colour
          * emitted beside each index is exactly the colour that index resolves
-         * to, so the resolved canvas is the authentic canvas. The instrument's
-         * negative self-test is the only thing that moves these today, and it
-         * has to move them far enough to survive the 8-bit resolve: a gain of
-         * 0.999 shifts a channel by at most 0.255 of a step and rounds back to
-         * the byte it started from, so it would leave the instrument reporting
-         * a clean run. This one moves every channel from 51 up. */
-        GLfloat gain = g_truecolor_break ? 0.99f : 1.0f;
+         * to, so the resolved canvas is the authentic canvas. A dependent that
+         * has moved -- the world gain today -- clears the early-out and the
+         * composition runs.
+         *
+         * The instrument's negative self-test detunes the gain, and has to
+         * detune it far enough to survive the 8-bit resolve: a gain of 0.999
+         * shifts a channel by at most 0.255 of a step and rounds back to the
+         * byte it started from, so it would leave the instrument reporting a
+         * clean run. This one moves every channel from 51 up. */
+        GLfloat gain = g_truecolor_break ? 0.99f : g_truecolor_want.gain;
+        int neutral = g_truecolor_break ? 0 : g_truecolor_want.neutral;
+        if (gain <= 0.0f)
+            gain = 1.0f;
         hwr_set_sampler(program, "u_palette", 8);
         hwr_uniform_3f(program, "u_gain", gain, gain, gain);
         hwr_uniform_3f(program, "u_add", 0.0f, 0.0f, 0.0f);
-        hwr_uniform_1i(program, "u_light_neutral", g_truecolor_break ? 0 : 1);
+        hwr_uniform_1i(program, "u_light_neutral", neutral);
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */
@@ -3094,7 +3292,11 @@ static int hwr_render_view_set(const struct hwr_gl_scene_view *views,
  * frame a stale-masked wall shows through its holes all need no rule of their
  * own: the colour plane is by construction the resolve of whatever the index
  * plane already holds. It samples the SNAPSHOT the stale pass has just taken,
- * never the attachment being written. */
+ * never the attachment being written.
+ *
+ * It resolves through the UNTINTED palette, because the colour plane holds the
+ * colours the world was composed in and the palette-level effects are applied
+ * to them at the end of the frame. */
 static void hwr_truecolor_prime(uint32_t width, uint32_t height)
 {
     static const GLenum color_target[1] = { GL_COLOR_ATTACHMENT2 };
@@ -3110,7 +3312,7 @@ static void hwr_truecolor_prime(uint32_t width, uint32_t height)
     g_gl.active_texture(GL_TEXTURE0);
     g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
     g_gl.active_texture(GL_TEXTURE1);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
     g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
     g_gl.depth_mask(GL_TRUE);
     g_gl.active_texture(GL_TEXTURE0);
@@ -3129,9 +3331,19 @@ static void hwr_scene_resolve_pass(uint32_t width, uint32_t height)
     if (g_truecolor_active && g_debug_vis == 0) {
         g_gl.use_program(g_truecolor_resolve_program);
         hwr_set_sampler(g_truecolor_resolve_program, "u_source", 0);
+        hwr_set_sampler(g_truecolor_resolve_program, "u_palette", 1);
+        /* The palette-level effects the engine is running reach the world image
+         * here, on the colour, rather than through the palette it was composed
+         * in. */
+        hwr_uniform_1i(g_truecolor_resolve_program, "u_damage_fade",
+                       g_effect_fade);
+        hwr_uniform_1i(g_truecolor_resolve_program, "u_grayscale",
+                       g_effect_grayscale);
         g_gl.bind_vertex_array(g_resolve_vao);
         g_gl.active_texture(GL_TEXTURE0);
         g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);
+        g_gl.active_texture(GL_TEXTURE1);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
         g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
         return;
     }
@@ -3324,17 +3536,36 @@ static void hwr_truecolor_compare_report(const struct hwr_gl_scene_view *views,
                 g_truecolor_compare_max_delta);
 }
 
+/* The palette-level effects this frame's resolve has to reproduce, taken from
+ * the state the caller published with the palette. */
+static void hwr_truecolor_set_effects(const struct hwr_gl_palette *palette)
+{
+    int fade;
+
+    g_effect_grayscale = palette->grayscale != 0;
+    if (palette->damage_level == 0) {
+        g_effect_fade = -1;
+        return;
+    }
+    /* The engine holds the fade at zero from below, so a heavy hit saturates
+     * the tint rather than coming back out of it. */
+    fade = 0xff - (int)palette->damage_level;
+    g_effect_fade = fade < 0 ? 0 : fade;
+}
+
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
                                     size_t view_count,
-                                    const uint8_t palette_rgba[1024],
+                                    const struct hwr_gl_palette *palette,
                                     uint32_t width, uint32_t height)
 {
     size_t view_index;
     uint64_t perf_t0 = 0;
     uint64_t perf_setup = 0;
+    uint64_t perf_prime = 0;
     uint64_t perf_views = 0;
     uint64_t perf_resolve = 0;
     static uint64_t perf_setup_sum;
+    static uint64_t perf_prime_sum;
     static uint64_t perf_views_sum;
     static uint64_t perf_resolve_sum;
     static uint64_t perf_readback_sum;
@@ -3352,7 +3583,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
 
     if (!g_initialized || !g_scene_uploaded || views == NULL ||
         view_count == 0 || view_count > (size_t)INT32_MAX ||
-        palette_rgba == NULL || width == 0 || height == 0 ||
+        palette == NULL || palette->rgba == NULL || width == 0 || height == 0 ||
         width > (uint32_t)INT32_MAX || height > (uint32_t)INT32_MAX ||
         !hwr_platform_make_current()) {
         snprintf(g_error, sizeof g_error, "scene render inputs are invalid");
@@ -3387,19 +3618,34 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         !hwr_create_framebuffer(width, height))
         return NULL;
     /* The true-colour foundation comes up on the first frame that asks for it
-     * and stands until the context goes. With nothing asking, no enhanced
-     * program is compiled, no colour attachment exists, and every pass below
-     * issues the calls it has always issued. */
+     * and goes on the first frame nothing does. With nothing asking, no
+     * enhanced program is compiled, no colour attachment exists, and every pass
+     * below issues the calls it has always issued.
+     *
+     * A frame with no untinted palette to compose in cannot take the enhanced
+     * path: the effects would have nowhere to be applied. */
     g_truecolor_active =
-        (hwr_truecolor_env() || hwr_truecolor_compare_enabled()) &&
-        hwr_truecolor_ensure(width, height);
+        (hwr_truecolor_env() || hwr_truecolor_compare_enabled() ||
+         g_truecolor_want.required) &&
+        palette->base_rgba != NULL && hwr_truecolor_ensure(width, height);
+    if (!g_truecolor_active && g_color_texture != 0)
+        hwr_truecolor_release();
     compare_active = g_truecolor_active && hwr_truecolor_compare_enabled();
+    hwr_truecolor_set_effects(palette);
 
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.active_texture(GL_TEXTURE1);
     g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
     g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
-                          GL_RGBA, GL_UNSIGNED_BYTE, palette_rgba);
+                          GL_RGBA, GL_UNSIGNED_BYTE, palette->rgba);
+    if (g_truecolor_active) {
+        g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
+        g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                              GL_RGBA, GL_UNSIGNED_BYTE, palette->base_rgba);
+        memcpy(g_base_palette_bytes, palette->base_rgba,
+               sizeof g_base_palette_bytes);
+        g_base_palette_valid = 1;
+    }
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.disable(GL_SCISSOR_TEST);
@@ -3467,6 +3713,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
 
     if (g_truecolor_active)
         hwr_truecolor_prime(width, height);
+    if (perf_enabled)
+        perf_prime = hwr_perf_now_ns();
     if (!hwr_render_view_set(views, view_count, width, height))
         return NULL;
     if (perf_enabled)
@@ -3482,7 +3730,8 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     if (perf_enabled) {
         uint64_t done = hwr_perf_now_ns();
         perf_setup_sum += perf_setup - perf_t0;
-        perf_views_sum += perf_views - perf_setup;
+        perf_prime_sum += perf_prime - perf_setup;
+        perf_views_sum += perf_views - perf_prime;
         perf_resolve_sum += perf_resolve - perf_views;
         perf_readback_sum += done - perf_resolve;
         perf_total_sum += done - perf_t0;
@@ -3493,18 +3742,25 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
             double divisor = (double)perf_samples * 1.0e6;
             fprintf(stderr,
                     "[renderer_overhaul] frame perf %ux%u avg/%u:"
-                    " setup=%.2fms views-submit=%.2fms"
+                    " setup=%.2fms truecolor-prime=%.2fms views-submit=%.2fms"
                     " resolve-submit=%.2fms gpu+readback=%.2fms"
-                    " total=%.2fms views=%.1f full-copies=%.1f\n",
+                    " total=%.2fms views=%.1f full-copies=%.1f"
+                    " truecolor=%s\n",
                     width, height, perf_samples,
                     perf_setup_sum / divisor,
+                    perf_prime_sum / divisor,
                     perf_views_sum / divisor,
                     perf_resolve_sum / divisor,
                     perf_readback_sum / divisor,
                     perf_total_sum / divisor,
                     (double)perf_view_sum / perf_samples,
-                    (double)perf_copy_sum / perf_samples);
+                    (double)perf_copy_sum / perf_samples,
+                    g_truecolor_active
+                        ? (g_truecolor_format == HWR_GL_COLOR_RGBA16F
+                               ? "rgba16f" : "rgba8")
+                        : "off");
             perf_setup_sum = 0;
+            perf_prime_sum = 0;
             perf_views_sum = 0;
             perf_resolve_sum = 0;
             perf_readback_sum = 0;
@@ -3523,37 +3779,72 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     return g_pixels;
 }
 
-const uint32_t *hwr_gl_scene_resolve(const uint8_t palette_rgba[1024],
+const uint32_t *hwr_gl_scene_resolve(const struct hwr_gl_palette *palette,
                                      uint32_t width, uint32_t height)
 {
-    if (!g_initialized || !g_scene_uploaded || palette_rgba == NULL ||
-        width == 0 || height == 0 || g_fbo_width != width ||
+    /* The true-colour twin: the colour target the last render left behind is
+     * re-resolved through the new palette-level effects. Both arms are "no
+     * geometry redrawn, only the transform changed", so the caller does not
+     * have to know which one ran -- except that a frame whose effects cannot be
+     * reproduced in colour space falls back to the palette-index arm, which
+     * reproduces them exactly by construction. */
+    int enhanced = g_truecolor_active && g_color_texture != 0 &&
+                   g_base_palette_texture != 0 &&
+                   palette != NULL && palette->base_rgba != NULL &&
+                   g_debug_vis == 0;
+
+    if (!g_initialized || !g_scene_uploaded || palette == NULL ||
+        palette->rgba == NULL || width == 0 || height == 0 ||
+        g_fbo_width != width ||
         g_fbo_height != height || g_pixels == NULL ||
         !hwr_platform_make_current()) {
         snprintf(g_error, sizeof g_error,
                  "no resolvable palette-index target is present");
         return NULL;
     }
-    /* Nothing has drawn into the index attachment since the render that
-     * produced the standing image, so resolving it again through a different
-     * palette yields exactly what that render would have produced with this
-     * palette. */
+    /* Nothing has drawn into the standing target since the render that produced
+     * the image, so resolving it again yields exactly what that render would
+     * have produced with these effects in force. */
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.active_texture(GL_TEXTURE1);
     g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
     g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
-                          GL_RGBA, GL_UNSIGNED_BYTE, palette_rgba);
+                          GL_RGBA, GL_UNSIGNED_BYTE, palette->rgba);
+    if (enhanced) {
+        g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
+        g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                              GL_RGBA, GL_UNSIGNED_BYTE, palette->base_rgba);
+        memcpy(g_base_palette_bytes, palette->base_rgba,
+               sizeof g_base_palette_bytes);
+        g_base_palette_valid = 1;
+        hwr_truecolor_set_effects(palette);
+    }
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.disable(GL_SCISSOR_TEST);
     g_gl.disable(GL_DEPTH_TEST);
-    g_gl.use_program(g_resolve_program);
-    hwr_uniform_1i(g_resolve_program, "u_debug_vis", g_debug_vis);
-    g_gl.bind_vertex_array(g_resolve_vao);
-    g_gl.active_texture(GL_TEXTURE0);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
-    g_gl.active_texture(GL_TEXTURE1);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    if (enhanced) {
+        g_gl.use_program(g_truecolor_resolve_program);
+        hwr_set_sampler(g_truecolor_resolve_program, "u_source", 0);
+        hwr_set_sampler(g_truecolor_resolve_program, "u_palette", 1);
+        hwr_uniform_1i(g_truecolor_resolve_program, "u_damage_fade",
+                       g_effect_fade);
+        hwr_uniform_1i(g_truecolor_resolve_program, "u_grayscale",
+                       g_effect_grayscale);
+        g_gl.bind_vertex_array(g_resolve_vao);
+        g_gl.active_texture(GL_TEXTURE0);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);
+        g_gl.active_texture(GL_TEXTURE1);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
+    } else {
+        g_gl.use_program(g_resolve_program);
+        hwr_uniform_1i(g_resolve_program, "u_debug_vis", g_debug_vis);
+        g_gl.bind_vertex_array(g_resolve_vao);
+        g_gl.active_texture(GL_TEXTURE0);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+        g_gl.active_texture(GL_TEXTURE1);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    }
     g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
@@ -3630,6 +3921,10 @@ void hwr_gl_shutdown(void)
     g_truecolor_active = 0;
     g_truecolor_failed = 0;
     g_truecolor_logged = 0;
+    g_truecolor_format = HWR_GL_COLOR_AUTO;
+    g_effect_fade = -1;
+    g_effect_grayscale = 0;
+    g_base_palette_valid = 0;
     g_initialized = 0;
     memset(&g_gl, 0, sizeof g_gl);
 }

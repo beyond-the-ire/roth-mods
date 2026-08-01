@@ -19,6 +19,27 @@ struct hwr_composite {
     uint16_t *palette_cube;
     uint32_t palette_cube_palette[256];
     int palette_cube_valid;
+    /* The enhanced plane's cube: the same grid with every empty cell filled
+     * with the nearest palette entry, keyed on the palette WITHOUT the engine's
+     * palette-level effects so a damage flash never invalidates it. It is read
+     * with no verify and no fallback -- one fetch per sample, the same cost the
+     * exact-match read has -- because a true-colour canvas holds colours the
+     * palette has no entry for. */
+    uint16_t *filled_cube;
+    uint32_t filled_cube_palette[256];
+    int filled_cube_valid;
+    /* Raised while the submitted canvas may hold a colour the palette has no
+     * entry for, which is what decides which of the two reads is right. */
+    int enhanced;
+    /* The read hwr_composite_quantize is currently making, chosen once per
+     * reduction rather than per sample. */
+    int quantize_filled;
+    /* What the baseline quantizer actually did, reported rather than left to a
+     * frame-rate report: a fall into the linear scan is a defect with a cause. */
+    uint64_t cube_hits;
+    uint64_t cube_misses;
+    uint64_t linear_scans;
+    unsigned quantize_frames;
     uint32_t *effect_pixels;
     size_t effect_capacity;
     uint32_t *source_pixels;
@@ -81,8 +102,35 @@ void hwr_composite_publish_palette(const uint8_t palette_rgb[768],
 /* The published palette entry for an engine index. */
 uint32_t hwr_composite_present_argb(unsigned index);
 
+/* The same table without the palette-level effects: the colours the map
+ * authored, which is what the true-colour path composes in. */
+void hwr_composite_base_rgba(uint8_t rgba_out[1024]);
+
+/* Whether the engine's desaturation table is the one its own published rule
+ * produces from the palette in force. It is built once per session from
+ * whatever palette was live then, so on a later map it can describe a palette
+ * that has since been replaced -- and a transform derived from the colour
+ * cannot reproduce a table that does not describe the colours. Saying so is
+ * what keeps the held image exact: the caller falls back to the palette-index
+ * resolve, which reproduces the engine's own table by construction. */
+int hwr_composite_grayscale_reproducible(const uint8_t lut[256]);
+
 uint8_t hwr_composite_palette_index(uint32_t pixel,
                                     const uint32_t palette[256]);
+
+/* Says whether the canvas being submitted may hold colours the palette has no
+ * entry for, which decides how the index baseline is quantized. */
+void hwr_composite_set_enhanced(struct hwr_composite *composite, int enhanced);
+
+/* Chooses the read that describes the image about to be reduced, once, before
+ * the samples start arriving. */
+void hwr_composite_quantize_begin(struct hwr_composite *composite);
+
+/* One canvas pixel to the engine index that stands for it, through whichever
+ * cube is current. Everything that reduces the submitted image shares it, so
+ * nothing is left holding the two-hundred-and-fifty-six-entry scan. */
+uint8_t hwr_composite_quantize(struct hwr_composite *composite,
+                               uint32_t pixel);
 
 void hwr_composite_clear(struct hwr_composite *composite);
 

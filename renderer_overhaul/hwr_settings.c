@@ -118,6 +118,11 @@ int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata)
     return 0;
 }
 
+void hwr_settings_mark_changed(uint32_t bits)
+{
+    g_dirty |= bits;
+}
+
 void hwr_settings_apply_pending(void)
 {
     uint32_t i;
