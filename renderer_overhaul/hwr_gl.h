@@ -45,6 +45,35 @@ enum hwr_gl_wall_wrap_flags {
  * identity during its normal depth-tested pass. */
 #define HWR_GL_WALL_OWNER_OVERLAY (1u << 7)
 
+/* wall_span_valid is a bit mask, because the things the wall column state feeds
+ * are validated independently.
+ *
+ *   TEXELS  the along-wall accumulators start at the face's authored end, so
+ *           the texel walk may run.  A near-plane-clipped edge starts partway
+ *           along the face and never sets it, which leaves that wall on the
+ *           interpolated sampler it already had -- no texture mapping moves.
+ *   SHADE   the screen span and endpoint rows are usable, so the candle corner
+ *           word path may run instead of the per-fragment radial.
+ *   RAMP    a CPU-seeded shade ramp is attached, valid on the half-open column
+ *           interval [ramp_x0, ramp_x1) and NOWHERE else.  That interval is the
+ *           set of columns stock itself drives this face on, so the engine's
+ *           corner law is stated exactly where the engine states it, and every
+ *           column outside it -- the extra area a wider target opens up
+ *           included -- keeps the law it already had.  Carrying the ramp in
+ *           attributes instead of in the vertex positions is what lets the
+ *           corner law re-anchor a shade word with no emitted vertex moving.
+ *   RAMP_ONLY  outside that interval this face has no usable corner word at all
+ *           (its authored end is behind the camera, so the varying carries the
+ *           blend GL generates at its own near plane).  Those fragments fall to
+ *           the per-fragment radial, which is exactly what the whole face had
+ *           before the near-plane clip existed. */
+enum hwr_gl_wall_span_flags {
+    HWR_GL_WALL_SPAN_TEXELS    = 1u << 0,
+    HWR_GL_WALL_SPAN_SHADE     = 1u << 1,
+    HWR_GL_WALL_SPAN_RAMP      = 1u << 2,
+    HWR_GL_WALL_SPAN_RAMP_ONLY = 1u << 3
+};
+
 /* High bits of flat_mapping_flags are available to non-flat geometry. Mesh
  * faces use perspective-correct wall_s/wall_top as direct atlas coordinates,
  * bypassing the wall-column and world-plane mapping drivers. */
@@ -81,6 +110,12 @@ struct hwr_gl_vertex {
      * sub-row shade interpolates bilinearly between this and the bottom-edge
      * word down each column.  Zero for flats and non-shaded geometry. */
     uint16_t wall_shade_endpoint_top;
+    /* The corner-law ramp's word pair at its FIRST column (ramp_x0): bottom
+     * edge then top edge, in the same (row<<8)|frac format.  Every vertex of
+     * the face carries the identical pair -- it describes a screen column, not
+     * a corner -- and it is read only where HWR_GL_WALL_SPAN_RAMP is set. */
+    uint16_t wall_shade_ramp_lo_bottom;
+    uint16_t wall_shade_ramp_lo_top;
     float wall_s;
     float wall_top;
     uint32_t texture_offset;
@@ -106,6 +141,14 @@ struct hwr_gl_vertex {
      * instead of interpolating that corner's row. Only the restore switch emits
      * it -- a view-clipped flat has no such corner left. Zero otherwise. */
     uint8_t flat_taint;
+    /* The corner-law ramp's word pair at its LAST column (ramp_x1) and the
+     * half-open framebuffer column interval [ramp_x0, ramp_x1) the ramp is
+     * valid on.  Four signed shorts so one attribute carries them; read only
+     * where HWR_GL_WALL_SPAN_RAMP is set, zero everywhere else. */
+    int16_t wall_shade_ramp_hi_bottom;
+    int16_t wall_shade_ramp_hi_top;
+    int16_t wall_shade_ramp_x0;
+    int16_t wall_shade_ramp_x1;
     /* Sub-unit world remainder of the position, added to the wrapped integer
      * position in the vertex shader. A view-clipped flat corner falls between
      * authored world units, and near the bottom of the frame one world unit is
