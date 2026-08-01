@@ -19,8 +19,9 @@ removing this folder, restores the original renderer exactly.
 Edit `renderer_overhaul.cfg` using `key=value` lines. Keys are case-insensitive and `#` starts a
 comment. Saving the file while the game is running reloads it automatically. A changed file must
 remain stable across two checks before it is applied, so editors that truncate and rewrite files
-cannot expose a partial configuration. If any line is invalid or unknown, the whole reload is
-rejected and the current settings remain active. The small file is checked once every 31 rendered
+cannot expose a partial configuration. If any line has an invalid value, the whole reload is
+rejected and the current settings remain active; a key this build does not recognize is reported
+and ignored so the rest of the file still loads. The small file is checked once every 31 rendered
 world frames, so the watcher has no meaningful steady-state cost. A resolution change can cause a
 one-frame hitch while the render targets are resized.
 
@@ -40,7 +41,6 @@ one-frame hitch while the render targets are resized.
   the original projection. Wider output aspects automatically gain horizontal view area.
 - `pitch_mode`: reserved for a later camera mode. Accepted values are `horizon_shift` and
   `true_rotation`; the current build uses the authentic horizon shift.
-- `render_mode`: `authentic` or `enhanced`. Enhanced currently uses the authentic renderer.
 
 ## Requirements
 
@@ -55,5 +55,6 @@ classification, text, menus, the HUD, and the cursor. At wide aspects the authen
 is centered without stretching while the world fills the configured canvas; gameplay picking uses
 the matching wide projection, and engine-only menus retain their original coordinate system.
 
-The in-game settings overlay and enhanced rendering mode are still planned. Configuration is
-file-based for now.
+The in-game settings overlay and the individually configurable visual enhancements are still
+planned. Configuration is file-based for now. Authentic rendering is what the mod produces with
+every enhancement off, so there is no separate rendering mode to select.

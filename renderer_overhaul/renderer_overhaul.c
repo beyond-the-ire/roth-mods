@@ -490,6 +490,18 @@ static void hwr_apply_window_requests(const struct roth_api_v1 *api)
     g_window_pending = 0;
 }
 
+/* The one place settings work happens: carry out a pending configuration
+ * request, hand the resulting changes to the apply hooks, then make the window
+ * requests those hooks queued. Every caller has to be non-reentrant with the
+ * world render, which is why only the render boundary and the game tick call
+ * it -- never a timer, compose, or present callback. */
+static void hwr_settings_pump(const struct roth_api_v1 *api)
+{
+    hwr_config_drain_request();
+    hwr_settings_apply_pending();
+    hwr_apply_window_requests(api);
+}
+
 /* Stop compositing. The descriptor's geometry survives: an engine routine that
  * takes the screen gives it back, and the canvas it is given back on has to be
  * the one it was taken from. */
@@ -912,8 +924,7 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     /* File I/O and settings application belong at this non-reentrant render
      * boundary, not in the timer-driven per-frame callback. */
     hwr_config_poll();
-    hwr_settings_apply_pending();
-    hwr_apply_window_requests(api);
+    hwr_settings_pump(api);
     g_wrap_serial++;
     /* THE LOAD BOUNDARY, read before the original renderer runs. The map loader
      * clears the engine's render-active latch and this very pass raises it
@@ -1760,8 +1771,9 @@ static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
 {
     if (g_world_render_active)
         return;
-    hwr_settings_apply_pending();
-    hwr_apply_window_requests(api);
+    /* The world pass is not dispatched while a menu owns the screen, so this
+     * is the safe point that answers a settings request made there. */
+    hwr_settings_pump(api);
     hwr_prewarm_shared_das(api);
 
     if (g_wrap_serial != g_watchdog_serial) {

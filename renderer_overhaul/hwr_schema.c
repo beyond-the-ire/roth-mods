@@ -18,8 +18,6 @@ _Static_assert(sizeof(enum hwr_present_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_pitch_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
-_Static_assert(sizeof(enum hwr_render_mode) == sizeof(int32_t),
-               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -40,9 +38,11 @@ static const struct hwr_enum_value HWR_PITCH_MODE_VALUES[] = {
     { "true_rotation", HWR_PITCH_TRUE_ROTATION, "True rotation" }
 };
 
+/* Retired, and kept only so that a configuration file written for an earlier
+ * build still parses. Neither token reaches a field. */
 static const struct hwr_enum_value HWR_RENDER_MODE_VALUES[] = {
-    { "authentic", HWR_RENDER_AUTHENTIC, "Authentic" },
-    { "enhanced",  HWR_RENDER_ENHANCED,  "Enhanced" }
+    { "authentic", 0, "Authentic" },
+    { "enhanced",  1, "Enhanced" }
 };
 
 /* Set-1 make scancodes, spelled the way the other first-party mods spell them
@@ -318,21 +318,23 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "Key that opens the renderer settings overlay."
     },
     {
+        /* Retired: authentic rendering is what every enhancement being off
+         * produces, so there is no whole-renderer mode to select. The key is
+         * still accepted, and a retired row's help is the clause the note
+         * about it carries. */
         .key = "render_mode",
         .type = HWR_VT_ENUM,
         .category = HWR_CAT_RENDERING,
-        .exposure = HWR_EXP_ADVANCED,
+        .exposure = HWR_EXP_RETIRED,
         .apply_kind = HWR_APPLY_NONE,
-        .change_bit = HWR_CHANGE_RENDER_MODE,
-        .offset = offsetof(struct hwr_settings, render_mode),
+        .change_bit = 0,
+        .offset = HWR_SCHEMA_NO_FIELD,
         .flags = 0,
-        .def = { .e = HWR_RENDER_AUTHENTIC },
-        .original = { .e = HWR_RENDER_AUTHENTIC },
         .values = HWR_RENDER_MODE_VALUES,
         .value_count = HWR_COUNT_OF(HWR_RENDER_MODE_VALUES),
         .depends_on = -1,
         .label = "Render mode",
-        .help = "Reserved. This build always renders the authentic baseline."
+        .help = "enhancements are individual settings, each with its own key"
     },
     {
         /* Retired: there is no manufactured world frame to colour any more.
@@ -350,8 +352,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .max = { .rgb = 0x00ffffffu },
         .depends_on = -1,
         .label = "Solid color",
-        .help = "Retired. It is still accepted so an existing configuration "
-                "file keeps loading."
+        .help = "the world frame it coloured is drawn from the map itself now"
     }
 };
 
