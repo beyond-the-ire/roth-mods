@@ -105,6 +105,12 @@ static int g_present_caps_valid;
 static int g_channel_owned;
 static struct hwr_input_route g_input_route;
 static int g_input_route_active;
+/* Raised for as long as this mod has the engine mouse rewritten into
+ * engine-layer coordinates for an engine routine to read. The value in game RAM
+ * is in full-canvas coordinates everywhere else, and localizing a value that is
+ * already local moves the point -- which matters because the timer-driven poll
+ * can arrive inside any of these windows. */
+static volatile sig_atomic_t g_engine_mouse_localized;
 static int g_gdv_palette_effect_active;
 static int g_suppress_active;
 static int g_gl_permanently_failed;
@@ -1509,12 +1515,14 @@ static uint32_t ROTH_CDECL hwr_render_world_view(
     if (!g_input_route_active)
         return roth_next_render_world_view(chain, es, fs, gs);
     hwr_input_set_world_mouse(api, &g_input_route);
+    g_engine_mouse_localized = 0;
     projection_changed = hwr_input_begin_pick_projection(
         api, &g_input_route, &saved);
     result = roth_next_render_world_view(chain, es, fs, gs);
     if (projection_changed)
         hwr_input_end_pick_projection(api, &saved);
     hwr_input_set_hud_mouse(api, &g_input_route);
+    g_engine_mouse_localized = 1;
     return result;
 }
 
@@ -1548,6 +1556,15 @@ static void hwr_fill_overlay_runtime(const struct roth_api_v1 *api,
     runtime->screen_available = g_ownership.state != HWR_OWNER_ENGINE_SCREEN &&
                                 !g_map_reload_pending && !g_map_event_pending;
     if (!with_cursor || api == NULL || api->game_ram == NULL)
+        return;
+    /* A poll can arrive while an engine routine is reading the localized mouse
+     * this mod wrote for it, and what is in game RAM then says nothing about
+     * where the pointer is: localizing it a second time would move the panel's
+     * hit point away from the pointer the player is aiming with, and reading it
+     * raw would move it the other way. The pointer the panel already has is the
+     * one it keeps until a poll can be trusted -- the engine cursor moves at
+     * most a frame's worth between them. */
+    if (g_engine_mouse_localized)
         return;
     if (hwr_canvas_published() &&
         g_last_frame.composite_mode ==
@@ -1618,8 +1635,10 @@ static void ROTH_CDECL hwr_run_gameplay_frame(
     }
     g_input_route_active = 1;
     hwr_input_set_hud_mouse(api, &g_input_route);
+    g_engine_mouse_localized = 1;
     roth_next_run_gameplay_frame(chain);
     hwr_input_restore_world_cursor(api, &g_input_route);
+    g_engine_mouse_localized = 0;
     g_input_route_active = 0;
 }
 
@@ -1640,8 +1659,10 @@ static void ROTH_CDECL hwr_handle_cursor_click(
         return;
     }
     hwr_input_set_hud_mouse(api, &route);
+    g_engine_mouse_localized = 1;
     roth_next_handle_cursor_click(chain);
     hwr_input_restore_world_cursor(api, &route);
+    g_engine_mouse_localized = 0;
 }
 
 /* The held inventory icon is drawn by the engine straight at the engine mouse
@@ -1666,8 +1687,10 @@ static void ROTH_CDECL hwr_draw_current_mouse_cursor_sprite(
         return;
     }
     hwr_input_set_hud_mouse(api, &route);
+    g_engine_mouse_localized = 1;
     roth_next_draw_current_mouse_cursor_sprite(chain);
     hwr_input_restore_world_cursor(api, &route);
+    g_engine_mouse_localized = 0;
 }
 
 /* The engine's save-under seam. Every window saves the pixels it is about to
@@ -1976,8 +1999,19 @@ static void hwr_prewarm_shared_das(const struct roth_api_v1 *api)
 static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
                                           struct roth_mouse_poll_v1 *poll)
 {
-    if (g_world_render_active)
+    if (g_world_render_active) {
+        /* The timer that polls the mouse can land anywhere, including inside
+         * the frame this mod is building, and nothing that draws or calls the
+         * engine may run there. The click still has to be taken and still has
+         * to be hidden from the game: dropping the poll outright loses presses
+         * the player made, and lets the ones it loses through to gameplay --
+         * where a held button is what puts the engine into the mouselook mode
+         * the panel reads its pointer from. Taking the buttons here and leaving
+         * the press to the next pump costs nothing and loses nothing. */
+        if (hwr_overlay_is_open())
+            hwr_overlay_mouse_capture(api, poll);
         return;
+    }
     if (hwr_overlay_is_open()) {
         struct hwr_overlay_runtime runtime;
 

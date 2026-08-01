@@ -48,6 +48,11 @@ void hwr_overlay_pump(const struct roth_api_v1 *api,
 void hwr_overlay_mouse(const struct roth_api_v1 *api,
                        struct roth_mouse_poll_v1 *poll,
                        const struct hwr_overlay_runtime *runtime);
+/* GAME, but from a poll the caller cannot pump on: take the buttons and hide
+ * them from the game, and nothing else. The button state is a level the next
+ * pump turns into a press, so a poll taken here loses no click. */
+void hwr_overlay_mouse_capture(const struct roth_api_v1 *api,
+                               struct roth_mouse_poll_v1 *poll);
 
 int hwr_overlay_is_open(void);
 /* Where the panel stands, in framebuffer coordinates. Returns 0 for nowhere. */

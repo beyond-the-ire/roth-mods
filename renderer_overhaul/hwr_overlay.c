@@ -1947,6 +1947,17 @@ static void hwr_overlay_press(const struct hwr_overlay_layout *layout, int kind,
         hwr_overlay_confirm_keep();
         return;
     }
+    /* An editor is open until something says otherwise, and a click somewhere
+     * else says it: the same answer Esc gives, since the click was not the
+     * Enter that accepts. It is the closing of the editor and the doing of what
+     * was clicked, both, because a click that only closed something would be a
+     * click the player has to make twice. The row an editor is anchored to is
+     * an index into the rows of the section it was opened in, so leaving it
+     * open across a click that changes them would leave it on a stranger. */
+    if (g_edit != HWR_EDIT_NONE && kind != HWR_HIT_NONE) {
+        hwr_overlay_end_edit();
+        hwr_overlay_status("Left as it was.", 0);
+    }
     switch (kind) {
     case HWR_HIT_SECTION:
         g_zone = HWR_ZONE_SECTIONS;
@@ -2222,18 +2233,32 @@ void hwr_overlay_pump(const struct roth_api_v1 *api,
     g_buttons_prev = g_buttons;
 
     hwr_overlay_update_modal();
-    if (g_redraw)
+    if (g_redraw) {
+        /* The same treatment the keys get: a click that changed the section --
+         * or that turned rows on or off -- changed how many rows there are, and
+         * the panel is drawn from the layout the next hit test will use rather
+         * than from the one the click was tested against. */
+        hwr_overlay_build_rows();
+        if (g_focus >= g_row_count)
+            g_focus = g_row_count > 0 ? g_row_count - 1 : 0;
+        hwr_overlay_layout(api, &layout);
         hwr_overlay_render(api, runtime, &layout);
+    }
     hwr_overlay_draw_set_cursor(g_cursor_owned, g_cursor_x, g_cursor_y);
 }
 
-void hwr_overlay_mouse(const struct roth_api_v1 *api,
-                       struct roth_mouse_poll_v1 *poll,
-                       const struct hwr_overlay_runtime *runtime)
+/* Everything a poll does that is not the pump: read the buttons, move the
+ * panel's own pointer, and hide both from the game. No drawing, no engine call,
+ * no file -- which is what lets a poll that arrives somewhere the pump cannot
+ * run still be taken. A runtime of NULL is a caller with no pointer to offer;
+ * the panel then keeps the one it has. */
+static void hwr_overlay_mouse_input(const struct roth_api_v1 *api,
+                                    struct roth_mouse_poll_v1 *poll,
+                                    const struct hwr_overlay_runtime *runtime)
 {
     int relative;
 
-    if (poll == NULL || runtime == NULL || !g_open)
+    if (poll == NULL || !g_open)
         return;
     relative = api != NULL && api->game_ram != NULL &&
                api->game_ram->u8(VA_G_MOUSE_RELATIVE_MODE) != 0;
@@ -2268,7 +2293,7 @@ void hwr_overlay_mouse(const struct roth_api_v1 *api,
     } else {
         /* The engine is drawing its own pointer; a second one would be wrong,
          * and the panel follows the engine's instead. */
-        if (runtime->cursor_valid) {
+        if (runtime != NULL && runtime->cursor_valid) {
             g_cursor_x = runtime->cursor_x;
             g_cursor_y = runtime->cursor_y;
             g_cursor_fx = (double)g_cursor_x;
@@ -2276,7 +2301,28 @@ void hwr_overlay_mouse(const struct roth_api_v1 *api,
         }
         g_cursor_owned = 0;
     }
+}
+
+void hwr_overlay_mouse(const struct roth_api_v1 *api,
+                       struct roth_mouse_poll_v1 *poll,
+                       const struct hwr_overlay_runtime *runtime)
+{
+    if (poll == NULL || runtime == NULL || !g_open)
+        return;
+    hwr_overlay_mouse_input(api, poll, runtime);
     hwr_overlay_pump(api, runtime);
+}
+
+void hwr_overlay_mouse_capture(const struct roth_api_v1 *api,
+                               struct roth_mouse_poll_v1 *poll)
+{
+    /* The buttons are a level, and the press is the edge the next pump takes
+     * from it against the level it saw last -- so a poll taken here is a click
+     * kept, not a click lost, and one taken here and pumped later is still one
+     * press. Hiding it from the game matters just as much: a click the game
+     * sees while the panel is up is a shot fired, and it also puts the engine
+     * into the mouselook mode the panel reads the pointer from. */
+    hwr_overlay_mouse_input(api, poll, NULL);
 }
 
 void hwr_overlay_init(void)
