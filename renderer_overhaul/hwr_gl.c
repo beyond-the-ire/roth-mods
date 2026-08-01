@@ -232,6 +232,8 @@ static GLuint g_color_texture;
 static GLuint g_base_palette_texture;
 /* Cached HWR_TRUECOLOR gate; -1 until first read. */
 static int g_truecolor_env = -1;
+/* Cached HWR_SHADE_RAMP gate; -1 until first read. */
+static int g_shade_ramp_env = -1;
 /* Raised while this frame renders through the enhanced program. */
 static int g_truecolor_active;
 /* Set once the foundation has failed to come up, so it is never retried. */
@@ -239,7 +241,8 @@ static int g_truecolor_failed;
 static int g_truecolor_logged;
 /* What the settings layer last asked for. */
 static struct hwr_gl_truecolor g_truecolor_want = { 0, 1, 1.0f, 1.0f,
-                                                    HWR_GL_COLOR_AUTO };
+                                                    HWR_GL_COLOR_AUTO,
+                                                    HWR_GL_SHADING_AUTHENTIC };
 /* The colour format in use, and the ones this driver has refused. */
 static enum hwr_gl_color_format g_truecolor_format = HWR_GL_COLOR_AUTO;
 static int g_truecolor_refused_rgba16f;
@@ -1179,6 +1182,80 @@ static const char g_geometry_fragment_body[] =
     "  int checker=(int(gl_FragCoord.x)+int(gl_FragCoord.y)) & 1;\n"
     "  return ((q & 1)==0 && checker!=0) ? max(row-1,0) : row;\n"
     "}\n"
+    /* The continuous twin of shade_row(), line for line: the same selection, the
+     * same terms, the same order, with the truncation to a whole row removed and
+     * every clamp taken on the float instead of on the integer it produced.
+     *
+     * Two properties follow from that and are what the smooth law rests on.
+     * Flooring this lands on exactly the row shade_row() returns -- each divisor
+     * is a power of two, so the float quotient floors to the shift it replaces,
+     * and every bias subtracted from it is a whole number, which commutes with
+     * the floor -- so the colour at a whole row is the authentic colour, bit for
+     * bit. And the 16-bit wrap the row law applies to its intermediate cannot
+     * reach: the depth word is 16 bits, the shift is at least five, and the
+     * biases are bytes, so the term it wraps never leaves +/-2200.
+     *
+     * The tinted paths already carry their shade as a fraction (the corner words
+     * hold the engine's own sub-row phase in their low byte), so for those this
+     * twin is the authentic expression with the floor lifted off it. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "float shade_amount(int selected_level, bool tinted) {\n"
+    "  int level=selected_level; int shr=5+level;\n"
+    "  int light=effective_light();\n"
+    "  if (light==0) return 0.0;\n"
+    "  int axv=light==0 ? 0 : light-128;\n"
+    "  int bias=8+axv;\n"
+    "  int scale=light==0 ? 32 : 32-(max(axv+4,0) >> 2);\n"
+    "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
+    "  int depth=(transformed >> 8) & 65535;\n"
+    "  bool flat_surface=(v_light_material.y & 8u)!=0u; float r;\n"
+    "  if (flat_surface) {\n"
+    "    if (tinted) {\n"
+    "      if (v_flat_taint==0u &&"
+    " (v_flat_span.w & 0x80000000u)==0u)"
+    " return clamp(v_wall_shade_endpoint/256.0,0.0,31.0);\n"
+    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
+    "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
+    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
+    "      r=float(edge_depth)/float(1 << shr)-float(bias)"
+    "-float(u_flat_edge_bias);\n"
+    /* The row law's low clamp is one, not zero, on both candle paths: a term at
+     * or below zero is drawn at row 1.  Clamping the float to 1.0 reproduces
+     * that for every fraction below it as well. */
+    "      return clamp(r,1.0,31.0);\n"
+    "    }\n"
+    "    r=float(depth)/float(1 << shr)-float(bias);\n"
+    "    return clamp(r,0.0,float(min(scale,31)));\n"
+    "  }\n"
+    "  if (tinted) {\n"
+    "    if (v_wall_span.w!=0u) {\n"
+    "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
+    "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
+    "      uint ba=v_wall_rows.y+v_wall_rows.w*uint(scol);\n"
+    "      float stop=float(signed16(ta>>16u));\n"
+    "      float sbot=float(signed16(ba>>16u));\n"
+    "      float cnt=sbot-stop+1.0;\n"
+    "      float t=cnt>0.5 ? clamp((floor(gl_FragCoord.y)-stop)/cnt,0.0,1.0) : 0.0;\n"
+    "      float V=mix(v_wall_shade_top,v_wall_shade_endpoint,t);\n"
+    "      return clamp(V/256.0,0.0,31.0);\n"
+    "    }\n"
+    "    {\n"
+    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
+    "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
+    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
+    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
+    "      int adj=int(v_wall_tint_adjust);\n"
+    "      r=float(edge_depth)/float(1 << shr)-float(bias-adj)"
+    "-float(u_wd_bias);\n"
+    "      return clamp(r,1.0,float(min(scale,31)));\n"
+    "    }\n"
+    "  }\n"
+    "  int dividend=2 << level;\n"
+    "  r=float(depth)/float(16*dividend)-float(bias);\n"
+    "  return clamp(r,0.0,float(min(scale,31)));\n"
+    "}\n"
+    "#endif\n"
     "uniform int u_debug_vis;\n"
     "uniform int u_depth_only;\n"
     /* Every index write in main() goes through emit(). The authentic build
@@ -1198,16 +1275,30 @@ static const char g_geometry_fragment_body[] =
     "uniform vec3 u_add;\n"
     "uniform float u_contrast;\n"
     "uniform int u_light_neutral;\n"
+    /* The shading law, and the bisect handle that resolves the smooth law at its
+     * lower row instead of between two -- which is the form the smooth picture's
+     * exactness is measured in. */
+    "uniform int u_shading_mode;\n"
+    "uniform int u_shade_ramp;\n"
     /* The unlit texel of the ordinary tail. Every other class is unlit in the
      * original and stays unlit here, and says so by leaving this unset. */
     "uint g_albedo_index=256u;\n"
+    /* The colour a law that resolves between two rows arrived at, which no
+     * single index can carry. The index beside it is still the row the fragment
+     * floors to, so every index-space mechanism -- the blend tables, the stale
+     * plane, the host's own composition -- keeps reading what it always read.
+     * Unset means the index is the whole answer, which is every class the
+     * original does not shade and every fragment in the authentic law. */
+    "vec3 g_shade_color=vec3(0.0);\n"
+    "bool g_shade_color_set=false;\n"
     "void emit(uint index) {\n"
     "  out_index=index;\n"
     "  vec4 lit=texelFetch(u_palette,ivec2(int(index),0),0);\n"
     "  if (u_light_neutral!=0) { out_color=lit; return; }\n"
     "  uint albedo_index=g_albedo_index<256u ? g_albedo_index : index;\n"
     "  vec3 albedo=texelFetch(u_palette,ivec2(int(albedo_index),0),0).rgb;\n"
-    "  vec3 shaded=lit.rgb*u_gain+albedo*u_add;\n"
+    "  vec3 shaded=(g_shade_color_set ? g_shade_color : lit.rgb)*u_gain"
+    "+albedo*u_add;\n"
     /* The picture's contrast: a pivot around mid grey, after everything that
      * decides how much light a surface got. The comparison is uniform across
      * the draw and it is what keeps one exactly one -- taking half away and
@@ -1324,8 +1415,17 @@ static const char g_geometry_fragment_body[] =
      * whole floor or ceiling polygon as readily as for a wall block.  Only in
      * normal rendering -- every debug_vis mode falls through so texel, offset,
      * material and shade-row attribution keep working on these surfaces. */
+    /* A law that resolves between rows has a real, smoothly varying shade for
+     * this block, so the fast path is the one thing it cannot keep: it would
+     * paint one flat index over a surface the law has an answer for everywhere.
+     * The decision is per fragment and nothing on the CPU changes -- the block
+     * is already submitted and its texel is already sampleable. */
     "  if (u_debug_vis==0 &&"
-    " (v_light_material.w & 8u)!=0u) {\n"
+    " (v_light_material.w & 8u)!=0u\n"
+    "#ifdef HWR_TRUECOLOR\n"
+    "      && u_shading_mode==0\n"
+    "#endif\n"
+    "     ) {\n"
     "    emit(uint(u_fill_index) & 255u);\n"
     "    return;\n"
     "  }\n"
@@ -1359,13 +1459,48 @@ static const char g_geometry_fragment_body[] =
     "  else if ((face_flags & 64u)!=0u && (u_glow_phase & 73)!=0)"
     " mapped=texelFetch(u_glow,ivec2(int(texel),1),0).r;\n"
     "  else { bool tinted=(face_flags & 2u)!=0u;"
-    " int row=shade_row(tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
-    "    row=dithered_row(row,tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
+    " int level=tinted ? u_tint_shade_level : u_shade_level;\n"
+    "#ifdef HWR_TRUECOLOR\n"
+    /* The smooth law. The shade quantity stays continuous, the index is still
+     * the row it floors to, and the colour is the ramp read between that row and
+     * the next -- two authored colours, mixed by the fraction the law landed
+     * between them. At a whole row the mix is the lower colour and the picture is
+     * the authentic picture exactly, which is what makes this arm auditable
+     * against that one surface by surface.
+     *
+     * The half-row dither is not carried over: it is a recovery trick for the
+     * quantization this law does not perform, and against a continuous shade it
+     * is only noise. */
+    "    if (u_shading_mode!=0) {\n"
+    "      float amount=shade_amount(level,tinted);\n"
+    "      int row=int(floor(amount)); int next=min(row+1,31);\n"
+    "      float between=u_shade_ramp!=0 ? amount-float(row) : 0.0;\n"
+    "      if (u_debug_vis==1) { emit(uint(row)|(tinted ? 64u : 0u)); return; }\n"
+    "      uint low=tinted ?"
+    " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
+    " texelFetch(u_colormap,ivec2(int(texel),row),0).r;\n"
+    "      uint high=tinted ?"
+    " texelFetch(u_tint,ivec2(int(texel),next),0).r :"
+    " texelFetch(u_colormap,ivec2(int(texel),next),0).r;\n"
+    "      g_shade_color=mix(texelFetch(u_palette,ivec2(int(low),0),0).rgb,\n"
+    "                        texelFetch(u_palette,ivec2(int(high),0),0).rgb,"
+    "between);\n"
+    "      g_shade_color_set=true;\n"
+    "      mapped=low;\n"
+    "    } else\n"
+    "#endif\n"
+    "    { int row=shade_row(level,tinted);\n"
+    "    row=dithered_row(row,level,tinted);\n"
     "    if (u_debug_vis==1) { emit(uint(row)|(tinted ? 64u : 0u)); return; }\n"
     "    mapped=tinted ?"
     " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
-    " texelFetch(u_colormap,ivec2(int(texel),row),0).r; }\n"
+    " texelFetch(u_colormap,ivec2(int(texel),row),0).r; } }\n"
     "  if (u_debug_vis==1) { emit(255u); return; }\n"  /* direct/glow marker */
+    /* Whether a blend table below decided this fragment's index. Where one did,
+     * the index is the whole answer and the colour is read from it, exactly as
+     * it is today: a blend is an index-space operation and the tables are
+     * authored in index space. */
+    "  bool blended=false;\n"
     /* A palette-colour surface on the solid-colour blend writer: EVERY pixel it
      * covers blends, with no high-bit gate and no index-0 skip, and the blend
      * table is indexed by the source colour first and the destination second --
@@ -1376,19 +1511,23 @@ static const char g_geometry_fragment_body[] =
     "  if (u_blend_pass!=0 && (v_light_material.w & 16u)!=0u) {\n"
     "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(dst),int(mapped)),0).r;\n"
+    "    blended=true;\n"
     "  } else if (u_blend_pass!=0 && (material & 16u)!=0u &&"
     " (texel & 128u)!=0u) {\n"
     "    uint dst=texelFetch(u_dst,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(dst)),0).r;\n"
+    "    blended=true;\n"
     "  }\n"
     /* The stale wall's high-bit texels blend against the same previous-frame
      * pixel its holes show, per the engine's masked writer. */
     "  if ((v_light_material.w & 4u)!=0u && (texel & 128u)!=0u) {\n"
     "    uint stale=texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(stale)),0).r;\n"
+    "    blended=true;\n"
     "  }\n"
     "#ifdef HWR_TRUECOLOR\n"
     "  g_albedo_index=texel;\n"
+    "  if (blended) g_shade_color_set=false;\n"
     "#endif\n"
     "  emit(mapped);\n"
     "}\n";
@@ -1900,6 +2039,20 @@ static int hwr_truecolor_env(void)
             setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
     }
     return g_truecolor_env;
+}
+
+/* HWR_SHADE_RAMP=0 resolves the smooth law at the row it floors to instead of
+ * between that row and the next. It is the bisect handle for the ramp
+ * interpolation alone -- the law, the clamps and every other difference the mode
+ * makes stay exactly where they are -- so what the smooth arm is at a whole row
+ * can be held against the authentic arm and measured. */
+static int hwr_shade_ramp_env(void)
+{
+    if (g_shade_ramp_env < 0) {
+        const char *setting = getenv("HWR_SHADE_RAMP");
+        g_shade_ramp_env = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return g_shade_ramp_env;
 }
 
 void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
@@ -2864,6 +3017,12 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         hwr_uniform_3f(program, "u_add", 0.0f, 0.0f, 0.0f);
         hwr_uniform_1f(program, "u_contrast", contrast);
         hwr_uniform_1i(program, "u_light_neutral", neutral);
+        /* The self-test detunes the gain and nothing else, so the law it runs
+         * against is whatever the settings layer asked for. */
+        hwr_uniform_1i(program, "u_shading_mode",
+                       g_truecolor_want.shading_mode !=
+                               HWR_GL_SHADING_AUTHENTIC);
+        hwr_uniform_1i(program, "u_shade_ramp", hwr_shade_ramp_env());
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */

@@ -18,6 +18,10 @@
 #define HWR_GAIN_ROW "world_gain"
 #define HWR_BRIGHTNESS_ROW "world_brightness"
 #define HWR_CONTRAST_ROW "world_contrast"
+/* The shading law. It is a dependent like any other -- the walk below is what
+ * brings the foundation up for it -- and the renderer is told which law to
+ * resolve with separately, because that is not a picture dial. */
+#define HWR_SHADING_ROW "shading_mode"
 
 /* The settings panel's draft while it is open, and whether there is one. Only
  * the picture dials are read out of it: everything else takes effect when it is
@@ -53,6 +57,29 @@ static float hwr_truecolor_row_float(const char *key,
     if (desc == NULL)
         return fallback;
     return hwr_truecolor_effective(desc, settings).f;
+}
+
+static int32_t hwr_truecolor_row_enum(const char *key,
+                                      const struct hwr_settings *settings,
+                                      int32_t fallback)
+{
+    const struct hwr_setting_desc *desc = hwr_schema_find(key);
+
+    if (desc == NULL)
+        return fallback;
+    return hwr_truecolor_effective(desc, settings).e;
+}
+
+static enum hwr_gl_shading_mode hwr_truecolor_gl_shading(
+    enum hwr_shading_mode mode)
+{
+    switch (mode) {
+    case HWR_SHADING_SMOOTH:
+        return HWR_GL_SHADING_SMOOTH;
+    case HWR_SHADING_AUTHENTIC:
+        break;
+    }
+    return HWR_GL_SHADING_AUTHENTIC;
 }
 
 static enum hwr_gl_color_format hwr_truecolor_gl_format(
@@ -118,6 +145,15 @@ static void hwr_truecolor_apply(uint32_t mask,
     state.gain = hwr_truecolor_row_float(HWR_GAIN_ROW, settings, 1.0f) *
                  hwr_truecolor_row_float(HWR_BRIGHTNESS_ROW, settings, 1.0f);
     state.contrast = hwr_truecolor_row_float(HWR_CONTRAST_ROW, settings, 1.0f);
+    /* The law the world image is resolved with, through the same road as the
+     * dials so a map's own choice reaches it. Its effect on whether the
+     * foundation exists at all is the walk above, which needs no help: an
+     * enumeration off its Original both requires the foundation and clears the
+     * neutral early-out, which is what a law that resolves colour between two
+     * rows has to have. */
+    state.shading_mode = hwr_truecolor_gl_shading(
+        (enum hwr_shading_mode)hwr_truecolor_row_enum(
+            HWR_SHADING_ROW, settings, HWR_SHADING_AUTHENTIC));
     hwr_gl_set_truecolor(&state);
 }
 

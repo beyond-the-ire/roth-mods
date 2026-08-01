@@ -22,6 +22,8 @@ _Static_assert(sizeof(enum hwr_pitch_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_truecolor_format) == sizeof(int32_t),
                "enum fields must be four bytes wide");
+_Static_assert(sizeof(enum hwr_shading_mode) == sizeof(int32_t),
+               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -46,6 +48,11 @@ static const struct hwr_enum_value HWR_TRUECOLOR_FORMAT_VALUES[] = {
     { "auto",    HWR_TRUECOLOR_FORMAT_AUTO,    "Automatic" },
     { "rgba8",   HWR_TRUECOLOR_FORMAT_RGBA8,   "Eight bits per channel" },
     { "rgba16f", HWR_TRUECOLOR_FORMAT_RGBA16F, "Sixteen-bit floating point" }
+};
+
+static const struct hwr_enum_value HWR_SHADING_MODE_VALUES[] = {
+    { "authentic", HWR_SHADING_AUTHENTIC, "Original" },
+    { "smooth",    HWR_SHADING_SMOOTH,    "Smooth" }
 };
 
 /* Retired, and kept only so that a configuration file written for an earlier
@@ -425,6 +432,35 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "True-colour storage",
         .help = "How the colour world image is stored. Automatic uses eight "
                 "bits per channel, which is exact for the authentic picture."
+    },
+    {
+        /* The shading law. Original is the picture the game has always drawn,
+         * to the byte; anything else asks for the colour world image and, being
+         * an enumeration rather than a switch, clears the neutral early-out --
+         * which is exactly what a law that resolves colour between two rows
+         * needs. Every later row of this family hangs off this one, so a dial
+         * moved while the law is Original changes nothing and asks for
+         * nothing. */
+        .key = "shading_mode",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, shading_mode),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .e = HWR_SHADING_AUTHENTIC },
+        .original = { .e = HWR_SHADING_AUTHENTIC },
+        .values = HWR_SHADING_MODE_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_SHADING_MODE_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "truecolor_force",
+        .label = "Shading",
+        .help = "How the world's light and distance are shaded. Original steps "
+                "through the thirty-two shades the map was authored with, "
+                "exactly as the game always has. Smooth follows the same "
+                "shades continuously, so a wall or a floor darkens evenly "
+                "instead of in bands."
     },
     {
         /* The foundation's first dependent, and the smallest one: at one it is

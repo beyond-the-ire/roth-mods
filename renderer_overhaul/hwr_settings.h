@@ -30,6 +30,16 @@ enum hwr_truecolor_format {
     HWR_TRUECOLOR_FORMAT_RGBA16F
 };
 
+/* Which law the world's shading is resolved with. Authentic is the original
+ * picture, byte for byte: the shade quantity is floored to one of the thirty-two
+ * colormap rows the map authored, exactly as it always has been. Smooth keeps
+ * the same quantity continuous and resolves the colour between the two rows it
+ * falls between, so the authored ramp is followed without the steps. */
+enum hwr_shading_mode {
+    HWR_SHADING_AUTHENTIC = 0,
+    HWR_SHADING_SMOOTH
+};
+
 struct hwr_settings {
     int enabled;
     int debug;
@@ -56,6 +66,11 @@ struct hwr_settings {
      * authentic one. */
     int truecolor_force;
     enum hwr_truecolor_format truecolor_format;
+    /* The shading law, and the first enhancement that changes what the world
+     * image is rather than how bright it is. Authentic asks for nothing and is
+     * the original picture; every other value is a dependent of the foundation
+     * and clears its neutral early-out. */
+    enum hwr_shading_mode shading_mode;
     /* Uniform gain on the world image, and the foundation's first dependent.
      * One means authentic and takes the neutral early-out. */
     float world_gain;

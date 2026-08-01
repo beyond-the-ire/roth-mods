@@ -66,6 +66,8 @@ line. Applying the settings rewrites the file with its own comments and ordering
 - `fov_deg`: horizontal FOV at the original 4:3 aspect, from 30 through 170 degrees. Zero preserves
   the original projection. Wider output aspects automatically gain horizontal view area.
 - `overlay_key`: which key opens the settings screen, by name, such as `f12` or `f9`.
+- `shading_mode`: `authentic` or `smooth`. `authentic` is the original picture; `smooth` follows the
+  same shading continuously instead of in thirty-two steps.
 - `world_brightness`, `world_contrast`: the picture settings, from 0.5 through 1.5 each. One is the
   original picture for both.
 
@@ -92,6 +94,14 @@ rendering mode to select.
 The Enhancements section of the settings screen holds the settings that change how the world looks
 rather than how much of it is drawn. Each one is off by its own value, and everything at that value
 is the original picture exactly, to the byte.
+
+**Shading** chooses how the world's light and distance are resolved. **Original** is the picture the
+game has always drawn: every surface takes one of the thirty-two shades its map was authored with,
+and the step from one to the next is what makes a corridor darken in bands. **Smooth** follows the
+same authored shades continuously, reading the colour between two of them rather than snapping to
+one, so a wall or a floor darkens evenly. It is the same art and the same palette either way —
+nothing is tinted, filtered or recoloured — and at any point where the shading lands on a whole
+shade the two are the same picture exactly.
 
 **Brightness** and **Contrast** are the picture settings. Brightness scales the world image and
 contrast opens or closes it around mid grey, both in full colour rather than through the original

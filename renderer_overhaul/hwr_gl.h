@@ -233,6 +233,16 @@ enum hwr_gl_color_format {
     HWR_GL_COLOR_RGBA16F
 };
 
+/* Which law the enhanced program resolves a shaded fragment with. Authentic
+ * floors the shade quantity to one colormap row, which is the picture the game
+ * has always drawn; smooth keeps that quantity continuous and mixes the two rows
+ * it falls between. The authentic program carries neither branch: the law is
+ * selected by a uniform inside the enhanced program alone. */
+enum hwr_gl_shading_mode {
+    HWR_GL_SHADING_AUTHENTIC = 0,
+    HWR_GL_SHADING_SMOOTH
+};
+
 /* What the settings layer has worked out about the true-colour foundation. */
 struct hwr_gl_truecolor {
     /* The foundation has to exist: a dependent enhancement is asking for it. */
@@ -250,6 +260,9 @@ struct hwr_gl_truecolor {
      * One leaves the colour where the gain put it. */
     float contrast;
     enum hwr_gl_color_format format;
+    /* The shading law in force. Authentic is the original picture and is what
+     * every neutral state resolves to. */
+    enum hwr_gl_shading_mode shading_mode;
 };
 
 /* The palette a frame is presented through, and the palette-level effects the
