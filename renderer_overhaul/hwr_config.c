@@ -9,8 +9,10 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef _WIN32
@@ -23,6 +25,16 @@
 #define HWR_CONFIG_POLL_FRAMES 30u
 /* Column the generated comment blocks wrap at, matching the shipped file. */
 #define HWR_CONFIG_COMMENT_WIDTH 78u
+/* Longest configuration file the kept copy is willing to hold. The generated
+ * file is well under a kilobyte, and a file this size is not one of ours. */
+#define HWR_CONFIG_MAX_BYTES (1u << 20)
+
+/* The two files that stand beside the configuration while a change waits to be
+ * confirmed: the configuration as it was, and the marker that says the change
+ * over it was never answered. */
+#define HWR_CONFIG_KEPT_SUFFIX   ".prev"
+#define HWR_CONFIG_MARKER_SUFFIX ".confirm"
+#define HWR_CONFIG_TEMP_SUFFIX   ".tmp"
 
 struct hwr_config_state {
     char path[2600];
@@ -30,6 +42,12 @@ struct hwr_config_state {
     uint64_t candidate_hash;
     uint32_t candidate_polls;
     uint32_t frames_until_poll;
+    /* A kept copy of the configuration is standing beside it. */
+    int holding;
+    /* The last thing that happened to the file, in words. */
+    uint32_t outcome_serial;
+    int outcome_error;
+    char outcome_text[160];
     /* One reload slot: a second request before the first is carried out
      * replaces it instead of queueing behind it. */
     int reload_pending;
@@ -43,6 +61,46 @@ struct hwr_config_state {
 };
 
 static struct hwr_config_state g_config;
+
+/* Defined below, with the rest of the file handling; called from the load. */
+static void hwr_config_recover(void);
+
+/* The one place the outcome of a load, a reload, or a save is written down, so
+ * the settings overlay reads the same sentence the log carries. */
+static void hwr_config_note(int error, const char *format, ...)
+{
+    va_list args;
+
+    va_start(args, format);
+    vsnprintf(g_config.outcome_text, sizeof g_config.outcome_text, format,
+              args);
+    va_end(args);
+    g_config.outcome_error = error;
+    g_config.outcome_serial++;
+}
+
+void hwr_config_last_outcome(struct hwr_config_outcome *out)
+{
+    if (out == NULL)
+        return;
+    out->serial = g_config.outcome_serial;
+    out->error = g_config.outcome_error;
+    snprintf(out->text, sizeof out->text, "%s", g_config.outcome_text);
+}
+
+/* The temporary, the kept copy, and the marker all live beside the file they
+ * belong to, so the replace that ends every write stays on one filesystem. */
+static int hwr_config_side_path(char *out, size_t out_size, const char *suffix)
+{
+    int written;
+
+    if (g_config.path[0] == 0)
+        return -1;
+    written = snprintf(out, out_size, "%s%s", g_config.path, suffix);
+    if (written < 0 || (size_t)written >= out_size)
+        return -1;
+    return 0;
+}
 
 static char *hwr_trim(char *text)
 {
@@ -229,6 +287,10 @@ void hwr_config_load(const char *plugin_dir)
         plugin_dir = "";
     snprintf(g_config.path, sizeof g_config.path,
              "%s/renderer_overhaul.cfg", plugin_dir);
+    /* Before the file is read for the first time: a change nobody was left to
+     * confirm is put back, so an unusable display setting cannot survive the
+     * session that made it. */
+    hwr_config_recover();
     result = hwr_config_read(&settings, &hash, 1);
     if (result == 0) {
         /* Not a failure: the built-in defaults are a complete configuration,
@@ -236,15 +298,34 @@ void hwr_config_load(const char *plugin_dir)
         fprintf(stderr,
                 "[renderer_overhaul] no configuration file at %s; using defaults\n",
                 g_config.path);
+        hwr_config_note(0, "No settings file yet; the built-in settings are in "
+                           "force.");
         return;
     }
     g_config.active_hash = hash;
     if (result < 0) {
         fprintf(stderr,
                 "[renderer_overhaul] configuration contains errors; keeping defaults\n");
+        hwr_config_note(1, "The settings file has errors; the built-in "
+                           "settings are in force.");
         return;
     }
     hwr_settings_replace(&settings);
+    hwr_config_note(0, "Settings loaded.");
+}
+
+/* The file is read once at startup and whenever it is asked for. Watching it
+ * for direct edits is a development convenience the settings overlay's Reload
+ * From File replaces, so it stays off unless it is asked for. */
+static int hwr_config_watch_enabled(void)
+{
+    static int state = -1;
+
+    if (state < 0) {
+        const char *setting = getenv("HWR_CFG_WATCH");
+        state = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    return state;
 }
 
 void hwr_config_poll(void)
@@ -253,7 +334,7 @@ void hwr_config_poll(void)
     uint64_t hash = 0;
     int result;
 
-    if (g_config.path[0] == 0)
+    if (!hwr_config_watch_enabled() || g_config.path[0] == 0)
         return;
     if (g_config.frames_until_poll != 0) {
         g_config.frames_until_poll--;
@@ -311,10 +392,13 @@ void hwr_config_drain_request(void)
     /* Read the file once more, this time reporting what is wrong with it. */
     result = hwr_config_read(&settings, &hash, 1);
     if (result == 0) {
-        if (!expects_hash)
+        if (!expects_hash) {
             fprintf(stderr,
                     "[renderer_overhaul] configuration file is unavailable: %s\n",
                     g_config.path);
+            hwr_config_note(1, "The settings file cannot be read; the settings "
+                               "in force are unchanged.");
+        }
         return;
     }
     if (expects_hash && hash != expected) {
@@ -329,10 +413,13 @@ void hwr_config_drain_request(void)
     if (result < 0) {
         fprintf(stderr,
                 "[renderer_overhaul] configuration reload rejected; keeping current settings\n");
+        hwr_config_note(1, "The settings file has errors; the settings in "
+                           "force are unchanged.");
         return;
     }
     hwr_settings_replace(&settings);
     fprintf(stderr, "[renderer_overhaul] configuration reloaded\n");
+    hwr_config_note(0, "Settings applied.");
 }
 
 static int hwr_config_sync(FILE *file)
@@ -358,6 +445,254 @@ static int hwr_config_replace_file(const char *temp_path, const char *path)
         return -1;
     return 0;
 #endif
+}
+
+static void hwr_config_fail(char *err, size_t err_size, const char *format, ...)
+{
+    va_list args;
+
+    if (err == NULL || err_size == 0)
+        return;
+    va_start(args, format);
+    vsnprintf(err, err_size, format, args);
+    va_end(args);
+}
+
+/* A whole file as bytes. A file that is not there reads as nothing at all,
+ * which loads as exactly the configuration an empty file does: the built-in
+ * settings. That is what lets a kept copy stand for "there was no file". */
+static char *hwr_config_take_bytes(const char *path, size_t *size, char *err,
+                                   size_t err_size)
+{
+    FILE *file;
+    char *bytes;
+    size_t used = 0;
+    size_t capacity = 4096;
+
+    *size = 0;
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        if (errno == ENOENT)
+            return calloc(1, 1);
+        hwr_config_fail(err, err_size, "the settings file cannot be read: %s",
+                        strerror(errno));
+        return NULL;
+    }
+    bytes = (char *)malloc(capacity);
+    if (bytes == NULL) {
+        fclose(file);
+        hwr_config_fail(err, err_size, "there is no room to keep the settings "
+                                       "file");
+        return NULL;
+    }
+    for (;;) {
+        size_t got = fread(bytes + used, 1, capacity - used, file);
+
+        used += got;
+        if (got == 0)
+            break;
+        if (used == capacity) {
+            char *grown;
+
+            if (capacity >= HWR_CONFIG_MAX_BYTES) {
+                free(bytes);
+                fclose(file);
+                hwr_config_fail(err, err_size, "the settings file is too large "
+                                               "to keep");
+                return NULL;
+            }
+            capacity *= 2u;
+            grown = (char *)realloc(bytes, capacity);
+            if (grown == NULL) {
+                free(bytes);
+                fclose(file);
+                hwr_config_fail(err, err_size, "there is no room to keep the "
+                                               "settings file");
+                return NULL;
+            }
+            bytes = grown;
+        }
+    }
+    if (ferror(file)) {
+        free(bytes);
+        fclose(file);
+        hwr_config_fail(err, err_size, "the settings file cannot be read");
+        return NULL;
+    }
+    fclose(file);
+    *size = used;
+    return bytes;
+}
+
+/* Bytes onto a path the same way the settings are written: a temporary beside
+ * it, flushed to the disk, then an atomic replace. Until the replace the
+ * destination is still whatever it was, and if the replace fails it stays that
+ * way. */
+static int hwr_config_put_bytes(const char *path, const char *bytes,
+                                size_t size, char *err, size_t err_size)
+{
+    char temp_path[2660];
+    FILE *file;
+    int written;
+
+    if (snprintf(temp_path, sizeof temp_path, "%s%s", path,
+                 HWR_CONFIG_TEMP_SUFFIX) < 0)
+        return -1;
+    file = fopen(temp_path, "wb");
+    if (file == NULL) {
+        hwr_config_fail(err, err_size, "%s cannot be written: %s", temp_path,
+                        strerror(errno));
+        return -1;
+    }
+    written = size == 0 || fwrite(bytes, 1, size, file) == size;
+    if (written && fflush(file) != 0)
+        written = 0;
+    if (written && hwr_config_sync(file) != 0)
+        written = 0;
+    if (fclose(file) != 0)
+        written = 0;
+    if (!written) {
+        remove(temp_path);
+        hwr_config_fail(err, err_size, "%s cannot be written", temp_path);
+        return -1;
+    }
+    if (hwr_config_replace_file(temp_path, path) != 0) {
+        remove(temp_path);
+        hwr_config_fail(err, err_size, "%s cannot be replaced", path);
+        return -1;
+    }
+    return 0;
+}
+
+int hwr_config_capture_bytes(char *err, size_t err_size)
+{
+    char kept_path[2660];
+    char marker_path[2660];
+    char *bytes;
+    size_t size = 0;
+    FILE *marker;
+
+    if (hwr_config_side_path(kept_path, sizeof kept_path,
+                             HWR_CONFIG_KEPT_SUFFIX) != 0 ||
+        hwr_config_side_path(marker_path, sizeof marker_path,
+                             HWR_CONFIG_MARKER_SUFFIX) != 0) {
+        hwr_config_fail(err, err_size, "there is nowhere to keep the settings "
+                                       "file");
+        return -1;
+    }
+    /* A capture that is already standing is the one to keep: it holds the last
+     * configuration somebody confirmed, and a second change made before the
+     * first is answered must not become the thing to go back to. */
+    if (g_config.holding)
+        return 0;
+    bytes = hwr_config_take_bytes(g_config.path, &size, err, err_size);
+    if (bytes == NULL)
+        return -1;
+    if (hwr_config_put_bytes(kept_path, bytes, size, err, err_size) != 0) {
+        free(bytes);
+        return -1;
+    }
+    free(bytes);
+    /* The marker goes down last, so a copy without one is a copy nothing is
+     * waiting on. */
+    marker = fopen(marker_path, "wb");
+    if (marker == NULL || fclose(marker) != 0) {
+        remove(kept_path);
+        hwr_config_fail(err, err_size, "%s cannot be written", marker_path);
+        return -1;
+    }
+    g_config.holding = 1;
+    return 0;
+}
+
+static void hwr_config_drop_kept(void)
+{
+    char kept_path[2660];
+    char marker_path[2660];
+
+    if (hwr_config_side_path(marker_path, sizeof marker_path,
+                             HWR_CONFIG_MARKER_SUFFIX) == 0)
+        remove(marker_path);
+    if (hwr_config_side_path(kept_path, sizeof kept_path,
+                             HWR_CONFIG_KEPT_SUFFIX) == 0)
+        remove(kept_path);
+    g_config.holding = 0;
+}
+
+void hwr_config_release_bytes(void)
+{
+    hwr_config_drop_kept();
+}
+
+int hwr_config_holding_bytes(void)
+{
+    return g_config.holding;
+}
+
+int hwr_config_restore_bytes(char *err, size_t err_size)
+{
+    char kept_path[2660];
+    char *bytes;
+    size_t size = 0;
+
+    if (!g_config.holding ||
+        hwr_config_side_path(kept_path, sizeof kept_path,
+                             HWR_CONFIG_KEPT_SUFFIX) != 0) {
+        hwr_config_fail(err, err_size, "there is no earlier settings file to "
+                                       "go back to");
+        return -1;
+    }
+    bytes = hwr_config_take_bytes(kept_path, &size, err, err_size);
+    if (bytes == NULL)
+        return -1;
+    if (hwr_config_put_bytes(g_config.path, bytes, size, err, err_size) != 0) {
+        free(bytes);
+        return -1;
+    }
+    free(bytes);
+    hwr_config_drop_kept();
+    /* No outcome of its own: putting the file back is half of one change, and
+     * the reload that finishes it is what there is to report. */
+    return 0;
+}
+
+/* A change that was never answered does not survive the session that made it.
+ * Both files go whatever happens: a copy that keeps failing to go back would
+ * otherwise stand over every later edit somebody makes by hand. */
+static void hwr_config_recover(void)
+{
+    char kept_path[2660];
+    char marker_path[2660];
+    char *bytes;
+    size_t size = 0;
+    FILE *marker;
+
+    if (hwr_config_side_path(kept_path, sizeof kept_path,
+                             HWR_CONFIG_KEPT_SUFFIX) != 0 ||
+        hwr_config_side_path(marker_path, sizeof marker_path,
+                             HWR_CONFIG_MARKER_SUFFIX) != 0)
+        return;
+    marker = fopen(marker_path, "rb");
+    if (marker == NULL) {
+        /* A copy with nothing waiting on it belongs to a change that was
+         * already answered. */
+        remove(kept_path);
+        return;
+    }
+    fclose(marker);
+    bytes = hwr_config_take_bytes(kept_path, &size, NULL, 0);
+    if (bytes != NULL) {
+        if (hwr_config_put_bytes(g_config.path, bytes, size, NULL, 0) == 0)
+            fprintf(stderr,
+                    "[renderer_overhaul] a display change from the previous session was never confirmed; the settings it replaced are back\n");
+        else
+            fprintf(stderr,
+                    "[renderer_overhaul] the settings kept for an unconfirmed display change could not be put back\n");
+        free(bytes);
+    }
+    remove(marker_path);
+    remove(kept_path);
+    g_config.holding = 0;
 }
 
 /* Which keys the file being replaced carries, by table index. An advanced key
@@ -486,21 +821,35 @@ static int hwr_config_write_stream(FILE *file,
     return 0;
 }
 
-int hwr_config_save(const struct hwr_settings *settings)
+int hwr_config_save(const struct hwr_settings *settings, char *err,
+                    size_t err_size)
 {
-    char temp_path[2620];
+    char temp_path[2660];
     uint64_t keep_advanced;
     FILE *file;
     int written;
 
-    if (settings == NULL || g_config.path[0] == 0)
+    if (settings == NULL || g_config.path[0] == 0) {
+        hwr_config_fail(err, err_size, "there is no settings file to write");
+        hwr_config_note(1, "There is no settings file to write.");
         return -1;
+    }
     keep_advanced = hwr_config_present_keys();
-    snprintf(temp_path, sizeof temp_path, "%s.tmp", g_config.path);
+    if (hwr_config_side_path(temp_path, sizeof temp_path,
+                             HWR_CONFIG_TEMP_SUFFIX) != 0) {
+        hwr_config_fail(err, err_size, "there is nowhere to write the settings "
+                                       "file");
+        hwr_config_note(1, "There is nowhere to write the settings file.");
+        return -1;
+    }
     file = fopen(temp_path, "wb");
     if (file == NULL) {
         fprintf(stderr, "[renderer_overhaul] cannot write %s: %s\n", temp_path,
                 strerror(errno));
+        hwr_config_fail(err, err_size, "%s cannot be written: %s", temp_path,
+                        strerror(errno));
+        hwr_config_note(1, "The settings could not be written; the file is "
+                           "unchanged.");
         return -1;
     }
     written = hwr_config_write_stream(file, settings, keep_advanced) == 0;
@@ -513,6 +862,9 @@ int hwr_config_save(const struct hwr_settings *settings)
     if (!written) {
         remove(temp_path);
         fprintf(stderr, "[renderer_overhaul] cannot write %s\n", temp_path);
+        hwr_config_fail(err, err_size, "%s cannot be written", temp_path);
+        hwr_config_note(1, "The settings could not be written; the file is "
+                           "unchanged.");
         return -1;
     }
     /* Until this succeeds the previous file is still the whole configuration,
@@ -521,6 +873,9 @@ int hwr_config_save(const struct hwr_settings *settings)
         remove(temp_path);
         fprintf(stderr, "[renderer_overhaul] cannot replace %s\n",
                 g_config.path);
+        hwr_config_fail(err, err_size, "%s cannot be replaced", g_config.path);
+        hwr_config_note(1, "The settings could not be written; the file is "
+                           "unchanged.");
         return -1;
     }
     return 0;

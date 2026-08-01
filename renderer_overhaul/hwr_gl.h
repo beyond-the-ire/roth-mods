@@ -285,6 +285,9 @@ int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t heigh
 void hwr_gl_invalidate_index_target(void);
 void hwr_gl_shutdown(void);
 const char *hwr_gl_last_error(void);
+/* The version and renderer the driver reports, in one line, once a context
+ * exists. Empty until then. */
+const char *hwr_gl_description(void);
 unsigned hwr_gl_drain_errors(void);
 /* Copies the palette-index attachment of the last scene render (row-major,
  * same orientation as the submitted frame). Returns 0 on failure. */

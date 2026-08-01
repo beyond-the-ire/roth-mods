@@ -14,33 +14,60 @@ Copy the `renderer_overhaul` folder into `<game>/mods/`. Keep `plugin.so` for Li
 The moddable ROTH.C executable loads the plugin automatically. Starting with `--no-mods`, or
 removing this folder, restores the original renderer exactly.
 
-## Configuration
+## Settings
 
-Edit `renderer_overhaul.cfg` using `key=value` lines. Keys are case-insensitive and `#` starts a
-comment. Saving the file while the game is running reloads it automatically. A changed file must
-remain stable across two checks before it is applied, so editors that truncate and rewrite files
-cannot expose a partial configuration. If any line has an invalid value, the whole reload is
-rejected and the current settings remain active; a key this build does not recognize is reported
-and ignored so the rest of the file still loads. The small file is checked once every 31 rendered
-world frames, so the watcher has no meaningful steady-state cost. A resolution change can cause a
-one-frame hitch while the render targets are resized.
+Press `F12` in the game to open the settings screen. It works everywhere the mod is loaded,
+including the main menu and with hardware rendering switched off, and it can be driven with the
+keyboard or the mouse:
+
+- arrow keys change the highlighted setting, `Tab` moves between the sections, the settings, and
+  the buttons, and `Enter` opens a value for typing or presses a button;
+- `Esc` closes an editor, and closes the screen when nothing is open. Leaving with changes that
+  were never applied asks first;
+- clicking works throughout, including the `<` and `>` on each row.
+
+Changes are collected as a draft and nothing takes effect until **Apply**, which writes the
+settings file and puts the whole file into force in one step. **Cancel** returns the draft to the
+settings in force, **Defaults** loads the built-in settings, **Original** restores the original
+look (640x480, original field of view, every enhancement off), and **Reload From File** reads the
+file again after it has been edited by hand.
+
+A change to the render size or the window mode is asked about after it is applied: keep it within
+fifteen seconds, or the settings it replaced come back on their own. That is what makes a display
+setting the screen cannot show safe to try, and it survives the game being closed or lost in that
+window: the next start returns to the settings that were in force before the change.
+
+The **System Information** section reports what the renderer and the host are actually doing,
+which is the place to look when a setting and the picture disagree. A row whose setting could not
+be honoured shows both, as `(in use: ...)`.
+
+The settings file is written whole, through a temporary file and an atomic replace, so a write
+that fails leaves the previous file exactly as it was and reports why on the settings screen.
+
+## Configuration file
+
+The settings screen owns `renderer_overhaul.cfg`, but the file is plain text and can be edited
+directly; use **Reload From File** afterwards, or restart the game. Lines are `key=value`, keys
+are case-insensitive, and `#` starts a comment. A line with an invalid value rejects that reload
+and leaves the settings in force alone; a key this build does not recognize costs only its own
+line. Applying the settings rewrites the file with its own comments and ordering.
 
 - `enabled`: `1` or `0`. When disabled, every rendering call passes through unchanged.
-- `debug`: `1` prints map geometry and texture archive statistics; `0` keeps them quiet.
 - `internal_w`, `internal_h`: world render resolution. Zero follows the engine viewport for that
-  dimension. Set both to the desired output resolution, such as `2560` and `1440`.
+  dimension. Set both to the desired output resolution, such as `2560` and `1440`. The rendered
+  view is never narrower than 4:3.
 - `window_mode`: `default`, `windowed`, or `borderless`. `default` leaves the host's selected
   window mode alone; use `windowed` to leave borderless fullscreen at runtime.
 - `present_mode`: `fifo` enables vertical synchronization, `immediate` disables it, and `adaptive`
   requests adaptive synchronization when the host supports it.
-- `fps_cap`: maximum host presents per second. Zero is uncapped. Internally this is converted to
-  a minimum present interval of `1000000 / fps_cap` microseconds.
-- `min_present_interval_us`: a direct interval alternative to `fps_cap`. If both are present,
-  the later line wins.
+- `fps_cap`: maximum host presents per second. Zero is uncapped. Internally this is a minimum
+  present interval of `1000000 / fps_cap` microseconds, and applying the settings writes it back
+  as `fps_cap`.
 - `fov_deg`: horizontal FOV at the original 4:3 aspect, from 30 through 170 degrees. Zero preserves
   the original projection. Wider output aspects automatically gain horizontal view area.
-- `pitch_mode`: reserved for a later camera mode. Accepted values are `horizon_shift` and
-  `true_rotation`; the current build uses the authentic horizon shift.
+- `overlay_key`: which key opens the settings screen, by name, such as `f12` or `f9`.
+
+A resolution change can cause a one-frame hitch while the render targets are resized.
 
 ## Requirements
 
@@ -55,6 +82,6 @@ classification, text, menus, the HUD, and the cursor. At wide aspects the authen
 is centered without stretching while the world fills the configured canvas; gameplay picking uses
 the matching wide projection, and engine-only menus retain their original coordinate system.
 
-The in-game settings overlay and the individually configurable visual enhancements are still
-planned. Configuration is file-based for now. Authentic rendering is what the mod produces with
+The individually configurable visual enhancements are still planned, so the Enhancements section
+of the settings screen is empty in this build. Authentic rendering is what the mod produces with
 every enhancement off, so there is no separate rendering mode to select.

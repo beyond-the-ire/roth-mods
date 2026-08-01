@@ -1,5 +1,6 @@
 #include "hwr_schema.h"
 
+#include "hwr_sysinfo.h"
 #include "hwr_util.h"
 
 #include <ctype.h>
@@ -373,6 +374,162 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .label = "Solid color",
         .help = "the world frame it coloured is drawn from the map itself now"
+    },
+    /* Reported state. These rows hold no value of their own and no key: each
+     * one asks the renderer or the host what is actually happening and answers
+     * in words, which is what makes the System section a table walk like every
+     * other section rather than a hand-written screen. */
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Plugin version",
+        .help = "Which build of the renderer is running.",
+        .read_info = hwr_sysinfo_read_version
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Hardware rendering",
+        .help = "Whether the hardware renderer is drawing the world, and what "
+                "is drawing it if not.",
+        .read_info = hwr_sysinfo_read_renderer
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Render size",
+        .help = "The size the world is actually being rendered at, which can "
+                "differ from the requested size the display section holds.",
+        .read_info = hwr_sysinfo_read_canvas
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Engine view",
+        .help = "The size of the engine's own world view, which the interface "
+                "is drawn around.",
+        .read_info = hwr_sysinfo_read_viewport
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Composition",
+        .help = "How the world image and the engine's own screen are put "
+                "together.",
+        .read_info = hwr_sysinfo_read_composition
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Window mode in use",
+        .help = "The window mode the host is in, which is what the requested "
+                "mode became.",
+        .read_info = hwr_sysinfo_read_window_mode
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Synchronization in use",
+        .help = "The synchronization the host is presenting with. Adaptive is "
+                "only used where the system provides it.",
+        .read_info = hwr_sysinfo_read_present_mode
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Present interval in use",
+        .help = "The shortest time the host leaves between two presents.",
+        .read_info = hwr_sysinfo_read_present_interval
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Last display request",
+        .help = "What the host did with the most recent window or "
+                "synchronization request.",
+        .read_info = hwr_sysinfo_read_request_result
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Display modes",
+        .help = "How many modes this display reports, and the largest of "
+                "them.",
+        .read_info = hwr_sysinfo_read_display_modes
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Largest render size",
+        .help = "The largest world image this host will accept.",
+        .read_info = hwr_sysinfo_read_present_limit
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Graphics driver",
+        .help = "The OpenGL version and driver the renderer is using.",
+        .read_info = hwr_sysinfo_read_graphics
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
+        .label = "Last message",
+        .help = "The last thing the settings screen reported, kept here once "
+                "it has left the line below the settings.",
+        .read_info = hwr_sysinfo_read_message
     }
 };
 

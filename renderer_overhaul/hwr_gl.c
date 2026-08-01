@@ -236,6 +236,8 @@ static uint32_t *g_pixels;
 static size_t g_pixels_bytes;
 static int g_initialized;
 static char g_error[192] = "OpenGL is not initialized";
+/* What the driver calls itself, for the settings overlay to report. */
+static char g_description[192];
 
 #ifdef _WIN32
 
@@ -1640,9 +1642,16 @@ int hwr_gl_init(void)
         return 0;
     }
     g_initialized = 1;
+    snprintf(g_description, sizeof g_description, "%s / %s",
+             (const char *)version, (const char *)renderer);
     fprintf(stderr, "[renderer_overhaul] GL %s / %s\n",
             (const char *)version, (const char *)renderer);
     return 1;
+}
+
+const char *hwr_gl_description(void)
+{
+    return g_description;
 }
 
 static void hwr_texture_2d_u8(GLuint *texture, GLsizei width, GLsizei height,

@@ -21,6 +21,7 @@
 #include "hwr_chrome.h"
 #include "hwr_ownership.h"
 #include "hwr_overlay.h"
+#include "hwr_sysinfo.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -1566,6 +1567,37 @@ static void hwr_fill_overlay_runtime(const struct roth_api_v1 *api,
     runtime->cursor_valid = 1;
 }
 
+/* And what it is told about the renderer's own state, which the reported-state
+ * rows read. Published from here so those rows need none of this file's
+ * statics and this file exports none of them. */
+static void hwr_publish_sysinfo(void)
+{
+    struct hwr_sysinfo_state state;
+
+    memset(&state, 0, sizeof state);
+    state.version = HWR_PLUGIN_VERSION;
+    state.hardware_active = g_render_settings.enabled &&
+                            !g_gl_permanently_failed &&
+                            (g_ownership.state == HWR_OWNER_HARDWARE ||
+                             g_ownership.state == HWR_OWNER_FROZEN);
+    state.canvas_published = hwr_canvas_published() &&
+                             g_last_frame_geometry_valid;
+    if (state.canvas_published) {
+        state.canvas_w = g_last_frame.w;
+        state.canvas_h = g_last_frame.h;
+        state.viewport_w = g_last_frame.vw;
+        state.viewport_h = g_last_frame.vh;
+        state.composite_mode = g_last_frame.composite_mode;
+    }
+    state.owner_name = hwr_ownership_name(g_ownership.state);
+    state.gl_error = g_gl_permanently_failed ? hwr_gl_last_error() : NULL;
+    state.present_max_w = g_present_max_w;
+    state.present_max_h = g_present_max_h;
+    state.present_caps_valid = g_present_caps_valid;
+    state.map_loaded = g_map_epoch_loaded != 0;
+    hwr_sysinfo_publish(&state);
+}
+
 static void ROTH_CDECL hwr_run_gameplay_frame(
     struct roth_chain *chain, const struct roth_api_v1 *api)
 {
@@ -1874,6 +1906,8 @@ static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
     /* The world pass is not dispatched while a menu owns the screen, so this
      * is the safe point that answers a settings request made there. */
     hwr_settings_pump(api);
+    if (hwr_overlay_is_open())
+        hwr_publish_sysinfo();
     hwr_fill_overlay_runtime(api, &runtime, hwr_overlay_is_open());
     hwr_overlay_pump(api, &runtime);
     hwr_announce_overlay_rect();
@@ -1950,6 +1984,7 @@ static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
         /* The panel takes the pointer here and hides it from the game, and
          * pumps from here as well: the screens it is most likely to be open
          * over drive this seam far more reliably than a per-frame callback. */
+        hwr_publish_sysinfo();
         hwr_fill_overlay_runtime(api, &runtime, 1);
         hwr_overlay_mouse(api, poll, &runtime);
         hwr_announce_overlay_rect();

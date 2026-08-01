@@ -1,8 +1,11 @@
 #include "hwr_overlay.h"
 
+#include "hwr_config.h"
 #include "hwr_overlay_draw.h"
+#include "hwr_perf.h"
 #include "hwr_schema.h"
 #include "hwr_settings.h"
+#include "hwr_sysinfo.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -80,21 +83,30 @@ enum {
     HWR_HIT_INCREASE,
     HWR_HIT_ACTION,
     HWR_HIT_SCROLL_UP,
-    HWR_HIT_SCROLL_DOWN
+    HWR_HIT_SCROLL_DOWN,
+    /* The line that asks about a display change is the thing to click to keep
+     * it, so the answer is reachable without the keyboard the change may have
+     * just made hard to see. */
+    HWR_HIT_CONFIRM
 };
 
-/* The actions that only ever touch the draft. Writing the file and reloading it
- * arrive with the persistence wiring. */
 enum {
-    HWR_ACTION_CANCEL = 0,
+    HWR_ACTION_APPLY = 0,
+    HWR_ACTION_CANCEL,
     HWR_ACTION_DEFAULTS,
     HWR_ACTION_ORIGINAL,
+    HWR_ACTION_RELOAD,
     HWR_ACTION_COUNT
 };
 
 static const char *const HWR_ACTION_LABELS[HWR_ACTION_COUNT] = {
-    "Cancel", "Defaults", "Original"
+    "Apply", "Cancel", "Defaults", "Original", "Reload From File"
 };
+
+/* How long a display change stands unanswered before the settings it replaced
+ * are put back. Long enough to find the keyboard, short enough that a screen
+ * nobody can see does not stay. */
+#define HWR_CONFIRM_SECONDS 15u
 
 static const char *const HWR_SECTION_LABELS[] = {
     "Display", "View", "Rendering", "Enhancements", "System"
@@ -162,6 +174,8 @@ struct hwr_overlay_layout {
     uint32_t tab_w;
     uint32_t action_x;
     uint32_t action_w;
+    int action_columns;
+    int action_lines;
     int frame;
     int arrows;
     int compact;
@@ -180,6 +194,15 @@ static volatile int g_can_open;
 static int g_available;
 static volatile uint32_t g_toggle_key = HWR_SC_F12;
 static volatile int g_shift_held;
+/* Esc belongs to the panel rather than to closing it: an editor, a question the
+ * panel has asked, or a display change waiting for an answer. */
+static volatile int g_modal;
+/* A display change is waiting to be answered, and when it stops waiting. The
+ * deadline is milliseconds from the same clock the tick reads, kept in one
+ * 32-bit word so the tick can never see half of it. */
+static volatile int g_confirm_pending;
+static volatile int g_confirm_expired;
+static volatile uint32_t g_confirm_deadline_ms;
 
 /* ---- state the game thread owns ---- */
 static int g_active;
@@ -218,6 +241,21 @@ static uint32_t g_panel_x;
 static uint32_t g_panel_y;
 static uint32_t g_panel_w;
 static uint32_t g_panel_h;
+/* The panel has asked whether to throw the draft away. */
+static int g_guard;
+/* The panel is to come down as soon as the keys in hand are dealt with. */
+static int g_close_now;
+/* The outcome of the last thing that happened to the settings file, so a new
+ * one can be told from the one already on the status line. */
+static uint32_t g_outcome_serial;
+/* A reload was asked for, so the draft follows the file when it lands. */
+static int g_await_reload;
+/* What to say when it lands, for a reload that is the second half of something
+ * the panel did rather than a reading of the file for its own sake. */
+static char g_await_status[160];
+/* The countdown as it was last drawn, so the panel is redrawn once a second
+ * rather than every tick. */
+static int g_confirm_drawn_seconds;
 
 /* ------------------------------- the ring -------------------------------- */
 
@@ -290,9 +328,11 @@ uint8_t hwr_overlay_scancode(uint8_t scancode)
         return 0;
     }
     /* While the panel waits for a key to bind, every key is that key -- which
-     * is why closing is left to the game thread for as long as it lasts. */
+     * is why closing is left to the game thread for as long as it lasts. Esc
+     * likewise belongs to the panel while something in it is waiting for an
+     * answer; the key that opens the panel always closes it. */
     if (!g_capture_armed &&
-        (make == (uint8_t)g_toggle_key || make == HWR_SC_ESC)) {
+        (make == (uint8_t)g_toggle_key || (make == HWR_SC_ESC && !g_modal))) {
         g_close_request = 1;
         g_open = 0;
         return 0;
@@ -302,9 +342,23 @@ uint8_t hwr_overlay_scancode(uint8_t scancode)
     return 0;
 }
 
+/* Milliseconds from a clock that only goes forward. Comparisons are made on the
+ * difference so that the wrap this word does every seven weeks costs nothing. */
+static uint32_t hwr_overlay_now_ms(void)
+{
+    return (uint32_t)(hwr_perf_now_ns() / 1000000u);
+}
+
 void hwr_overlay_compose(const struct roth_api_v1 *api, uint8_t *pixels,
                          uint32_t width, uint32_t height)
 {
+    /* The tick keeps running when the game thread is struggling with the very
+     * display change that is waiting to be answered, so noticing that its time
+     * is up belongs here. Putting the earlier settings back is file work, and
+     * file work belongs to the game thread. */
+    if (g_confirm_pending && !g_confirm_expired &&
+        (int32_t)(hwr_overlay_now_ms() - g_confirm_deadline_ms) >= 0)
+        g_confirm_expired = 1;
     if (!g_open)
         return;
     hwr_overlay_draw_compose(api, pixels, width, height);
@@ -337,7 +391,18 @@ static void hwr_overlay_status(const char *text, int error)
 {
     snprintf(g_status, sizeof g_status, "%s", text != NULL ? text : "");
     g_status_error = error;
+    /* The System section keeps the last message, so one that has been replaced
+     * on the status line is still somewhere to be read. */
+    if (g_status[0] != 0)
+        hwr_sysinfo_note_message(g_status);
     g_redraw = 1;
+}
+
+/* Esc is the panel's own while an editor is open, while the panel has asked a
+ * question, or while a display change is waiting to be answered. */
+static void hwr_overlay_update_modal(void)
+{
+    g_modal = g_guard || g_confirm_pending || g_edit != HWR_EDIT_NONE;
 }
 
 static int hwr_overlay_row_visible(const struct hwr_setting_desc *desc)
@@ -817,6 +882,7 @@ static void hwr_overlay_begin_edit(int row)
     g_edit_length = strlen(g_edit_text);
     g_edit = HWR_EDIT_TEXT;
     g_edit_row = row;
+    hwr_overlay_update_modal();
     g_redraw = 1;
 }
 
@@ -827,6 +893,7 @@ static void hwr_overlay_end_edit(void)
     g_edit_text[0] = 0;
     g_edit_length = 0;
     g_capture_armed = 0;
+    hwr_overlay_update_modal();
     g_redraw = 1;
 }
 
@@ -924,21 +991,204 @@ static void hwr_overlay_reset_draft(void)
     g_redraw = 1;
 }
 
+static int hwr_overlay_value_same(const struct hwr_setting_desc *desc,
+                                  union hwr_value a, union hwr_value b)
+{
+    switch (desc->type) {
+    case HWR_VT_BOOL:
+        return (a.b != 0) == (b.b != 0);
+    case HWR_VT_U32:
+    case HWR_VT_COLOR:
+        return a.u == b.u;
+    case HWR_VT_F32:
+        return a.f == b.f;
+    case HWR_VT_ENUM:
+        return a.e == b.e;
+    }
+    return 1;
+}
+
+/* Whether the draft says anything the settings in force do not. Rows the panel
+ * never shows count too: the draft carries the whole configuration, so a value
+ * only the file has is still something to be asked about before it is lost. */
+static int hwr_overlay_draft_dirty(void)
+{
+    const struct hwr_settings *saved = hwr_settings_get();
+    size_t count = hwr_schema_count();
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        const struct hwr_setting_desc *desc = hwr_schema_at(i);
+
+        if (desc->offset == HWR_SCHEMA_NO_FIELD)
+            continue;
+        if (!hwr_overlay_value_same(desc, hwr_schema_get(&g_draft, desc),
+                                    hwr_schema_get(saved, desc)))
+            return 1;
+    }
+    return 0;
+}
+
+/* Whether the draft moves one of the settings that can leave a screen nobody
+ * can see. Those are the changes that are asked about and put back if the
+ * question goes unanswered; the rest simply take effect. */
+static int hwr_overlay_confirm_needed(void)
+{
+    const struct hwr_settings *saved = hwr_settings_get();
+    size_t count = hwr_schema_count();
+    size_t i;
+
+    for (i = 0; i < count; i++) {
+        const struct hwr_setting_desc *desc = hwr_schema_at(i);
+
+        if ((desc->flags & HWR_SF_NEEDS_CONFIRM) == 0 ||
+            desc->offset == HWR_SCHEMA_NO_FIELD)
+            continue;
+        if (!hwr_overlay_value_same(desc, hwr_schema_get(&g_draft, desc),
+                                    hwr_schema_get(saved, desc)))
+            return 1;
+    }
+    return 0;
+}
+
+static void hwr_overlay_begin_confirm(void)
+{
+    g_confirm_deadline_ms = hwr_overlay_now_ms() + HWR_CONFIRM_SECONDS * 1000u;
+    g_confirm_expired = 0;
+    g_confirm_pending = 1;
+    g_confirm_drawn_seconds = -1;
+    hwr_overlay_update_modal();
+    /* The line itself is drawn from the countdown, so that it can count. */
+    hwr_overlay_status("", 0);
+    g_redraw = 1;
+}
+
+/* Seconds still on the clock, rounded up so the last one is shown. */
+static int hwr_overlay_confirm_seconds(void)
+{
+    int32_t left;
+
+    if (!g_confirm_pending)
+        return 0;
+    left = (int32_t)(g_confirm_deadline_ms - hwr_overlay_now_ms());
+    if (left < 0)
+        return 0;
+    return (int)((left + 999) / 1000);
+}
+
+static void hwr_overlay_confirm_keep(void)
+{
+    if (!g_confirm_pending)
+        return;
+    g_confirm_pending = 0;
+    g_confirm_expired = 0;
+    hwr_config_release_bytes();
+    hwr_overlay_update_modal();
+    hwr_overlay_status("Kept.", 0);
+}
+
+/* Putting a display change back is only writing a configuration, so it takes
+ * the same road every other change takes: the file, then one reload. */
+static void hwr_overlay_confirm_revert(const char *reason)
+{
+    char message[160];
+
+    if (!g_confirm_pending)
+        return;
+    message[0] = 0;
+    g_confirm_pending = 0;
+    g_confirm_expired = 0;
+    hwr_overlay_update_modal();
+    if (hwr_config_restore_bytes(message, sizeof message) != 0) {
+        /* The kept copy stays where it is: the next run of the game starts on
+         * it, which is the whole reason it is a file and not a buffer. */
+        hwr_overlay_status(message, 1);
+        return;
+    }
+    hwr_config_request_reload();
+    g_await_reload = 1;
+    snprintf(g_await_status, sizeof g_await_status, "%s", reason);
+    hwr_overlay_status(reason, 0);
+}
+
+static void hwr_overlay_apply(void)
+{
+    char message[160];
+    int confirm;
+
+    message[0] = 0;
+    if (!hwr_schema_validate_all(&g_draft, message, sizeof message)) {
+        hwr_overlay_status(message, 1);
+        return;
+    }
+    confirm = hwr_overlay_confirm_needed();
+    /* The file about to be replaced is kept first, so a display change nobody
+     * can see to answer can always be taken back -- by this run of the game or,
+     * if it never gets the chance, by the next one. */
+    if (confirm && hwr_config_capture_bytes(message, sizeof message) != 0) {
+        hwr_overlay_status(message, 1);
+        return;
+    }
+    if (hwr_config_save(&g_draft, message, sizeof message) != 0) {
+        /* Nothing was written, so nothing is waiting to be answered either --
+         * unless an earlier change already was, whose kept copy is not this
+         * one's to drop. */
+        if (confirm && !g_confirm_pending)
+            hwr_config_release_bytes();
+        hwr_overlay_status(message, 1);
+        return;
+    }
+    hwr_config_request_reload();
+    if (confirm)
+        hwr_overlay_begin_confirm();
+    else
+        hwr_overlay_status("Saved.", 0);
+}
+
+static void hwr_overlay_begin_guard(void)
+{
+    g_guard = 1;
+    g_close_request = 0;
+    /* The keystroke callback took the panel down the moment the key arrived;
+     * it stays up for as long as the question does. */
+    g_open = 1;
+    hwr_overlay_update_modal();
+    hwr_overlay_status("Leave without applying? Enter throws the changes away, "
+                       "Esc goes back to them.", 0);
+}
+
+static void hwr_overlay_end_guard(void)
+{
+    g_guard = 0;
+    hwr_overlay_update_modal();
+}
+
 static void hwr_overlay_run_action(int action)
 {
     switch (action) {
+    case HWR_ACTION_APPLY:
+        hwr_overlay_apply();
+        return;
     case HWR_ACTION_CANCEL:
         hwr_overlay_reset_draft();
         hwr_overlay_status("Back to the settings in force.", 0);
         return;
     case HWR_ACTION_DEFAULTS:
         hwr_schema_defaults(&g_draft);
-        hwr_overlay_status("Built-in defaults are in the draft.", 0);
+        hwr_overlay_status("Built-in defaults are in the draft. Apply puts "
+                           "them in force.", 0);
         return;
     case HWR_ACTION_ORIGINAL:
         hwr_schema_original(&g_draft);
         hwr_overlay_status("The original look is in the draft: 640 by 480, "
                            "original field of view, every enhancement off.", 0);
+        return;
+    case HWR_ACTION_RELOAD:
+        /* The one road from the file into the settings, asked for by hand
+         * instead of by a save. */
+        hwr_config_request_reload();
+        g_await_reload = 1;
+        hwr_overlay_status("Reading the settings file.", 0);
         return;
     default:
         return;
@@ -966,6 +1216,8 @@ static void hwr_overlay_layout(const struct roth_api_v1 *api,
     uint32_t inner;
     uint32_t body;
     uint32_t rows_room;
+    uint32_t widest_action = 0;
+    int i;
 
     memset(layout, 0, sizeof *layout);
     layout->scale = hwr_overlay_draw_line_scale(api);
@@ -1004,17 +1256,39 @@ static void hwr_overlay_layout(const struct roth_api_v1 *api,
     inner = layout->cx1 - layout->cx0;
     body = layout->cy1 - layout->cy0;
 
+    /* The buttons take one line where they fit on one, and two where the
+     * widest of them says otherwise, which is what a 320-wide frame says. */
+    for (i = 0; i < HWR_ACTION_COUNT; i++) {
+        uint32_t width = hwr_overlay_draw_measure(api, HWR_ACTION_LABELS[i]);
+
+        if (width > widest_action)
+            widest_action = width;
+    }
+    widest_action += 10u;
+    layout->action_columns =
+        widest_action * (uint32_t)HWR_ACTION_COUNT <= inner
+            ? HWR_ACTION_COUNT : (HWR_ACTION_COUNT + 1) / 2;
+    layout->action_lines = (HWR_ACTION_COUNT + layout->action_columns - 1) /
+                           layout->action_columns;
+    /* Title, sections, one setting, the status line, and the buttons are the
+     * least a panel can be; anything smaller is not opened over. */
+    if (body < (4u + (uint32_t)layout->action_lines) * layout->row_h) {
+        layout->visible = 0;
+        return;
+    }
+
     /* Top down: the title and the section strip. Bottom up: the actions, the
      * status line, and the help text. The rows take what is left. */
     layout->title_y = layout->cy0;
     layout->strip_y = layout->title_y + layout->row_h + 1u;
-    layout->actions_y = layout->cy1 - layout->row_h;
+    layout->actions_y =
+        layout->cy1 - (uint32_t)layout->action_lines * layout->row_h;
     layout->status_y = layout->actions_y - layout->row_h - 1u;
     layout->help_y = layout->status_y - 2u * layout->row_h - 1u;
     layout->rows_y0 = layout->strip_y + layout->row_h + 2u;
     layout->rows_y1 = layout->help_y;
     /* A frame too short for all of it keeps the rows and drops the help. */
-    if (body < 8u * layout->row_h) {
+    if (body < (8u + (uint32_t)layout->action_lines) * layout->row_h) {
         layout->help_y = layout->status_y;
         layout->rows_y1 = layout->status_y;
     }
@@ -1048,7 +1322,8 @@ static void hwr_overlay_layout(const struct roth_api_v1 *api,
     layout->value_x = layout->cx0 +
                       (layout->content_x1 - layout->cx0) * 45u / 100u;
 
-    layout->action_w = (layout->cx1 - layout->cx0) / (uint32_t)HWR_ACTION_COUNT;
+    layout->action_w =
+        (layout->cx1 - layout->cx0) / (uint32_t)layout->action_columns;
     layout->action_x = layout->cx0;
 }
 
@@ -1124,7 +1399,21 @@ static void hwr_overlay_draw_row(const struct roth_api_v1 *api,
     } else if (g_edit == HWR_EDIT_KEY && g_edit_row == row) {
         snprintf(value, sizeof value, "press a key");
     } else {
+        char active[80];
+        size_t used;
+
         hwr_overlay_value_text(api, row, value, sizeof value);
+        /* What the setting asks for and what it is getting are not always the
+         * same thing: a size the host would not give, a synchronization this
+         * system does not have, a renderer that had to stand down. The row says
+         * both rather than quietly showing the request as though it were the
+         * answer. */
+        used = strlen(value);
+        if (g_rows[row].widget != HWR_W_INFO && used + 8u < sizeof value &&
+            hwr_sysinfo_active_text(api, desc, hwr_settings_get(), active,
+                                    sizeof active))
+            snprintf(value + used, sizeof value - used, "  (in use: %s)",
+                     active);
     }
     if (g_rows[row].widget != HWR_W_INFO && g_rows[row].selectable) {
         uint32_t marker_w = 8u;
@@ -1281,32 +1570,41 @@ static void hwr_overlay_render(const struct roth_api_v1 *api,
         }
     }
 
-    /* Status. */
+    /* Status, or the question a display change is waiting on. */
     hwr_overlay_draw_fill(&canvas, layout->cx0, layout->status_y, layout->cx1,
-                          layout->status_y + layout->row_h, colors->panel);
+                          layout->status_y + layout->row_h,
+                          g_confirm_pending ? colors->gold_lo : colors->panel);
+    if (g_confirm_pending) {
+        g_confirm_drawn_seconds = hwr_overlay_confirm_seconds();
+        snprintf(text, sizeof text,
+                 "Keep this display change? Enter or a click keeps it, Esc "
+                 "puts it back. %d", g_confirm_drawn_seconds);
+    } else {
+        snprintf(text, sizeof text, "%s", g_status);
+    }
     hwr_overlay_draw_text(api, &canvas, layout->cx0 + 3u,
                           layout->status_y + layout->scale,
                           layout->cx1 - layout->cx0 - 6u,
-                          g_status_error ? colors->gold_hi : colors->text,
-                          g_status);
+                          g_status_error || g_confirm_pending ? colors->gold_hi
+                                                              : colors->text,
+                          text);
 
     /* Actions. */
     for (i = 0; i < HWR_ACTION_COUNT; i++) {
-        uint32_t x = layout->action_x + (uint32_t)i * layout->action_w;
+        uint32_t x = layout->action_x +
+                     (uint32_t)(i % layout->action_columns) * layout->action_w;
+        uint32_t y0 = layout->actions_y +
+                      (uint32_t)(i / layout->action_columns) * layout->row_h;
         int focused = g_zone == HWR_ZONE_ACTIONS && g_action == i;
         int hovered = g_hover_kind == HWR_HIT_ACTION && g_hover_index == i;
 
-        hwr_overlay_draw_fill(&canvas, x, layout->actions_y,
-                              x + layout->action_w - 2u,
-                              layout->actions_y + layout->row_h,
+        hwr_overlay_draw_fill(&canvas, x, y0, x + layout->action_w - 2u,
+                              y0 + layout->row_h,
                               hovered ? colors->gold_lo : colors->panel);
         if (focused)
-            hwr_overlay_draw_border(&canvas, x, layout->actions_y,
-                                    x + layout->action_w - 2u,
-                                    layout->actions_y + layout->row_h,
-                                    colors->gold_hi);
-        hwr_overlay_draw_text(api, &canvas, x + 4u,
-                              layout->actions_y + layout->scale,
+            hwr_overlay_draw_border(&canvas, x, y0, x + layout->action_w - 2u,
+                                    y0 + layout->row_h, colors->gold_hi);
+        hwr_overlay_draw_text(api, &canvas, x + 4u, y0 + layout->scale,
                               layout->action_w - 10u,
                               focused ? colors->gold_hi : colors->text,
                               HWR_ACTION_LABELS[i]);
@@ -1460,6 +1758,29 @@ static void hwr_overlay_key(const struct hwr_overlay_layout *layout,
         }
         return;
     }
+    /* A question the panel has asked is answered before anything else it could
+     * be asked to do. */
+    if (g_guard) {
+        if (make == HWR_SC_ENTER) {
+            g_close_now = 1;
+        } else if (make == HWR_SC_ESC) {
+            hwr_overlay_end_guard();
+            hwr_overlay_status("Still here. Apply puts the changes in force.",
+                               0);
+        }
+        return;
+    }
+    if (g_confirm_pending) {
+        if (make == HWR_SC_ENTER) {
+            hwr_overlay_confirm_keep();
+            return;
+        }
+        if (make == HWR_SC_ESC) {
+            hwr_overlay_confirm_revert("The earlier display settings are "
+                                       "back.");
+            return;
+        }
+    }
     switch (make) {
     case HWR_SC_TAB:
         g_zone = shifted ? (g_zone + HWR_ZONE_COUNT - 1) % HWR_ZONE_COUNT
@@ -1593,10 +1914,22 @@ static int hwr_overlay_hit(const struct hwr_overlay_layout *layout, int32_t x,
         }
         return HWR_HIT_NONE;
     }
-    if (py >= layout->actions_y && py < layout->actions_y + layout->row_h &&
-        px >= layout->action_x && layout->action_w != 0) {
-        i = (int)((px - layout->action_x) / layout->action_w);
-        if (i >= 0 && i < HWR_ACTION_COUNT) {
+    /* While a display change waits for an answer, the line that asks for it is
+     * the thing to click. */
+    if (g_confirm_pending && py >= layout->status_y &&
+        py < layout->status_y + layout->row_h && px >= layout->cx0 &&
+        px < layout->cx1)
+        return HWR_HIT_CONFIRM;
+    if (py >= layout->actions_y &&
+        py < layout->actions_y +
+                 (uint32_t)layout->action_lines * layout->row_h &&
+        px >= layout->action_x && layout->action_w != 0 &&
+        layout->row_h != 0 && layout->action_columns > 0) {
+        int column = (int)((px - layout->action_x) / layout->action_w);
+        int line = (int)((py - layout->actions_y) / layout->row_h);
+
+        i = line * layout->action_columns + column;
+        if (column < layout->action_columns && i >= 0 && i < HWR_ACTION_COUNT) {
             *index = i;
             return HWR_HIT_ACTION;
         }
@@ -1607,6 +1940,13 @@ static int hwr_overlay_hit(const struct hwr_overlay_layout *layout, int32_t x,
 static void hwr_overlay_press(const struct hwr_overlay_layout *layout, int kind,
                               int index, int secondary)
 {
+    /* Nothing but the question is live while the panel is asking one. */
+    if (g_guard)
+        return;
+    if (g_confirm_pending && kind == HWR_HIT_CONFIRM) {
+        hwr_overlay_confirm_keep();
+        return;
+    }
     switch (kind) {
     case HWR_HIT_SECTION:
         g_zone = HWR_ZONE_SECTIONS;
@@ -1656,11 +1996,19 @@ static void hwr_overlay_press(const struct hwr_overlay_layout *layout, int kind,
 
 static void hwr_overlay_close(void)
 {
+    /* A display change is only kept by somebody saying so. The panel coming
+     * down -- for any reason, including a cutscene taking the screen -- is the
+     * end of the chance to say it. */
+    if (g_confirm_pending)
+        hwr_overlay_confirm_revert("The earlier display settings are back.");
     g_open = 0;
     g_close_request = 0;
+    g_close_now = 0;
     g_active = 0;
+    g_guard = 0;
     g_capture_armed = 0;
     g_edit = HWR_EDIT_NONE;
+    hwr_overlay_update_modal();
     g_hold_kind = HWR_HIT_NONE;
     g_hover_kind = HWR_HIT_NONE;
     g_buttons = 0;
@@ -1674,6 +2022,8 @@ static void hwr_overlay_close(void)
 
 static void hwr_overlay_open(void)
 {
+    struct hwr_config_outcome outcome;
+
     g_active = 1;
     g_zone = HWR_ZONE_ROWS;
     g_section = 0;
@@ -1681,6 +2031,15 @@ static void hwr_overlay_open(void)
     g_action = 0;
     g_edit = HWR_EDIT_NONE;
     g_edit_row = -1;
+    g_guard = 0;
+    g_close_now = 0;
+    g_await_reload = 0;
+    g_await_status[0] = 0;
+    /* Whatever the file last did, it did before the panel was opened: it is
+     * taken as read rather than announced. */
+    hwr_config_last_outcome(&outcome);
+    g_outcome_serial = outcome.serial;
+    hwr_overlay_update_modal();
     g_hover_kind = HWR_HIT_NONE;
     g_hold_kind = HWR_HIT_NONE;
     g_buttons = 0;
@@ -1738,8 +2097,18 @@ void hwr_overlay_pump(const struct roth_api_v1 *api,
     g_toggle_key = hwr_settings_get()->overlay_key;
     g_can_open = runtime->screen_available && g_available;
 
-    if (g_close_request || (g_active && !g_open) ||
-        (g_active && !runtime->screen_available)) {
+    /* A display change whose time ran out goes back here, on the thread that
+     * may write files, however the panel stands. */
+    if (g_confirm_expired)
+        hwr_overlay_confirm_revert("Nobody kept the display change, so the "
+                                   "earlier settings are back.");
+    if ((g_close_request || (g_active && !g_open)) && g_active && !g_guard &&
+        runtime->screen_available && hwr_overlay_draft_dirty()) {
+        /* Changes nobody applied are worth one question before they are lost.
+         * The key that opens the panel asked once; asking again closes. */
+        hwr_overlay_begin_guard();
+    } else if (g_close_request || (g_active && !g_open) ||
+               (g_active && !runtime->screen_available)) {
         hwr_overlay_close();
         return;
     }
@@ -1764,10 +2133,36 @@ void hwr_overlay_pump(const struct roth_api_v1 *api,
     hwr_overlay_layout(api, &layout);
     while (hwr_overlay_ring_pop(&entry))
         hwr_overlay_key(&layout, entry);
+    if (g_close_now) {
+        hwr_overlay_close();
+        return;
+    }
     if (g_keys_dropped) {
         g_keys_dropped = 0;
         hwr_overlay_status("Some keystrokes were dropped.", 1);
     }
+    /* What the settings file last did, once. A reload the panel asked for
+     * brings the draft with it; one it only caused does not, because the draft
+     * is already what was written. */
+    {
+        struct hwr_config_outcome outcome;
+
+        hwr_config_last_outcome(&outcome);
+        if (outcome.serial != g_outcome_serial) {
+            g_outcome_serial = outcome.serial;
+            if (!outcome.error && g_await_reload && g_await_status[0] != 0)
+                hwr_overlay_status(g_await_status, 0);
+            else if (outcome.text[0] != 0)
+                hwr_overlay_status(outcome.text, outcome.error);
+            if (!outcome.error && g_await_reload)
+                hwr_overlay_reset_draft();
+            g_await_reload = 0;
+            g_await_status[0] = 0;
+        }
+    }
+    if (g_confirm_pending &&
+        g_confirm_drawn_seconds != hwr_overlay_confirm_seconds())
+        g_redraw = 1;
     /* The rows and the layout are recomputed after the keys, so a section
      * change is drawn from the same state the hit test will use. */
     hwr_overlay_build_rows();
@@ -1826,6 +2221,7 @@ void hwr_overlay_pump(const struct roth_api_v1 *api,
     }
     g_buttons_prev = g_buttons;
 
+    hwr_overlay_update_modal();
     if (g_redraw)
         hwr_overlay_render(api, runtime, &layout);
     hwr_overlay_draw_set_cursor(g_cursor_owned, g_cursor_x, g_cursor_y);
