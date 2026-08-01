@@ -39,6 +39,9 @@
 #ifndef GL_COLOR_ATTACHMENT1
 #define GL_COLOR_ATTACHMENT1 0x8ce1
 #endif
+#ifndef GL_COLOR_ATTACHMENT2
+#define GL_COLOR_ATTACHMENT2 0x8ce2
+#endif
 #ifndef GL_R32UI
 #define GL_R32UI 0x8236
 #endif
@@ -137,6 +140,7 @@ struct hwr_gl_functions {
     PFNGLUNIFORM2IPROC uniform_2i;
     PFNGLUNIFORM1FPROC uniform_1f;
     PFNGLUNIFORM2FPROC uniform_2f;
+    PFNGLUNIFORM3FPROC uniform_3f;
     PFNGLGENVERTEXARRAYSPROC gen_vertex_arrays;
     PFNGLDELETEVERTEXARRAYSPROC delete_vertex_arrays;
     PFNGLBINDVERTEXARRAYPROC bind_vertex_array;
@@ -205,6 +209,38 @@ static GLuint g_geometry_program;
 static GLuint g_sky_program;
 static GLuint g_resolve_program;
 static GLuint g_probe_program;
+/* The true-colour foundation. The enhanced world program is the authentic
+ * source compiled a second time with the define set; it, the colour attachment
+ * it writes, and the passes that prime and resolve that attachment come into
+ * existence only when the foundation is required, and nothing on the authentic
+ * path knows they exist. */
+static GLuint g_truecolor_program;
+static GLuint g_truecolor_resolve_program;
+static GLuint g_index_restore_program;
+static GLuint g_color_texture;
+/* Cached HWR_TRUECOLOR gate; -1 until first read. */
+static int g_truecolor_env = -1;
+/* Raised while this frame renders through the enhanced program. */
+static int g_truecolor_active;
+/* Set once the foundation has failed to come up, so it is never retried. */
+static int g_truecolor_failed;
+static int g_truecolor_logged;
+/* The acceptance instrument: HWR_TRUECOLOR_COMPARE=<path-prefix> renders the
+ * frame's view set twice -- once through the authentic program, once through
+ * the enhanced one -- from identical state, and counts differing canvas pixels.
+ * HWR_TRUECOLOR_COMPARE_BREAK=1 detunes the enhanced arm so the instrument has
+ * to report a non-zero count; an instrument that has never failed has not been
+ * shown to work. */
+static char g_truecolor_compare_path[2048];
+static int g_truecolor_compare_state = -1;
+static int g_truecolor_break;
+static uint32_t *g_truecolor_compare_pixels;
+static size_t g_truecolor_compare_bytes;
+static unsigned g_truecolor_compare_frames;
+static unsigned g_truecolor_compare_bad_frames;
+static unsigned g_truecolor_compare_dumps;
+static uint64_t g_truecolor_compare_bad_pixels;
+static unsigned g_truecolor_compare_max_delta;
 static int g_scene_uploaded;
 /* Reference data for the sampling self-test: a rare state has been observed
  * where every lookup-table fetch returns zero (the world renders black while
@@ -618,6 +654,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(uniform_2i, PFNGLUNIFORM2IPROC, "glUniform2i");
     HWR_LOAD_GL(uniform_1f, PFNGLUNIFORM1FPROC, "glUniform1f");
     HWR_LOAD_GL(uniform_2f, PFNGLUNIFORM2FPROC, "glUniform2f");
+    HWR_LOAD_GL(uniform_3f, PFNGLUNIFORM3FPROC, "glUniform3f");
     HWR_LOAD_GL(gen_vertex_arrays, PFNGLGENVERTEXARRAYSPROC, "glGenVertexArrays");
     HWR_LOAD_GL(delete_vertex_arrays, PFNGLDELETEVERTEXARRAYSPROC, "glDeleteVertexArrays");
     HWR_LOAD_GL(bind_vertex_array, PFNGLBINDVERTEXARRAYPROC, "glBindVertexArray");
@@ -728,8 +765,15 @@ static const char g_geometry_vertex_shader[] =
     "  v_flat_taint=a_tint_adjust_taint.y;\n"
     "}\n";
 
-static const char g_geometry_fragment_shader[] =
-    "#version 330 core\n"
+/* The version directive and the optional true-colour define are separate source
+ * chunks so ONE body can be compiled twice: once with an empty define chunk,
+ * whose concatenated text is character for character the source the authentic
+ * program has always been built from, and once with the define, which adds a
+ * colour output inside emit() and changes nothing anywhere else. */
+static const char g_glsl_version[] = "#version 330 core\n";
+static const char g_truecolor_define[] = "#define HWR_TRUECOLOR 1\n";
+
+static const char g_geometry_fragment_body[] =
     "layout(location=0) out uint out_index;\n"
     "layout(location=1) out uint out_floor_id;\n"
     "uniform usamplerBuffer u_texels;\n"
@@ -1109,6 +1153,34 @@ static const char g_geometry_fragment_shader[] =
     "}\n"
     "uniform int u_debug_vis;\n"
     "uniform int u_depth_only;\n"
+    /* Every index write in main() goes through emit(). The authentic build
+     * writes the palette index and nothing else, exactly as the assignments it
+     * replaced did. The true-colour build writes the same index and, beside it,
+     * the colour that index already resolves to -- so with every dependent at
+     * its neutral value the resolved canvas is the authentic canvas, byte for
+     * byte, rather than an approximation of it. Later lighting features move
+     * u_gain / u_add and clear u_light_neutral; they never touch this
+     * structure, and they never touch any index-space mechanism. */
+    "#ifndef HWR_TRUECOLOR\n"
+    "void emit(uint index) { out_index=index; }\n"
+    "#else\n"
+    "layout(location=2) out vec4 out_color;\n"
+    "uniform sampler2D u_palette;\n"
+    "uniform vec3 u_gain;\n"
+    "uniform vec3 u_add;\n"
+    "uniform int u_light_neutral;\n"
+    /* The unlit texel of the ordinary tail. Every other class is unlit in the
+     * original and stays unlit here, and says so by leaving this unset. */
+    "uint g_albedo_index=256u;\n"
+    "void emit(uint index) {\n"
+    "  out_index=index;\n"
+    "  vec4 lit=texelFetch(u_palette,ivec2(int(index),0),0);\n"
+    "  if (u_light_neutral!=0) { out_color=lit; return; }\n"
+    "  uint albedo_index=g_albedo_index<256u ? g_albedo_index : index;\n"
+    "  vec3 albedo=texelFetch(u_palette,ivec2(int(albedo_index),0),0).rgb;\n"
+    "  out_color=vec4(lit.rgb*u_gain+albedo*u_add,lit.a);\n"
+    "}\n"
+    "#endif\n"
     "void main() {\n"
     "  uint material=v_light_material.y;\n"
     /* Portal-clipped geometry retains its original world vertices and texture
@@ -1121,7 +1193,7 @@ static const char g_geometry_fragment_shader[] =
     /* A scheduled primary mirror is colourless but still owns depth at its
      * plane. This early exit deliberately bypasses texture masks and shading;
      * glDrawBuffers(GL_NONE) discards both outputs while depth is retained. */
-    "  if (u_depth_only!=0) { out_index=0u; out_floor_id=0u; return; }\n"
+    "  if (u_depth_only!=0) { emit(0u); out_floor_id=0u; return; }\n"
     /* Opaque winner identity. World flats publish FLOOR_TAG | z as before,
      * except the few that a mid-platform of their own sector has to paint over:
      * those carry a sector-scoped identity in v_wall_source.x (a flat has no
@@ -1204,7 +1276,7 @@ static const char g_geometry_fragment_shader[] =
     "    srow=clamp(srow,0,u_sky_texture_height-1);\n"
     "    uint stexel=texelFetch(u_texels,\n"
     "        u_sky_texture_offset+u_sky_source_offset+srow*256+scolumn).r;\n"
-    "    out_index=u_debug_vis==1 ? 255u : stexel;\n"
+    "    emit(u_debug_vis==1 ? 255u : stexel);\n"
     "    return;\n"
     "  }\n"
     /* An all-corners-saturated tinted block (flagged on the wall-wrap attribute
@@ -1215,24 +1287,24 @@ static const char g_geometry_fragment_shader[] =
      * material and shade-row attribution keep working on these surfaces. */
     "  if (u_debug_vis==0 &&"
     " (v_light_material.w & 8u)!=0u) {\n"
-    "    out_index=uint(u_fill_index) & 255u;\n"
+    "    emit(uint(u_fill_index) & 255u);\n"
     "    return;\n"
     "  }\n"
     "  uint texel=sample_texel();\n"
     "  if ((material & 1u)!=0u && texel==0u) discard;\n"
     /* Mode 2: the raw pre-colormap texel byte, for offline texel-vs-shade
      * mismatch attribution. */
-    "  if (u_debug_vis==2) { out_index=texel & 255u; return; }\n"
+    "  if (u_debug_vis==2) { emit(texel & 255u); return; }\n"
     /* Modes 4 and 5 report which surface won a pixel: the low and high bytes
      * of its texture's byte offset in the store, which identifies the texture
      * uniquely. Mode 6 reports the material bits, which give the surface kind.
      * Capturing 4 and 5 together names the surface behind any pixel. */
-    "  if (u_debug_vis==4) { out_index=v_offset & 255u; return; }\n"
-    "  if (u_debug_vis==5) { out_index=(v_offset >> 8) & 255u; return; }\n"
-    "  if (u_debug_vis==6) { out_index=material & 255u; return; }\n"
-    "  if (u_debug_vis==7) { out_index=v_dims.x & 255u; return; }\n"
-    "  if (u_debug_vis==8) { out_index=uint(dbg_ix) & 255u; return; }\n"
-    "  if (u_debug_vis==9) { out_index=uint(dbg_iy) & 255u; return; }\n"
+    "  if (u_debug_vis==4) { emit(v_offset & 255u); return; }\n"
+    "  if (u_debug_vis==5) { emit((v_offset >> 8) & 255u); return; }\n"
+    "  if (u_debug_vis==6) { emit(material & 255u); return; }\n"
+    "  if (u_debug_vis==7) { emit(v_dims.x & 255u); return; }\n"
+    "  if (u_debug_vis==8) { emit(uint(dbg_ix) & 255u); return; }\n"
+    "  if (u_debug_vis==9) { emit(uint(dbg_iy) & 255u); return; }\n"
     /* A one-sided wall with a block-transparent texture: the engine's masked
      * writer skips index-0 texels, and no traversal ever paints behind a
      * one-sided wall, so the skipped pixel keeps what the PREVIOUS frame left
@@ -1240,7 +1312,7 @@ static const char g_geometry_fragment_shader[] =
      * the engine's void smear and still occludes this frame's geometry behind
      * the wall, which the engine never draws. */
     "  if ((v_light_material.w & 4u)!=0u && texel==0u) {\n"
-    "    out_index=texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r;\n"
+    "    emit(texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r);\n"
     "    return;\n"
     "  }\n"
     "  uint mapped; uint face_flags=v_pan_scale_flags.w;\n"
@@ -1250,11 +1322,11 @@ static const char g_geometry_fragment_shader[] =
     "  else { bool tinted=(face_flags & 2u)!=0u;"
     " int row=shade_row(tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
     "    row=dithered_row(row,tinted ? u_tint_shade_level : u_shade_level,tinted);\n"
-    "    if (u_debug_vis==1) { out_index=uint(row)|(tinted ? 64u : 0u); return; }\n"
+    "    if (u_debug_vis==1) { emit(uint(row)|(tinted ? 64u : 0u)); return; }\n"
     "    mapped=tinted ?"
     " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
     " texelFetch(u_colormap,ivec2(int(texel),row),0).r; }\n"
-    "  if (u_debug_vis==1) { out_index=255u; return; }\n"  /* direct/glow marker */
+    "  if (u_debug_vis==1) { emit(255u); return; }\n"  /* direct/glow marker */
     /* A palette-colour surface on the solid-colour blend writer: EVERY pixel it
      * covers blends, with no high-bit gate and no index-0 skip, and the blend
      * table is indexed by the source colour first and the destination second --
@@ -1276,7 +1348,10 @@ static const char g_geometry_fragment_shader[] =
     "    uint stale=texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r;\n"
     "    mapped=texelFetch(u_blend,ivec2(int(mapped),int(stale)),0).r;\n"
     "  }\n"
-    "  out_index=mapped;\n"
+    "#ifdef HWR_TRUECOLOR\n"
+    "  g_albedo_index=texel;\n"
+    "#endif\n"
+    "  emit(mapped);\n"
     "}\n";
 
 static const char g_resolve_vertex_shader[] =
@@ -1346,6 +1421,27 @@ static const char g_resolve_fragment_shader[] =
     "  }\n"
     "  out_color=texelFetch(u_palette,ivec2(int(i),0),0); }\n";
 
+/* The true-colour resolve. The geometry pass has already written the colour the
+ * palette index resolves to, so this is a copy; the palette-level effects join
+ * it later. Debug visualisations are index planes by definition and keep the
+ * authentic resolve above. */
+static const char g_truecolor_resolve_fragment_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) out vec4 out_color;\n"
+    "uniform sampler2D u_source;\n"
+    "void main()"
+    " { out_color=texelFetch(u_source,ivec2(gl_FragCoord.xy),0); }\n";
+
+/* Writes a palette-index plane back into the index target. Only the acceptance
+ * instrument uses it: it restores the frame's starting index target between the
+ * authentic and the true-colour arm so both arms start from identical state. */
+static const char g_index_restore_fragment_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) out uint out_index;\n"
+    "uniform usampler2D u_source;\n"
+    "void main()"
+    " { out_index=texelFetch(u_source,ivec2(gl_FragCoord.xy),0).r; }\n";
+
 /* Fetches known texels from the texture store and the colormap through the
  * same texture units the world pass uses; pixel 0 receives the store byte at
  * the configured offset, pixel 1 the colormap byte, pixel 2 the first store
@@ -1365,13 +1461,15 @@ static const char g_probe_fragment_shader[] =
     "  else out_index=texelFetch(u_texels,u_last).r;\n"
     "}\n";
 
-static GLuint hwr_compile_shader(GLenum type, const char *source)
+static GLuint hwr_compile_shader_sources(GLenum type,
+                                         const char *const *sources,
+                                         GLsizei count)
 {
     GLuint shader = g_gl.create_shader(type);
     GLint status = 0;
     if (shader == 0)
         return 0;
-    g_gl.shader_source(shader, 1, &source, NULL);
+    g_gl.shader_source(shader, count, sources, NULL);
     g_gl.compile_shader(shader);
     g_gl.get_shader_iv(shader, GL_COMPILE_STATUS, &status);
     if (!status) {
@@ -1385,15 +1483,19 @@ static GLuint hwr_compile_shader(GLenum type, const char *source)
     return shader;
 }
 
-static GLuint hwr_link_program(const char *vertex_source, const char *fragment_source)
+static GLuint hwr_link_program_sources(const char *vertex_source,
+                                       const char *const *fragment_sources,
+                                       GLsizei fragment_count)
 {
-    GLuint vertex = hwr_compile_shader(GL_VERTEX_SHADER, vertex_source);
+    GLuint vertex = hwr_compile_shader_sources(GL_VERTEX_SHADER,
+                                               &vertex_source, 1);
     GLuint fragment;
     GLuint program;
     GLint status = 0;
     if (vertex == 0)
         return 0;
-    fragment = hwr_compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+    fragment = hwr_compile_shader_sources(GL_FRAGMENT_SHADER, fragment_sources,
+                                          fragment_count);
     if (fragment == 0) {
         g_gl.delete_shader(vertex);
         return 0;
@@ -1416,6 +1518,24 @@ static GLuint hwr_link_program(const char *vertex_source, const char *fragment_s
     return program;
 }
 
+static GLuint hwr_link_program(const char *vertex_source,
+                               const char *fragment_source)
+{
+    return hwr_link_program_sources(vertex_source, &fragment_source, 1);
+}
+
+/* The world pass's program, built from the shared body with the given define
+ * chunk. An empty chunk yields the authentic program: the three strings
+ * concatenate to exactly the text this shader has always been compiled from. */
+static GLuint hwr_link_geometry_program(const char *define_chunk)
+{
+    const char *sources[3];
+    sources[0] = g_glsl_version;
+    sources[1] = define_chunk;
+    sources[2] = g_geometry_fragment_body;
+    return hwr_link_program_sources(g_geometry_vertex_shader, sources, 3);
+}
+
 static void hwr_delete_texture(GLuint *texture)
 {
     if (*texture != 0) {
@@ -1424,11 +1544,12 @@ static void hwr_delete_texture(GLuint *texture)
     }
 }
 
-/* The four shader programs are built from compile-time-constant source, so they
- * are linked once and kept alive for the context's lifetime rather than relinked
- * on every scene upload (each relink is a compile + link of two shaders). They
- * are deliberately NOT torn down with the per-scene buffers below; only the GL
- * shutdown path releases them. */
+/* The shader programs are built from compile-time-constant source, so they are
+ * linked once and kept alive for the context's lifetime rather than relinked on
+ * every scene upload (each relink is a compile + link of two shaders). They are
+ * deliberately NOT torn down with the per-scene buffers below; only the GL
+ * shutdown path releases them. The true-colour set is absent unless the
+ * foundation has been asked for, and releasing a zero program is a no-op. */
 static void hwr_destroy_programs(void)
 {
     if (g_geometry_program != 0)
@@ -1439,23 +1560,31 @@ static void hwr_destroy_programs(void)
         g_gl.delete_program(g_resolve_program);
     if (g_probe_program != 0)
         g_gl.delete_program(g_probe_program);
+    if (g_truecolor_program != 0)
+        g_gl.delete_program(g_truecolor_program);
+    if (g_truecolor_resolve_program != 0)
+        g_gl.delete_program(g_truecolor_resolve_program);
+    if (g_index_restore_program != 0)
+        g_gl.delete_program(g_index_restore_program);
     g_geometry_program = 0;
     g_sky_program = 0;
     g_resolve_program = 0;
     g_probe_program = 0;
+    g_truecolor_program = 0;
+    g_truecolor_resolve_program = 0;
+    g_index_restore_program = 0;
 }
 
-/* Links the four programs on first use (or after a shutdown); a no-op once they
- * are live. Returns 1 when all four are ready, 0 (with the set cleared) on a
- * link failure so the caller falls back to the solid renderer. */
+/* Links the four always-present programs on first use (or after a shutdown); a
+ * no-op once they are live. Returns 1 when all four are ready, 0 (with the set
+ * cleared) on a link failure so the caller falls back to the solid renderer. */
 static int hwr_gl_ensure_programs(void)
 {
     if (g_geometry_program != 0 && g_sky_program != 0 &&
         g_resolve_program != 0 && g_probe_program != 0)
         return 1;
     hwr_destroy_programs();
-    g_geometry_program = hwr_link_program(g_geometry_vertex_shader,
-                                          g_geometry_fragment_shader);
+    g_geometry_program = hwr_link_geometry_program("");
     g_sky_program = hwr_link_program(g_resolve_vertex_shader,
                                      g_sky_fragment_shader);
     g_resolve_program = hwr_link_program(g_resolve_vertex_shader,
@@ -1502,6 +1631,7 @@ static void hwr_destroy_framebuffer(void)
     hwr_delete_texture(&g_floor_id_texture);
     hwr_delete_texture(&g_index_copy_texture);
     hwr_delete_texture(&g_stale_copy_texture);
+    hwr_delete_texture(&g_color_texture);
     if (g_depth_buffer != 0) {
         g_gl.delete_renderbuffers(1, &g_depth_buffer);
         g_depth_buffer = 0;
@@ -1673,6 +1803,96 @@ static void hwr_set_sampler(GLuint program, const char *name, GLint unit)
     GLint location = g_gl.get_uniform_location(program, name);
     if (location >= 0)
         g_gl.uniform_1i(location, unit);
+}
+
+/* HWR_TRUECOLOR=1 forces the true-colour foundation on. It is the only thing
+ * that asks for it today: there is no consumer setting, and with the switch
+ * absent no enhanced program is compiled, no colour attachment exists, and the
+ * world pass runs the instruction stream it has always run. */
+static int hwr_truecolor_env(void)
+{
+    if (g_truecolor_env < 0) {
+        const char *setting = getenv("HWR_TRUECOLOR");
+        g_truecolor_env =
+            setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    return g_truecolor_env;
+}
+
+/* Links the enhanced program and creates the colour attachment on the first
+ * frame the foundation is required, and reports whether the foundation is
+ * usable. A failure is permanent for the process and leaves the authentic path
+ * exactly as it was. */
+static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
+{
+    if (g_truecolor_failed)
+        return 0;
+    if (g_truecolor_program == 0) {
+        g_truecolor_program = hwr_link_geometry_program(g_truecolor_define);
+        if (g_truecolor_program == 0) {
+            fprintf(stderr, "[renderer_overhaul] the true-colour program did"
+                            " not link: %s\n", g_error);
+            g_truecolor_failed = 1;
+            return 0;
+        }
+        g_gl.use_program(g_truecolor_program);
+        hwr_set_sampler(g_truecolor_program, "u_texels", 0);
+        hwr_set_sampler(g_truecolor_program, "u_colormap", 1);
+        hwr_set_sampler(g_truecolor_program, "u_tint", 2);
+        hwr_set_sampler(g_truecolor_program, "u_glow", 3);
+        hwr_set_sampler(g_truecolor_program, "u_blend", 4);
+        hwr_set_sampler(g_truecolor_program, "u_dst", 5);
+        hwr_set_sampler(g_truecolor_program, "u_stale", 6);
+        hwr_set_sampler(g_truecolor_program, "u_floor_id", 7);
+        /* The world pass already spends units 0-7; the palette joins on 8. */
+        hwr_set_sampler(g_truecolor_program, "u_palette", 8);
+        g_gl.use_program(0);
+    }
+    if (g_truecolor_resolve_program == 0) {
+        g_truecolor_resolve_program =
+            hwr_link_program(g_resolve_vertex_shader,
+                             g_truecolor_resolve_fragment_shader);
+        if (g_truecolor_resolve_program == 0) {
+            fprintf(stderr, "[renderer_overhaul] the true-colour resolve did"
+                            " not link: %s\n", g_error);
+            g_truecolor_failed = 1;
+            return 0;
+        }
+        g_gl.use_program(g_truecolor_resolve_program);
+        hwr_set_sampler(g_truecolor_resolve_program, "u_source", 0);
+        g_gl.use_program(0);
+    }
+    if (g_color_texture == 0) {
+        if (g_index_fbo == 0 || width != g_fbo_width || height != g_fbo_height)
+            return 0;
+        g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+        /* Create it on unit 0 rather than on whichever unit the previous frame
+         * happened to leave selected, and hand that unit back cleared. */
+        g_gl.active_texture(GL_TEXTURE0);
+        hwr_texture_2d_u8(&g_color_texture, (GLsizei)width, (GLsizei)height,
+                          GL_RGBA8, GL_RGBA, NULL);
+        g_gl.bind_texture(GL_TEXTURE_2D, 0);
+        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                                    GL_TEXTURE_2D, g_color_texture, 0);
+        if (g_gl.check_framebuffer_status(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE) {
+            snprintf(g_error, sizeof g_error,
+                     "the true-colour attachment leaves the framebuffer"
+                     " incomplete");
+            fprintf(stderr, "[renderer_overhaul] %s\n", g_error);
+            g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                                        GL_TEXTURE_2D, 0, 0);
+            hwr_delete_texture(&g_color_texture);
+            g_truecolor_failed = 1;
+            return 0;
+        }
+        if (!g_truecolor_logged) {
+            fprintf(stderr, "[renderer_overhaul] true-colour foundation active"
+                            " (%ux%u RGBA8)\n", width, height);
+            g_truecolor_logged = 1;
+        }
+    }
+    return 1;
 }
 
 static uint32_t hwr_hash_bytes(const uint8_t *bytes, size_t count)
@@ -1965,6 +2185,12 @@ static void hwr_bind_scene_textures(void)
         g_gl.active_texture(GL_TEXTURE0 + i);
         g_gl.bind_texture(targets[i], textures[i]);
     }
+    /* The world pass spends units 0-7; the enhanced program resolves its own
+     * emitted index through the palette on unit 8. */
+    if (g_truecolor_active) {
+        g_gl.active_texture(GL_TEXTURE0 + 8);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    }
     /* The final pass of the previous frame leaves the index framebuffer's
      * color attachment bound to unit 0's two-dimensional slot. Sampling
      * anything on that unit while drawing into that framebuffer is then a
@@ -1972,6 +2198,32 @@ static void hwr_bind_scene_textures(void)
      * fetches; clear the stale binding before the world pass. */
     g_gl.active_texture(GL_TEXTURE0);
     g_gl.bind_texture(GL_TEXTURE_2D, 0);
+}
+
+/* The world pass's draw-buffer sets. The colour attachment joins each set only
+ * while the true-colour target exists; with the foundation off these are the
+ * one- and two-element arrays the pass has always issued. */
+static void hwr_draw_buffers_world(void)
+{
+    static const GLenum both_buffers[2] =
+        { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+    static const GLenum with_color[3] =
+        { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2 };
+    if (g_truecolor_active)
+        g_gl.draw_buffers(3, with_color);
+    else
+        g_gl.draw_buffers(2, both_buffers);
+}
+
+static void hwr_draw_buffers_index(void)
+{
+    static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
+    static const GLenum with_color[3] =
+        { GL_COLOR_ATTACHMENT0, GL_NONE, GL_COLOR_ATTACHMENT2 };
+    if (g_truecolor_active)
+        g_gl.draw_buffers(3, with_color);
+    else
+        g_gl.draw_buffers(1, index_only);
 }
 
 static void hwr_uniform_1i(GLuint program, const char *name, GLint value)
@@ -1993,6 +2245,14 @@ static void hwr_uniform_2f(GLuint program, const char *name, GLfloat x, GLfloat 
     GLint location = g_gl.get_uniform_location(program, name);
     if (location >= 0)
         g_gl.uniform_2f(location, x, y);
+}
+
+static void hwr_uniform_3f(GLuint program, const char *name,
+                           GLfloat x, GLfloat y, GLfloat z)
+{
+    GLint location = g_gl.get_uniform_location(program, name);
+    if (location >= 0)
+        g_gl.uniform_3f(location, x, y, z);
 }
 
 /* Verifies the uploaded lookup data three ways: the texture store bytes read
@@ -2228,8 +2488,6 @@ static void hwr_clear_wide_persistence_wings(
 {
     const struct hwr_gl_scene_view *primary = NULL;
     static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
-    static const GLenum both_buffers[2] =
-        { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
     size_t i;
     int center_left;
     int center_right;
@@ -2260,7 +2518,7 @@ static void hwr_clear_wide_persistence_wings(
         g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
     }
     g_gl.disable(GL_SCISSOR_TEST);
-    g_gl.draw_buffers(2, both_buffers);
+    hwr_draw_buffers_world();
 }
 
 static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
@@ -2292,6 +2550,11 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                       camera->source_width <= 0x288u) ? 1 : 0;
     size_t total = sky_vertices + mirror_depth_vertices +
                    opaque_vertices + translucent_vertices;
+    /* The enhanced program is the same source with the colour output added, so
+     * every uniform, sampler, draw call and pass ordering below is shared. With
+     * the foundation off this is the program the pass has always used. */
+    GLuint program = g_truecolor_active ? g_truecolor_program
+                                        : g_geometry_program;
     GLint blend_location;
 
     g_gl.bind_vertex_array(g_scene_vao);
@@ -2313,11 +2576,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     /* The world pass records both the palette index (COLOR0) and the owner-floor
      * identity (COLOR1); the exception/translucent passes switch back to COLOR0
      * only so they never disturb the recorded ids. */
-    {
-        static const GLenum both_buffers[2] =
-            { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-        g_gl.draw_buffers(2, both_buffers);
-    }
+    hwr_draw_buffers_world();
     /* Depth and floor ownership belong to this view alone. Colour remains so
      * later views composite over earlier ones. */
     {
@@ -2357,90 +2616,106 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     g_gl.depth_func(GL_LESS);
     g_gl.depth_mask(GL_TRUE);
     g_gl.disable(GL_BLEND);
-    g_gl.use_program(g_geometry_program);
+    g_gl.use_program(program);
     /* Sampler assignments have been observed to come up lost on some runs
      * (every lookup then lands on unit 0 and the world renders black);
      * re-asserting them each frame costs nothing and heals that state. */
-    hwr_set_sampler(g_geometry_program, "u_texels", 0);
-    hwr_set_sampler(g_geometry_program, "u_colormap", 1);
-    hwr_set_sampler(g_geometry_program, "u_tint", 2);
-    hwr_set_sampler(g_geometry_program, "u_glow", 3);
-    hwr_set_sampler(g_geometry_program, "u_blend", 4);
-    hwr_set_sampler(g_geometry_program, "u_dst", 5);
-    hwr_set_sampler(g_geometry_program, "u_stale", 6);
-    hwr_set_sampler(g_geometry_program, "u_floor_id", 7);
+    hwr_set_sampler(program, "u_texels", 0);
+    hwr_set_sampler(program, "u_colormap", 1);
+    hwr_set_sampler(program, "u_tint", 2);
+    hwr_set_sampler(program, "u_glow", 3);
+    hwr_set_sampler(program, "u_blend", 4);
+    hwr_set_sampler(program, "u_dst", 5);
+    hwr_set_sampler(program, "u_stale", 6);
+    hwr_set_sampler(program, "u_floor_id", 7);
+    if (g_truecolor_active) {
+        /* The foundation ships neutral: with the early-out taken, the colour
+         * emitted beside each index is exactly the colour that index resolves
+         * to, so the resolved canvas is the authentic canvas. The instrument's
+         * negative self-test is the only thing that moves these today, and it
+         * has to move them far enough to survive the 8-bit resolve: a gain of
+         * 0.999 shifts a channel by at most 0.255 of a step and rounds back to
+         * the byte it started from, so it would leave the instrument reporting
+         * a clean run. This one moves every channel from 51 up. */
+        GLfloat gain = g_truecolor_break ? 0.99f : 1.0f;
+        hwr_set_sampler(program, "u_palette", 8);
+        hwr_uniform_3f(program, "u_gain", gain, gain, gain);
+        hwr_uniform_3f(program, "u_add", 0.0f, 0.0f, 0.0f);
+        hwr_uniform_1i(program, "u_light_neutral", g_truecolor_break ? 0 : 1);
+    }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */
-    hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
+    hwr_uniform_1i(program, "u_floor_exception", 0);
     g_gl.active_texture(GL_TEXTURE0 + 7);
     g_gl.bind_texture(GL_TEXTURE_2D, 0);
     g_gl.active_texture(GL_TEXTURE0);
-    hwr_uniform_1i(g_geometry_program, "u_debug_vis", g_debug_vis);
-    hwr_uniform_1i(g_geometry_program, "u_depth_only", 0);
-    hwr_uniform_2i(g_geometry_program, "u_view_offset",
+    hwr_uniform_1i(program, "u_debug_vis", g_debug_vis);
+    hwr_uniform_1i(program, "u_depth_only", 0);
+    hwr_uniform_2i(program, "u_view_offset",
                    camera->view_offset_x, camera->view_offset_y);
-    hwr_uniform_1i(g_geometry_program, "u_eye_z", camera->eye_z);
-    hwr_uniform_1i(g_geometry_program, "u_x_flip", camera->x_flip != 0);
-    hwr_uniform_2f(g_geometry_program, "u_basis",
+    hwr_uniform_1i(program, "u_eye_z", camera->eye_z);
+    hwr_uniform_1i(program, "u_x_flip", camera->x_flip != 0);
+    hwr_uniform_2f(program, "u_basis",
                    (GLfloat)camera->yaw_sin / 16384.0f,
                    (GLfloat)camera->yaw_cos / 16384.0f);
-    hwr_uniform_2i(g_geometry_program, "u_basis_fixed",
+    hwr_uniform_2i(program, "u_basis_fixed",
                    camera->yaw_sin, camera->yaw_cos);
-    hwr_uniform_2f(g_geometry_program, "u_focal",
+    hwr_uniform_2f(program, "u_focal",
                    (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
-    hwr_uniform_2i(g_geometry_program, "u_focal_i",
+    hwr_uniform_2i(program, "u_focal_i",
                    camera->focal_x, camera->focal_y);
-    hwr_uniform_2f(g_geometry_program, "u_center",
+    hwr_uniform_2f(program, "u_center",
                    (GLfloat)camera->center_x, (GLfloat)camera->horizon);
-    hwr_uniform_2i(g_geometry_program, "u_center_i",
+    hwr_uniform_2i(program, "u_center_i",
                    camera->center_x, camera->horizon);
-    hwr_uniform_2i(g_geometry_program, "u_shade_origin",
+    hwr_uniform_2i(program, "u_shade_origin",
                    camera->shade_origin_x, camera->shade_origin_y);
-    hwr_uniform_1i(g_geometry_program, "u_flat_edge_bias", camera->flat_edge_bias);
-    hwr_uniform_2f(g_geometry_program, "u_viewport", (GLfloat)width, (GLfloat)height);
-    hwr_uniform_2i(g_geometry_program, "u_source_viewport",
+    hwr_uniform_1i(program, "u_flat_edge_bias", camera->flat_edge_bias);
+    hwr_uniform_2f(program, "u_viewport", (GLfloat)width, (GLfloat)height);
+    hwr_uniform_2i(program, "u_source_viewport",
                    camera->source_width, camera->source_height);
-    hwr_uniform_2i(g_geometry_program, "u_source_focal",
+    hwr_uniform_2i(program, "u_source_focal",
                    camera->source_focal_x, camera->source_focal_y);
-    hwr_uniform_2i(g_geometry_program, "u_source_center",
+    hwr_uniform_2i(program, "u_source_center",
                    camera->source_center_x, camera->source_horizon);
-    hwr_uniform_1i(g_geometry_program, "u_shade_level", camera->shade_level);
-    hwr_uniform_1i(g_geometry_program, "u_tint_shade_level", camera->tint_shade_level);
-    hwr_uniform_1i(g_geometry_program, "u_light_bias", camera->global_light_bias);
-    hwr_uniform_1i(g_geometry_program, "u_fill_index",
+    hwr_uniform_1i(program, "u_shade_level", camera->shade_level);
+    hwr_uniform_1i(program, "u_tint_shade_level", camera->tint_shade_level);
+    hwr_uniform_1i(program, "u_light_bias", camera->global_light_bias);
+    hwr_uniform_1i(program, "u_fill_index",
                    camera->solid_fill_index);
     /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
      * scaled down with the shade level the same way its shift is. */
-    hwr_uniform_1i(g_geometry_program, "u_wd_bias",
+    hwr_uniform_1i(program, "u_wd_bias",
                    8 >> camera->tint_shade_level);
-    hwr_uniform_1i(g_geometry_program, "u_glow_phase", camera->glow_phase);
+    hwr_uniform_1i(program, "u_glow_phase", camera->glow_phase);
     {
         /* Feed the sky-cap fragment branch the same inputs the retired
          * full-screen prepass used, gated on the identical draw condition
          * (valid sky texture and a viewport the projection table covers) so the
          * caps sample the skybox only when the backdrop previously would have. */
-        hwr_uniform_1i(g_geometry_program, "u_sky_valid", sky_active);
-        hwr_uniform_1i(g_geometry_program, "u_sky_texture_offset",
+        hwr_uniform_1i(program, "u_sky_valid", sky_active);
+        hwr_uniform_1i(program, "u_sky_texture_offset",
                        (GLint)camera->sky_texture_offset);
-        hwr_uniform_1i(g_geometry_program, "u_sky_source_offset",
+        hwr_uniform_1i(program, "u_sky_source_offset",
                        camera->sky_source_offset);
-        hwr_uniform_1i(g_geometry_program, "u_sky_projection_offset",
+        hwr_uniform_1i(program, "u_sky_projection_offset",
                        (GLint)camera->sky_projection_offset);
-        hwr_uniform_1i(g_geometry_program, "u_sky_texture_height",
+        hwr_uniform_1i(program, "u_sky_texture_height",
                        camera->sky_texture_height);
-        hwr_uniform_1i(g_geometry_program, "u_sky_start_row", camera->sky_start_row);
-        hwr_uniform_1i(g_geometry_program, "u_sky_yaw", camera->sky_yaw);
-        hwr_uniform_1i(g_geometry_program, "u_sky_double_scanline",
+        hwr_uniform_1i(program, "u_sky_start_row", camera->sky_start_row);
+        hwr_uniform_1i(program, "u_sky_yaw", camera->sky_yaw);
+        hwr_uniform_1i(program, "u_sky_double_scanline",
                        camera->sky_double_scanline);
-        hwr_uniform_1i(g_geometry_program, "u_sky_occlusion_pass", 0);
+        hwr_uniform_1i(program, "u_sky_occlusion_pass", 0);
     }
     {
-        GLint scale_location = g_gl.get_uniform_location(g_geometry_program, "u_depth_scale");
+        GLint scale_location =
+            g_gl.get_uniform_location(program, "u_depth_scale");
         if (scale_location >= 0)
             g_gl.uniform_1f(scale_location, camera->shade_depth_scale > 0.0f
                                           ? camera->shade_depth_scale : 1.0f);
     }
-    blend_location = g_gl.get_uniform_location(g_geometry_program, "u_blend_pass");
+    blend_location = g_gl.get_uniform_location(program, "u_blend_pass");
     if (blend_location >= 0)
         g_gl.uniform_1i(blend_location, 0);
     /* Sky background candidate: colour only, no depth interaction.  Every cap
@@ -2469,9 +2744,9 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
          * should hide. */
         g_gl.enable(GL_POLYGON_OFFSET_FILL);
         g_gl.polygon_offset(1.0f, 1.0f);
-        hwr_uniform_1i(g_geometry_program, "u_sky_occlusion_pass", 1);
+        hwr_uniform_1i(program, "u_sky_occlusion_pass", 1);
         g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)sky_vertices);
-        hwr_uniform_1i(g_geometry_program, "u_sky_occlusion_pass", 0);
+        hwr_uniform_1i(program, "u_sky_occlusion_pass", 0);
         g_gl.polygon_offset(0.0f, 0.0f);
         g_gl.disable(GL_POLYGON_OFFSET_FILL);
     }
@@ -2483,19 +2758,17 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
      * overlay later passes at equal depth under GL_LEQUAL. */
     if (mirror_depth_vertices != 0) {
         static const GLenum no_buffers[1] = { GL_NONE };
-        static const GLenum both_buffers[2] =
-            { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
         g_gl.enable(GL_DEPTH_TEST);
         g_gl.depth_func(GL_LESS);
         g_gl.depth_mask(GL_TRUE);
         g_gl.draw_buffers(1, no_buffers);
-        hwr_uniform_1i(g_geometry_program, "u_depth_only", 1);
+        hwr_uniform_1i(program, "u_depth_only", 1);
         g_gl.draw_arrays(GL_TRIANGLES,
                          (GLint)(sky_vertices + opaque_vertices +
                                  translucent_vertices),
                          (GLsizei)mirror_depth_vertices);
-        hwr_uniform_1i(g_geometry_program, "u_depth_only", 0);
-        g_gl.draw_buffers(2, both_buffers);
+        hwr_uniform_1i(program, "u_depth_only", 0);
+        hwr_draw_buffers_world();
     }
     /* Opaque geometry overwrites the colour-only sky and wins against a
      * farther sky occluder wherever it projects. Stock paints sector faces
@@ -2553,10 +2826,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     }
     /* From here only the palette index is written; the recorded owner-surface
      * ids stay intact for the exception passes to sample. */
-    {
-        static const GLenum index_only[1] = { GL_COLOR_ATTACHMENT0 };
-        g_gl.draw_buffers(1, index_only);
-    }
+    hwr_draw_buffers_index();
     /* The main translucent range excludes the ground shadows appended to its
      * tail: those go through the floor-exception pass below. */
     {
@@ -2578,7 +2848,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         g_gl.active_texture(GL_TEXTURE0 + 7);
         g_gl.bind_texture(GL_TEXTURE_2D, g_floor_id_texture);
         g_gl.active_texture(GL_TEXTURE0);
-        hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
+        hwr_uniform_1i(program, "u_floor_exception", 1);
         /* Opaque mid-platform surfaces go FIRST, while the depth test is still
          * on: they are world geometry, and the objects, shadows and wall art
          * that follow stand on top of them. GEQUAL admits exactly the fragments
@@ -2642,7 +2912,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                 (GLint)(sky_vertices + opaque_vertices - flat_vertices),
                 (GLsizei)flat_vertices);
         }
-        hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
+        hwr_uniform_1i(program, "u_floor_exception", 0);
         g_gl.enable(GL_DEPTH_TEST);
         g_gl.depth_mask(GL_TRUE);
     }
@@ -2701,14 +2971,14 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                                HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION)) != 0) {
                     int slab = (translucent_run_flags[run] &
                                 HWR_GL_TRANSLUCENT_RUN_SLAB_EXCEPTION) != 0;
-                    hwr_uniform_1i(g_geometry_program, "u_floor_exception", 1);
+                    hwr_uniform_1i(program, "u_floor_exception", 1);
                     if (slab)
                         g_gl.depth_func(GL_GREATER);
                     else
                         g_gl.disable(GL_DEPTH_TEST);
                     g_gl.draw_arrays(GL_TRIANGLES, first,
                                      (GLsizei)translucent_runs[run]);
-                    hwr_uniform_1i(g_geometry_program, "u_floor_exception", 0);
+                    hwr_uniform_1i(program, "u_floor_exception", 0);
                     if (!slab)
                         g_gl.enable(GL_DEPTH_TEST);
                     g_gl.depth_func(GL_LEQUAL);
@@ -2807,6 +3077,253 @@ static int hwr_gl_scene_view_valid(const struct hwr_gl_scene_view *view,
     return 1;
 }
 
+static int hwr_render_view_set(const struct hwr_gl_scene_view *views,
+                               size_t view_count,
+                               uint32_t width, uint32_t height)
+{
+    size_t view_index;
+    for (view_index = 0; view_index < view_count; view_index++) {
+        if (!hwr_gl_render_view(&views[view_index], width, height))
+            return 0;
+    }
+    return 1;
+}
+
+/* Primes the colour attachment from the frame's starting index plane, so void
+ * persistence, the backdrop seed, the widescreen wing wipe and the previous
+ * frame a stale-masked wall shows through its holes all need no rule of their
+ * own: the colour plane is by construction the resolve of whatever the index
+ * plane already holds. It samples the SNAPSHOT the stale pass has just taken,
+ * never the attachment being written. */
+static void hwr_truecolor_prime(uint32_t width, uint32_t height)
+{
+    static const GLenum color_target[1] = { GL_COLOR_ATTACHMENT2 };
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.depth_mask(GL_FALSE);
+    g_gl.draw_buffers(1, color_target);
+    g_gl.use_program(g_resolve_program);
+    hwr_uniform_1i(g_resolve_program, "u_debug_vis", 0);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    g_gl.depth_mask(GL_TRUE);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+}
+
+/* The frame's final resolve into the RGBA target the readback reads. */
+static void hwr_scene_resolve_pass(uint32_t width, uint32_t height)
+{
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.disable(GL_DEPTH_TEST);
+    /* Every debug visualisation is an index plane by definition, so it keeps
+     * the palette-index resolve however the foundation stands. */
+    if (g_truecolor_active && g_debug_vis == 0) {
+        g_gl.use_program(g_truecolor_resolve_program);
+        hwr_set_sampler(g_truecolor_resolve_program, "u_source", 0);
+        g_gl.bind_vertex_array(g_resolve_vao);
+        g_gl.active_texture(GL_TEXTURE0);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);
+        g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+        return;
+    }
+    g_gl.use_program(g_resolve_program);
+    hwr_uniform_1i(g_resolve_program, "u_debug_vis", g_debug_vis);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
+    g_gl.active_texture(GL_TEXTURE1);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
+    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+}
+
+static int hwr_truecolor_compare_enabled(void)
+{
+    if (g_truecolor_compare_state < 0) {
+        const char *prefix = getenv("HWR_TRUECOLOR_COMPARE");
+        const char *negative = getenv("HWR_TRUECOLOR_COMPARE_BREAK");
+        g_truecolor_compare_state =
+            prefix != NULL && prefix[0] != 0 ? 1 : 0;
+        if (g_truecolor_compare_state)
+            snprintf(g_truecolor_compare_path,
+                     sizeof g_truecolor_compare_path, "%s", prefix);
+        g_truecolor_break = g_truecolor_compare_state && negative != NULL &&
+                            negative[0] != '0' && negative[0] != 0;
+        if (g_truecolor_compare_state)
+            fprintf(stderr, "[renderer_overhaul] true-colour compare armed"
+                            " (prefix %s%s)\n", g_truecolor_compare_path,
+                    g_truecolor_break ? ", NEGATIVE SELF-TEST" : "");
+    }
+    return g_truecolor_compare_state;
+}
+
+/* Restores the index target to the frame's starting plane, so the instrument's
+ * two arms render from identical state rather than from each other's result. */
+static int hwr_truecolor_restore_index(uint32_t width, uint32_t height)
+{
+    static const GLenum index_target[1] = { GL_COLOR_ATTACHMENT0 };
+    if (g_index_restore_program == 0) {
+        g_index_restore_program =
+            hwr_link_program(g_resolve_vertex_shader,
+                             g_index_restore_fragment_shader);
+        if (g_index_restore_program == 0) {
+            fprintf(stderr, "[renderer_overhaul] the index restore pass did"
+                            " not link: %s\n", g_error);
+            return 0;
+        }
+        g_gl.use_program(g_index_restore_program);
+        hwr_set_sampler(g_index_restore_program, "u_source", 0);
+        g_gl.use_program(0);
+    }
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.depth_mask(GL_FALSE);
+    g_gl.draw_buffers(1, index_target);
+    g_gl.use_program(g_index_restore_program);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_copy_texture);
+    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    g_gl.depth_mask(GL_TRUE);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    return 1;
+}
+
+static void hwr_truecolor_write_ppm(const char *suffix, const uint32_t *pixels,
+                                    uint32_t width, uint32_t height,
+                                    unsigned serial)
+{
+    char path[2176];
+    FILE *file;
+    uint32_t i;
+    snprintf(path, sizeof path, "%s_%s.ppm", g_truecolor_compare_path, suffix);
+    file = fopen(path, "wb");
+    if (file == NULL)
+        return;
+    fprintf(file, "P6\n# frame %u\n%u %u\n255\n", serial, width, height);
+    for (i = 0; i < width * height; i++) {
+        uint8_t rgb[3];
+        rgb[0] = (uint8_t)(pixels[i] >> 16);
+        rgb[1] = (uint8_t)(pixels[i] >> 8);
+        rgb[2] = (uint8_t)pixels[i];
+        fwrite(rgb, 1, 3, file);
+    }
+    fclose(file);
+}
+
+static void hwr_truecolor_write_pgm(const char *suffix, const uint8_t *plane,
+                                    uint32_t width, uint32_t height,
+                                    unsigned serial)
+{
+    char path[2176];
+    FILE *file;
+    snprintf(path, sizeof path, "%s_%s.pgm", g_truecolor_compare_path, suffix);
+    file = fopen(path, "wb");
+    if (file == NULL)
+        return;
+    fprintf(file, "P5\n# frame %u\n%u %u\n255\n", serial, width, height);
+    fwrite(plane, 1, (size_t)width * height, file);
+    fclose(file);
+}
+
+/* On a differing frame, name the surface classes involved: render the same view
+ * set once more at the material-bit visualisation and dump that plane. The
+ * probe leaves the index target holding material bits, so the frame's own image
+ * is rendered again afterwards and the canvas re-read. */
+static void hwr_truecolor_dump_material(const struct hwr_gl_scene_view *views,
+                                        size_t view_count,
+                                        uint32_t width, uint32_t height,
+                                        unsigned serial)
+{
+    uint8_t *plane = (uint8_t *)malloc((size_t)width * height);
+    int saved_vis = g_debug_vis;
+    if (plane != NULL) {
+        g_debug_vis = 6;
+        g_truecolor_active = 0;
+        if (hwr_truecolor_restore_index(width, height) &&
+            hwr_render_view_set(views, view_count, width, height) &&
+            hwr_gl_read_scene_indices(plane, width, height))
+            hwr_truecolor_write_pgm("material", plane, width, height, serial);
+        g_debug_vis = saved_vis;
+        g_truecolor_active = 1;
+        free(plane);
+    }
+    if (!hwr_truecolor_restore_index(width, height))
+        return;
+    hwr_truecolor_prime(width, height);
+    if (!hwr_render_view_set(views, view_count, width, height))
+        return;
+    hwr_scene_resolve_pass(width, height);
+    g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
+                     GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
+}
+
+/* The metric: differing pixels between the authentic and the true-colour arm,
+ * over the whole canvas. The bar is zero, so anything above it is a defect with
+ * a cause and the frame is dumped for it. */
+static void hwr_truecolor_compare_report(const struct hwr_gl_scene_view *views,
+                                         size_t view_count,
+                                         uint32_t width, uint32_t height)
+{
+    size_t plane = (size_t)width * height;
+    size_t differing = 0;
+    unsigned max_delta = 0;
+    size_t i;
+    for (i = 0; i < plane; i++) {
+        uint32_t a = g_truecolor_compare_pixels[i];
+        uint32_t b = g_pixels[i];
+        unsigned shift;
+        if (a == b)
+            continue;
+        differing++;
+        for (shift = 0; shift < 32u; shift += 8u) {
+            int delta = (int)((a >> shift) & 0xffu) -
+                        (int)((b >> shift) & 0xffu);
+            if (delta < 0)
+                delta = -delta;
+            if ((unsigned)delta > max_delta)
+                max_delta = (unsigned)delta;
+        }
+    }
+    g_truecolor_compare_frames++;
+    g_truecolor_compare_bad_pixels += differing;
+    if (max_delta > g_truecolor_compare_max_delta)
+        g_truecolor_compare_max_delta = max_delta;
+    if (differing != 0) {
+        g_truecolor_compare_bad_frames++;
+        fprintf(stderr, "[renderer_overhaul] truecolor compare frame %u:"
+                        " differing=%lu/%lu max-delta=%u\n",
+                g_truecolor_compare_frames, (unsigned long)differing,
+                (unsigned long)plane, max_delta);
+        if (g_truecolor_compare_dumps < 4u) {
+            g_truecolor_compare_dumps++;
+            hwr_truecolor_write_ppm("authentic", g_truecolor_compare_pixels,
+                                    width, height,
+                                    g_truecolor_compare_frames);
+            hwr_truecolor_write_ppm("truecolor", g_pixels, width, height,
+                                    g_truecolor_compare_frames);
+            hwr_truecolor_dump_material(views, view_count, width, height,
+                                        g_truecolor_compare_frames);
+        }
+    }
+    if ((g_truecolor_compare_frames % 60u) == 0u)
+        fprintf(stderr, "[renderer_overhaul] truecolor compare %u frames:"
+                        " differing frames=%u pixels=%llu max-delta=%u\n",
+                g_truecolor_compare_frames, g_truecolor_compare_bad_frames,
+                (unsigned long long)g_truecolor_compare_bad_pixels,
+                g_truecolor_compare_max_delta);
+}
+
 const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
                                     size_t view_count,
                                     const uint8_t palette_rgba[1024],
@@ -2826,6 +3343,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     static size_t perf_copy_sum;
     static unsigned perf_samples;
     static int perf_enabled = -1;
+    int compare_active;
     size_t full_copy_count = 1u; /* previous-frame stale target */
     /* Only reached where the target has no starting art -- the frame after it
      * is created or resized, or a backdrop repaint with no usable image -- so
@@ -2868,6 +3386,14 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     if ((g_fbo_width != width || g_fbo_height != height) &&
         !hwr_create_framebuffer(width, height))
         return NULL;
+    /* The true-colour foundation comes up on the first frame that asks for it
+     * and stands until the context goes. With nothing asking, no enhanced
+     * program is compiled, no colour attachment exists, and every pass below
+     * issues the calls it has always issued. */
+    g_truecolor_active =
+        (hwr_truecolor_env() || hwr_truecolor_compare_enabled()) &&
+        hwr_truecolor_ensure(width, height);
+    compare_active = g_truecolor_active && hwr_truecolor_compare_enabled();
 
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.active_texture(GL_TEXTURE1);
@@ -2877,11 +3403,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
     g_gl.disable(GL_SCISSOR_TEST);
-    {
-        static const GLenum both_buffers[2] =
-            { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
-        g_gl.draw_buffers(2, both_buffers);
-    }
+    hwr_draw_buffers_world();
     /* The original never wipes the view before drawing it, so a column no
      * surface covers keeps whatever the previous frame left in that pixel.
      * This shows up where a see-through surface has nothing but void behind
@@ -2914,29 +3436,49 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     if (perf_enabled)
         perf_setup = hwr_perf_now_ns();
 
-    for (view_index = 0; view_index < view_count; view_index++) {
-        if (!hwr_gl_render_view(&views[view_index], width, height))
-            return NULL;
+    /* The acceptance instrument's authentic arm: the same view set, the same
+     * camera, the same palette and the same starting index plane, rendered
+     * through the program the foundation replaces. It runs first so the frame's
+     * own arm is the one that stands when it is done. */
+    if (compare_active) {
+        size_t bytes = (size_t)width * height * sizeof *g_pixels;
+        if (bytes > g_truecolor_compare_bytes) {
+            uint32_t *buffer =
+                (uint32_t *)realloc(g_truecolor_compare_pixels, bytes);
+            if (buffer == NULL)
+                compare_active = 0;
+            else {
+                g_truecolor_compare_pixels = buffer;
+                g_truecolor_compare_bytes = bytes;
+            }
+        }
     }
+    if (compare_active) {
+        g_truecolor_active = 0;
+        if (!hwr_render_view_set(views, view_count, width, height))
+            return NULL;
+        hwr_scene_resolve_pass(width, height);
+        g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height, GL_BGRA,
+                         GL_UNSIGNED_INT_8_8_8_8_REV,
+                         g_truecolor_compare_pixels);
+        g_truecolor_active = 1;
+        compare_active = hwr_truecolor_restore_index(width, height);
+    }
+
+    if (g_truecolor_active)
+        hwr_truecolor_prime(width, height);
+    if (!hwr_render_view_set(views, view_count, width, height))
+        return NULL;
     if (perf_enabled)
         perf_views = hwr_perf_now_ns();
 
-    g_gl.disable(GL_SCISSOR_TEST);
-    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
-    g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
-    g_gl.disable(GL_DEPTH_TEST);
-    g_gl.use_program(g_resolve_program);
-    hwr_uniform_1i(g_resolve_program, "u_debug_vis", g_debug_vis);
-    g_gl.bind_vertex_array(g_resolve_vao);
-    g_gl.active_texture(GL_TEXTURE0);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_index_texture);
-    g_gl.active_texture(GL_TEXTURE1);
-    g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
-    g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    hwr_scene_resolve_pass(width, height);
     if (perf_enabled)
         perf_resolve = hwr_perf_now_ns();
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
+    if (compare_active)
+        hwr_truecolor_compare_report(views, view_count, width, height);
     if (perf_enabled) {
         uint64_t done = hwr_perf_now_ns();
         perf_setup_sum += perf_setup - perf_t0;
@@ -3058,6 +3600,16 @@ int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height)
 
 void hwr_gl_shutdown(void)
 {
+    /* An acceptance run always ends on a verdict line, however few frames it
+     * sampled. */
+    if (g_truecolor_compare_frames != 0)
+        fprintf(stderr, "[renderer_overhaul] truecolor compare final:"
+                        " %u frames, differing frames=%u pixels=%llu"
+                        " max-delta=%u%s\n",
+                g_truecolor_compare_frames, g_truecolor_compare_bad_frames,
+                (unsigned long long)g_truecolor_compare_bad_pixels,
+                g_truecolor_compare_max_delta,
+                g_truecolor_break ? " (negative self-test)" : "");
     if (g_initialized && hwr_platform_make_current()) {
         hwr_destroy_scene_objects();
         hwr_destroy_programs();
@@ -3072,6 +3624,12 @@ void hwr_gl_shutdown(void)
     g_index_seed_width = 0;
     g_index_seed_height = 0;
     g_index_seed_ready = 0;
+    free(g_truecolor_compare_pixels);
+    g_truecolor_compare_pixels = NULL;
+    g_truecolor_compare_bytes = 0;
+    g_truecolor_active = 0;
+    g_truecolor_failed = 0;
+    g_truecolor_logged = 0;
     g_initialized = 0;
     memset(&g_gl, 0, sizeof g_gl);
 }
