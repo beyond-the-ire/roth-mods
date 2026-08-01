@@ -43,6 +43,15 @@ enum hwr_apply_kind {
     HWR_APPLY_NONE        /* nothing consumes it yet */
 };
 
+/* Which control the settings overlay offers for a row. The table says so rather
+ * than the overlay recognising particular keys, which is the whole point of
+ * having one description of a setting. AUTO follows from the value type. */
+enum hwr_widget {
+    HWR_WIDGET_AUTO = 0,
+    HWR_WIDGET_RESOLUTION_PAIR, /* this row and the next of its kind are one control */
+    HWR_WIDGET_KEY_CAPTURE      /* the value is the next key the player presses */
+};
+
 enum {
     HWR_SF_NEEDS_CONFIRM = 1u << 0, /* a change wants confirm/revert */
     HWR_SF_ZERO_IS_AUTO  = 1u << 1, /* zero is legal and means "follow" */
@@ -82,11 +91,17 @@ struct hwr_setting_desc {
     union hwr_value def;            /* built-in default */
     union hwr_value original;       /* the Original preset */
     union hwr_value min, max;       /* numeric range; unused for BOOL/ENUM */
+    /* One adjustment and one page of adjustment. Zero means "derive from the
+     * type", so a row only carries them when its own scale differs. */
+    union hwr_value step, page_step;
     const struct hwr_enum_value *values;
     size_t value_count;
     int depends_on;                 /* index of the enabling row, or -1 */
+    enum hwr_widget widget;
     const char *label;
     const char *help;
+    /* What a zero means in words, for a row whose zero is automatic. */
+    const char *auto_label;
     /* Optional. NULL unless the row needs them. */
     int (*available)(void);
     void (*to_field)(struct hwr_settings *, union hwr_value);
@@ -104,6 +119,12 @@ int hwr_schema_parse(const struct hwr_setting_desc *desc, const char *text,
                      union hwr_value *out, char *err, size_t err_size);
 int hwr_schema_validate(const struct hwr_setting_desc *desc,
                         union hwr_value value, char *err, size_t err_size);
+/* Every row of one whole settings object, plus the rules that span two rows and
+ * therefore cannot be checked as a value arrives. Both writers into the store --
+ * the configuration file and the settings overlay -- ask this before they
+ * commit, so neither can express a state the other would refuse. */
+int hwr_schema_validate_all(const struct hwr_settings *settings,
+                            char *err, size_t err_size);
 /* Value to text, in the spelling the cfg file uses. Returns 1 on success. */
 int hwr_schema_format(const struct hwr_setting_desc *desc,
                       union hwr_value value, char *out, size_t out_size);

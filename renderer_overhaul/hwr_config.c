@@ -200,6 +200,20 @@ static int hwr_config_read(struct hwr_settings *settings,
     if (ferror(file))
         valid = 0;
     fclose(file);
+    /* The rules that span two keys cannot be judged as each line arrives, so
+     * they are judged once the file is whole -- and a file that breaks one is
+     * as invalid as a file with a value out of range. */
+    if (valid) {
+        char message[160];
+
+        message[0] = 0;
+        if (!hwr_schema_validate_all(settings, message, sizeof message)) {
+            if (report_errors)
+                fprintf(stderr, "[renderer_overhaul] %s: %s\n", g_config.path,
+                        message);
+            valid = 0;
+        }
+    }
     *content_hash = hash;
     return valid ? 1 : -1;
 }

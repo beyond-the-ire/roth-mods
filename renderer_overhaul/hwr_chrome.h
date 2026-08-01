@@ -66,6 +66,14 @@ struct hwr_chrome_rect {
 struct hwr_chrome {
     struct hwr_chrome_rect rects[HWR_CHROME_MAX_RECTS];
     unsigned count;
+    /* The one rect no engine window announces: the mod's own settings panel.
+     * It has no save-under handle and no lifecycle of its own -- whoever draws
+     * it says where it is and when it is gone. */
+    int overlay_active;
+    uint32_t overlay_x;
+    uint32_t overlay_y;
+    uint32_t overlay_w;
+    uint32_t overlay_h;
     uint8_t *plane;
     size_t plane_capacity;
     int overflow_logged;
@@ -82,6 +90,31 @@ int hwr_chrome_enabled(void);
 void hwr_chrome_record(struct hwr_chrome *chrome, const struct roth_api_v1 *api,
                        uint32_t handle, uint32_t x, uint32_t y,
                        uint32_t width, uint32_t height);
+
+/* The index the panel rect is closed with, and the contract that goes with it:
+ * whoever draws into that rect guarantees no pixel it publishes carries this
+ * index.
+ *
+ * An engine window is closed against the LIVE framebuffer, because the window's
+ * pixels are already in it when the baseline is taken. The mod's own panel is
+ * not: it is composed onto the published frame after the frame it travels with
+ * has been submitted (traps.c dispatches the compose seam between the publish
+ * and the pairing), and the presentation layer compares the baseline against
+ * that composed frame. A token derived from the pre-compose framebuffer would
+ * therefore say nothing about the pixels it has to differ from. A fixed index
+ * the panel never draws does, for every panel pixel, in every frame, with no
+ * dependence on when the panel was last redrawn. */
+#define HWR_CHROME_PANEL_TOKEN 0xffu
+
+/* Where the mod's own panel covers the screen, in framebuffer coordinates, or
+ * active = 0 for "nowhere". Unlike an engine window this rect is closed whole:
+ * the panel is opaque everywhere it stands, so there is nothing to test per
+ * pixel and no save-under to ask. Set it from the game thread, and keep it one
+ * frame past the panel coming down so a cleared rect can never arrive before
+ * the last frame that still carries the panel's pixels. */
+void hwr_chrome_set_overlay_rect(struct hwr_chrome *chrome, int active,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t width, uint32_t height);
 
 /* The window re-captured what is under it and is about to draw again. */
 void hwr_chrome_cover(struct hwr_chrome *chrome, uint32_t handle);

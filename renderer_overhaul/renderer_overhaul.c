@@ -20,6 +20,7 @@
 #include "hwr_composite.h"
 #include "hwr_chrome.h"
 #include "hwr_ownership.h"
+#include "hwr_overlay.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -45,6 +46,12 @@
 #define VA_G_MAP_DAS_NAME              0x7023cu
 #define VA_G_SHARED_DAS_NAME           0x702dcu
 #define VA_G_GDV_PALETTE_MODE          0x91de6u
+#define VA_G_MOUSE_X                   0x707b3u
+#define VA_G_MOUSE_Y                   0x707b7u
+
+/* One spelling of the version, for the plugin record and for the settings
+ * overlay that shows it. */
+#define HWR_PLUGIN_VERSION "0.1.0"
 
 struct hwr_viewport {
     int32_t x;
@@ -119,6 +126,8 @@ static uint32_t g_selfheal_tick;
  * reallocated while hwr_scene_build_mesh is walking them.  Several loads before
  * the next dispatch coalesce into one reload of whatever is staged then. */
 static int g_map_reload_pending;
+/* Frames the settings panel's rect stays announced after the panel is gone. */
+static int g_overlay_rect_held;
 /* Development aid: HWR_DUMP_FRAME=<path.ppm> periodically writes the submitted
  * world frame (atomically, via rename) for offline comparison against the
  * original renderer's output. */
@@ -716,12 +725,44 @@ static void hwr_close_windows_on_published_frame(const struct roth_api_v1 *api)
  * frame only reaches the screen paired with an engine page flip, and the host
  * drops one that stops being refreshed, so the mod's publishing cadence has to
  * be the engine's present cadence rather than a timer of its own. */
+/* The rect the settings panel stands in, handed to the chrome set so the
+ * baseline that travels with the frame closes it. Called right after the panel
+ * is drawn, so the first frame it is composed onto is already submitted with
+ * the rect closed. */
+static void hwr_announce_overlay_rect(void)
+{
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+
+    if (!hwr_overlay_rect(&x, &y, &width, &height))
+        return;
+    hwr_chrome_set_overlay_rect(&g_chrome, 1, x, y, width, height);
+    g_overlay_rect_held = 2;
+}
+
+/* And the other end of it, once per present: a rect is kept one present past
+ * the panel coming down, so a cleared rect can never reach a frame that still
+ * carries the panel's pixels. */
+static void hwr_retire_overlay_rect(void)
+{
+    if (g_overlay_rect_held == 0)
+        return;
+    if (hwr_overlay_rect(NULL, NULL, NULL, NULL))
+        return;
+    if (--g_overlay_rect_held == 0)
+        hwr_chrome_set_overlay_rect(&g_chrome, 0, 0, 0, 0, 0);
+}
+
 static void hwr_present_seam(const struct roth_api_v1 *api)
 {
     int supplied;
 
     if (g_world_render_active)
         return;
+    hwr_announce_overlay_rect();
+    hwr_retire_overlay_rect();
     supplied = g_submitted_for_present;
     g_submitted_for_present = 0;
     if (supplied) {
@@ -1487,6 +1528,44 @@ static int hwr_canvas_published(void)
            g_last_frame_geometry_valid;
 }
 
+/* What the settings panel is told about the renderer around it. Filling a small
+ * value struct keeps the entry file's statics private and gives the overlay one
+ * consistent view per pump. With the panel closed only the first two fields are
+ * read, and the pointer -- the one part with any work in it -- is left out. */
+static void hwr_fill_overlay_runtime(const struct roth_api_v1 *api,
+                                     struct hwr_overlay_runtime *runtime,
+                                     int with_cursor)
+{
+    struct hwr_input_route route;
+
+    memset(runtime, 0, sizeof *runtime);
+    runtime->version = HWR_PLUGIN_VERSION;
+    /* A cutscene sequence owns the screen outright, and a map being staged owns
+     * the next frame or two. Everything else -- the main menu, gameplay, the
+     * inventory, and hardware rendering switched off -- is the panel's to open
+     * over. */
+    runtime->screen_available = g_ownership.state != HWR_OWNER_ENGINE_SCREEN &&
+                                !g_map_reload_pending && !g_map_event_pending;
+    if (!with_cursor || api == NULL || api->game_ram == NULL)
+        return;
+    if (hwr_canvas_published() &&
+        g_last_frame.composite_mode ==
+            ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS &&
+        hwr_input_prepare_ui_draw_route(api, g_last_frame.w, g_last_frame.h,
+                                        &route)) {
+        /* The engine layer is centred on a wider canvas, so the pointer the
+         * host publishes is in canvas space and the panel is not. The draw
+         * route localises it without parking an off-layer point, so a pointer
+         * out in a wing simply misses the panel. */
+        runtime->cursor_x = route.hud_x;
+        runtime->cursor_y = route.hud_y;
+    } else {
+        runtime->cursor_x = (int32_t)api->game_ram->u32(VA_G_MOUSE_X);
+        runtime->cursor_y = (int32_t)api->game_ram->u32(VA_G_MOUSE_Y);
+    }
+    runtime->cursor_valid = 1;
+}
+
 static void ROTH_CDECL hwr_run_gameplay_frame(
     struct roth_chain *chain, const struct roth_api_v1 *api)
 {
@@ -1765,15 +1844,39 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
         hwr_settings_register_apply(hwr_window_settings_apply, NULL) != 0)
         fprintf(stderr, "[renderer_overhaul] settings apply-hook registration failed\n");
     hwr_config_load(g_plugin_dir);
+    hwr_overlay_init();
+}
+
+/* The keystroke seam, in the tick. Everything it can do is flip a flag and note
+ * the key; the panel itself runs on the game thread. */
+static uint8_t ROTH_CDECL hwr_on_scancode(const struct roth_api_v1 *api,
+                                           uint8_t scancode)
+{
+    (void)api;
+    return hwr_overlay_scancode(scancode);
+}
+
+/* The compose seam, in the tick: the drawn panel onto the frame that is about
+ * to be presented, and nothing else. */
+static void ROTH_CDECL hwr_on_compose_tick(const struct roth_api_v1 *api,
+                                            uint8_t *pixels, uint32_t width,
+                                            uint32_t height)
+{
+    hwr_overlay_compose(api, pixels, width, height);
 }
 
 static void ROTH_CDECL hwr_on_frame_game(const struct roth_api_v1 *api)
 {
+    struct hwr_overlay_runtime runtime;
+
     if (g_world_render_active)
         return;
     /* The world pass is not dispatched while a menu owns the screen, so this
      * is the safe point that answers a settings request made there. */
     hwr_settings_pump(api);
+    hwr_fill_overlay_runtime(api, &runtime, hwr_overlay_is_open());
+    hwr_overlay_pump(api, &runtime);
+    hwr_announce_overlay_rect();
     hwr_prewarm_shared_das(api);
 
     if (g_wrap_serial != g_watchdog_serial) {
@@ -1839,9 +1942,18 @@ static void hwr_prewarm_shared_das(const struct roth_api_v1 *api)
 static void ROTH_CDECL hwr_on_mouse_poll(const struct roth_api_v1 *api,
                                           struct roth_mouse_poll_v1 *poll)
 {
-    (void)poll;
     if (g_world_render_active)
         return;
+    if (hwr_overlay_is_open()) {
+        struct hwr_overlay_runtime runtime;
+
+        /* The panel takes the pointer here and hides it from the game, and
+         * pumps from here as well: the screens it is most likely to be open
+         * over drive this seam far more reliably than a per-frame callback. */
+        hwr_fill_overlay_runtime(api, &runtime, 1);
+        hwr_overlay_mouse(api, poll, &runtime);
+        hwr_announce_overlay_rect();
+    }
     if (g_wrap_serial != g_poll_serial) {
         g_poll_serial = g_wrap_serial;
         g_poll_stall_count = 0;
@@ -2051,6 +2163,7 @@ static void ROTH_CDECL hwr_on_video_mode_changed(const struct roth_api_v1 *api,
 static void ROTH_CDECL hwr_on_unload(const struct roth_api_v1 *api)
 {
     hwr_enter_software(api, "the renderer is unloading");
+    hwr_overlay_shutdown();
     hwr_map_data_clear(0, 0);
     hwr_objects_clear(&g_objects);
     hwr_scene_clear(&g_scene);
@@ -2123,14 +2236,17 @@ static const struct roth_plugin_info_v1 RENDERER_OVERHAUL = {
     .struct_size = sizeof(struct roth_plugin_info_v1),
     .id = "ire.roth.renderer_overhaul",
     .name = "Renderer Overhaul",
-    .version = "0.1.0",
+    .version = HWR_PLUGIN_VERSION,
     .sdk_req_major = ROTH_SDK_MAJOR,
     .sdk_req_minor = ROTH_SDK_MINOR,
-    .api_use = ROTH_API_USE_GAME_RAM,
+    .api_use = ROTH_API_USE_GAME_RAM | ROTH_API_USE_ENGINE |
+               ROTH_API_USE_COMPOSE | ROTH_API_USE_INPUT,
     .on_load = hwr_on_load,
     .on_frame_game = hwr_on_frame_game,
+    .on_compose_tick = hwr_on_compose_tick,
     .on_unload = hwr_on_unload,
     .on_register_overrides = hwr_on_register_overrides,
+    .on_scancode = hwr_on_scancode,
     .on_mouse_poll = hwr_on_mouse_poll,
     .on_map_loaded = hwr_on_map_loaded,
     .on_video_mode_changed = hwr_on_video_mode_changed

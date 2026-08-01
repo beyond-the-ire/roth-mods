@@ -132,10 +132,14 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .original = { .u = 640u },
         .min = { .u = 0u },
         .max = { .u = 16384u },
+        .step = { .u = 16u },
+        .page_step = { .u = 160u },
         .depends_on = -1,
+        .widget = HWR_WIDGET_RESOLUTION_PAIR,
         .label = "Render width",
         .help = "World render width in pixels. Zero follows the engine "
-                "viewport."
+                "viewport.",
+        .auto_label = "Follow engine"
     },
     {
         .key = "internal_h",
@@ -151,10 +155,14 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .original = { .u = 480u },
         .min = { .u = 0u },
         .max = { .u = 16384u },
+        .step = { .u = 16u },
+        .page_step = { .u = 160u },
         .depends_on = -1,
+        .widget = HWR_WIDGET_RESOLUTION_PAIR,
         .label = "Render height",
         .help = "World render height in pixels. Zero follows the engine "
-                "viewport."
+                "viewport.",
+        .auto_label = "Follow engine"
     },
     {
         .key = "window_mode",
@@ -193,10 +201,15 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "frame. Adaptive is used only where the host supports it."
     },
     {
+        /* The frame-rate cap is the spelling a player uses for the present
+         * interval, so it is an ordinary consumer row that happens to reach its
+         * field through a transform. Being a second spelling is what to_field
+         * and from_field say; it is not a visibility class, and this is the only
+         * frame-rate control the settings overlay has to offer. */
         .key = "fps_cap",
         .type = HWR_VT_U32,
         .category = HWR_CAT_DISPLAY,
-        .exposure = HWR_EXP_ALIAS,
+        .exposure = HWR_EXP_CONSUMER,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_PRESENT_INTERVAL,
         .offset = HWR_SCHEMA_NO_FIELD,
@@ -205,9 +218,12 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .original = { .u = 0u },
         .min = { .u = 0u },
         .max = { .u = 1000000u },
+        .step = { .u = 5u },
+        .page_step = { .u = 30u },
         .depends_on = -1,
         .label = "Frame-rate cap",
         .help = "Maximum host presents per second. Zero is uncapped.",
+        .auto_label = "Uncapped",
         .to_field = hwr_fps_cap_to_field,
         .from_field = hwr_fps_cap_from_field
     },
@@ -242,11 +258,14 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .original = { .f = 0.0f },
         .min = { .f = 30.0f },
         .max = { .f = 170.0f },
+        .step = { .f = 1.0f },
+        .page_step = { .f = 10.0f },
         .depends_on = -1,
         .label = "Field of view",
         .help = "Horizontal field of view at the original 4:3 aspect. Zero "
                 "preserves the original projection; wider output aspects gain "
-                "horizontal view area either way."
+                "horizontal view area either way.",
+        .auto_label = "Original"
     },
     {
         .key = "pitch_mode",
@@ -314,6 +333,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .values = HWR_KEY_VALUES,
         .value_count = HWR_COUNT_OF(HWR_KEY_VALUES),
         .depends_on = -1,
+        .widget = HWR_WIDGET_KEY_CAPTURE,
         .label = "Settings overlay key",
         .help = "Key that opens the renderer settings overlay."
     },
@@ -519,6 +539,42 @@ int hwr_schema_validate(const struct hwr_setting_desc *desc,
         return 0;
     }
     return 0;
+}
+
+int hwr_schema_validate_all(const struct hwr_settings *settings,
+                            char *err, size_t err_size)
+{
+    size_t i;
+
+    if (settings == NULL)
+        return 0;
+    for (i = 0; i < HWR_COUNT_OF(HWR_SCHEMA); i++) {
+        const struct hwr_setting_desc *desc = &HWR_SCHEMA[i];
+        char message[160];
+
+        /* A row with no field of its own holds nothing to check, and a second
+         * spelling is checked as the field it writes. */
+        if (desc->offset == HWR_SCHEMA_NO_FIELD)
+            continue;
+        if (hwr_schema_validate(desc, hwr_schema_get(settings, desc), message,
+                                sizeof message))
+            continue;
+        hwr_schema_error(err, err_size, "%s: %s", desc->key, message);
+        return 0;
+    }
+    /* The rendered view never goes narrower than four by three. Focal length
+     * follows the target height, so a canvas taller than that silently loses
+     * horizontal view instead of gaining it, and nothing downstream puts it
+     * back. */
+    if (settings->internal_w != 0 && settings->internal_h != 0 &&
+        (uint64_t)settings->internal_w * 3u <
+            (uint64_t)settings->internal_h * 4u) {
+        hwr_schema_error(err, err_size,
+                         "the render size may not be narrower than 4:3; %u by %u is",
+                         settings->internal_w, settings->internal_h);
+        return 0;
+    }
+    return 1;
 }
 
 int hwr_schema_parse(const struct hwr_setting_desc *desc, const char *text,

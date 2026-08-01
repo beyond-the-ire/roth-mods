@@ -143,6 +143,23 @@ void hwr_chrome_record(struct hwr_chrome *chrome, const struct roth_api_v1 *api,
     rect->settled = 0;
 }
 
+void hwr_chrome_set_overlay_rect(struct hwr_chrome *chrome, int active,
+                                 uint32_t x, uint32_t y,
+                                 uint32_t width, uint32_t height)
+{
+    if (chrome == NULL)
+        return;
+    if (!active || width == 0 || height == 0) {
+        chrome->overlay_active = 0;
+        return;
+    }
+    chrome->overlay_active = 1;
+    chrome->overlay_x = x;
+    chrome->overlay_y = y;
+    chrome->overlay_w = width;
+    chrome->overlay_h = height;
+}
+
 void hwr_chrome_cover(struct hwr_chrome *chrome, uint32_t handle)
 {
     struct hwr_chrome_rect *rect = chrome != NULL
@@ -225,8 +242,12 @@ void hwr_chrome_settle(struct hwr_chrome *chrome)
 
 void hwr_chrome_reset(struct hwr_chrome *chrome)
 {
-    if (chrome != NULL)
-        chrome->count = 0;
+    if (chrome == NULL)
+        return;
+    chrome->count = 0;
+    /* The panel rect describes a position in the screen geometry that is being
+     * dropped, and whoever draws the panel republishes it every frame. */
+    chrome->overlay_active = 0;
 }
 
 void hwr_chrome_clear(struct hwr_chrome *chrome)
@@ -237,6 +258,7 @@ void hwr_chrome_clear(struct hwr_chrome *chrome)
     chrome->plane = NULL;
     chrome->plane_capacity = 0;
     chrome->count = 0;
+    chrome->overlay_active = 0;
     chrome->overflow_logged = 0;
 }
 
@@ -289,6 +311,23 @@ static const uint8_t *hwr_chrome_saved_rows(const struct roth_api_v1 *api,
     return (const uint8_t *)api->game_ram->to_ptr(chunk_offset + 0xcu);
 }
 
+/* The working copy of the baseline the stamps are written into, taken the first
+ * time a pixel really has to be closed so a frame with nothing to close still
+ * submits the plane it was given. */
+static uint8_t *hwr_chrome_ensure_plane(struct hwr_chrome *chrome,
+                                        const uint8_t *base, size_t required)
+{
+    if (required > chrome->plane_capacity) {
+        uint8_t *grown = (uint8_t *)realloc(chrome->plane, required);
+        if (grown == NULL)
+            return NULL;
+        chrome->plane = grown;
+        chrome->plane_capacity = required;
+    }
+    memcpy(chrome->plane, base, required);
+    return chrome->plane;
+}
+
 const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
                                    const struct roth_api_v1 *api,
                                    const struct roth_world_frame_v1 *frame,
@@ -304,7 +343,8 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
     unsigned i;
 
     if (chrome == NULL || api == NULL || api->game_ram == NULL ||
-        frame == NULL || base == NULL || chrome->count == 0 ||
+        frame == NULL || base == NULL ||
+        (chrome->count == 0 && !chrome->overlay_active) ||
         !hwr_chrome_enabled())
         return base;
     if (frame->vx < 0 || frame->vy < 0 || frame->vw == 0 || frame->vh == 0)
@@ -377,16 +417,9 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
                     (under == NULL || live[x] == under[x - rect->x]))
                     continue;
                 if (plane == NULL) {
-                    if (required > chrome->plane_capacity) {
-                        uint8_t *grown = (uint8_t *)realloc(chrome->plane,
-                                                            required);
-                        if (grown == NULL)
-                            return base;
-                        chrome->plane = grown;
-                        chrome->plane_capacity = required;
-                    }
-                    memcpy(chrome->plane, base, required);
-                    plane = chrome->plane;
+                    plane = hwr_chrome_ensure_plane(chrome, base, required);
+                    if (plane == NULL)
+                        return base;
                 }
                 /* Derived from the live pixel, so it cannot equal it, and half
                  * the palette away from it, so it cannot equal the NEXT value
@@ -396,6 +429,41 @@ const uint8_t *hwr_chrome_baseline(struct hwr_chrome *chrome,
                  * what the next frame's value tends to be. */
                 plane[index] = (uint8_t)(live[x] ^ 0x80u);
             }
+        }
+    }
+    /* The mod's own panel. No window announced it, so the frame it travels with
+     * carries a baseline that knows nothing about it: every panel pixel that
+     * happened to equal the pixel beneath it would read as world and be
+     * replaced by the world image, which is a moving speckle across the panel.
+     * The panel is opaque wherever it stands and never carries the token, so
+     * the whole rect is closed with it rather than tested. */
+    if (chrome->overlay_active) {
+        uint32_t left = chrome->overlay_x > (uint32_t)frame->vx
+                      ? chrome->overlay_x : (uint32_t)frame->vx;
+        uint32_t top = chrome->overlay_y > (uint32_t)frame->vy
+                     ? chrome->overlay_y : (uint32_t)frame->vy;
+        uint32_t right = chrome->overlay_x + chrome->overlay_w;
+        uint32_t bottom = chrome->overlay_y + chrome->overlay_h;
+        uint32_t y;
+
+        if (right > (uint32_t)frame->vx + frame->vw)
+            right = (uint32_t)frame->vx + frame->vw;
+        if (bottom > (uint32_t)frame->vy + frame->vh)
+            bottom = (uint32_t)frame->vy + frame->vh;
+        if (bottom > screen_height)
+            bottom = screen_height;
+        if (right > pitch)
+            right = pitch;
+        for (y = top; y < bottom && left < right; y++) {
+            size_t row = (size_t)(y - (uint32_t)frame->vy) * base_pitch;
+
+            if (plane == NULL) {
+                plane = hwr_chrome_ensure_plane(chrome, base, required);
+                if (plane == NULL)
+                    return base;
+            }
+            memset(plane + row + (left - (uint32_t)frame->vx),
+                   HWR_CHROME_PANEL_TOKEN, right - left);
         }
     }
     return plane != NULL ? plane : base;
