@@ -273,14 +273,6 @@ struct hwr_scene {
      * union. */
     struct hwr_sector_xspan door_spans[HWR_DOOR_MAX];
     int door_portal_clip_valid;
-    /* The windows stock draws each sector's faces under this frame, lifted from
-     * its ordered draw list's face chains. They are the bound its wall driver
-     * measures the corner clip against, so the candle corner law reads them.
-     * sector_portal_valid is 0 when nothing could be recovered, which every
-     * reader takes as "the frame". */
-    struct hwr_sector_xspan *sector_spans;
-    size_t sector_span_count;
-    int sector_portal_valid;
     /* Reflected walks retain every narrowed screen-X window per reached
      * sector. World geometry uses these directly; object sources receive a
      * per-object copy in spans above. */
