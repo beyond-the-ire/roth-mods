@@ -99,22 +99,6 @@ int hwr_compute_object_portal_windows(
     const struct roth_api_v1 *api, struct hwr_sector_xspan *spans,
     size_t span_count);
 
-/* Recovers, per sector, the set of screen-X windows the software renderer draws
- * that sector's faces under. Its ordered draw list hangs a face chain off every
- * node; each surviving link names the drawn sector at +0x02 and carries the
- * bounds that link is rendered with at +0x04 / +0x06 -- the values stock loads
- * into its left/right view bounds before it drives the face. A sector reached
- * through several portals appears once per visit, each visit with its own
- * window, so the result is a set and not one interval.
- *
- * `spans` is indexed by sector and must have at least world->sector_count
- * entries. Returns 1 when the whole list was walked and at least one window was
- * captured; on any structural doubt every sector is left with no window and 0
- * is returned, which callers read as "nothing recovered" and fail open. */
-int hwr_compute_sector_portal_windows(
-    const struct hwr_world *world, const struct roth_api_v1 *api,
-    struct hwr_sector_xspan *spans, size_t span_count);
-
 /* Recovers type-4 worklist membership for the post-tick primary hinged-door
  * snapshot. Entries are matched by exact pool-record pointer, then assigned
  * the union of the ordered face-chain windows under which stock renders their

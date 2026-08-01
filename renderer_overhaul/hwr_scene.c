@@ -1381,7 +1381,6 @@ static void hwr_scene_clear_keeping(struct hwr_scene *scene, int keep_store)
     free(scene->spans);
     free(scene->reflection_spans);
     free(scene->wide_spans);
-    free(scene->sector_spans);
     for (i = 0; i < HWR_REFLECTION_MAX; i++) {
         free(scene->reflections[i].vertices);
         free(scene->reflections[i].runs);
@@ -2638,70 +2637,12 @@ static uint16_t hwr_shade_edge_term(int screen_x, int screen_y,
     return (uint16_t)(projected + (uint16_t)depth);
 }
 
-/* The original wall projector does not drop a wall whose edge crosses the near
- * plane: it interpolates the crossing point along the edge, projects THAT point
- * at the near depth, and carries on (renderer.c:7412-7452, the per-wall
- * projection loop; a wall with BOTH ends behind the plane is the only one it
- * skips).  Restoring that clip is what gives such a wall its column walk and,
- * with it, the endpoint-anchored candle shade the whole class was missing. */
-static int hwr_wall_near_clip_enabled(void)
-{
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *setting = getenv("HWR_WALL_NEAR_CLIP");
-        enabled = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return enabled;
-}
-
-/* The near depth in the 8-bit-fraction view domain both the projector and the
- * span walk work in (16 world units). */
-#define HWR_WALL_NEAR_DEPTH_Q8 0x1000
-
-/* Where an end that falls outside the drawn columns is re-sampled.  The
- * original does not carry such an end's own coordinates into the shade: it
- * substitutes the point where the edge meets the near plane (for an end the
- * view cannot see) and then, for EITHER end that still lies outside the drawn
- * columns, the point on the edge at the first (or last) drawn column --
- * interpolating the corner's row and RESCALING its depth to that column
- * (renderer.c:4948-4978, the corner-clip adjust) before the corner projector
- * runs.  Every substitution is a view position and a view depth, so one anchor
- * carries them.
- *
- * THE ANCHOR IS A SAMPLING POSITION AND NOTHING ELSE.  It never reaches an
- * emitted vertex: the word it produces travels to the shader as the corner-law
- * ramp's endpoint, walked in absolute framebuffer columns.  An earlier pass
- * moved the vertex here instead, which shortened the quad and deleted the
- * geometry between the authored end and the drawn column -- invisible at the
- * engine's own aspect, where that geometry is off-frame anyway, and a hole at
- * every wider one. */
-struct hwr_wall_near_anchor {
-    double view_x;
-    double depth;
-    uint32_t active;
-};
-
-/* Record the view position and depth (both in the 8-bit-fraction view domain)
- * the corner word is to be taken at.  Composing this way lets the near-plane
- * crossing and the corner-clip column apply to the same end in order, exactly
- * as the original applies them. */
-static void hwr_wall_anchor_set(struct hwr_wall_near_anchor *anchor,
-                                double view_x_q8, double depth_q8)
-{
-    anchor->view_x = view_x_q8 / 256.0;
-    anchor->depth = depth_q8 / 256.0;
-    anchor->active = 1u;
-}
-
-/* anchor, when non-NULL and active, replaces this end's view position and view
- * depth with the substituted point above. */
 static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
                                        const struct hwr_mesh_vertex *vertex,
                                        int16_t bottom_z,
                                        const struct hwr_gl_camera *camera,
                                        uint32_t width, uint32_t height,
-                                       int tint_clip_adjust,
-                                       const struct hwr_wall_near_anchor *anchor)
+                                       int tint_clip_adjust)
 {
     double view_x;
     double depth_f = hwr_vertex_view_depth(vertex, camera, &view_x);
@@ -2718,10 +2659,6 @@ static uint16_t hwr_wall_endpoint_word(const struct hwr_mesh_surface *surface,
     int shade;
 
     hwr_shade_window_init(&window, camera, width, height);
-    if (anchor != NULL && anchor->active != 0u) {
-        view_x = anchor->view_x;
-        depth_f = anchor->depth;
-    }
     if (depth_f < 16.0)
         depth_f = 16.0;
     depth = (int)(depth_f * (camera->shade_depth_scale > 0.0f
@@ -3095,22 +3032,6 @@ struct hwr_wall_span_state {
     uint32_t valid;
     int32_t vertical_origin;
     uint32_t vertical_seeded;
-    /* Per end -- [0] is end A (the left projection), [1] is end B -- the point
-     * the original substitutes for it when the view or the drawn columns cannot
-     * reach the authored end.  Sampling positions only; no emitted vertex ever
-     * reads them. */
-    struct hwr_wall_near_anchor ends[2];
-    /* The face's two ends as the span walk found them, so the corner words can
-     * be re-taken at the anchors once the per-face tint adjust is known. */
-    const struct hwr_mesh_vertex *end_vertex[2];
-    int16_t end_bottom[2];
-    int16_t end_top[2];
-    /* The half-open framebuffer column interval the corner-law ramp is valid
-     * on: the columns the engine itself drives this face on, mapped into this
-     * target's projection.  Empty when no end was substituted, in which case
-     * the face keeps the law it already had everywhere. */
-    int32_t ramp_x0;
-    int32_t ramp_x1;
 };
 
 static int32_t hwr_shift_right_6(int32_t value)
@@ -3165,63 +3086,12 @@ static int hwr_wall_uses_image_fit(const struct hwr_mesh_surface *surface,
            ((surface->mapping_flags & HWR_TEX_TRANSPARENT) == 0 || middle);
 }
 
-/* Substitute one end of the face with the point on its edge that projects at
- * `column` -- the drawn range's own edge on that side, in the ENGINE's own
- * projection, which is where the original states the bound.  Screen X is
- * view_x*focal/depth + centre and both view_x and depth are linear along the
- * edge, so the along-edge parameter is one linear solve; a vanishing
- * denominator (the edge holds that column everywhere) or a solution outside the
- * segment leaves the end where the near clip put it.  view_p/depth_p is the end
- * being substituted, view_q/depth_q the far end, both as the near clip left
- * them.  Nothing but the anchor is written: no position, no attribute that
- * describes where the face IS. */
-static int hwr_wall_corner_clip(struct hwr_wall_near_anchor *anchor,
-                                double column, double focal, double center,
-                                int32_t view_p, int32_t depth_p,
-                                int32_t view_q, int32_t depth_q)
-{
-    double offset = column - center;
-    double denominator = offset * ((double)depth_q - (double)depth_p) -
-                         ((double)view_q - (double)view_p) * focal;
-    double numerator = (double)view_p * focal - offset * (double)depth_p;
-    double along;
-    if (denominator > -1e-9 && denominator < 1e-9)
-        return 0;
-    along = numerator / denominator;
-    if (along <= 0.0 || along >= 1.0)
-        return 0;
-    hwr_wall_anchor_set(anchor,
-        (double)view_p + along * ((double)view_q - (double)view_p),
-        (double)depth_p + along * ((double)depth_q - (double)depth_p));
-    return 1;
-}
-
-/* Where one anchor lands in THIS target's framebuffer columns.  The anchor is
- * solved in the engine's projection so the law is the engine's; the ramp it
- * seeds has to be walked in the columns the fragments actually carry. */
-static int hwr_wall_anchor_column(const struct hwr_wall_near_anchor *anchor,
-                                  const struct hwr_gl_camera *camera)
-{
-    return hwr_project_fixed((int32_t)(anchor->view_x * 256.0),
-                             camera->focal_x,
-                             (int32_t)(anchor->depth * 256.0),
-                             camera->center_x);
-}
-
-/* bound_left/bound_right are the half-open screen-X window, in the ENGINE's
- * projection columns, that this face is drawn under -- the pair stock loads
- * into its left/right view bounds for the chain visit this quad stands for.
- * bound_right <= bound_left means no window was recovered and the engine's own
- * frame stands in, which is also what stock reduces to at its outermost visit.
- * The bound reaches nothing but the shade anchors and the interval the ramp
- * seeded from them is valid on. */
 static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
                                 const struct hwr_mesh_surface *surface,
                                 const struct hwr_gl_camera *camera,
                                 uint32_t viewport_width,
                                 uint16_t texture_width,
                                 uint16_t texture_height,
-                                int bound_left, int bound_right,
                                 struct hwr_wall_span_state *state)
 {
     const struct hwr_mesh_vertex *vertices =
@@ -3235,7 +3105,6 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
     int xl, xr, row_top_a, row_top_b, row_bottom_a, row_bottom_b;
     int original_top_a, original_bottom_a;
     int segment_columns, left_clip, right_clip, columns;
-    int near_clipped = 0;
     uint32_t reciprocal_a, reciprocal_b;
     uint32_t dividend = 2u << camera->shade_level;
     uint64_t product;
@@ -3259,12 +3128,6 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
     }
     if (end_a == NULL || end_b == NULL)
         return;
-    state->end_vertex[0] = end_a;
-    state->end_vertex[1] = end_b;
-    state->end_bottom[0] = bottom_a;
-    state->end_top[0] = top_a;
-    state->end_bottom[1] = bottom_b;
-    state->end_top[1] = top_b;
 
     fit_texture = hwr_wall_uses_image_fit(surface, texture_width,
                                           texture_height);
@@ -3291,34 +3154,8 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
 
     hwr_wall_view_point(camera, end_a->x, end_a->y, &view_a, &depth_a_q8);
     hwr_wall_view_point(camera, end_b->x, end_b->y, &view_b, &depth_b_q8);
-    if (!hwr_wall_near_clip_enabled()) {
-        if (depth_a_q8 < HWR_WALL_NEAR_DEPTH_Q8 ||
-            depth_b_q8 < HWR_WALL_NEAR_DEPTH_Q8)
-            return;
-    } else if (depth_a_q8 < HWR_WALL_NEAR_DEPTH_Q8 &&
-               depth_b_q8 < HWR_WALL_NEAR_DEPTH_Q8) {
-        /* Wholly behind the near plane: the original marks the wall with its
-         * sentinel and draws nothing at all. */
+    if (depth_a_q8 < 0x1000 || depth_b_q8 < 0x1000)
         return;
-    } else if (depth_a_q8 < HWR_WALL_NEAR_DEPTH_Q8) {
-        int32_t numerator = HWR_WALL_NEAR_DEPTH_Q8 - depth_a_q8;
-        int32_t denominator = depth_b_q8 - depth_a_q8;
-        view_a += (int32_t)(((int64_t)numerator *
-                             (int64_t)(view_b - view_a)) / denominator);
-        depth_a_q8 = HWR_WALL_NEAR_DEPTH_Q8;
-        near_clipped = 1;
-        hwr_wall_anchor_set(&state->ends[0], (double)view_a,
-                            (double)HWR_WALL_NEAR_DEPTH_Q8);
-    } else if (depth_b_q8 < HWR_WALL_NEAR_DEPTH_Q8) {
-        int32_t numerator = HWR_WALL_NEAR_DEPTH_Q8 - depth_b_q8;
-        int32_t denominator = depth_a_q8 - depth_b_q8;
-        view_b += (int32_t)(((int64_t)numerator *
-                             (int64_t)(view_a - view_b)) / denominator);
-        depth_b_q8 = HWR_WALL_NEAR_DEPTH_Q8;
-        near_clipped = 1;
-        hwr_wall_anchor_set(&state->ends[1], (double)view_b,
-                            (double)HWR_WALL_NEAR_DEPTH_Q8);
-    }
     depth_a = depth_a_q8 >> 8;
     depth_b = depth_b_q8 >> 8;
     if (depth_a == 0 || depth_b == 0)
@@ -3369,100 +3206,6 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
         return;
     state->first_x = xl + left_clip;
 
-    /* THE CORNER-CLIP ADJUST, both halves (renderer.c:4948-4962 for the left
-     * corner, 4964-4978 for the right).  A wall whose end projects outside the
-     * columns the driver is drawing it on is not shaded from that end: the
-     * original interpolates that corner's top and bottom rows to the first (or
-     * last) DRAWN column and rescales the corner's depth word by the ratio of
-     * the projected wall heights there, then measures its radial arm at the
-     * drawn column (renderer.c:5008-5017) and seeds the shade DDA there over
-     * the DRAWN count (5034-5040, 5103).
-     *
-     * POPULATION, read straight off those two blocks: the left half runs
-     * whenever the left clip max(0, view_bound_left - xl) (renderer.c:4896-4898)
-     * is nonzero and the right half whenever the right clip max(0, xr -
-     * view_bound_right) (4919-4921) is nonzero.  Both sit in the wall driver's
-     * unconditional setup path with no other gate: EVERY wall running off its
-     * bound is adjusted at that end, near-plane class or not.
-     *
-     * THE BOUND IS NOT THE FRAME.  render_world_face_list rewrites those bounds
-     * from the face chain of the draw-list node it is walking, once per chain
-     * visit (renderer.c:8940 / 9056 / 9181-9183 / 9316), and the portal walk
-     * narrows them as it descends (renderer.c:6913-6940).  They are the portal
-     * window that visit is drawn under and reduce to the frame only at the
-     * outermost one.  The whole solve therefore runs in the ENGINE's projection
-     * columns, which is also what makes it aspect-invariant: the substituted
-     * point is a point in the world, the same point at every target shape.
-     *
-     * Each half reads the OPPOSITE corner's pre-adjust values -- the left half
-     * runs first on the unadjusted right corner, the right half on the copies
-     * of the left corner saved at renderer.c:4923-4925 -- so both solves use
-     * view_a/view_b and depth_a/depth_b as the near clip left them.
-     *
-     * Row and depth need no separate ports: at the wall's own z, projecting the
-     * substituted point's own view depth IS the original's interpolated row and
-     * rescaled depth word, because the projection of a straight world edge is a
-     * straight screen segment and a face's two ends carry the same top and
-     * bottom heights.
-     *
-     * NOTHING HERE MOVES GEOMETRY.  The substituted points are sampling
-     * positions for two shade words; the ramp between them is handed to the
-     * shader as an attribute pair plus the column interval it is valid on. */
-    if (hwr_wall_near_clip_enabled()) {
-        struct hwr_shade_window window;
-        double focal, center;
-        int frame_lo, frame_hi, win_lo, win_hi, sxl, sxr;
-        int substituted = 0;
-        hwr_shade_window_init(&window, camera, viewport_width, 0u);
-        focal = (double)window.focal_x;
-        center = (double)window.center_x;
-        frame_lo = 0;
-        frame_hi = window.width != 0 ? (int)window.width : (int)viewport_width;
-        if (bound_right > bound_left) {
-            win_lo = bound_left;
-            win_hi = bound_right;
-        } else {
-            win_lo = frame_lo;
-            win_hi = frame_hi;
-        }
-        if (win_lo < frame_lo)
-            win_lo = frame_lo;
-        if (win_hi > frame_hi)
-            win_hi = frame_hi;
-        sxl = hwr_project_fixed(view_a, (int32_t)window.focal_x,
-                                depth_a_q8, window.center_x);
-        sxr = hwr_project_fixed(view_b, (int32_t)window.focal_x,
-                                depth_b_q8, window.center_x);
-        /* A face whose projection misses the window entirely is drawn nowhere
-         * by that visit, so stock's law says nothing about it.  Those columns
-         * keep the law they already had rather than an extrapolation of a
-         * window they never touch. */
-        if (win_hi > win_lo && sxl < win_hi && sxr >= win_lo) {
-            if (sxl < win_lo)
-                substituted |= hwr_wall_corner_clip(
-                    &state->ends[0], (double)win_lo, focal, center,
-                    view_a, depth_a_q8, view_b, depth_b_q8);
-            if (sxr > win_hi - 1)
-                substituted |= hwr_wall_corner_clip(
-                    &state->ends[1], (double)win_hi, focal, center,
-                    view_b, depth_b_q8, view_a, depth_a_q8);
-        }
-        if (substituted || near_clipped) {
-            int rx0 = state->ends[0].active != 0u
-                ? hwr_wall_anchor_column(&state->ends[0], camera) : xl;
-            int rx1 = state->ends[1].active != 0u
-                ? hwr_wall_anchor_column(&state->ends[1], camera) : xr;
-            if (rx0 < INT16_MIN) rx0 = INT16_MIN;
-            if (rx0 > INT16_MAX) rx0 = INT16_MAX;
-            if (rx1 < INT16_MIN) rx1 = INT16_MIN;
-            if (rx1 > INT16_MAX) rx1 = INT16_MAX;
-            if (rx1 > rx0) {
-                state->ramp_x0 = rx0;
-                state->ramp_x1 = rx1;
-            }
-        }
-    }
-
     reciprocal_a = (dividend << 16) / (uint32_t)depth_a;
     reciprocal_b = (dividend << 16) / (uint32_t)depth_b;
     state->denominator_step =
@@ -3501,19 +3244,7 @@ static void hwr_wall_span_state(const struct hwr_scene_mesh *mesh,
                                            columns - 1);
     state->top_accum = ((uint32_t)(uint16_t)row_top_a << 16) | 0x7fffu;
     state->bottom_accum = ((uint32_t)(uint16_t)row_bottom_a << 16) | 0x7fffu;
-    /* A near-plane-clipped edge starts partway along the face, so its texel
-     * accumulators would seed the sampler at the wrong point on the texture:
-     * that wall keeps the interpolated sampler it already had and takes only
-     * the shade walk.  It also loses its own corner words -- the authored end
-     * is behind the camera and GL blends it at the near plane -- so off the
-     * ramp it keeps the per-fragment radial it had before this existed. */
-    state->valid = HWR_GL_WALL_SPAN_SHADE;
-    if (near_clipped)
-        state->valid |= HWR_GL_WALL_SPAN_RAMP_ONLY;
-    else
-        state->valid |= HWR_GL_WALL_SPAN_TEXELS;
-    if (state->ramp_x1 > state->ramp_x0)
-        state->valid |= HWR_GL_WALL_SPAN_RAMP;
+    state->valid = 1;
 }
 
 /* ======================================================================
@@ -3793,10 +3524,10 @@ static size_t hwr_emit_wall_segmented(const struct hwr_scene_mesh *mesh,
                     o->z = vz;
                     o->wall_shade_endpoint = hwr_wall_endpoint_word(
                         surface, &mv, hwr_round_i16(bz), camera, width, height,
-                        wall_tint_adjust, NULL);
+                        wall_tint_adjust);
                     o->wall_shade_endpoint_top = hwr_wall_endpoint_word(
                         surface, &mv, hwr_round_i16(tz), camera, width, height,
-                        wall_tint_adjust, NULL);
+                        wall_tint_adjust);
                     if (o->wall_shade_endpoint != 0x1fffu ||
                         o->wall_shade_endpoint_top != 0x1fffu)
                         seg_all_sat = 0;
@@ -4352,15 +4083,8 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                                       const struct hwr_gl_camera *camera,
                                       uint32_t width, uint32_t height,
                                       int clip_left, int clip_right,
-                                      int bound_left, int bound_right,
                                       struct hwr_gl_vertex *destination)
 {
-    /* The corner-law ramp, staged once for the face and copied to every vertex
-     * of it: the two re-anchored word pairs and the half-open column interval
-     * they are walked over.  It describes shading, not shape. */
-    uint16_t ramp_lo_bottom = 0, ramp_lo_top = 0;
-    int16_t ramp_hi_bottom = 0, ramp_hi_top = 0;
-    int16_t ramp_x0 = 0, ramp_x1 = 0;
     uint16_t logical = (uint16_t)surface->texture_id;
     uint16_t texture_width = 0;
     uint16_t texture_height = 0;
@@ -4482,30 +4206,9 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
             flat_guard = HWR_WORLD_WALL_TAG |
                          (uint32_t)surface->sector_index;
         hwr_wall_span_state(&scene->mesh, surface, camera, width,
-                            texture_width, texture_height,
-                            bound_left, bound_right, &wall_span);
+                            texture_width, texture_height, &wall_span);
         wall_tint_adjust =
             hwr_wall_tint_clip_adjust(surface, &scene->mesh, camera);
-        /* The corner words are re-taken at the substituted points now that the
-         * per-face tint adjust is known.  Same word function, same face, one
-         * different sampling position -- the engine's own. */
-        if ((wall_span.valid & HWR_GL_WALL_SPAN_RAMP) != 0 &&
-            wall_span.end_vertex[0] != NULL && wall_span.end_vertex[1] != NULL) {
-            ramp_lo_bottom = hwr_wall_endpoint_word(
-                surface, wall_span.end_vertex[0], wall_span.end_bottom[0],
-                camera, width, height, wall_tint_adjust, &wall_span.ends[0]);
-            ramp_lo_top = hwr_wall_endpoint_word(
-                surface, wall_span.end_vertex[0], wall_span.end_top[0],
-                camera, width, height, wall_tint_adjust, &wall_span.ends[0]);
-            ramp_hi_bottom = (int16_t)hwr_wall_endpoint_word(
-                surface, wall_span.end_vertex[1], wall_span.end_bottom[1],
-                camera, width, height, wall_tint_adjust, &wall_span.ends[1]);
-            ramp_hi_top = (int16_t)hwr_wall_endpoint_word(
-                surface, wall_span.end_vertex[1], wall_span.end_top[1],
-                camera, width, height, wall_tint_adjust, &wall_span.ends[1]);
-            ramp_x0 = (int16_t)wall_span.ramp_x0;
-            ramp_x1 = (int16_t)wall_span.ramp_x1;
-        }
     }
     /* A tinted flat is emitted as its VIEW-CLIPPED loop, so its corners -- the
      * only places the candle law is sampled -- sit where the engine's are.
@@ -4552,8 +4255,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
      * a face with no saturation stays single-ramp and byte-exact. */
     if ((surface->flags & HWR_SURFACE_FLAT) == 0 &&
         surface->kind != HWR_SURFACE_DOOR &&
-        (surface->sector_flags & 2u) != 0 &&
-        (wall_span.valid & HWR_GL_WALL_SPAN_TEXELS) != 0 &&
+        (surface->sector_flags & 2u) != 0 && wall_span.valid &&
         fill_ok &&
         !hwr_wall_uses_image_fit(surface, texture_width, texture_height)) {
         const struct hwr_mesh_vertex *verts =
@@ -4587,13 +4289,13 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
             va != NULL && vb != NULL) {
             int sat =
                 (hwr_wall_endpoint_word(surface, va, bottom_a, camera,
-                     width, height, wall_tint_adjust, NULL) == 0x1fffu) +
+                     width, height, wall_tint_adjust) == 0x1fffu) +
                 (hwr_wall_endpoint_word(surface, va, top_a, camera,
-                     width, height, wall_tint_adjust, NULL) == 0x1fffu) +
+                     width, height, wall_tint_adjust) == 0x1fffu) +
                 (hwr_wall_endpoint_word(surface, vb, bottom_b, camera,
-                     width, height, wall_tint_adjust, NULL) == 0x1fffu) +
+                     width, height, wall_tint_adjust) == 0x1fffu) +
                 (hwr_wall_endpoint_word(surface, vb, top_b, camera,
-                     width, height, wall_tint_adjust, NULL) == 0x1fffu);
+                     width, height, wall_tint_adjust) == 0x1fffu);
             want_seg = (sat > 0 && sat < 4);
         }
         segments = 1;
@@ -4653,13 +4355,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
             tmpl.wall_first_x = wall_span.first_x;
             tmpl.wall_along_extent = wall_span.along_extent;
             tmpl.wall_vertical_extent = wall_span.vertical_extent;
-            /* The along-screen sub-quad emit re-anchors its own corner words
-             * at its slab vertices every forty columns, which is a mod-side
-             * refinement and not the engine's geometry.  It is left exactly as
-             * it was: the face-wide ramp does not belong to those slabs. */
-            tmpl.wall_span_valid = wall_span.valid &
-                ~(uint32_t)(HWR_GL_WALL_SPAN_RAMP |
-                            HWR_GL_WALL_SPAN_RAMP_ONLY);
+            tmpl.wall_span_valid = wall_span.valid;
             tmpl.wall_vertical_origin = wall_span.vertical_origin;
             tmpl.wall_vertical_seeded = wall_span.vertical_seeded;
             return hwr_emit_wall_segmented(
@@ -4714,7 +4410,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
             }
             target->wall_shade_endpoint = hwr_wall_endpoint_word(
                 surface, source, bottom_z, camera, width, height,
-                wall_tint_adjust, NULL);
+                wall_tint_adjust);
             /* Companion TOP-edge corner word: the same wd_project shade taken at
              * the wall's TOP screen row (screen_y from top_z) instead of the
              * bottom.  Both corners of a side share the vertex's x/y, so every
@@ -4722,7 +4418,7 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
              * shader interpolates them bilinearly for the sub-row candle DDA. */
             target->wall_shade_endpoint_top = hwr_wall_endpoint_word(
                 surface, source, top_z, camera, width, height,
-                wall_tint_adjust, NULL);
+                wall_tint_adjust);
             target->wall_tint_adjust = (uint8_t)wall_tint_adjust;
             if (fit_texture) {
                 target->wall_s = end_b
@@ -4803,12 +4499,6 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
         target->wall_along_extent = wall_span.along_extent;
         target->wall_vertical_extent = wall_span.vertical_extent;
         target->wall_span_valid = wall_span.valid;
-        target->wall_shade_ramp_lo_bottom = ramp_lo_bottom;
-        target->wall_shade_ramp_lo_top = ramp_lo_top;
-        target->wall_shade_ramp_hi_bottom = ramp_hi_bottom;
-        target->wall_shade_ramp_hi_top = ramp_hi_top;
-        target->wall_shade_ramp_x0 = ramp_x0;
-        target->wall_shade_ramp_x1 = ramp_x1;
         target->wall_vertical_origin = wall_span.vertical_origin;
         target->wall_vertical_seeded = wall_span.vertical_seeded;
         /* A flat has no wall-column state, so that attribute carries the two
@@ -4881,12 +4571,11 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                                    const struct hwr_gl_camera *camera,
                                    uint32_t width, uint32_t height,
                                    int clip_left, int clip_right,
-                                   int bound_left, int bound_right,
                                    struct hwr_gl_vertex *destination)
 {
     size_t count = hwr_copy_gpu_surface_raw(
         scene, surface, camera, width, height, clip_left, clip_right,
-        bound_left, bound_right, destination);
+        destination);
     hwr_apply_frame_clip(destination, count, camera, clip_left, clip_right);
     return count;
 }
@@ -5253,74 +4942,6 @@ static const struct hwr_sector_xspan *hwr_surface_windows(
     return span;
 }
 
-/* The most portal windows one sector may be re-visited through and still have
- * an unambiguous shading bound.  A sector with more windows than this, or with
- * several a single emission cannot be attributed to, keeps the engine frame,
- * which is the behaviour the whole class had before any of this landed. */
-#define HWR_WALL_WINDOW_MAX 8u
-
-/* Stock's window set for the sector this face belongs to, or NULL when nothing
- * was recovered this frame. Flats are excluded because the flat law states its
- * own clip; doors carry their own window set already; a reflected view is
- * excluded because its face chains were overwritten by the primary pass long
- * before the callback runs, and the wall column state declines that camera
- * anyway. */
-static const struct hwr_sector_xspan *hwr_wall_sector_window(
-    const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
-    const struct hwr_gl_camera *camera)
-{
-    const struct hwr_sector_xspan *window;
-    if (!scene->sector_portal_valid || camera->reflected ||
-        scene->sector_spans == NULL || !hwr_wall_near_clip_enabled())
-        return NULL;
-    if ((surface->flags & (HWR_SURFACE_FLAT | HWR_SURFACE_SKY_CAP)) != 0 ||
-        surface->kind == HWR_SURFACE_DOOR ||
-        surface->sector_index >= scene->sector_span_count)
-        return NULL;
-    window = &scene->sector_spans[surface->sector_index];
-    return window->count != 0 && window->count <= HWR_WALL_WINDOW_MAX
-         ? window : NULL;
-}
-
-/* Which of those windows one emission is shaded in.  An emission that carries
- * no clip of its own stands for the whole face and takes the sector's only
- * window; a clipped one stands for the visit it overlaps most, which is the
- * visit whose bounds stock would have loaded while drawing those columns.  A
- * sector visited through several windows that this emission cannot be
- * attributed to keeps the engine frame: one quad carries one ramp, and the mod
- * does not split a quad to carry more.  This function chooses DATA; it never
- * clips, moves or counts anything. */
-static int hwr_wall_anchor_window(const struct hwr_sector_xspan *set,
-                                  int clip_left, int clip_right,
-                                  int *bound_left, int *bound_right)
-{
-    unsigned i;
-    unsigned best = 0;
-    int best_overlap = 0;
-    if (set == NULL || set->count == 0)
-        return 0;
-    if (clip_right <= clip_left) {
-        if (set->count != 1u)
-            return 0;
-        *bound_left = set->lo[0];
-        *bound_right = set->hi[0];
-        return 1;
-    }
-    for (i = 0; i < set->count; i++) {
-        int lo = set->lo[i] > clip_left ? set->lo[i] : clip_left;
-        int hi = set->hi[i] < clip_right ? set->hi[i] : clip_right;
-        if (hi - lo > best_overlap) {
-            best_overlap = hi - lo;
-            best = i;
-        }
-    }
-    if (best_overlap <= 0)
-        return 0;
-    *bound_left = set->lo[best];
-    *bound_right = set->hi[best];
-    return 1;
-}
-
 static size_t hwr_surface_window_count(
     const struct hwr_scene *scene, const struct hwr_mesh_surface *surface,
     const struct hwr_gl_camera *camera)
@@ -5337,23 +4958,11 @@ static size_t hwr_copy_gpu_surface_windows(
 {
     const struct hwr_sector_xspan *span =
         hwr_surface_windows(scene, surface, camera);
-    const struct hwr_sector_xspan *anchor =
-        hwr_wall_sector_window(scene, surface, camera);
-    int bound_left = 0;
-    int bound_right = 0;
     size_t emitted = 0;
     unsigned i;
-    /* THE EMISSION STRUCTURE IS THE BASELINE'S, UNCHANGED.  The window set
-     * below decides how many quads a surface produces and where they are
-     * clipped; the engine window only decides which columns a shade word is
-     * sampled at.  Nothing here adds, removes or re-clips an emission. */
-    if (span == NULL) {
-        (void)hwr_wall_anchor_window(anchor, 0, 0,
-                                     &bound_left, &bound_right);
+    if (span == NULL)
         return hwr_copy_gpu_surface(scene, surface, camera, width, height,
-                                    0, 0, bound_left, bound_right,
-                                    destination);
-    }
+                                    0, 0, destination);
     for (i = 0; i < span->count; i++) {
         int left, right;
         if (camera->reflected) {
@@ -5371,19 +4980,9 @@ static size_t hwr_copy_gpu_surface_windows(
             if (left >= right)
                 continue;
         }
-        /* This emission already carries a window of its own -- a door's, or a
-         * widened frustum's.  The ramp still belongs to the engine-window visit
-         * whose columns it overlaps, and it is applied only on those columns,
-         * so a merged wing-plus-centre interval hands the engine bound nothing
-         * outside the engine's own frame. */
-        bound_left = 0;
-        bound_right = 0;
-        if (!camera->reflected)
-            (void)hwr_wall_anchor_window(anchor, left, right,
-                                         &bound_left, &bound_right);
         emitted += hwr_copy_gpu_surface(
             scene, surface, camera, width, height, left, right,
-            bound_left, bound_right, destination + emitted);
+            destination + emitted);
     }
     return emitted;
 }
@@ -5857,15 +5456,6 @@ static int hwr_scene_ensure_visible(struct hwr_scene *scene, size_t sector_count
             return -1;
         scene->wide_spans = buffer;
         scene->wide_span_count = sector_count;
-    }
-    if (scene->sector_span_count < sector_count) {
-        struct hwr_sector_xspan *buffer =
-            (struct hwr_sector_xspan *)realloc(
-                scene->sector_spans, sector_count * sizeof *buffer);
-        if (buffer == NULL)
-            return -1;
-        scene->sector_spans = buffer;
-        scene->sector_span_count = sector_count;
     }
     if (object_count != 0 && scene->span_count < object_count) {
         struct hwr_sector_xspan *buffer = (struct hwr_sector_xspan *)realloc(
@@ -6341,30 +5931,6 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     scene->door_portal_clip_valid = 0;
     scene->reflection_clip_valid = 0;
     scene->wide_clip_valid = 0;
-    /* The bound the wall driver clips its corners to is the window of the chain
-     * visit it is drawing under, so the corner law needs stock's own per-sector
-     * window set.  It is recovered from the same ordered draw list the
-     * visibility gate reads and is independent of that gate's own switch:
-     * whether a sector is submitted and what window its faces are shaded in are
-     * different questions.  The result is read only by the shade anchors. */
-    scene->sector_portal_valid =
-        scene->sector_spans != NULL &&
-        hwr_compute_sector_portal_windows(
-            world, api, scene->sector_spans, scene->sector_span_count);
-    if (scene->sector_portal_valid) {
-        /* Stock stores the pair inclusively -- the wall driver's right clip is
-         * max(0, xr - right_bound), so the right bound's own column is drawn --
-         * while every window the mod carries is half-open. Convert once, here,
-         * so exactly one convention leaves this function. */
-        size_t s;
-        for (s = 0; s < world->sector_count; s++) {
-            struct hwr_sector_xspan *set = &scene->sector_spans[s];
-            unsigned w;
-            for (w = 0; w < set->count && w < HWR_SECTOR_CLIP_MAX; w++)
-                if (set->hi[w] < INT16_MAX)
-                    set->hi[w] = (int16_t)(set->hi[w] + 1);
-        }
-    }
     if (hwr_pvs_enabled()) {
         if (wide_projection) {
             int engine_valid;

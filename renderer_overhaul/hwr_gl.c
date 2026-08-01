@@ -651,13 +651,8 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=4) in uint a_aux;\n"
     "layout(location=5) in uvec4 a_pan_scale_flags;\n"
     "layout(location=6) in uvec4 a_light_material;\n"
-    /* .x/.y are the bottom/top corner words; .z/.w are the corner-law ramp's
-     * word pair at its first column.  One attribute carries all four because
-     * they are adjacent shorts and the sixteen guaranteed slots are full. */
-    "layout(location=7) in uvec4 a_wall_shade;\n"
-    /* .x/.y the ramp's word pair at its last column, .z/.w its half-open
-     * framebuffer column interval. */
-    "layout(location=15) in ivec4 a_wall_shade_ramp;\n"
+    "layout(location=7) in uint a_wall_shade_endpoint;\n"
+    "layout(location=15) in uint a_wall_shade_top;\n"
     /* .x = the tinted-wall depth-bias adjust, .y = the legacy flat escape. */
     "layout(location=13) in uvec2 a_tint_adjust_taint;\n"
     "layout(location=14) in vec2 a_pos_frac;\n"
@@ -691,8 +686,6 @@ static const char g_geometry_vertex_shader[] =
     "flat out uvec4 v_wall_vertical;\n"
     "noperspective out float v_wall_shade_endpoint;\n"
     "noperspective out float v_wall_shade_top;\n"
-    "flat out uvec2 v_wall_shade_ramp_lo;\n"
-    "flat out ivec4 v_wall_shade_ramp;\n"
     "flat out uint v_wall_tint_adjust;\n"
     "flat out uint v_flat_taint;\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
@@ -727,10 +720,8 @@ static const char g_geometry_vertex_shader[] =
     "  v_wall_source=a_wall_source; v_wall_rows=a_wall_rows;\n"
     "  v_wall_span=a_wall_span;\n"
     "  v_wall_vertical=a_wall_vertical;\n"
-    "  v_wall_shade_endpoint=float(a_wall_shade.x);\n"
-    "  v_wall_shade_top=float(a_wall_shade.y);\n"
-    "  v_wall_shade_ramp_lo=a_wall_shade.zw;\n"
-    "  v_wall_shade_ramp=a_wall_shade_ramp;\n"
+    "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
+    "  v_wall_shade_top=float(a_wall_shade_top);\n"
     "  v_wall_tint_adjust=a_tint_adjust_taint.x;\n"
     "  v_flat_taint=a_tint_adjust_taint.y;\n"
     "}\n";
@@ -804,8 +795,6 @@ static const char g_geometry_fragment_shader[] =
     "flat in uvec4 v_wall_vertical;\n"
     "noperspective in float v_wall_shade_endpoint;\n"
     "noperspective in float v_wall_shade_top;\n"
-    "flat in uvec2 v_wall_shade_ramp_lo;\n"
-    "flat in ivec4 v_wall_shade_ramp;\n"
     "flat in uint v_wall_tint_adjust;\n"
     "flat in uint v_flat_taint;\n"
     "int imul_shift2(int a,int b) { return int(uint(a)*uint(b)) >> 2; }\n"
@@ -930,11 +919,8 @@ static const char g_geometry_fragment_shader[] =
     "    }\n"
     "  } else {\n"
     /* Wall texture coordinates come from the original integer column
-     * accumulators. The staged state is consumed before each advance.  Bit 0 of
-     * the span word is what says those accumulators start at the face's
-     * authored end; a near-plane-clipped edge validates the shade walk only, so
-     * its texture mapping is left exactly where it already was. */
-    "    if ((v_wall_span.w & 1u)==0u) {\n"
+     * accumulators. The staged state is consumed before each advance. */
+    "    if (v_wall_span.w==0u) {\n"
     "      float wall_s=max(v_wall.x-0.5*dFdx(v_wall.x),0.0);\n"
     "      int base=((int(floor(wall_s))+int(v_pan_scale_flags.x)*2) & 65535) >> 1;\n"
     "      if ((flags & 32u)!=0u) base=((h-1)-base) & 65535;\n"
@@ -1068,7 +1054,7 @@ static const char g_geometry_fragment_shader[] =
      * shade row.  That is the engine's seed24 + k*q >> 16 DDA in floating point:
      * row = floor(V/256).  A degenerate-span wall (no valid column DDA) falls to
      * the per-pixel radial below. */
-    "    if ((v_wall_span.w & 2u)!=0u) {\n"
+    "    if (v_wall_span.w!=0u) {\n"
     "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
     "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
     "      uint ba=v_wall_rows.y+v_wall_rows.w*uint(scol);\n"
@@ -1076,37 +1062,8 @@ static const char g_geometry_fragment_shader[] =
     "      float sbot=float(signed16(ba>>16u));\n"
     "      float cnt=sbot-stop+1.0;\n"
     "      float t=cnt>0.5 ? clamp((floor(gl_FragCoord.y)-stop)/cnt,0.0,1.0) : 0.0;\n"
-    "      float wtop=v_wall_shade_top, wbot=v_wall_shade_endpoint;\n"
-    "      bool ramped=false;\n"
-    /* THE CORNER-LAW RAMP.  Where an end of the face falls outside the columns
-     * the engine drives it on, the engine does not shade from that end: it
-     * re-anchors the corner word at the first (or last) DRAWN column and steps
-     * the shade DDA over the drawn count (renderer.c:4948-4978 for the row and
-     * depth adjust, 5008-5017 for the radial arm, 5034-5040 / 5103 for the
-     * DDA).  Both re-anchored words arrive here as attributes and the ramp
-     * between them is walked in ABSOLUTE framebuffer columns, so the law is
-     * re-anchored without any emitted vertex moving to the drawn column.  It is
-     * applied on exactly the interval the engine drives, and nowhere else. */
-    "      if ((v_wall_span.w & 4u)!=0u) {\n"
-    "        int fx=int(gl_FragCoord.x);\n"
-    "        int rx0=v_wall_shade_ramp.z, rx1=v_wall_shade_ramp.w;\n"
-    "        if (rx1>rx0 && fx>=rx0 && fx<rx1) {\n"
-    "          float u=float(fx-rx0)/float(rx1-rx0);\n"
-    "          wtop=mix(float(v_wall_shade_ramp_lo.y),"
-    "float(v_wall_shade_ramp.y),u);\n"
-    "          wbot=mix(float(v_wall_shade_ramp_lo.x),"
-    "float(v_wall_shade_ramp.x),u);\n"
-    "          ramped=true;\n"
-    "        }\n"
-    "      }\n"
-    /* Bit 3 says the varyings above are not a law this face owns -- its authored
-     * end sits behind the camera, so GL handed the near-plane vertex a blend of
-     * the two ends.  Off the ramp those fragments keep the per-fragment radial
-     * they had before the near clip existed. */
-    "      if (ramped || (v_wall_span.w & 8u)==0u) {\n"
-    "        float V=mix(wtop,wbot,t);\n"
-    "        return clamp(int(floor(V/256.0)),0,31);\n"
-    "      }\n"
+    "      float V=mix(v_wall_shade_top,v_wall_shade_endpoint,t);\n"
+    "      return clamp(int(floor(V/256.0)),0,31);\n"
     "    }\n"
     "    {\n"
     "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
@@ -1813,11 +1770,8 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(6);
     g_gl.vertex_attrib_i_pointer(6, 4, GL_UNSIGNED_BYTE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, light));
-    /* The bottom and top corner words and the ramp's first-column pair are four
-     * adjacent shorts, so one attribute carries them and the format stays
-     * inside the sixteen guaranteed vertex attributes. */
     g_gl.enable_vertex_attrib_array(7);
-    g_gl.vertex_attrib_i_pointer(7, 4, GL_UNSIGNED_SHORT, (GLsizei)stride,
+    g_gl.vertex_attrib_i_pointer(7, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint));
     /* wall_tint_adjust and flat_taint are adjacent bytes, so one two-component
      * attribute carries both and leaves slot 14 for the position remainder --
@@ -1829,9 +1783,8 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.vertex_attrib_pointer(14, 2, GL_FLOAT, GL_FALSE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, pos_frac_x));
     g_gl.enable_vertex_attrib_array(15);
-    g_gl.vertex_attrib_i_pointer(15, 4, GL_SHORT, (GLsizei)stride,
-        (const void *)offsetof(struct hwr_gl_vertex,
-                               wall_shade_ramp_hi_bottom));
+    g_gl.vertex_attrib_i_pointer(15, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint_top));
     g_gl.enable_vertex_attrib_array(8);
     g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
