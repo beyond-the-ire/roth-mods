@@ -4363,8 +4363,12 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
             if (texture_width != 0 &&
                 (texture_width & (uint16_t)(texture_width - 1u)) == 0)
                 tmpl.wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
-            if (wall_stale)
+            if (wall_stale) {
                 tmpl.wall_wrap_flags |= HWR_GL_WALL_STALE_MASK;
+                /* And the frame says it has one, so the previous frame is kept
+                 * in colour as well wherever the picture is a composed one. */
+                scene->stale_mask_seen = 1;
+            }
             if (solid_blend)
                 tmpl.wall_wrap_flags |= HWR_GL_WALL_SOLID_BLEND;
             tmpl.wall_source_numerator = wall_span.numerator;
@@ -4465,8 +4469,10 @@ static size_t hwr_copy_gpu_surface_raw(struct hwr_scene *scene,
                 target->wall_wrap_flags |= HWR_GL_WALL_WRAP_ALONG;
             if (wrap_vertical)
                 target->wall_wrap_flags |= HWR_GL_WALL_WRAP_VERTICAL;
-            if (wall_stale)
+            if (wall_stale) {
                 target->wall_wrap_flags |= HWR_GL_WALL_STALE_MASK;
+                scene->stale_mask_seen = 1;
+            }
             if (solid_blend)
                 target->wall_wrap_flags |= HWR_GL_WALL_SOLID_BLEND;
         } else {
@@ -5946,6 +5952,10 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         hwr_scene_fail(scene, "%s", scene->mesh.error);
         return NULL;
     }
+    /* Counted afresh over every view this frame emits, the reflected ones
+     * included: a surface that shows the previous frame is a property of what is
+     * on screen, not of the map. */
+    scene->stale_mask_seen = 0;
     hwr_scene_animate(scene, api);
     /* The light the player carries, moved on for this frame: the flame in it
      * and what this map's own candle word makes of it are both one number a
@@ -6182,5 +6192,6 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     view_count++;
 
     hwr_build_palette(world, palette, base_palette, &published);
+    hwr_gl_set_stale_mask(scene->stale_mask_seen);
     return hwr_gl_scene_render(views, view_count, &published, width, height);
 }

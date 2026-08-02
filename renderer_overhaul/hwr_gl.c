@@ -66,6 +66,7 @@ typedef void (APIENTRY *hwr_gl_clear_color_fn)(GLclampf, GLclampf, GLclampf, GLc
 typedef void (APIENTRY *hwr_gl_clear_fn)(GLbitfield);
 typedef void (APIENTRY *hwr_gl_read_pixels_fn)(GLint, GLint, GLsizei, GLsizei,
                                                GLenum, GLenum, GLvoid *);
+typedef void (APIENTRY *hwr_gl_read_buffer_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_gen_framebuffers_fn)(GLsizei, GLuint *);
 typedef void (APIENTRY *hwr_gl_delete_framebuffers_fn)(GLsizei, const GLuint *);
 typedef void (APIENTRY *hwr_gl_bind_framebuffer_fn)(GLenum, GLuint);
@@ -106,6 +107,9 @@ struct hwr_gl_functions {
     hwr_gl_clear_color_fn clear_color;
     hwr_gl_clear_fn clear;
     hwr_gl_read_pixels_fn read_pixels;
+    /* Which attachment a copy or a read takes its pixels from. The frame's
+     * copies all take the palette-index plane, which is where it is left. */
+    hwr_gl_read_buffer_fn read_buffer;
     hwr_gl_gen_framebuffers_fn gen_framebuffers;
     hwr_gl_delete_framebuffers_fn delete_framebuffers;
     hwr_gl_bind_framebuffer_fn bind_framebuffer;
@@ -224,6 +228,31 @@ static GLuint g_truecolor_program;
 static GLuint g_truecolor_resolve_program;
 static GLuint g_index_restore_program;
 static GLuint g_color_texture;
+/* The colour twin of g_stale_copy_texture: the same snapshot of the same
+ * moment, in the space the world image is composed in. A surface that shows
+ * the previous frame through its holes has to show the previous frame's own
+ * COLOUR, not the colour its index resolves to under a palette -- those are
+ * the same thing under the original law and are not under any other, where the
+ * second one is a hole of full daylight in a darkened room. Carried only while
+ * the picture is a composed one and the frame has a surface that reads it. */
+static GLuint g_stale_color_texture;
+/* Whether that snapshot describes this frame's starting plane, which is what
+ * the world pass is told before it decides to sample it. */
+static int g_stale_color_valid;
+/* What the frame was told about surfaces that read the previous frame, before
+ * it was told anything: assume there are some. The copy is a cost, never a
+ * correctness question, so the answer nobody has given yet is the safe one. */
+static int g_stale_mask_present = 1;
+/* Whether the colour plane still describes the same picture the index plane
+ * does. The colour target persists exactly as the index target does -- that is
+ * what makes the void, the wings and the previous frame a stale-masked wall
+ * shows coherent in colour space -- so it is primed from the index plane only
+ * where the index plane itself restarted, or where what a colour MEANS has
+ * changed underneath it. */
+static int g_color_prime_pending = 1;
+/* The law the standing colour plane was composed under, so a law that moves
+ * without the plane restarting is one of those changes. */
+static enum hwr_gl_shading_mode g_color_prime_mode = HWR_GL_SHADING_AUTHENTIC;
 /* The palette WITHOUT the engine's palette-level effects. The enhanced program
  * composes in it and the enhanced resolve applies the effects to the colour
  * afterwards, so the colours a map authored are what a lighting term is
@@ -677,6 +706,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(clear_color, hwr_gl_clear_color_fn, "glClearColor");
     HWR_LOAD_GL(clear, hwr_gl_clear_fn, "glClear");
     HWR_LOAD_GL(read_pixels, hwr_gl_read_pixels_fn, "glReadPixels");
+    HWR_LOAD_GL(read_buffer, hwr_gl_read_buffer_fn, "glReadBuffer");
     HWR_LOAD_GL(gen_framebuffers, hwr_gl_gen_framebuffers_fn, "glGenFramebuffers");
     HWR_LOAD_GL(delete_framebuffers, hwr_gl_delete_framebuffers_fn, "glDeleteFramebuffers");
     HWR_LOAD_GL(bind_framebuffer, hwr_gl_bind_framebuffer_fn, "glBindFramebuffer");
@@ -1433,6 +1463,11 @@ static const char g_geometry_fragment_body[] =
     "#else\n"
     "layout(location=2) out vec4 out_color;\n"
     "uniform sampler2D u_palette;\n"
+    /* The previous frame, in colour, and whether there is one. Sampled at the
+     * same pixel and from the same moment as the palette-index snapshot beside
+     * it, so the two never describe two different frames. */
+    "uniform sampler2D u_stale_color;\n"
+    "uniform int u_stale_color_valid;\n"
     "uniform vec3 u_gain;\n"
     "uniform vec3 u_add;\n"
     "uniform float u_contrast;\n"
@@ -1584,10 +1619,25 @@ static const char g_geometry_fragment_body[] =
      * done the conversion to add in, and converting it back only to convert it
      * forward again would spend two more of them for nothing. */
     "bool g_shade_linear=false;\n"
+    /* And whether it is a FINISHED colour rather than a shaded texel: a colour
+     * this frame is copying from an earlier one, which the picture dials were
+     * already spent on when it was drawn. Composing it again would spend them
+     * twice, so it is handed to the canvas as it stands. */
+    "bool g_shade_color_final=false;\n"
+    /* What the light rig made of this fragment, kept because a blend below may
+     * need it after the index it produced has already been decided. Unset means
+     * no law lit this fragment, which is every class the modern law refuses and
+     * every fragment of the other two laws. */
+    "vec3 g_light_total=vec3(1.0);\n"
+    "bool g_light_total_set=false;\n"
     "void emit(uint index) {\n"
     "  out_index=index;\n"
     "  vec4 lit=texelFetch(u_palette,ivec2(int(index),0),0);\n"
     "  if (u_light_neutral!=0) { out_color=lit; return; }\n"
+    "  if (g_shade_color_final) {\n"
+    "    out_color=vec4(max(g_shade_color,0.0),lit.a);\n"
+    "    return;\n"
+    "  }\n"
     "  uint albedo_index=g_albedo_index<256u ? g_albedo_index : index;\n"
     "  vec3 albedo=texelFetch(u_palette,ivec2(int(albedo_index),0),0).rgb;\n"
     "  vec3 base=g_shade_color_set ? g_shade_color : lit.rgb;\n"
@@ -1768,6 +1818,18 @@ static const char g_geometry_fragment_body[] =
      * the engine's void smear and still occludes this frame's geometry behind
      * the wall, which the engine never draws. */
     "  if ((v_light_material.w & 4u)!=0u && texel==0u) {\n"
+    /* The hole shows the previous frame, so under a law that composes colour it
+     * shows the previous frame's COLOUR. The index beside it is still the index
+     * that pixel held, so the plane the host composes against and everything
+     * else in index space keeps reading exactly what it read before. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "    if (u_stale_color_valid!=0) {\n"
+    "      g_shade_color="
+    "texelFetch(u_stale_color,ivec2(gl_FragCoord.xy),0).rgb;\n"
+    "      g_shade_color_set=true;\n"
+    "      g_shade_color_final=true;\n"
+    "    }\n"
+    "#endif\n"
     "    emit(texelFetch(u_stale,ivec2(gl_FragCoord.xy),0).r);\n"
     "    return;\n"
     "  }\n"
@@ -1814,7 +1876,9 @@ static const char g_geometry_fragment_body[] =
     "        if (modern_lit()) {\n"
     "          vec3 art=light_space("
     "texelFetch(u_palette,ivec2(int(texel),0),0).rgb);\n"
-    "          g_shade_color=art*modern_light(tinted,amount);\n"
+    "          g_light_total=modern_light(tinted,amount);\n"
+    "          g_light_total_set=true;\n"
+    "          g_shade_color=art*g_light_total;\n"
     "          g_shade_linear=u_light_linear!=0;\n"
     "        } else {\n"
     "          g_shade_color_set=false;\n"
@@ -1867,7 +1931,30 @@ static const char g_geometry_fragment_body[] =
     "  }\n"
     "#ifdef HWR_TRUECOLOR\n"
     "  g_albedo_index=texel;\n"
-    "  if (blended) g_shade_color_set=false;\n"
+    /* A blend is an index-space operation and it stays one: the tables are
+     * authored in index space, the destination they read is a plane of indices,
+     * and the index this fragment writes is the one they produced. What the
+     * blended colour then owes to the surface in front is the light that
+     * reaches THAT surface -- so the blended colour is taken back into the
+     * working space and multiplied by it.
+     *
+     * The error in that is bounded and named: the surface behind may have had a
+     * light of its own, and where the two share a sector there is none at all.
+     * The exact form is a colour twin of the per-run destination snapshot, which
+     * doubles the most expensive copies in the frame for it.
+     *
+     * A fragment no law lit -- every fragment of the original and the smooth
+     * laws, and every class the modern law refuses -- keeps what it has always
+     * had: the colour its blended index resolves to. */
+    "  if (blended) {\n"
+    "    if (g_light_total_set) {\n"
+    "      g_shade_color=light_space("
+    "texelFetch(u_palette,ivec2(int(mapped),0),0).rgb)*g_light_total;\n"
+    "      g_shade_linear=u_light_linear!=0;\n"
+    "    } else {\n"
+    "      g_shade_color_set=false;\n"
+    "    }\n"
+    "  }\n"
     "#endif\n"
     "  emit(mapped);\n"
     "}\n";
@@ -2245,6 +2332,8 @@ static void hwr_destroy_framebuffer(void)
     hwr_delete_texture(&g_index_copy_texture);
     hwr_delete_texture(&g_stale_copy_texture);
     hwr_delete_texture(&g_color_texture);
+    hwr_delete_texture(&g_stale_color_texture);
+    g_stale_color_valid = 0;
     if (g_depth_buffer != 0) {
         g_gl.delete_renderbuffers(1, &g_depth_buffer);
         g_depth_buffer = 0;
@@ -2793,8 +2882,28 @@ static int hwr_truecolor_attach(uint32_t width, uint32_t height,
     g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
                                 GL_TEXTURE_2D, g_color_texture, 0);
     if (g_gl.check_framebuffer_status(GL_FRAMEBUFFER) ==
-        GL_FRAMEBUFFER_COMPLETE && hwr_gl_drain_errors() == 0)
+        GL_FRAMEBUFFER_COMPLETE && hwr_gl_drain_errors() == 0) {
+        /* And its twin, which is the same picture one frame ago. It is a plain
+         * texture rather than an attachment -- nothing draws into it -- and it
+         * matches the target's own precision, because a snapshot that rounded
+         * the colour it copied would make the previous frame a slightly
+         * different frame. */
+        g_gl.active_texture(GL_TEXTURE0);
+        g_gl.gen_textures(1, &g_stale_color_texture);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_stale_color_texture);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, (GLint)internal_format,
+                          (GLsizei)width, (GLsizei)height, 0, GL_RGBA, type,
+                          NULL);
+        g_gl.bind_texture(GL_TEXTURE_2D, 0);
+        g_stale_color_valid = 0;
         return 1;
+    }
     g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
                                 GL_TEXTURE_2D, 0, 0);
     hwr_delete_texture(&g_color_texture);
@@ -2812,6 +2921,9 @@ static void hwr_truecolor_release(void)
                                     GL_TEXTURE_2D, 0, 0);
     }
     hwr_delete_texture(&g_color_texture);
+    hwr_delete_texture(&g_stale_color_texture);
+    g_stale_color_valid = 0;
+    g_color_prime_pending = 1;
     hwr_delete_texture(&g_base_palette_texture);
     if (g_truecolor_program != 0)
         g_gl.delete_program(g_truecolor_program);
@@ -2848,8 +2960,10 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
         hwr_set_sampler(g_truecolor_program, "u_dst", 5);
         hwr_set_sampler(g_truecolor_program, "u_stale", 6);
         hwr_set_sampler(g_truecolor_program, "u_floor_id", 7);
-        /* The world pass already spends units 0-7; the palette joins on 8. */
+        /* The world pass already spends units 0-7; the palette joins on 8 and
+         * the previous frame's colour on 9. */
         hwr_set_sampler(g_truecolor_program, "u_palette", 8);
+        hwr_set_sampler(g_truecolor_program, "u_stale_color", 9);
         g_gl.use_program(0);
     }
     if (g_truecolor_resolve_program == 0) {
@@ -2886,6 +3000,8 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
                                         GL_TEXTURE_2D, 0, 0);
         }
         hwr_delete_texture(&g_color_texture);
+        hwr_delete_texture(&g_stale_color_texture);
+        g_stale_color_valid = 0;
         g_truecolor_format = HWR_GL_COLOR_AUTO;
         g_truecolor_logged = 0;
     }
@@ -2914,6 +3030,9 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
             }
         }
         g_truecolor_format = wanted;
+        /* A colour target with nothing in it describes no picture at all, so
+         * the frame that creates one primes it whatever else is true. */
+        g_color_prime_pending = 1;
         if (!g_truecolor_logged) {
             unsigned channel_bytes = wanted == HWR_GL_COLOR_RGBA16F ? 8u : 4u;
             fprintf(stderr, "[renderer_overhaul] true-colour foundation active"
@@ -3227,10 +3346,13 @@ static void hwr_bind_scene_textures(void)
         g_gl.bind_texture(targets[i], textures[i]);
     }
     /* The world pass spends units 0-7; the enhanced program resolves its own
-     * emitted index through the untinted palette on unit 8. */
+     * emitted index through the untinted palette on unit 8, and reads the
+     * previous frame's colour on unit 9. */
     if (g_truecolor_active) {
         g_gl.active_texture(GL_TEXTURE0 + 8);
         g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
+        g_gl.active_texture(GL_TEXTURE0 + 9);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_stale_color_texture);
     }
     /* The final pass of the previous frame leaves the index framebuffer's
      * color attachment bound to unit 0's two-dimensional slot. Sampling
@@ -3523,6 +3645,11 @@ void hwr_gl_invalidate_index_target(void)
     g_index_target_dirty = 1;
 }
 
+void hwr_gl_set_stale_mask(int present)
+{
+    g_stale_mask_present = present != 0;
+}
+
 /* Lays a pending seed of the right size into the index target and drops it, so
  * later frames persist into those pixels rather than replacing them. */
 static int hwr_consume_index_seed(uint32_t width, uint32_t height)
@@ -3622,6 +3749,9 @@ static void hwr_clear_wide_persistence_wings(
         return;
 
     g_gl.draw_buffers(1, index_only);
+    /* The wings are cleared in index space alone, so the colour plane no longer
+     * describes them and has to be primed from the plane that does. */
+    g_color_prime_pending = 1;
     g_gl.enable(GL_SCISSOR_TEST);
     if (center_left > 0) {
         g_gl.scissor(0, 0, center_left, (GLsizei)height);
@@ -3767,6 +3897,13 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         if (contrast <= 0.0f)
             contrast = 1.0f;
         hwr_set_sampler(program, "u_palette", 8);
+        hwr_set_sampler(program, "u_stale_color", 9);
+        /* Whether there is a previous frame in colour to read. Where there is
+         * not -- the original law, a frame with no surface that reads one, the
+         * first frame after the target came into existence -- the class falls
+         * back to the colour its index resolves to, which is what it has always
+         * shown and is the right answer wherever the two agree. */
+        hwr_uniform_1i(program, "u_stale_color_valid", g_stale_color_valid);
         hwr_uniform_3f(program, "u_gain", gain, gain, gain);
         hwr_uniform_3f(program, "u_add", 0.0f, 0.0f, 0.0f);
         hwr_uniform_1f(program, "u_contrast", contrast);
@@ -4265,6 +4402,45 @@ static void hwr_truecolor_prime(uint32_t width, uint32_t height)
     g_gl.bind_texture(GL_TEXTURE_2D, 0);
 }
 
+/* Priming EVERY frame is the same thing as persisting only while the colour a
+ * pixel holds and the colour its index resolves to are one colour -- which is
+ * the original law and nothing else. Under a law that composes, re-priming
+ * would replace the picture a pixel was actually drawn with by the picture its
+ * index stands for: a corridor the player has walked out of, still lit as the
+ * lamp left it, would come back at full daylight.
+ *
+ * So the colour target persists exactly as the index target does, and it is
+ * primed on the frames the plane under it restarted -- a seed, a wipe, an
+ * invalidation, a target that has just come into existence -- or the frames
+ * what a colour MEANS changed, which is a law moving under a standing plane. */
+static void hwr_truecolor_prime_pending(uint32_t width, uint32_t height)
+{
+    if (!g_truecolor_active || !g_color_prime_pending)
+        return;
+    hwr_truecolor_prime(width, height);
+    g_color_prime_pending = 0;
+}
+
+/* The colour twin of the frame's starting-plane snapshot: the same pixels of the
+ * same moment, in the space the world image is composed in. Taken AFTER any
+ * prime, so the two snapshots can never describe two different frames.
+ *
+ * The read buffer is a property of the framebuffer, and every other copy and
+ * read of this one takes the palette-index plane, so it is put back before
+ * anything else looks. */
+static void hwr_truecolor_snapshot_color(uint32_t width, uint32_t height)
+{
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+    g_gl.read_buffer(GL_COLOR_ATTACHMENT2);
+    g_gl.active_texture(GL_TEXTURE0 + 9);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_stale_color_texture);
+    g_gl.copy_tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                               (GLsizei)width, (GLsizei)height);
+    g_gl.read_buffer(GL_COLOR_ATTACHMENT0);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+}
+
 /* The frame's final resolve into the RGBA target the readback reads. */
 static void hwr_scene_resolve_pass(uint32_t width, uint32_t height)
 {
@@ -4424,7 +4600,7 @@ static void hwr_truecolor_dump_material(const struct hwr_gl_scene_view *views,
     }
     if (!hwr_truecolor_restore_index(width, height))
         return;
-    hwr_truecolor_prime(width, height);
+    hwr_truecolor_prime_pending(width, height);
     if (!hwr_render_view_set(views, view_count, width, height))
         return;
     hwr_scene_resolve_pass(width, height);
@@ -4582,6 +4758,13 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         palette->base_rgba != NULL && hwr_truecolor_ensure(width, height);
     if (!g_truecolor_active && g_color_texture != 0)
         hwr_truecolor_release();
+    /* A law moving under a standing colour plane changes what the colours in it
+     * mean without touching the plane they describe, so the plane is primed
+     * from the index one and the frames after it persist again. */
+    if (g_truecolor_want.shading_mode != g_color_prime_mode) {
+        g_color_prime_mode = g_truecolor_want.shading_mode;
+        g_color_prime_pending = 1;
+    }
     compare_active = g_truecolor_active && hwr_truecolor_compare_enabled();
     hwr_truecolor_set_effects(palette);
 
@@ -4621,6 +4804,9 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         if (!hwr_consume_index_seed(width, height))
             g_gl.clear_buffer_uiv(GL_COLOR, 0, clear_index);
         g_index_target_dirty = 0;
+        /* The plane the colour target describes has just been replaced, so what
+         * the colour target holds no longer describes anything. */
+        g_color_prime_pending = 1;
     }
     hwr_clear_wide_persistence_wings(views, view_count, width, height,
                                      clear_index);
@@ -4663,8 +4849,19 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         compare_active = hwr_truecolor_restore_index(width, height);
     }
 
-    if (g_truecolor_active)
-        hwr_truecolor_prime(width, height);
+    hwr_truecolor_prime_pending(width, height);
+    /* And the previous frame in colour, for the surfaces that show it. One
+     * full-frame copy, and only where there is a composed picture to copy, a
+     * law that would resolve it differently from its indices, and a surface in
+     * the frame that reads it. */
+    g_stale_color_valid = 0;
+    if (g_truecolor_active && g_stale_color_texture != 0 &&
+        g_truecolor_want.shading_mode != HWR_GL_SHADING_AUTHENTIC &&
+        g_stale_mask_present) {
+        hwr_truecolor_snapshot_color(width, height);
+        g_stale_color_valid = 1;
+        full_copy_count++;
+    }
     if (perf_enabled)
         perf_prime = hwr_perf_now_ns();
     if (!hwr_render_view_set(views, view_count, width, height))

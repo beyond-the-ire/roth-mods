@@ -469,6 +469,12 @@ int hwr_gl_set_index_seed(const uint8_t *indices, uint32_t width, uint32_t heigh
  * flat clear -- instead of persisting into whatever is already there. Safe to
  * call before the renderer exists. */
 void hwr_gl_invalidate_index_target(void);
+/* Declares whether the frame about to be submitted carries any surface that
+ * shows the previous frame through its own holes. Only such a surface needs the
+ * previous frame kept in colour as well as in palette indices, and keeping it
+ * costs one full-frame copy, so a frame that says no does not pay it. Never
+ * called means yes: the copy is a cost, not a correctness question. */
+void hwr_gl_set_stale_mask(int present);
 void hwr_gl_shutdown(void);
 const char *hwr_gl_last_error(void);
 /* The version and renderer the driver reports, in one line, once a context

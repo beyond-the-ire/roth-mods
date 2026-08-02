@@ -306,6 +306,11 @@ struct hwr_scene {
      * are streamed after the world surfaces. Archive pointers are retained from
      * the rebuild so the emitter can resolve object graphic ids each frame. */
     struct hwr_billboards billboards;
+    /* Whether this frame staged a one-sided wall that shows the previous frame
+     * through its own holes. Counted while the views are emitted and handed to
+     * the renderer with them, so the previous frame is kept in colour as well as
+     * in indices only for the frames that have something to read it. */
+    int stale_mask_seen;
     struct hwr_das_archive *map_archive;
     struct hwr_das_archive *shared_archive;
     int uploaded;
