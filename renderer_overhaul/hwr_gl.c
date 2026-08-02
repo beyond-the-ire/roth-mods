@@ -234,6 +234,13 @@ static GLuint g_base_palette_texture;
 static int g_truecolor_env = -1;
 /* Cached HWR_SHADE_RAMP gate; -1 until first read. */
 static int g_shade_ramp_env = -1;
+/* Cached gates for the three parts of the still, round, per-fragment candle;
+ * -1 until first read. Each one restores the part of the original pool it names
+ * and nothing else, so what the still pool owes to the fixed origin, to the
+ * round metric and to sampling every fragment can be told apart. */
+static int g_shade_origin_fixed_env = -1;
+static int g_shade_radial_round_env = -1;
+static int g_shade_per_fragment_env = -1;
 /* Raised while this frame renders through the enhanced program. */
 static int g_truecolor_active;
 /* Set once the foundation has failed to come up, so it is never retried. */
@@ -1199,6 +1206,39 @@ static const char g_geometry_fragment_body[] =
      * hold the engine's own sub-row phase in their low byte), so for those this
      * twin is the authentic expression with the floor lifted off it. */
     "#ifdef HWR_TRUECOLOR\n"
+    /* The three parts of the candle the smooth law does differently, each its
+     * own uniform so each can be put back on its own. */
+    "uniform int u_shade_fixed_origin;\n"
+    "uniform int u_shade_round;\n"
+    "uniform int u_shade_per_fragment;\n"
+    /* The candle term the tinted law adds to depth, in the depth word's units.
+     *
+     * The engine measures it from a light position that lives in screen space
+     * and is moved every seventh tick by a random step around the view centre,
+     * and that dance is the flicker. Measuring from the view centre itself --
+     * the place the dance is a dance around -- leaves the pool where it always
+     * was and stops it moving, without inventing a light position the map never
+     * had.
+     *
+     * The engine's distance is the larger of the two axis terms, which makes a
+     * pool with straight edges and corners; the length of the pair makes it
+     * round. The axis terms keep the engine's own per-axis focal scales, so a
+     * pool is as wide as the projection makes it either way.
+     *
+     * The sixteen-bit wrap the engine's intermediate carries is kept on the
+     * square metric so restoring it restores that law whole. The round metric
+     * does not take it: a term the wrap reaches is one the row law would have
+     * clamped into darkness, and wrapping it lands a bright ring in the dark
+     * instead. */
+    "float candle_edge_depth(int depth) {\n"
+    "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i : u_shade_origin;\n"
+    "  int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
+    "  int px=(abs(wrap16(source_column()-origin.x)) * sx) >> 8;\n"
+    "  int py=(abs(wrap16(int(gl_FragCoord.y)-origin.y)) * sy) >> 8;\n"
+    "  if (u_shade_round!=0)\n"
+    "    return float(depth)+length(vec2(float(px),float(py)));\n"
+    "  return float((depth+max(px,py)) & 65535);\n"
+    "}\n"
     "float shade_amount(int selected_level, bool tinted) {\n"
     "  int level=selected_level; int shr=5+level;\n"
     "  int light=effective_light();\n"
@@ -1211,14 +1251,16 @@ static const char g_geometry_fragment_body[] =
     "  bool flat_surface=(v_light_material.y & 8u)!=0u; float r;\n"
     "  if (flat_surface) {\n"
     "    if (tinted) {\n"
-    "      if (v_flat_taint==0u &&"
+    /* The engine samples a flat's candle only at the corners of the polygon it
+     * rasterises and interpolates between them, which is what splits a room's
+     * pool into two lobes that slide as the light position moves. Reading the
+     * law at the fragment instead is the whole pool, in one piece, wherever the
+     * fragment is -- and it is uniformly brighter than the chord between two
+     * corners, because the law is convex where it is not clamped. */
+    "      if (u_shade_per_fragment==0 && v_flat_taint==0u &&"
     " (v_flat_span.w & 0x80000000u)==0u)"
     " return clamp(v_wall_shade_endpoint/256.0,0.0,31.0);\n"
-    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
-    "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
-    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
-    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
-    "      r=float(edge_depth)/float(1 << shr)-float(bias)"
+    "      r=candle_edge_depth(depth)/float(1 << shr)-float(bias)"
     "-float(u_flat_edge_bias);\n"
     /* The row law's low clamp is one, not zero, on both candle paths: a term at
      * or below zero is drawn at row 1.  Clamping the float to 1.0 reproduces
@@ -1229,7 +1271,11 @@ static const char g_geometry_fragment_body[] =
     "    return clamp(r,0.0,float(min(scale,31)));\n"
     "  }\n"
     "  if (tinted) {\n"
-    "    if (v_wall_span.w!=0u) {\n"
+    /* And a wall's candle is seeded at the corners of its segment and walked
+     * down each column, which is the same corner sampling one axis at a time.
+     * The per-fragment form below is the law the corner words were made from,
+     * evaluated where it is being drawn. */
+    "    if (u_shade_per_fragment==0 && v_wall_span.w!=0u) {\n"
     "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
     "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
     "      uint ba=v_wall_rows.y+v_wall_rows.w*uint(scol);\n"
@@ -1241,12 +1287,8 @@ static const char g_geometry_fragment_body[] =
     "      return clamp(V/256.0,0.0,31.0);\n"
     "    }\n"
     "    {\n"
-    "      int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
-    "      int px=(abs(wrap16(source_column()-u_shade_origin.x)) * sx) >> 8;\n"
-    "      int py=(abs(wrap16(int(gl_FragCoord.y)-u_shade_origin.y)) * sy) >> 8;\n"
-    "      int edge_depth=(depth+max(px,py)) & 65535;\n"
     "      int adj=int(v_wall_tint_adjust);\n"
-    "      r=float(edge_depth)/float(1 << shr)-float(bias-adj)"
+    "      r=candle_edge_depth(depth)/float(1 << shr)-float(bias-adj)"
     "-float(u_wd_bias);\n"
     "      return clamp(r,1.0,float(min(scale,31)));\n"
     "    }\n"
@@ -2053,6 +2095,39 @@ static int hwr_shade_ramp_env(void)
         g_shade_ramp_env = setting != NULL && setting[0] == '0' ? 0 : 1;
     }
     return g_shade_ramp_env;
+}
+
+/* And the three parts of the still, round, per-fragment candle. Each switch
+ * puts back the part of the original pool it names -- the light position that
+ * moves, the metric with corners, the sampling at polygon corners -- and leaves
+ * the other two where the smooth law puts them, so what each one is worth can be
+ * measured on its own. Like the ramp switch above they are bisect handles rather
+ * than settings: a consumer chooses the law, not the parts of it. */
+static int hwr_shade_origin_fixed_env(void)
+{
+    if (g_shade_origin_fixed_env < 0) {
+        const char *setting = getenv("HWR_SHADE_ORIGIN_FIXED");
+        g_shade_origin_fixed_env = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return g_shade_origin_fixed_env;
+}
+
+static int hwr_shade_radial_round_env(void)
+{
+    if (g_shade_radial_round_env < 0) {
+        const char *setting = getenv("HWR_SHADE_RADIAL_ROUND");
+        g_shade_radial_round_env = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return g_shade_radial_round_env;
+}
+
+static int hwr_shade_per_fragment_env(void)
+{
+    if (g_shade_per_fragment_env < 0) {
+        const char *setting = getenv("HWR_SHADE_PER_FRAGMENT");
+        g_shade_per_fragment_env = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return g_shade_per_fragment_env;
 }
 
 void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
@@ -3023,6 +3098,12 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                        g_truecolor_want.shading_mode !=
                                HWR_GL_SHADING_AUTHENTIC);
         hwr_uniform_1i(program, "u_shade_ramp", hwr_shade_ramp_env());
+        hwr_uniform_1i(program, "u_shade_fixed_origin",
+                       hwr_shade_origin_fixed_env());
+        hwr_uniform_1i(program, "u_shade_round",
+                       hwr_shade_radial_round_env());
+        hwr_uniform_1i(program, "u_shade_per_fragment",
+                       hwr_shade_per_fragment_env());
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */
