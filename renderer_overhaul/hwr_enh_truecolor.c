@@ -22,6 +22,10 @@
  * brings the foundation up for it -- and the renderer is told which law to
  * resolve with separately, because that is not a picture dial. */
 #define HWR_SHADING_ROW "shading_mode"
+/* Where the picture is quantized, which is a property of the screen rather than
+ * of the law. It hangs off the law all the same, so it is asked for the law's
+ * value once the law is known. */
+#define HWR_DITHER_ROW "shading_dither"
 
 /* The settings panel's draft while it is open, and whether there is one. Only
  * the picture dials are read out of it: everything else takes effect when it is
@@ -80,6 +84,25 @@ static enum hwr_gl_shading_mode hwr_truecolor_gl_shading(
         break;
     }
     return HWR_GL_SHADING_AUTHENTIC;
+}
+
+/* Automatic follows the law: the original picture is a palette picture and every
+ * byte of it is already a colour the map authored, so there is nothing for a
+ * pattern to recover and it is left alone. Any other law composes a colour
+ * between two of them, and the levels it lands on near black are finer than the
+ * canvas it is read back through. */
+static int hwr_truecolor_dither_wanted(enum hwr_shading_dither choice,
+                                       enum hwr_gl_shading_mode mode)
+{
+    switch (choice) {
+    case HWR_SHADING_DITHER_OFF:
+        return 0;
+    case HWR_SHADING_DITHER_ON:
+        return 1;
+    case HWR_SHADING_DITHER_AUTO:
+        break;
+    }
+    return mode != HWR_GL_SHADING_AUTHENTIC;
 }
 
 static enum hwr_gl_color_format hwr_truecolor_gl_format(
@@ -154,6 +177,10 @@ static void hwr_truecolor_apply(uint32_t mask,
     state.shading_mode = hwr_truecolor_gl_shading(
         (enum hwr_shading_mode)hwr_truecolor_row_enum(
             HWR_SHADING_ROW, settings, HWR_SHADING_AUTHENTIC));
+    state.dither = hwr_truecolor_dither_wanted(
+        (enum hwr_shading_dither)hwr_truecolor_row_enum(
+            HWR_DITHER_ROW, settings, HWR_SHADING_DITHER_AUTO),
+        state.shading_mode);
     hwr_gl_set_truecolor(&state);
 }
 

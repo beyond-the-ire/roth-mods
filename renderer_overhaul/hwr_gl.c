@@ -241,6 +241,13 @@ static int g_shade_ramp_env = -1;
 static int g_shade_origin_fixed_env = -1;
 static int g_shade_radial_round_env = -1;
 static int g_shade_per_fragment_env = -1;
+/* The working space a non-authentic law composes in; -1 until first read. The
+ * smooth law resolves colour between two entries of an authored ramp, which is a
+ * display-space operation by definition, so it stays where the palette lives and
+ * this is off. A law that ADDS light has to add it where light adds, and this is
+ * the handle that holds the round trip against the picture it must not move
+ * before there is a term depending on it. */
+static int g_shade_linear_env = -1;
 /* Raised while this frame renders through the enhanced program. */
 static int g_truecolor_active;
 /* Set once the foundation has failed to come up, so it is never retried. */
@@ -249,7 +256,8 @@ static int g_truecolor_logged;
 /* What the settings layer last asked for. */
 static struct hwr_gl_truecolor g_truecolor_want = { 0, 1, 1.0f, 1.0f,
                                                     HWR_GL_COLOR_AUTO,
-                                                    HWR_GL_SHADING_AUTHENTIC };
+                                                    HWR_GL_SHADING_AUTHENTIC,
+                                                    0 };
 /* The colour format in use, and the ones this driver has refused. */
 static enum hwr_gl_color_format g_truecolor_format = HWR_GL_COLOR_AUTO;
 static int g_truecolor_refused_rgba16f;
@@ -1322,6 +1330,17 @@ static const char g_geometry_fragment_body[] =
      * exactness is measured in. */
     "uniform int u_shading_mode;\n"
     "uniform int u_shade_ramp;\n"
+    /* The working space the composition runs in. The palette holds display-
+     * referred colour and the smooth law reads BETWEEN two entries of it, which
+     * is a display-space operation: linearizing for it would move colours the
+     * map authored for no gain, so it composes where the palette lives and this
+     * is zero. A law that adds light rather than reading a ramp has to add it in
+     * linear, one conversion in and one back out; the pair is its own inverse,
+     * which is what makes turning it on with nothing else moving leave the
+     * picture exactly where it was. */
+    "uniform int u_light_linear;\n"
+    "vec3 to_linear(vec3 c) { return pow(max(c,0.0),vec3(2.2)); }\n"
+    "vec3 to_display(vec3 c) { return pow(max(c,0.0),vec3(1.0/2.2)); }\n"
     /* The unlit texel of the ordinary tail. Every other class is unlit in the
      * original and stays unlit here, and says so by leaving this unset. */
     "uint g_albedo_index=256u;\n"
@@ -1339,8 +1358,10 @@ static const char g_geometry_fragment_body[] =
     "  if (u_light_neutral!=0) { out_color=lit; return; }\n"
     "  uint albedo_index=g_albedo_index<256u ? g_albedo_index : index;\n"
     "  vec3 albedo=texelFetch(u_palette,ivec2(int(albedo_index),0),0).rgb;\n"
-    "  vec3 shaded=(g_shade_color_set ? g_shade_color : lit.rgb)*u_gain"
-    "+albedo*u_add;\n"
+    "  vec3 base=g_shade_color_set ? g_shade_color : lit.rgb;\n"
+    "  vec3 shaded=u_light_linear!=0\n"
+    "      ? to_display(to_linear(base)*u_gain+to_linear(albedo)*u_add)\n"
+    "      : base*u_gain+albedo*u_add;\n"
     /* The picture's contrast: a pivot around mid grey, after everything that
      * decides how much light a surface got. The comparison is uniform across
      * the draw and it is what keeps one exactly one -- taking half away and
@@ -1663,20 +1684,64 @@ static const char g_truecolor_resolve_fragment_shader[] =
     "uniform sampler2D u_palette;\n"
     "uniform int u_damage_fade;\n"
     "uniform int u_grayscale;\n"
+    /* Whether this resolve dithers. Off is the picture as it was composed, to
+     * the byte, and is what every neutral frame gets whatever the setting says. */
+    "uniform int u_dither;\n"
     /* The eight-bit value the colour stands for. The clamp is for a colour a
      * later term has taken outside the displayable range in a floating-point
      * target; it changes nothing for one that is inside it. */
     "int byte_of(float v) { return clamp(int(v*255.0+0.5),0,255); }\n"
+    /* An ordered screen-space pattern in [0,1) -- the interleaved gradient, three
+     * instructions and no visible tiling. Added ahead of a quantizer, a ramp too
+     * shallow to change a level per pixel breaks into a fine pattern instead of
+     * into flat plateaus with a step between them, and it costs nothing where the
+     * ramp is steep enough to change levels on its own.
+     *
+     * It is taken to each quantizer's own convention, so that the mean lands
+     * exactly where the composition put it either way: the eight-bit write below
+     * rounds to nearest and wants the pattern centred on zero, and the six-bit
+     * collapse truncates and wants it unsigned.
+     *
+     * And it is spent inside a margin rather than across the whole step. A colour
+     * that IS one the map authored has to come out as the byte that colour
+     * resolves to, and a floating-point world image holds such a colour about an
+     * eighth of a level away from it -- so a pattern reaching a full half step
+     * could round an exact colour onto its neighbour, which is the one thing this
+     * is not allowed to do. The margin below is that distance in canvas levels,
+     * and each quantizer keeps a step less twice the margin measured in ITS OWN
+     * steps: the eight-bit write gives up a third of its span for it, and the
+     * six-bit collapse, whose step is four levels wide, gives up almost nothing.
+     * Either way the span stays centred, so the mean does not move. */
+    "float dither_unit() {\n"
+    "  return fract(52.9829189*fract(dot(gl_FragCoord.xy,"
+    "vec2(0.06711056,0.00583715))));\n"
+    "}\n"
+    "const float DITHER_MARGIN=0.15;\n"
     /* The engine takes its damage-flash product down by a signed shift of eight,
      * which rounds toward negative infinity; integer division rounds toward
      * zero, so the negative case is spelled out. */
     "int shift8(int v) { return v>=0 ? v/256 : -((-v+255)/256); }\n"
     "void main() {\n"
     "  vec4 texel=texelFetch(u_source,ivec2(gl_FragCoord.xy),0);\n"
-    "  if (u_damage_fade<0 && u_grayscale==0) { out_color=texel; return; }\n"
-    "  int r6=byte_of(texel.r)>>2;\n"
-    "  int g6=byte_of(texel.g)>>2;\n"
-    "  int b6=byte_of(texel.b)>>2;\n"
+    "  float pattern=u_dither!=0 ? dither_unit() : 0.0;\n"
+    /* The plain resolve, which is a copy: the only quantizer left is the write
+     * into the eight-bit canvas the frame is read back through, and that is
+     * where a floating-point world image spends the precision it was composed
+     * at. */
+    "  if (u_damage_fade<0 && u_grayscale==0) {\n"
+    "    float fine=u_dither!=0 ?"
+    " (pattern-0.5)*(1.0-2.0*DITHER_MARGIN)/255.0 : 0.0;\n"
+    "    out_color=vec4(texel.rgb+fine,texel.a);\n"
+    "    return;\n"
+    "  }\n"
+    /* An effect is running, and the value it is authored on is six bits: that
+     * collapse is now the coarsest quantizer in the frame and is where the
+     * pattern has to be spent, not after it. */
+    "  float coarse=u_dither!=0 ?"
+    " ((pattern-0.5)*(1.0-0.5*DITHER_MARGIN)+0.5)*4.0/255.0 : 0.0;\n"
+    "  int r6=byte_of(texel.r+coarse)>>2;\n"
+    "  int g6=byte_of(texel.g+coarse)>>2;\n"
+    "  int b6=byte_of(texel.b+coarse)>>2;\n"
     /* The inventory desaturation: the engine's green-weighted luminance of the
      * six-bit entry, read off the same sixteen-entry ramp it remaps into. */
     "  if (u_grayscale!=0) {\n"
@@ -2130,6 +2195,19 @@ static int hwr_shade_per_fragment_env(void)
     return g_shade_per_fragment_env;
 }
 
+/* Unlike the three above this one is off unless it is asked for: the law that
+ * needs a linear working space is not the one shipping here, and the smooth law
+ * composes where the palette lives on purpose. */
+static int hwr_shade_linear_env(void)
+{
+    if (g_shade_linear_env < 0) {
+        const char *setting = getenv("HWR_SHADE_LINEAR");
+        g_shade_linear_env =
+            setting != NULL && setting[0] != 0 && setting[0] != '0';
+    }
+    return g_shade_linear_env;
+}
+
 void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
 {
     if (state == NULL)
@@ -2149,9 +2227,33 @@ int hwr_gl_color_format_available(enum hwr_gl_color_format format)
     return 1;
 }
 
-/* Attaches a colour target of the asked-for format and reports whether the
- * framebuffer took it. Automatic is eight bits per channel: it is exact for the
- * authentic picture, and headroom is something a later term asks for by name. */
+enum hwr_gl_color_format hwr_gl_color_format_in_use(void)
+{
+    return g_color_texture != 0 ? g_truecolor_format : HWR_GL_COLOR_AUTO;
+}
+
+/* What the world image is to be kept in, once automatic has been read. Eight
+ * bits per channel is exact for the authentic picture and is what it keeps; a
+ * law that resolves colour between two authored rows composes levels finer than
+ * the canvas it is read back through, and keeping them is what the resolve's
+ * dither then has to spend. A driver that has refused the floating-point format
+ * once is never asked again. */
+static enum hwr_gl_color_format hwr_truecolor_wanted_format(void)
+{
+    enum hwr_gl_color_format wanted = g_truecolor_want.format;
+
+    if (wanted != HWR_GL_COLOR_AUTO)
+        return wanted;
+    if (g_truecolor_want.shading_mode != HWR_GL_SHADING_AUTHENTIC &&
+        !g_truecolor_refused_rgba16f)
+        return HWR_GL_COLOR_RGBA16F;
+    return HWR_GL_COLOR_RGBA8;
+}
+
+/* Attaches a colour target of the format resolved above and reports whether the
+ * framebuffer took it. A driver that will not take the floating-point one is
+ * answered with eight bits, which is what the picture asking for automatic would
+ * have been given anyway wherever the original law is in force. */
 static int hwr_truecolor_attach(uint32_t width, uint32_t height,
                                 enum hwr_gl_color_format format)
 {
@@ -2255,15 +2357,29 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
                           NULL);
         g_gl.bind_texture(GL_TEXTURE_2D, 0);
     }
+    /* The law can move without a restart, and with it the precision the colour
+     * has to be kept at. The attachment is the only thing that has to be rebuilt
+     * for it: the frame primes it from the standing index plane before it draws,
+     * so the frame after the change composes the same picture into the new one
+     * and nothing has to be carried across. */
+    if (g_color_texture != 0 &&
+        g_truecolor_format != hwr_truecolor_wanted_format()) {
+        if (g_index_fbo != 0) {
+            g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
+            g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                                        GL_TEXTURE_2D, 0, 0);
+        }
+        hwr_delete_texture(&g_color_texture);
+        g_truecolor_format = HWR_GL_COLOR_AUTO;
+        g_truecolor_logged = 0;
+    }
     if (g_color_texture == 0) {
-        enum hwr_gl_color_format wanted = g_truecolor_want.format;
+        enum hwr_gl_color_format wanted = hwr_truecolor_wanted_format();
 
         if (g_index_fbo == 0 || width != g_fbo_width || height != g_fbo_height)
             return 0;
         g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
         hwr_gl_drain_errors();
-        if (wanted == HWR_GL_COLOR_AUTO)
-            wanted = HWR_GL_COLOR_RGBA8;
         if (!hwr_truecolor_attach(width, height, wanted)) {
             if (wanted == HWR_GL_COLOR_RGBA16F) {
                 fprintf(stderr, "[renderer_overhaul] this driver will not take "
@@ -3098,6 +3214,13 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                        g_truecolor_want.shading_mode !=
                                HWR_GL_SHADING_AUTHENTIC);
         hwr_uniform_1i(program, "u_shade_ramp", hwr_shade_ramp_env());
+        /* The working space, which only a departing law may be composed in: the
+         * authentic law resolves one authored colour per fragment and there is
+         * nothing to add it to. */
+        hwr_uniform_1i(program, "u_light_linear",
+                       g_truecolor_want.shading_mode !=
+                               HWR_GL_SHADING_AUTHENTIC &&
+                       hwr_shade_linear_env());
         hwr_uniform_1i(program, "u_shade_fixed_origin",
                        hwr_shade_origin_fixed_env());
         hwr_uniform_1i(program, "u_shade_round",
@@ -3603,6 +3726,12 @@ static void hwr_scene_resolve_pass(uint32_t width, uint32_t height)
                        g_effect_fade);
         hwr_uniform_1i(g_truecolor_resolve_program, "u_grayscale",
                        g_effect_grayscale);
+        /* And whether this frame is dithered where it is quantized. A neutral
+         * picture IS the authentic picture, so it is never patterned whatever
+         * the setting asks for -- the state that short-circuits the composition
+         * is what decides it, so the two can never disagree. */
+        hwr_uniform_1i(g_truecolor_resolve_program, "u_dither",
+                       g_truecolor_want.dither && !g_truecolor_want.neutral);
         g_gl.bind_vertex_array(g_resolve_vao);
         g_gl.active_texture(GL_TEXTURE0);
         g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);
@@ -4095,6 +4224,8 @@ const uint32_t *hwr_gl_scene_resolve(const struct hwr_gl_palette *palette,
                        g_effect_fade);
         hwr_uniform_1i(g_truecolor_resolve_program, "u_grayscale",
                        g_effect_grayscale);
+        hwr_uniform_1i(g_truecolor_resolve_program, "u_dither",
+                       g_truecolor_want.dither && !g_truecolor_want.neutral);
         g_gl.bind_vertex_array(g_resolve_vao);
         g_gl.active_texture(GL_TEXTURE0);
         g_gl.bind_texture(GL_TEXTURE_2D, g_color_texture);

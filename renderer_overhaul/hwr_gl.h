@@ -225,8 +225,10 @@ struct hwr_gl_scene_view {
 };
 
 /* Where the true-colour world image is kept. Eight bits per channel is exact
- * for the authentic picture; the floating-point format is headroom, offered
- * only where the driver proves the attachment completes. */
+ * for the authentic picture; the floating-point format is the precision a law
+ * that resolves colour continuously is composed at, and is offered only where
+ * the driver proves the attachment completes. Automatic reads the shading law:
+ * eight bits for the original picture, floating point for any other. */
 enum hwr_gl_color_format {
     HWR_GL_COLOR_AUTO = 0,
     HWR_GL_COLOR_RGBA8,
@@ -263,6 +265,11 @@ struct hwr_gl_truecolor {
     /* The shading law in force. Authentic is the original picture and is what
      * every neutral state resolves to. */
     enum hwr_gl_shading_mode shading_mode;
+    /* Dither the world image where it is quantized into screen colours. The
+     * renderer holds it off whenever the picture is neutral, whatever this says:
+     * a picture that is the authentic picture must come out as the authentic
+     * bytes, and half a level of pattern is still a moved byte. */
+    int dither;
 };
 
 /* The palette a frame is presented through, and the palette-level effects the
@@ -347,6 +354,10 @@ int hwr_gl_truecolor_active(void);
 /* Whether a colour format can be used here. Auto and eight-bit are always
  * available; a format the driver has refused is not. */
 int hwr_gl_color_format_available(enum hwr_gl_color_format format);
+/* The format the world image is actually being kept in, which is what automatic
+ * resolved to and what the driver accepted. Auto means there is no colour world
+ * image right now. */
+enum hwr_gl_color_format hwr_gl_color_format_in_use(void);
 void hwr_gl_scene_clear(void);
 /* Hands over the pixels the palette-index target should start from instead of a
  * flat clear, in the same orientation as a scene readback. The next scene render

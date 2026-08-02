@@ -24,6 +24,8 @@ _Static_assert(sizeof(enum hwr_truecolor_format) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_shading_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
+_Static_assert(sizeof(enum hwr_shading_dither) == sizeof(int32_t),
+               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -53,6 +55,12 @@ static const struct hwr_enum_value HWR_TRUECOLOR_FORMAT_VALUES[] = {
 static const struct hwr_enum_value HWR_SHADING_MODE_VALUES[] = {
     { "authentic", HWR_SHADING_AUTHENTIC, "Original" },
     { "smooth",    HWR_SHADING_SMOOTH,    "Smooth" }
+};
+
+static const struct hwr_enum_value HWR_SHADING_DITHER_VALUES[] = {
+    { "auto", HWR_SHADING_DITHER_AUTO, "Follow the shading" },
+    { "off",  HWR_SHADING_DITHER_OFF,  "Off" },
+    { "on",   HWR_SHADING_DITHER_ON,   "On" }
 };
 
 /* Retired, and kept only so that a configuration file written for an earlier
@@ -431,7 +439,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .available = hwr_truecolor_format_offered,
         .label = "True-colour storage",
         .help = "How the colour world image is stored. Automatic uses eight "
-                "bits per channel, which is exact for the authentic picture."
+                "bits per channel for the original picture, which is exact for "
+                "it, and more precision than the screen has for any other "
+                "shading, which is what keeps its darkest levels smooth."
     },
     {
         /* The shading law. Original is the picture the game has always drawn,
@@ -461,6 +471,34 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "exactly as the game always has. Smooth follows the same "
                 "shades continuously, so a wall or a floor darkens evenly "
                 "instead of in bands."
+    },
+    {
+        /* Where the picture is finally quantized into screen colours, and the
+         * one place near-black can be kept smooth: an ordered half-level pattern
+         * spends the precision the world image was composed at instead of
+         * letting a shallow ramp land as flat plateaus. It says something about
+         * a screen rather than about a map, so no per-map override reaches it,
+         * and it hangs off the shading law: moving it while the picture is the
+         * original one changes nothing and asks for nothing. */
+        .key = "shading_dither",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, shading_dither),
+        .flags = HWR_SF_RESTART_FREE,
+        .def = { .e = HWR_SHADING_DITHER_AUTO },
+        .original = { .e = HWR_SHADING_DITHER_AUTO },
+        .values = HWR_SHADING_DITHER_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_SHADING_DITHER_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Shading dither",
+        .help = "Whether the world image is dithered where it becomes screen "
+                "colours, so that its darkest levels stay smooth instead of "
+                "stepping. Automatic follows the shading: the original picture "
+                "is left exactly as it is, and smooth shading is dithered."
     },
     {
         /* The foundation's first dependent, and the smallest one: at one it is

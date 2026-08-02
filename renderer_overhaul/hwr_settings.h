@@ -21,9 +21,10 @@ enum hwr_pitch_mode {
 };
 
 /* Storage the true-colour world image is kept in. Eight bits per channel is
- * exact for the authentic picture and is what auto selects; the floating-point
- * format is headroom a later lighting term can ask for, and is offered only
- * where the driver proves it round-trips. */
+ * exact for the authentic picture and is what auto selects for it; a shading law
+ * that resolves colour continuously is composed at more precision than the
+ * eight-bit canvas it is finally quantized into, so auto selects the
+ * floating-point format for one where the driver offers it. */
 enum hwr_truecolor_format {
     HWR_TRUECOLOR_FORMAT_AUTO = 0,
     HWR_TRUECOLOR_FORMAT_RGBA8,
@@ -38,6 +39,19 @@ enum hwr_truecolor_format {
 enum hwr_shading_mode {
     HWR_SHADING_AUTHENTIC = 0,
     HWR_SHADING_SMOOTH
+};
+
+/* Whether the world image is dithered where it is finally turned into screen
+ * colours. Near-black is where eight bits run out: a ramp too shallow to change
+ * a level from one pixel to the next lands as flat plateaus with a visible step
+ * between them, and an ordered pattern of half a level spends the precision the
+ * image was composed at on breaking those plateaus up instead. Automatic follows
+ * the shading law -- the original picture is a palette picture and is left
+ * exactly alone, a continuous law is dithered. */
+enum hwr_shading_dither {
+    HWR_SHADING_DITHER_AUTO = 0,
+    HWR_SHADING_DITHER_OFF,
+    HWR_SHADING_DITHER_ON
 };
 
 struct hwr_settings {
@@ -71,6 +85,10 @@ struct hwr_settings {
      * the original picture; every other value is a dependent of the foundation
      * and clears its neutral early-out. */
     enum hwr_shading_mode shading_mode;
+    /* Where the world image is dithered. It hangs off the shading law rather
+     * than off the foundation: it says what a screen needs of a picture that is
+     * already departing, and it never brings a departure into existence. */
+    enum hwr_shading_dither shading_dither;
     /* Uniform gain on the world image, and the foundation's first dependent.
      * One means authentic and takes the neutral early-out. */
     float world_gain;
