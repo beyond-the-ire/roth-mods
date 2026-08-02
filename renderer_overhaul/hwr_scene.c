@@ -7,6 +7,7 @@
 #include "hwr_settings.h"
 
 #include "hwr_gl.h"
+#include "hwr_lights.h"
 
 #include "hwr_util.h"
 #include "hwr_visibility.h"
@@ -6193,5 +6194,21 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
 
     hwr_build_palette(world, palette, base_palette, &published);
     hwr_gl_set_stale_mask(scene->stale_mask_seen);
+    /* The lights that are not at the eye, found afresh for this frame and handed
+     * over whole. It sits here, after every view is built and before any of them
+     * is drawn, for the reason the array is in world space: a light belongs to
+     * the frame rather than to the view that happens to see it, and each view
+     * puts it into its own space as it binds. */
+    {
+        struct hwr_gl_point_light lights[HWR_GL_POINT_LIGHT_MAX];
+        struct hwr_lights_frame frame;
+        size_t count;
+
+        memset(&frame, 0, sizeof frame);
+        frame.world = world;
+        frame.objects = objects;
+        count = hwr_lights_build(&frame, lights, HWR_GL_POINT_LIGHT_MAX);
+        hwr_gl_set_point_lights(lights, count);
+    }
     return hwr_gl_scene_render(views, view_count, &published, width, height);
 }

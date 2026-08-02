@@ -57,8 +57,8 @@ struct hwr_config_state {
      * come from the watcher carries no expectation. */
     int reload_expects_hash;
     uint64_t reload_hash;
-    /* One note per retired key per session, by table index. */
-    uint64_t retired_noted;
+    /* One note per retired key per session, by table position. */
+    struct hwr_row_set retired_noted;
 };
 
 static struct hwr_config_state g_config;
@@ -114,18 +114,6 @@ static char *hwr_trim(char *text)
     return text;
 }
 
-static int hwr_config_row_index(const struct hwr_setting_desc *desc)
-{
-    size_t count = hwr_schema_count();
-    size_t i;
-
-    for (i = 0; i < count && i < 64; i++) {
-        if (hwr_schema_at(i) == desc)
-            return (int)i;
-    }
-    return -1;
-}
-
 /* One key=value pair against the schema: 1 accepted, 0 invalid value,
  * -1 unknown key. Every bound, token, and transform comes from the table, so
  * the file and the settings overlay can only ever agree. */
@@ -152,11 +140,11 @@ static int hwr_apply_config_value(struct hwr_settings *settings,
 static void hwr_note_retired(const struct hwr_setting_desc *desc,
                              unsigned int line_number)
 {
-    int index = hwr_config_row_index(desc);
+    int index = hwr_schema_index_of(desc);
 
-    if (index < 0 || (g_config.retired_noted & (UINT64_C(1) << index)) != 0)
+    if (index < 0 || hwr_row_set_has(&g_config.retired_noted, index))
         return;
-    g_config.retired_noted |= UINT64_C(1) << index;
+    hwr_row_set_add(&g_config.retired_noted, index);
     fprintf(stderr,
             "[renderer_overhaul] %s:%u: '%s' is retired and has no effect; %s\n",
             g_config.path, line_number, desc->key, desc->help);
@@ -692,32 +680,29 @@ static void hwr_config_recover(void)
     g_config.holding = 0;
 }
 
-/* Which keys the file being replaced carries, by table index. An advanced key
+/* Which keys the file being replaced carries, by table position. An advanced key
  * somebody wrote by hand is kept; one they never asked for is not added. */
-static uint64_t hwr_config_present_keys(void)
+static void hwr_config_present_keys(struct hwr_row_set *present)
 {
     char line[512];
     FILE *file;
-    uint64_t present = 0;
 
+    hwr_row_set_clear(present);
     file = fopen(g_config.path, "r");
     if (file == NULL)
-        return 0;
+        return;
     while (fgets(line, sizeof line, file) != NULL) {
         char *equals;
-        int index;
 
         hwr_strip_comment(line);
         equals = strchr(line, '=');
         if (equals == NULL)
             continue;
         *equals = 0;
-        index = hwr_config_row_index(hwr_schema_find(hwr_trim(line)));
-        if (index >= 0)
-            present |= UINT64_C(1) << index;
+        hwr_row_set_add(present,
+                        hwr_schema_index_of(hwr_schema_find(hwr_trim(line))));
     }
     fclose(file);
-    return present;
 }
 
 static int hwr_config_write_comment(FILE *file, const char *text)
@@ -767,7 +752,7 @@ static int hwr_config_write_row(FILE *file, const struct hwr_settings *settings,
  * are never written, so the first save is also what removes them. */
 static int hwr_config_write_stream(FILE *file,
                                    const struct hwr_settings *settings,
-                                   uint64_t keep_advanced)
+                                   const struct hwr_row_set *keep_advanced)
 {
     size_t count = hwr_schema_count();
     size_t i;
@@ -797,11 +782,10 @@ static int hwr_config_write_stream(FILE *file,
     }
     for (i = 0; i < count; i++) {
         const struct hwr_setting_desc *desc = hwr_schema_at(i);
-        int index = (int)i;
 
         if (desc->key == NULL || desc->exposure != HWR_EXP_ADVANCED)
             continue;
-        if (index >= 64 || (keep_advanced & (UINT64_C(1) << index)) == 0)
+        if (!hwr_row_set_has(keep_advanced, (int)i))
             continue;
         if (!wrote_advanced_header) {
             if (fprintf(file, "\n# Kept from the previous file. A later line "
@@ -820,7 +804,7 @@ int hwr_config_save(const struct hwr_settings *settings, char *err,
                     size_t err_size)
 {
     char temp_path[2660];
-    uint64_t keep_advanced;
+    struct hwr_row_set keep_advanced;
     FILE *file;
     int written;
 
@@ -829,7 +813,7 @@ int hwr_config_save(const struct hwr_settings *settings, char *err,
         hwr_config_note(1, "There is no settings file to write.");
         return -1;
     }
-    keep_advanced = hwr_config_present_keys();
+    hwr_config_present_keys(&keep_advanced);
     if (hwr_config_side_path(temp_path, sizeof temp_path,
                              HWR_CONFIG_TEMP_SUFFIX) != 0) {
         hwr_config_fail(err, err_size, "there is nowhere to write the settings "
@@ -847,7 +831,7 @@ int hwr_config_save(const struct hwr_settings *settings, char *err,
                            "unchanged.");
         return -1;
     }
-    written = hwr_config_write_stream(file, settings, keep_advanced) == 0;
+    written = hwr_config_write_stream(file, settings, &keep_advanced) == 0;
     if (written && fflush(file) != 0)
         written = 0;
     if (written && hwr_config_sync(file) != 0)

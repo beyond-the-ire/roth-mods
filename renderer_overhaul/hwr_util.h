@@ -5,6 +5,31 @@
 
 int hwr_ascii_equal_ci(const char *a, const char *b);
 
+/* A set of settings rows, held by table position.
+ *
+ * Three parts of the mod keep one: which keys the file being replaced carried,
+ * which rows the current map overrides, and which rows a panel has already
+ * drawn. Each of them used to keep it in a single machine word, which is
+ * sixty-four positions -- and the table is already longer than that. A row past
+ * the sixty-fourth was therefore outside every one of those sets in silence: its
+ * key dropped from the file it was written in, its per-map override refused, and
+ * nothing said about either. The width is one number here, and the table asserts
+ * it is wide enough for itself (hwr_schema.c), so a row added past the end stops
+ * the build rather than quietly stopping working. */
+#define HWR_ROW_SET_MAX 128u
+#define HWR_ROW_SET_WORDS ((HWR_ROW_SET_MAX + 31u) / 32u)
+
+struct hwr_row_set {
+    uint32_t word[HWR_ROW_SET_WORDS];
+};
+
+void hwr_row_set_clear(struct hwr_row_set *set);
+/* Both take a table position and refuse one outside the set's range, so a caller
+ * already holding the -1 that means "not a row of this table" needs no second
+ * test for it. */
+void hwr_row_set_add(struct hwr_row_set *set, int index);
+int hwr_row_set_has(const struct hwr_row_set *set, int index);
+
 /* Cuts a configuration line at its comment and hands the line back. Both files
  * the mod reads -- the settings it is given and the look it is described with --
  * say a hash starts a comment, and they say it in one place so that neither can

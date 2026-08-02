@@ -8,6 +8,7 @@
 #include "hwr_schema.h"
 #include "hwr_settings.h"
 #include "hwr_sysinfo.h"
+#include "hwr_util.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -472,9 +473,10 @@ static int hwr_overlay_row_enabled(const struct hwr_setting_desc *desc)
 static void hwr_overlay_build_rows(void)
 {
     size_t count = hwr_schema_count();
-    uint64_t consumed = 0;
+    struct hwr_row_set consumed;
     size_t i;
 
+    hwr_row_set_clear(&consumed);
     g_row_count = 0;
     for (i = 0; i < count && g_row_count < HWR_OVERLAY_MAX_ROWS; i++) {
         const struct hwr_setting_desc *desc = hwr_schema_at(i);
@@ -483,12 +485,12 @@ static void hwr_overlay_build_rows(void)
 
         if ((int)desc->category != g_section || !hwr_overlay_row_visible(desc))
             continue;
-        if (i < 64u && (consumed & (UINT64_C(1) << i)) != 0)
+        if (hwr_row_set_has(&consumed, (int)i))
             continue;
         if (desc->widget == HWR_WIDGET_RESOLUTION_PAIR) {
             size_t j;
 
-            for (j = i + 1u; j < count && j < 64u; j++) {
+            for (j = i + 1u; j < count; j++) {
                 const struct hwr_setting_desc *other = hwr_schema_at(j);
 
                 if ((int)other->category != g_section ||
@@ -496,7 +498,7 @@ static void hwr_overlay_build_rows(void)
                     other->widget != HWR_WIDGET_RESOLUTION_PAIR)
                     continue;
                 partner = (int)j;
-                consumed |= UINT64_C(1) << j;
+                hwr_row_set_add(&consumed, (int)j);
                 break;
             }
         }

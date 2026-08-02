@@ -161,6 +161,8 @@ struct hwr_gl_functions {
     PFNGLUNIFORM1FPROC uniform_1f;
     PFNGLUNIFORM2FPROC uniform_2f;
     PFNGLUNIFORM3FPROC uniform_3f;
+    PFNGLUNIFORM2FVPROC uniform_2fv;
+    PFNGLUNIFORM4FVPROC uniform_4fv;
     PFNGLGENVERTEXARRAYSPROC gen_vertex_arrays;
     PFNGLDELETEVERTEXARRAYSPROC delete_vertex_arrays;
     PFNGLBINDVERTEXARRAYPROC bind_vertex_array;
@@ -794,6 +796,8 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(uniform_1f, PFNGLUNIFORM1FPROC, "glUniform1f");
     HWR_LOAD_GL(uniform_2f, PFNGLUNIFORM2FPROC, "glUniform2f");
     HWR_LOAD_GL(uniform_3f, PFNGLUNIFORM3FPROC, "glUniform3f");
+    HWR_LOAD_GL(uniform_2fv, PFNGLUNIFORM2FVPROC, "glUniform2fv");
+    HWR_LOAD_GL(uniform_4fv, PFNGLUNIFORM4FVPROC, "glUniform4fv");
     HWR_LOAD_GL(gen_vertex_arrays, PFNGLGENVERTEXARRAYSPROC, "glGenVertexArrays");
     HWR_LOAD_GL(delete_vertex_arrays, PFNGLDELETEVERTEXARRAYSPROC, "glDeleteVertexArrays");
     HWR_LOAD_GL(bind_vertex_array, PFNGLBINDVERTEXARRAYPROC, "glBindVertexArray");
@@ -1606,6 +1610,19 @@ static const char g_geometry_fragment_body[] =
     "uniform vec3 u_key_dir;\n"
     "uniform vec3 u_key_color;\n"
     "uniform float u_key_intensity;\n"
+    /* The lights that are NOT at the eye: a torch on a wall, a candle on a
+     * table, a lit window. One array, whatever seeded them, so a class added
+     * later is a seeder rather than a second lighting path -- and every one of
+     * them is in the VIEW's own space, which is the same reason the key
+     * direction above is: a reflected view carries its own camera and the term
+     * is evaluated against it, so a mirror needs no rule of its own.
+     *
+     * How many are live is a uniform, and it is zero until something seeds one.
+     * The law that reads them lands with the seeding. */
+    "uniform vec4 u_point_a[16];\n"         /* position.xyz, where it ends */
+    "uniform vec4 u_point_b[16];\n"         /* colour.rgb, energy */
+    "uniform vec2 u_point_z[16];\n"         /* the world-Z window it stays in */
+    "uniform int u_point_count;\n"
     /* The three classes the modern law must not touch, and why each one would be
      * a disaster if it did.
      *
@@ -3029,6 +3046,29 @@ void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
     }
 }
 
+/* The lights that are not at the eye, as the frame about to be drawn found
+ * them. Nothing is kept from one frame to the next: the set is what this frame
+ * seeded, so a light whose source has gone is gone with it rather than held by
+ * this array. The shader declares the arrays at sixteen and this is what fills
+ * them, so the two are held together here rather than by reading. */
+_Static_assert(HWR_GL_POINT_LIGHT_MAX == 16u,
+               "the world shader declares the light arrays at sixteen");
+
+static struct hwr_gl_point_light g_point_lights[HWR_GL_POINT_LIGHT_MAX];
+static size_t g_point_light_count;
+
+void hwr_gl_set_point_lights(const struct hwr_gl_point_light *lights,
+                             size_t count)
+{
+    if (lights == NULL)
+        count = 0;
+    if (count > HWR_GL_POINT_LIGHT_MAX)
+        count = HWR_GL_POINT_LIGHT_MAX;
+    if (count != 0)
+        memcpy(g_point_lights, lights, count * sizeof *g_point_lights);
+    g_point_light_count = count;
+}
+
 void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
 {
     if (state == NULL)
@@ -3808,6 +3848,87 @@ static void hwr_bind_light_uniforms(GLuint program,
     hwr_uniform_1f(program, "u_key_intensity", 0.0f);
 }
 
+/* The geometry stage's own world-to-view transform, in C, for a position that is
+ * not a vertex.
+ *
+ * It is the transform at the top of the vertex stage line for line: the whole
+ * units are added to the view offset and wrapped in sixteen bits -- the engine's
+ * own add, which a light at the far edge of the world depends on -- the
+ * sub-unit remainder is added after the wrap, the pair is turned into the view's
+ * basis, a reflected view flips the across axis, and the vertical is the drop
+ * from the eye. What comes out is the space the fragment tail reconstructs its
+ * own position in, so a term written against the two needs no third space to
+ * agree in. */
+static float hwr_wrap16f(int32_t value)
+{
+    int32_t wrapped = value & 0xffff;
+
+    return (float)(wrapped >= 0x8000 ? wrapped - 0x10000 : wrapped);
+}
+
+static void hwr_point_light_view(const struct hwr_gl_camera *camera,
+                                 float world_x, float world_y, float world_z,
+                                 float out[3])
+{
+    int32_t whole_x = (int32_t)floorf(world_x);
+    int32_t whole_y = (int32_t)floorf(world_y);
+    float across = hwr_wrap16f(whole_x + camera->view_offset_x) +
+                   (world_x - (float)whole_x);
+    float along = hwr_wrap16f(whole_y + camera->view_offset_y) +
+                  (world_y - (float)whole_y);
+    float yaw_sin = (float)camera->yaw_sin / 16384.0f;
+    float yaw_cos = (float)camera->yaw_cos / 16384.0f;
+    float view_x = yaw_sin * across + yaw_cos * along;
+
+    out[0] = camera->x_flip != 0 ? -view_x : view_x;
+    out[1] = yaw_sin * along - yaw_cos * across;
+    out[2] = (float)camera->eye_z - world_z;
+}
+
+/* The frame's lights, in this view's own space. The vertical window stays in
+ * world units: the fragment reconstructs its own world height from the position
+ * above, so the window is the same window in every view. */
+static void hwr_bind_point_lights(GLuint program,
+                                  const struct hwr_gl_camera *camera)
+{
+    GLfloat position_range[HWR_GL_POINT_LIGHT_MAX * 4];
+    GLfloat color_energy[HWR_GL_POINT_LIGHT_MAX * 4];
+    GLfloat window[HWR_GL_POINT_LIGHT_MAX * 2];
+    GLint location;
+    size_t i;
+
+    hwr_uniform_1i(program, "u_point_count", (GLint)g_point_light_count);
+    if (g_point_light_count == 0)
+        return;
+    for (i = 0; i < g_point_light_count; i++) {
+        const struct hwr_gl_point_light *light = &g_point_lights[i];
+        float view[3];
+
+        hwr_point_light_view(camera, light->world_x, light->world_y,
+                             light->world_z, view);
+        position_range[i * 4u + 0u] = view[0];
+        position_range[i * 4u + 1u] = view[1];
+        position_range[i * 4u + 2u] = view[2];
+        position_range[i * 4u + 3u] = light->range;
+        color_energy[i * 4u + 0u] = light->color[0];
+        color_energy[i * 4u + 1u] = light->color[1];
+        color_energy[i * 4u + 2u] = light->color[2];
+        color_energy[i * 4u + 3u] = light->intensity;
+        window[i * 2u + 0u] = light->z_lo;
+        window[i * 2u + 1u] = light->z_hi;
+    }
+    location = g_gl.get_uniform_location(program, "u_point_a");
+    if (location >= 0)
+        g_gl.uniform_4fv(location, (GLsizei)g_point_light_count,
+                         position_range);
+    location = g_gl.get_uniform_location(program, "u_point_b");
+    if (location >= 0)
+        g_gl.uniform_4fv(location, (GLsizei)g_point_light_count, color_energy);
+    location = g_gl.get_uniform_location(program, "u_point_z");
+    if (location >= 0)
+        g_gl.uniform_2fv(location, (GLsizei)g_point_light_count, window);
+}
+
 /* Verifies the uploaded lookup data three ways: the texture store bytes read
  * back from the buffer object, the colormap bytes read back from the texture,
  * and a live two-pixel draw that samples both through the world pass's texture
@@ -4283,6 +4404,9 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         hwr_uniform_1i(program, "u_transmit_pass", 0);
         hwr_uniform_1i(program, "u_transmit_receive", 1);
         hwr_bind_light_uniforms(program, &g_truecolor_want.light);
+        /* And the lights that are not at the eye, in THIS view's space: the
+         * rig above is one frame's answer, this is one view's. */
+        hwr_bind_point_lights(program, camera);
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */

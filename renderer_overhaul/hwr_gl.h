@@ -342,6 +342,41 @@ struct hwr_gl_light {
     float sprite_wrap;
 };
 
+/* How many lights that are NOT at the eye the world pass carries at once. Two
+ * four-component slots and one two-component slot each, which is 160 uniform
+ * components against the 1024 the oldest driver the mod supports guarantees. A
+ * buffer-backed block is the road to hundreds and is not taken for sixteen: it
+ * would add a binding-point contract to a program that has none. */
+#define HWR_GL_POINT_LIGHT_MAX 16u
+
+/* One light in the world, as a seeding class handed it over.
+ *
+ * The position is in the WORLD's own coordinates and is transformed into each
+ * view's own space as that view binds, by the same transform the geometry stage
+ * runs on every vertex. That is what makes a mirror free: a reflected view
+ * carries its own camera, so a light in it is lit from the reflected side by
+ * construction rather than by a reflection rule written twice. */
+struct hwr_gl_point_light {
+    float world_x;
+    float world_y;
+    float world_z;
+    /* Where the pool ends, in world units. The falloff is windowed rather than a
+     * true inverse square, so this is where the light reaches nothing rather
+     * than where it becomes imperceptible. */
+    float range;
+    /* The colour it throws and the energy behind it, kept apart for the same
+     * reason the rig above keeps them apart: one is a colour somebody picked and
+     * the other is light. */
+    float color[3];
+    float intensity;
+    /* The vertical window its contribution is held inside, in world Z: the
+     * owner sector's own floor and ceiling with slack either side. A fragment's
+     * world Z is exactly reconstructible from the view position, so this costs
+     * no vertex data -- it is what stops a torch lighting the room above it. */
+    float z_lo;
+    float z_hi;
+};
+
 /* What the settings layer has worked out about the true-colour foundation. */
 struct hwr_gl_truecolor {
     /* The foundation has to exist: a dependent enhancement is asking for it. */
@@ -474,6 +509,14 @@ void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
                          uint64_t now_ns);
 /* Puts the flame back where it starts and forgets both clocks. */
 void hwr_gl_lamp_reset(void);
+/* Hands over the lights that are not at the eye for the frame about to be
+ * submitted. The set is replaced whole, once a frame, and every view of that
+ * frame -- a mirror's included -- is lit from it, so a light is a property of
+ * the world rather than of the view that happens to see it. Anything past the
+ * cap above is dropped; a frame that publishes nothing, which is every frame
+ * until something seeds one, leaves the pass with no such light at all. */
+void hwr_gl_set_point_lights(const struct hwr_gl_point_light *lights,
+                             size_t count);
 /* Whether a colour format can be used here. Auto and eight-bit are always
  * available; a format the driver has refused is not. */
 int hwr_gl_color_format_available(enum hwr_gl_color_format format);

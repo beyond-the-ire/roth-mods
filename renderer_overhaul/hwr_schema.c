@@ -1479,6 +1479,15 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
     }
 };
 
+/* The bookkeeping that walks this table by position -- which keys a file
+ * carried, which rows a map overrides, which rows a panel has already drawn --
+ * holds one row per position in a set of a fixed width. The table is the only
+ * thing that knows how long it is, so the table is where the two are held
+ * together: a row added past the end of that width stops the build here rather
+ * than falling outside every one of those sets in silence. */
+_Static_assert(HWR_COUNT_OF(HWR_SCHEMA) <= HWR_ROW_SET_MAX,
+               "the settings table has outgrown the row set that indexes it");
+
 size_t hwr_schema_count(void)
 {
     return HWR_COUNT_OF(HWR_SCHEMA);

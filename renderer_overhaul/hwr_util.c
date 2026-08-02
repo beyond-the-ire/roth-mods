@@ -16,6 +16,27 @@ int hwr_ascii_equal_ci(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
+void hwr_row_set_clear(struct hwr_row_set *set)
+{
+    if (set != NULL)
+        memset(set, 0, sizeof *set);
+}
+
+void hwr_row_set_add(struct hwr_row_set *set, int index)
+{
+    if (set == NULL || index < 0 || (unsigned)index >= HWR_ROW_SET_MAX)
+        return;
+    set->word[(unsigned)index / 32u] |= UINT32_C(1) << ((unsigned)index % 32u);
+}
+
+int hwr_row_set_has(const struct hwr_row_set *set, int index)
+{
+    if (set == NULL || index < 0 || (unsigned)index >= HWR_ROW_SET_MAX)
+        return 0;
+    return (set->word[(unsigned)index / 32u] &
+            (UINT32_C(1) << ((unsigned)index % 32u))) != 0;
+}
+
 char *hwr_strip_comment(char *line)
 {
     char *comment;

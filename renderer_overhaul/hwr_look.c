@@ -9,17 +9,17 @@
 #include <string.h>
 
 #define HWR_LOOK_POLL_FRAMES 30u
-/* The table index is carried in a sixty-four bit mask, exactly as the settings
- * file's own bookkeeping carries it, so a row past that cannot be overridden.
- * The table is nowhere near that long and a row that ever is says so in a log
- * line rather than being silently dropped. */
-#define HWR_LOOK_MAX_ROWS 64u
+/* One override per row of the settings table, held by table position in the
+ * same row set the settings file's own bookkeeping uses, so a row this file may
+ * override is every row the table marks as one -- wherever in the table it
+ * happens to sit. */
+#define HWR_LOOK_MAX_ROWS HWR_ROW_SET_MAX
 #define HWR_LOOK_MAX_PROFILES 16u
 #define HWR_LOOK_MAX_MAPS 64u
 #define HWR_LOOK_NAME 64u
 
 struct hwr_look_values {
-    uint64_t present;
+    struct hwr_row_set present;
     union hwr_value value[HWR_LOOK_MAX_ROWS];
 };
 
@@ -116,17 +116,18 @@ static int hwr_look_row_index(const struct hwr_setting_desc *desc)
 static void hwr_look_set(struct hwr_look_values *values, int index,
                          union hwr_value value)
 {
-    values->present |= UINT64_C(1) << index;
+    hwr_row_set_add(&values->present, index);
     values->value[index] = value;
 }
 
 static void hwr_look_merge(struct hwr_look_values *into,
                            const struct hwr_look_values *from)
 {
-    unsigned i;
+    size_t count = hwr_schema_count();
+    size_t i;
 
-    for (i = 0; i < HWR_LOOK_MAX_ROWS; i++) {
-        if ((from->present & (UINT64_C(1) << i)) != 0)
+    for (i = 0; i < count; i++) {
+        if (hwr_row_set_has(&from->present, (int)i))
             hwr_look_set(into, (int)i, from->value[i]);
     }
 }
@@ -337,12 +338,12 @@ static void hwr_look_compose(const struct hwr_look_file *file,
 static void hwr_look_publish(const struct hwr_look_values *next)
 {
     uint32_t changed = 0;
-    unsigned i;
+    size_t count = hwr_schema_count();
+    size_t i;
 
-    for (i = 0; i < HWR_LOOK_MAX_ROWS; i++) {
-        uint64_t bit = UINT64_C(1) << i;
-        int had = (g_effective.present & bit) != 0;
-        int has = (next->present & bit) != 0;
+    for (i = 0; i < count; i++) {
+        int had = hwr_row_set_has(&g_effective.present, (int)i);
+        int has = hwr_row_set_has(&next->present, (int)i);
         const struct hwr_setting_desc *desc;
 
         if (!had && !has)
@@ -494,7 +495,7 @@ union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
 {
     int index = hwr_look_row_index(desc);
 
-    if (index >= 0 && (g_effective.present & (UINT64_C(1) << index)) != 0)
+    if (index >= 0 && hwr_row_set_has(&g_effective.present, index))
         return g_effective.value[index];
     return hwr_schema_get(settings, desc);
 }
@@ -503,8 +504,7 @@ int hwr_look_overrides(const struct hwr_setting_desc *desc)
 {
     int index = hwr_look_row_index(desc);
 
-    return index >= 0 &&
-           (g_effective.present & (UINT64_C(1) << index)) != 0;
+    return index >= 0 && hwr_row_set_has(&g_effective.present, index);
 }
 
 void hwr_look_clear(void)
