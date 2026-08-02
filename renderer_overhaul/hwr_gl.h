@@ -268,7 +268,9 @@ enum hwr_gl_color_format {
 /* Which law the enhanced program resolves a shaded fragment with. Authentic
  * floors the shade quantity to one colormap row, which is the picture the game
  * has always drawn; smooth keeps that quantity continuous and mixes the two rows
- * it falls between; modern leaves the ramp behind and multiplies the texel's own
+ * it falls between, and changes nothing else about it -- the same depth law and
+ * the same candle, jitter, corners and all, so flooring it lands back on the
+ * authentic row; modern leaves the ramp behind and multiplies the texel's own
  * colour by the light that reaches it. The authentic program carries none of
  * these branches: the law is selected by a uniform inside the enhanced program
  * alone. */

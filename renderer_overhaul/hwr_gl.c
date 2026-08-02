@@ -293,13 +293,19 @@ static GLuint g_base_palette_texture;
 static int g_truecolor_env = -1;
 /* Cached HWR_SHADE_RAMP gate; -1 until first read. */
 static int g_shade_ramp_env = -1;
-/* Cached gates for the three parts of the still, round, per-fragment candle;
- * -1 until first read. Each one restores the part of the original pool it names
- * and nothing else, so what the still pool owes to the fixed origin, to the
- * round metric and to sampling every fragment can be told apart. */
-static int g_shade_origin_fixed_env = -1;
-static int g_shade_radial_round_env = -1;
-static int g_shade_per_fragment_env = -1;
+/* Cached gates for the three parts of the still, round, per-fragment candle.
+ * Each one names the part of the original pool it departs from -- the light
+ * position that moves, the metric with corners, the sampling at polygon corners
+ * -- so what the still pool owes to each can be told apart.
+ *
+ * Three answers rather than two: HWR_SHADE_PART_UNREAD until the handle has
+ * been looked at, then -1 where nothing asked either way and the law that is
+ * running decides, and 0 or 1 where something asked outright. Which law asks
+ * for which part is hwr_shade_part_wanted() below. */
+#define HWR_SHADE_PART_UNREAD (-2)
+static int g_shade_origin_fixed_env = HWR_SHADE_PART_UNREAD;
+static int g_shade_radial_round_env = HWR_SHADE_PART_UNREAD;
+static int g_shade_per_fragment_env = HWR_SHADE_PART_UNREAD;
 /* And the handle that puts the light the player carries back through every
  * see-through surface whole, which is where it was before the pass that stops
  * it existed; -1 until first read. */
@@ -1342,8 +1348,10 @@ static const char g_geometry_fragment_body[] =
      * hold the engine's own sub-row phase in their low byte), so for those this
      * twin is the authentic expression with the floor lifted off it. */
     "#ifdef HWR_TRUECOLOR\n"
-    /* The three parts of the candle the smooth law does differently, each its
-     * own uniform so each can be put back on its own. */
+    /* The three parts of the candle a law may draw differently from the
+     * original one, each its own uniform so each can be asked for on its own.
+     * The smooth law asks for none of them and the modern law asks for all
+     * three; which law asks for what is hwr_shade_part_wanted(). */
     "uniform int u_shade_fixed_origin;\n"
     "uniform int u_shade_round;\n"
     "uniform int u_shade_per_fragment;\n"
@@ -1351,21 +1359,21 @@ static const char g_geometry_fragment_body[] =
      *
      * The engine measures it from a light position that lives in screen space
      * and is moved every seventh tick by a random step around the view centre,
-     * and that dance is the flicker. Measuring from the view centre itself --
-     * the place the dance is a dance around -- leaves the pool where it always
-     * was and stops it moving, without inventing a light position the map never
-     * had.
+     * and that dance is the flicker. A law whose light no longer dances
+     * measures from the view centre itself -- the place the dance is a dance
+     * around -- which leaves the pool where it always was and stops it moving,
+     * without inventing a light position the map never had.
      *
      * The engine's distance is the larger of the two axis terms, which makes a
      * pool with straight edges and corners; the length of the pair makes it
      * round. The axis terms keep the engine's own per-axis focal scales, so a
      * pool is as wide as the projection makes it either way.
      *
-     * The sixteen-bit wrap the engine's intermediate carries is kept on the
-     * square metric so restoring it restores that law whole. The round metric
-     * does not take it: a term the wrap reaches is one the row law would have
-     * clamped into darkness, and wrapping it lands a bright ring in the dark
-     * instead. */
+     * The sixteen-bit wrap the engine's intermediate carries stays on the
+     * square metric, which is what makes that arm the engine's law whole. The
+     * round metric does not take it: a term the wrap reaches is one the row law
+     * would have clamped into darkness, and wrapping it lands a bright ring in
+     * the dark instead. */
     "float candle_edge_depth(int depth) {\n"
     "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i : u_shade_origin;\n"
     "  int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
@@ -1389,10 +1397,12 @@ static const char g_geometry_fragment_body[] =
     "    if (tinted) {\n"
     /* The engine samples a flat's candle only at the corners of the polygon it
      * rasterises and interpolates between them, which is what splits a room's
-     * pool into two lobes that slide as the light position moves. Reading the
-     * law at the fragment instead is the whole pool, in one piece, wherever the
-     * fragment is -- and it is uniformly brighter than the chord between two
-     * corners, because the law is convex where it is not clamped. */
+     * pool into two lobes that slide as the light position moves. The smooth
+     * law samples exactly there, because that shape is the original picture's
+     * and only the quantizer is being taken out of it. A law that asks to be
+     * read at the fragment gets the whole pool, in one piece, wherever the
+     * fragment is -- and uniformly brighter than the chord between two corners,
+     * because the law is convex where it is not clamped. */
     "      if (u_shade_per_fragment==0 && v_flat_taint==0u &&"
     " (v_flat_span.w & 0x80000000u)==0u)"
     " return clamp(v_wall_shade_endpoint/256.0,0.0,31.0);\n"
@@ -1408,9 +1418,10 @@ static const char g_geometry_fragment_body[] =
     "  }\n"
     "  if (tinted) {\n"
     /* And a wall's candle is seeded at the corners of its segment and walked
-     * down each column, which is the same corner sampling one axis at a time.
-     * The per-fragment form below is the law the corner words were made from,
-     * evaluated where it is being drawn. */
+     * down each column, which is the same corner sampling one axis at a time,
+     * and the same reason for keeping it. The per-fragment form below is the
+     * law those corner words were made from, evaluated where it is being
+     * drawn. */
     "    if (u_shade_per_fragment==0 && v_wall_span.w!=0u) {\n"
     "      int scol=int(gl_FragCoord.x)-int(v_wall_span.x); if (scol<0) scol=0;\n"
     "      uint ta=v_wall_rows.x+v_wall_rows.z*uint(scol);\n"
@@ -1951,6 +1962,13 @@ static const char g_geometry_fragment_body[] =
      * between them. At a whole row the mix is the lower colour and the picture is
      * the authentic picture exactly, which is what makes this arm auditable
      * against that one surface by surface.
+     *
+     * And that is its ONLY departure. The shade quantity it resolves is the
+     * original's own, on every class: the same depth law, the same candle, the
+     * same light position walking every seventh tick, the same shade read at the
+     * corners the engine reads it at. Flooring it lands on the row the original
+     * law returns, everywhere, which is the exactness claim stated as strongly
+     * as it can be stated.
      *
      * The half-row dither is not carried over: it is a recovery trick for the
      * quantization this law does not perform, and against a continuous shade it
@@ -2642,36 +2660,64 @@ static int hwr_shade_ramp_env(void)
 }
 
 /* And the three parts of the still, round, per-fragment candle. Each switch
- * puts back the part of the original pool it names -- the light position that
- * moves, the metric with corners, the sampling at polygon corners -- and leaves
- * the other two where the smooth law puts them, so what each one is worth can be
- * measured on its own. Like the ramp switch above they are bisect handles rather
- * than settings: a consumer chooses the law, not the parts of it. */
+ * decides one part of the pool on its own -- the light position, the metric,
+ * where the law is sampled -- and leaves the other two where the running law
+ * puts them, so what each one is worth can be measured by itself. Like the ramp
+ * switch above they are bisect handles rather than settings: a consumer chooses
+ * the law, not the parts of it, and a handle nobody set answers -1 so the law
+ * keeps its own. */
+static int hwr_shade_part_env(const char *name, int *cache)
+{
+    if (*cache == HWR_SHADE_PART_UNREAD) {
+        const char *setting = getenv(name);
+
+        *cache = setting == NULL || setting[0] == 0 ? -1
+               : (setting[0] == '0' ? 0 : 1);
+    }
+    return *cache;
+}
+
 static int hwr_shade_origin_fixed_env(void)
 {
-    if (g_shade_origin_fixed_env < 0) {
-        const char *setting = getenv("HWR_SHADE_ORIGIN_FIXED");
-        g_shade_origin_fixed_env = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return g_shade_origin_fixed_env;
+    return hwr_shade_part_env("HWR_SHADE_ORIGIN_FIXED",
+                              &g_shade_origin_fixed_env);
 }
 
 static int hwr_shade_radial_round_env(void)
 {
-    if (g_shade_radial_round_env < 0) {
-        const char *setting = getenv("HWR_SHADE_RADIAL_ROUND");
-        g_shade_radial_round_env = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return g_shade_radial_round_env;
+    return hwr_shade_part_env("HWR_SHADE_RADIAL_ROUND",
+                              &g_shade_radial_round_env);
 }
 
 static int hwr_shade_per_fragment_env(void)
 {
-    if (g_shade_per_fragment_env < 0) {
-        const char *setting = getenv("HWR_SHADE_PER_FRAGMENT");
-        g_shade_per_fragment_env = setting != NULL && setting[0] == '0' ? 0 : 1;
-    }
-    return g_shade_per_fragment_env;
+    return hwr_shade_part_env("HWR_SHADE_PER_FRAGMENT",
+                              &g_shade_per_fragment_env);
+}
+
+/* And which law draws which pool, where no handle has spoken.
+ *
+ * The smooth law draws the original's candle whole: the light position the
+ * engine walks every seventh tick, the larger of the two axis terms, and the
+ * shade sampled at the corners the engine samples it at. Its one departure from
+ * the original picture is the quantizer, and the pool is not the quantizer --
+ * the jitter, the corners of the pool and its two lobes are the original's own
+ * character, and a law offered as "the same picture without the bands" has no
+ * business taking them.
+ *
+ * The modern law replaces the candle outright with a lamp at the eye, and the
+ * row it still records is the one every index-space mechanism in the frame
+ * reads; measuring that row from where the lamp is, round, and at the fragment
+ * is what keeps the index under a still light consistent with the colour beside
+ * it. So it asks for all three.
+ *
+ * The original law reads none of this: it resolves one authored row per
+ * fragment through its own arithmetic and never calls the continuous twin. */
+static int hwr_shade_part_wanted(int asked, enum hwr_gl_shading_mode mode)
+{
+    if (asked >= 0)
+        return asked;
+    return mode == HWR_GL_SHADING_MODERN;
 }
 
 /* HWR_LAMP_TRANSMIT=0 lets the light the player carries through every
@@ -4153,12 +4199,17 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         /* The working space, which only a departing law may be composed in. */
         hwr_uniform_1i(program, "u_light_linear",
                        hwr_shade_linear_wanted(g_truecolor_want.shading_mode));
+        /* The three parts of the pool, each resolved against the law in force
+         * unless a handle asked for it by name. */
         hwr_uniform_1i(program, "u_shade_fixed_origin",
-                       hwr_shade_origin_fixed_env());
+                       hwr_shade_part_wanted(hwr_shade_origin_fixed_env(),
+                                             g_truecolor_want.shading_mode));
         hwr_uniform_1i(program, "u_shade_round",
-                       hwr_shade_radial_round_env());
+                       hwr_shade_part_wanted(hwr_shade_radial_round_env(),
+                                             g_truecolor_want.shading_mode));
         hwr_uniform_1i(program, "u_shade_per_fragment",
-                       hwr_shade_per_fragment_env());
+                       hwr_shade_part_wanted(hwr_shade_per_fragment_env(),
+                                             g_truecolor_want.shading_mode));
         /* What a blended texel lets through, as the map's own table has it. */
         hwr_uniform_1f(program, "u_transmit_blend", g_transmit_blend);
         hwr_uniform_1i(program, "u_transmit_pass", 0);

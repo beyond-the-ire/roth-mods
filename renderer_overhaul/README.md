@@ -154,8 +154,9 @@ in bands.
 **Smooth** follows the same authored shades continuously, reading the colour between two of them
 rather than snapping to one, so a wall or a floor darkens evenly. It is the same art and the same
 palette either way — nothing is tinted, filtered or recoloured — and at any point where the shading
-lands on a whole shade the two are the same picture exactly. The pool of light around you stops
-jittering, becomes round instead of square, and is one pool rather than two.
+lands on a whole shade the two are the same picture exactly. Nothing else about the original picture
+changes: the light you carry keeps its own shape, its own flicker and its own place. Smooth is the
+original with the bands taken out of it, and with nothing else taken out of it.
 
 **Modern** lights the world instead of shading it. Each room glows with the brightness it was built
 with, so a room the map calls bright is bright and one it calls dim is dim; a fill and the light
