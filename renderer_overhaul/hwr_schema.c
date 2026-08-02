@@ -26,6 +26,8 @@ _Static_assert(sizeof(enum hwr_shading_mode) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_shading_dither) == sizeof(int32_t),
                "enum fields must be four bytes wide");
+_Static_assert(sizeof(enum hwr_light_scope) == sizeof(int32_t),
+               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -54,7 +56,13 @@ static const struct hwr_enum_value HWR_TRUECOLOR_FORMAT_VALUES[] = {
 
 static const struct hwr_enum_value HWR_SHADING_MODE_VALUES[] = {
     { "authentic", HWR_SHADING_AUTHENTIC, "Original" },
-    { "smooth",    HWR_SHADING_SMOOTH,    "Smooth" }
+    { "smooth",    HWR_SHADING_SMOOTH,    "Smooth" },
+    { "modern",    HWR_SHADING_MODERN,    "Modern" }
+};
+
+static const struct hwr_enum_value HWR_LIGHT_SCOPE_VALUES[] = {
+    { "tinted", HWR_LIGHT_SCOPE_TINTED, "Where the map says" },
+    { "all",    HWR_LIGHT_SCOPE_ALL,    "Everywhere" }
 };
 
 static const struct hwr_enum_value HWR_SHADING_DITHER_VALUES[] = {
@@ -470,7 +478,10 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "through the thirty-two shades the map was authored with, "
                 "exactly as the game always has. Smooth follows the same "
                 "shades continuously, so a wall or a floor darkens evenly "
-                "instead of in bands."
+                "instead of in bands. Modern lights the world instead: each "
+                "room glows with the brightness it was built with, a fill and "
+                "the light you carry are added to it, and distance stops "
+                "darkening anything on its own."
     },
     {
         /* Where the picture is finally quantized into screen colours, and the
@@ -572,6 +583,339 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "Contrast",
         .help = "Contrast of the world image, taken around mid grey and after "
                 "the brightness. One is the original picture."
+    },
+    /* The light rig, which only the Modern shading has anything to do with.
+     * Every row here names the shading law as its parent rather than the
+     * foundation, so a dial moved while the shading is Original neither brings
+     * the colour world image into existence nor moves a single byte of the
+     * picture -- without that, a whole family of inert tuning dials would each
+     * be an accidental trigger. All of them may be set per map: how a place is
+     * lit belongs to the place. */
+    {
+        .key = "room_light_gain",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_gain),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Room brightness",
+        .help = "How much light a room gives off from the brightness it was "
+                "built with. Lower makes the world darker everywhere without "
+                "touching what the map says is bright and what is dim."
+    },
+    {
+        .key = "room_light_gamma",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_gamma),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 2.2f },
+        .original = { .f = 2.2f },
+        .min = { .f = 1.0f },
+        .max = { .f = 3.0f },
+        .step = { .f = 0.1f },
+        .page_step = { .f = 0.5f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Room brightness curve",
+        .help = "How steeply a room's built-in brightness turns into light. "
+                "The map's values are shades rather than light, and this is "
+                "what makes the difference between two nearby ones visible."
+    },
+    {
+        .key = "room_light_floor",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_floor),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 0.25f },
+        .step = { .f = 0.01f },
+        .page_step = { .f = 0.05f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Never darker than",
+        .help = "The least light any surface receives, so nowhere is ever "
+                "completely black. Zero is honest darkness."
+    },
+    {
+        .key = "room_light_ceiling_authentic",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings,
+                           room_light_ceiling_authentic),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .b = 0 },
+        .original = { .b = 0 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Keep the original's darkness limit",
+        .help = "The original stops a bright room's surfaces from ever fading "
+                "past a certain shade. Keeping that limit preserves its "
+                "authored feel; dropping it is what lets a lit room stand out "
+                "against a dark one."
+    },
+    {
+        .key = "world_light_ceiling",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, world_light_ceiling),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 1.0f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.1f },
+        .page_step = { .f = 0.5f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Brightest a surface may be",
+        .help = "Where the light landing on a surface stops counting. One is "
+                "as bright as the picture the texture was drawn at."
+    },
+    {
+        .key = "world_distance_shading",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, world_distance_shading),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Distance darkening",
+        .help = "How much walking away from something darkens it all by "
+                "itself, the way the original does. Zero lets the light run "
+                "out on its own instead."
+    },
+    {
+        .key = "ambient_light",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, ambient_light),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .b = 0 },
+        .original = { .b = 0 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Ambient fill",
+        .help = "A little light everywhere, so what nothing else reaches is "
+                "still faintly visible."
+    },
+    {
+        .key = "ambient_color",
+        .type = HWR_VT_COLOR,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, ambient_color),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .rgb = 0x00666666u },
+        .original = { .rgb = 0x00666666u },
+        .min = { .rgb = 0x00000000u },
+        .max = { .rgb = 0x00ffffffu },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Ambient colour",
+        .help = "The colour of that fill. A neutral grey by day, something "
+                "cooler at night."
+    },
+    {
+        .key = "ambient_intensity",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, ambient_intensity),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 2.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Ambient strength",
+        .help = "How much of that fill there is."
+    },
+    {
+        .key = "player_light",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .b = 0 },
+        .original = { .b = 0 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Carried light",
+        .help = "A real light where you are standing, in place of the "
+                "original's pool on the screen. Surfaces facing you catch it "
+                "and surfaces turned away do not."
+    },
+    {
+        .key = "player_light_color",
+        .type = HWR_VT_COLOR,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_color),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .rgb = 0x00ffede0u },
+        .original = { .rgb = 0x00ffede0u },
+        .min = { .rgb = 0x00000000u },
+        .max = { .rgb = 0x00ffffffu },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Carried light colour",
+        .help = "The colour of the light you carry. A warm white reads as a "
+                "flame."
+    },
+    {
+        .key = "player_light_intensity",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_intensity),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 2.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Carried light strength",
+        .help = "How bright the light you carry is."
+    },
+    {
+        .key = "player_light_range",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_range),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 800.0f },
+        .original = { .f = 800.0f },
+        .min = { .f = 100.0f },
+        .max = { .f = 4000.0f },
+        .step = { .f = 50.0f },
+        .page_step = { .f = 200.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Carried light reach",
+        .help = "How far the light you carry reaches before it runs out. "
+                "Smaller is a tighter pool around you."
+    },
+    {
+        .key = "player_light_scope",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_scope),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .e = HWR_LIGHT_SCOPE_TINTED },
+        .original = { .e = HWR_LIGHT_SCOPE_TINTED },
+        .values = HWR_LIGHT_SCOPE_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_LIGHT_SCOPE_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Carried light reaches",
+        .help = "The map marks which surfaces the light you carry is meant to "
+                "matter on. Honouring that mark is the faithful answer; the "
+                "other lights everything you can see."
+    },
+    {
+        .key = "sprite_light_gain",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sprite_light_gain),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Item and figure brightness",
+        .help = "How much of the light you carry lands on people, creatures "
+                "and things you can pick up. Raise it if a dark room makes "
+                "them hard to find."
+    },
+    {
+        .key = "sprite_light_wrap",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sprite_light_wrap),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .def = { .f = 0.5f },
+        .original = { .f = 0.5f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .label = "Item and figure softness",
+        .help = "How far light carries around a figure past the edge it "
+                "would stop at, so the side away from you is shaded rather "
+                "than black."
     },
     /* Reported state. These rows hold no value of their own and no key: each
      * one asks the renderer or the host what is actually happening and answers
@@ -998,6 +1342,13 @@ int hwr_schema_parse(const struct hwr_setting_desc *desc, const char *text,
         }
         break;
     case HWR_VT_COLOR:
+        /* A colour is written back as bare hexadecimal, and that is the
+         * spelling a configuration file has to use -- a hash in one starts a
+         * comment. The hash is still accepted here, because a value that
+         * reaches this from anywhere else is written the way a person writes a
+         * colour. */
+        if (text[0] == '#')
+            text++;
         if (!hwr_parse_u32(text, 16, UINT32_MAX, &value.rgb)) {
             hwr_schema_error(err, err_size, "expected a hexadecimal color");
             return 0;

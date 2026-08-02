@@ -248,16 +248,33 @@ static int g_shade_per_fragment_env = -1;
  * the handle that holds the round trip against the picture it must not move
  * before there is a term depending on it. */
 static int g_shade_linear_env = -1;
+/* And whether the same handle was set to zero outright, which is what turns the
+ * round trip OFF for a law that would otherwise compose in linear because it has
+ * to. Kept apart from the value above so that "nobody asked" and "somebody
+ * refused" stay two different answers. */
+static int g_shade_linear_denied_env = -1;
 /* Raised while this frame renders through the enhanced program. */
 static int g_truecolor_active;
 /* Set once the foundation has failed to come up, so it is never retried. */
 static int g_truecolor_failed;
 static int g_truecolor_logged;
 /* What the settings layer last asked for. */
-static struct hwr_gl_truecolor g_truecolor_want = { 0, 1, 1.0f, 1.0f,
-                                                    HWR_GL_COLOR_AUTO,
-                                                    HWR_GL_SHADING_AUTHENTIC,
-                                                    0 };
+static struct hwr_gl_truecolor g_truecolor_want = {
+    .required = 0,
+    .neutral = 1,
+    .gain = 1.0f,
+    .contrast = 1.0f,
+    .format = HWR_GL_COLOR_AUTO,
+    .shading_mode = HWR_GL_SHADING_AUTHENTIC,
+    /* The rig at the values its rows hold, so the state is a sane rig from the
+     * first frame rather than one whose reach is zero. Nothing reads it until a
+     * law that composes with it is asked for. */
+    .light = { .room_gain = 1.0f, .room_gamma = 2.2f, .world_ceiling = 1.0f,
+               .ambient_color = { 0.4f, 0.4f, 0.4f },
+               .lamp_color = { 1.0f, 237.0f / 255.0f, 224.0f / 255.0f },
+               .lamp_range = 800.0f, .sprite_gain = 1.0f, .sprite_wrap = 0.5f },
+    .dither = 0
+};
 /* The colour format in use, and the ones this driver has refused. */
 static enum hwr_gl_color_format g_truecolor_format = HWR_GL_COLOR_AUTO;
 static int g_truecolor_refused_rgba16f;
@@ -1387,6 +1404,19 @@ static const char g_geometry_fragment_body[] =
     "  float c=axis==0 ? n.x : (axis==1 ? n.y : n.z);\n"
     "  return uint(clamp(floor(c*127.0+128.5),1.0,255.0));\n"
     "}\n"
+    /* Which of the five classes a lighting law sorts this fragment into, as a
+     * palette index, for reading the sorting back off a rendered frame. Four of
+     * the five are the ones where a one-line mistake makes something glow: a
+     * face the author declared unshaded, a face the map marked for the light the
+     * player carries, an emissive face, and a surface no light may reach at all.
+     * The fifth is everything else. */
+    "uint light_class() {\n"
+    "  uint face=v_pan_scale_flags.w;\n"
+    "  if ((v_light_material.w & 64u)!=0u) return 4u;\n"
+    "  if (effective_light()==0) return 0u;\n"
+    "  if ((face & 64u)!=0u && (u_glow_phase & 73)!=0) return 2u;\n"
+    "  return (face & 2u)!=0u ? 1u : 3u;\n"
+    "}\n"
     "#endif\n"
     "uniform int u_debug_vis;\n"
     "uniform int u_depth_only;\n"
@@ -1423,6 +1453,110 @@ static const char g_geometry_fragment_body[] =
     "uniform int u_light_linear;\n"
     "vec3 to_linear(vec3 c) { return pow(max(c,0.0),vec3(2.2)); }\n"
     "vec3 to_display(vec3 c) { return pow(max(c,0.0),vec3(1.0/2.2)); }\n"
+    /* A colour somebody chose, in the space the composition is running in.
+     * Every colour a light carries arrives display-referred -- that is the space
+     * it was picked in and the space it is written down in -- and the one place
+     * that decides where light is added is here. */
+    "vec3 light_space(vec3 c) { return u_light_linear!=0 ? to_linear(c) : c; }\n"
+    /* The modern law's rig. The authored sector byte, the fill, the light at the
+     * eye, and the direction slot a later key light fills; each colour and its
+     * strength stay apart so the strength scales light rather than a colour. */
+    "uniform vec2 u_room_light;\n"          /* gain, exponent */
+    "uniform vec2 u_light_limits;\n"        /* darkest allowed, where it clips */
+    "uniform int u_room_ceiling_authentic;\n"
+    "uniform float u_distance_shading;\n"
+    "uniform vec3 u_ambient_color;\n"
+    "uniform float u_ambient_intensity;\n"
+    "uniform vec3 u_lamp_color;\n"
+    "uniform float u_lamp_intensity;\n"
+    "uniform float u_lamp_range;\n"
+    "uniform int u_lamp_scope_all;\n"
+    "uniform vec2 u_sprite_light;\n"        /* gain, wrap */
+    /* The sun/moon slot: bound, added, and zero. An enhancement ships with its
+     * own key or it does not ship, so there is no row behind these yet -- what
+     * is here is the shape the later one lands in, which costs one multiply of
+     * zero and no restructuring. The direction is in the view's own space, so a
+     * reflected view is lit from the reflected side by construction. */
+    "uniform vec3 u_key_dir;\n"
+    "uniform vec3 u_key_color;\n"
+    "uniform float u_key_intensity;\n"
+    /* The three classes the modern law must not touch, and why each one would be
+     * a disaster if it did.
+     *
+     * A surface the emitter marked unlit is a ground shadow above all: a
+     * DARKENING decal, drawn at light zero, which any light at all would turn
+     * into a bright oval under the figure it belongs to.
+     *
+     * A face whose effective light is zero is the original's unshaded class --
+     * fullbright at every distance, by the author's own instruction. Leaving it
+     * to the index it already resolved is that, exactly, rather than nearly, and
+     * it is exact whatever the ceiling above is set to.
+     *
+     * The other two are refused before they ever arrive: a sky cap returns
+     * before any shading runs, and a glow face resolves through its own table
+     * and never reaches the branch this is called from. */
+    "bool modern_lit() {\n"
+    "  if ((v_light_material.w & 64u)!=0u) return false;\n"
+    "  return effective_light()!=0;\n"
+    "}\n"
+    /* What reaches this fragment, as a multiplier on the colour of its texel.
+     *
+     * The authored byte is a ratio in the palette's own perceptual space, so the
+     * exponent is what turns it into light -- without it the map's common step
+     * from 118 to 128 is a few percent and invisible. The weapon flash is free:
+     * the engine adds it to the byte and the byte is what this reads, so a flash
+     * is a smooth brightening instead of a jump between two rows. So are light
+     * switches: the engine mutates the sector's byte and the mod re-reads it
+     * every frame.
+     *
+     * `amount` is the continuous shade the original's own depth law would have
+     * produced. Nothing uses it unless the distance dial is moved off zero,
+     * which is the point: distance does not darken a surface, light runs out. */
+    "vec3 modern_light(bool tinted, float amount) {\n"
+    "  int light=effective_light();\n"
+    "  vec3 total=vec3(u_room_light.x*pow(float(light)/128.0,u_room_light.y));\n"
+    "  total+=light_space(u_ambient_color)*u_ambient_intensity;\n"
+    "  vec3 n=surface_normal();\n"
+    "  if (n!=vec3(0.0)) {\n"
+    /* The light at the eye. The map marks which faces the light the player
+     * carries is meant to matter on, and honouring that mark is the default. */
+    "    if (u_lamp_scope_all!=0 || tinted) {\n"
+    "      vec3 p=view_position();\n"
+    "      float dist=length(p);\n"
+    "      vec3 l=dist>0.0 ? -p/dist : vec3(0.0,-1.0,0.0);\n"
+    "      float ndl=dot(n,l);\n"
+    "      float gain=1.0;\n"
+    /* A standing figure is not a wall: light wraps past the edge it would stop
+     * at, so its far side is shaded rather than black, and it keeps its own
+     * brightness dial so a dark room never makes it unfindable. */
+    "      if ((v_light_material.w & 32u)!=0u) {\n"
+    "        ndl=(ndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
+    "        gain=u_sprite_light.x;\n"
+    "      }\n"
+    /* A windowed quadratic rather than a true inverse square, so the reach is
+     * exactly where the pool ends rather than where it becomes imperceptible. */
+    "      float att=max(1.0-dist/u_lamp_range,0.0);\n"
+    "      total+=light_space(u_lamp_color)*u_lamp_intensity*"
+    "max(ndl,0.0)*gain*att*att;\n"
+    "    }\n"
+    "    total+=light_space(u_key_color)*u_key_intensity*"
+    "max(dot(n,u_key_dir),0.0);\n"
+    "  }\n"
+    /* The original's depth law, at whatever weight is asked for. Its shade runs
+     * from nothing to the whole ramp, so what survives is the ramp read the
+     * other way round and taken to the same exponent the authored byte is. */
+    "  if (u_distance_shading>0.0)\n"
+    "    total*=mix(1.0,pow(max(1.0-amount/32.0,0.0),u_room_light.y),\n"
+    "               u_distance_shading);\n"
+    /* And the original's darkness ceiling, which is a floor on brightness: a
+     * bright sector's surfaces never fade past its own clip row. It is a
+     * thirty-two-step artifact and is dropped unless it is asked for. */
+    "  if (u_room_ceiling_authentic!=0) {\n"
+    "    float rows=float(min(32-(max(light-128+4,0) >> 2),31));\n"
+    "    total=max(total,vec3(pow(max(1.0-rows/32.0,0.0),u_room_light.y)));\n"
+    "  }\n"
+    "  return clamp(total,vec3(u_light_limits.x),vec3(u_light_limits.y));\n"
+    "}\n"
     /* The unlit texel of the ordinary tail. Every other class is unlit in the
      * original and stays unlit here, and says so by leaving this unset. */
     "uint g_albedo_index=256u;\n"
@@ -1434,6 +1568,12 @@ static const char g_geometry_fragment_body[] =
      * original does not shade and every fragment in the authentic law. */
     "vec3 g_shade_color=vec3(0.0);\n"
     "bool g_shade_color_set=false;\n"
+    /* Whether that colour is already in the space the composition runs in. A law
+     * that READS between two authored entries hands over a display-referred
+     * colour and the conversion below is its; a law that ADDS light has already
+     * done the conversion to add in, and converting it back only to convert it
+     * forward again would spend two more of them for nothing. */
+    "bool g_shade_linear=false;\n"
     "void emit(uint index) {\n"
     "  out_index=index;\n"
     "  vec4 lit=texelFetch(u_palette,ivec2(int(index),0),0);\n"
@@ -1442,7 +1582,8 @@ static const char g_geometry_fragment_body[] =
     "  vec3 albedo=texelFetch(u_palette,ivec2(int(albedo_index),0),0).rgb;\n"
     "  vec3 base=g_shade_color_set ? g_shade_color : lit.rgb;\n"
     "  vec3 shaded=u_light_linear!=0\n"
-    "      ? to_display(to_linear(base)*u_gain+to_linear(albedo)*u_add)\n"
+    "      ? to_display((g_shade_linear ? base : to_linear(base))*u_gain\n"
+    "                   +to_linear(albedo)*u_add)\n"
     "      : base*u_gain+albedo*u_add;\n"
     /* The picture's contrast: a pivot around mid grey, after everything that
      * decides how much light a surface got. The comparison is uniform across
@@ -1503,11 +1644,11 @@ static const char g_geometry_fragment_body[] =
      * translucent pass writes colour with depth-write off, so under any probe
      * mode (2 and up) drop translucent fragments and let the recorded index
      * stay whatever opaque geometry owns the pixel. */
-    /* The normal modes are the exception: what they ask about is the surface
-     * that is there, and the two classes a light must never reach -- a ground
-     * shadow and a see-through pane -- are both translucent, so dropping them
-     * would hide exactly the fragments worth checking. */
-    "  if (u_debug_vis>=2 && u_debug_vis<11 && (material & 16u)!=0u) discard;\n"
+    /* The class and normal modes are the exception: what they ask about is the
+     * surface that is there, and the two classes a light must never reach -- a
+     * ground shadow and a see-through pane -- are both translucent, so dropping
+     * them would hide exactly the fragments worth checking. */
+    "  if (u_debug_vis>=2 && u_debug_vis<10 && (material & 16u)!=0u) discard;\n"
     /* Sky-cap fragment: fill the column with the screen-space skybox texel and
      * stop.  The math is a verbatim port of the retired sky prepass shader; the
      * cap geometry is what limits it to the region above each sky wall and lets
@@ -1523,9 +1664,11 @@ static const char g_geometry_fragment_body[] =
      * letting it write depth would hide the geometry seen through the arch. */
     "    if (u_sky_occlusion_pass!=0 && (material & 64u)==0u) discard;\n"
     "    if (u_sky_valid==0) discard;\n"
-    /* A sky cap answers the normal modes too, and its answer is that no light
-     * reaches it -- which is what the class bit its emitter set says. */
+    /* A sky cap answers the class and the normal modes too, and its answer to
+     * both is that no light reaches it -- which is what the class bit its
+     * emitter set says. */
     "#ifdef HWR_TRUECOLOR\n"
+    "    if (u_debug_vis==10) { emit(light_class()); return; }\n"
     "    if (u_debug_vis>=11 && u_debug_vis<=13)"
     " { emit(normal_component_index(surface_normal(),u_debug_vis-11)); return; }\n"
     "#endif\n"
@@ -1599,10 +1742,12 @@ static const char g_geometry_fragment_body[] =
     "  if (u_debug_vis==7) { emit(v_dims.x & 255u); return; }\n"
     "  if (u_debug_vis==8) { emit(uint(dbg_ix) & 255u); return; }\n"
     "  if (u_debug_vis==9) { emit(uint(dbg_iy) & 255u); return; }\n"
-    /* Modes 11, 12 and 13 report the three components of the normal a lighting
-     * law would use here, one per capture. They exist only where a normal does:
-     * in the authentic program they fall through and the fragment is shaded. */
+    /* Mode 10 reports which class a lighting law sorts the fragment into, and
+     * modes 11, 12 and 13 the three components of the normal it would use here,
+     * one per capture. They exist only where a lighting law does: in the
+     * authentic program they fall through and the fragment is shaded. */
     "#ifdef HWR_TRUECOLOR\n"
+    "  if (u_debug_vis==10) { emit(light_class()); return; }\n"
     "  if (u_debug_vis>=11 && u_debug_vis<=13)"
     " { emit(normal_component_index(surface_normal(),u_debug_vis-11)); return; }\n"
     "#endif\n"
@@ -1641,14 +1786,37 @@ static const char g_geometry_fragment_body[] =
     "      uint low=tinted ?"
     " texelFetch(u_tint,ivec2(int(texel),row),0).r :"
     " texelFetch(u_colormap,ivec2(int(texel),row),0).r;\n"
-    "      uint high=tinted ?"
-    " texelFetch(u_tint,ivec2(int(texel),next),0).r :"
-    " texelFetch(u_colormap,ivec2(int(texel),next),0).r;\n"
-    "      g_shade_color=mix(texelFetch(u_palette,ivec2(int(low),0),0).rgb,\n"
-    "                        texelFetch(u_palette,ivec2(int(high),0),0).rgb,"
-    "between);\n"
     "      g_shade_color_set=true;\n"
     "      mapped=low;\n"
+    /* The modern law. The index stays the row the fragment floors to, exactly as
+     * the ramp law leaves it -- every index-space mechanism in the frame keeps
+     * reading what it always read -- and only the COLOUR beside it is decided
+     * differently: the texel's own colour, multiplied by the light that reaches
+     * it, rather than a place between two rows of an authored ramp.
+     *
+     * A class the rig refuses leaves the colour unset, which is the index's own
+     * colour and therefore the authentic answer for it, byte for byte.
+     *
+     * The two laws are exclusive, which is what keeps the ramp's second table
+     * lookup and its second palette lookup off the modern law: it has no use for
+     * the row above, only for the row it recorded. */
+    "      if (u_shading_mode==2) {\n"
+    "        if (modern_lit()) {\n"
+    "          vec3 art=light_space("
+    "texelFetch(u_palette,ivec2(int(texel),0),0).rgb);\n"
+    "          g_shade_color=art*modern_light(tinted,amount);\n"
+    "          g_shade_linear=u_light_linear!=0;\n"
+    "        } else {\n"
+    "          g_shade_color_set=false;\n"
+    "        }\n"
+    "      } else {\n"
+    "        uint high=tinted ?"
+    " texelFetch(u_tint,ivec2(int(texel),next),0).r :"
+    " texelFetch(u_colormap,ivec2(int(texel),next),0).r;\n"
+    "        g_shade_color=mix(texelFetch(u_palette,ivec2(int(low),0),0).rgb,\n"
+    "                          texelFetch(u_palette,ivec2(int(high),0),0).rgb,"
+    "between);\n"
+    "      }\n"
     "    } else\n"
     "#endif\n"
     "    { int row=shade_row(level,tinted);\n"
@@ -2314,6 +2482,31 @@ static int hwr_shade_linear_env(void)
     return g_shade_linear_env;
 }
 
+static int hwr_shade_linear_denied_env(void)
+{
+    if (g_shade_linear_denied_env < 0) {
+        const char *setting = getenv("HWR_SHADE_LINEAR");
+        g_shade_linear_denied_env = setting != NULL && setting[0] == '0';
+    }
+    return g_shade_linear_denied_env;
+}
+
+/* The space each law is composed in. The modern law ADDS light, and light adds
+ * in linear, so it is composed there unless the handle refuses outright -- which
+ * is the bisect control for the round trip on its own, the same rig composed
+ * where the palette lives. The smooth law READS between two authored entries,
+ * which is a display-space operation, so it stays where the palette lives unless
+ * the handle asks. The original law never enters either: it resolves one
+ * authored colour per fragment and there is nothing to add it to. */
+static int hwr_shade_linear_wanted(enum hwr_gl_shading_mode mode)
+{
+    if (mode == HWR_GL_SHADING_AUTHENTIC)
+        return 0;
+    if (mode == HWR_GL_SHADING_MODERN)
+        return !hwr_shade_linear_denied_env();
+    return hwr_shade_linear_env();
+}
+
 void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
 {
     if (state == NULL)
@@ -2904,6 +3097,36 @@ static void hwr_uniform_3f(GLuint program, const char *name,
         g_gl.uniform_3f(location, x, y, z);
 }
 
+/* The modern law's rig, as the settings layer worked it out. Bound whatever the
+ * law is: only the modern one reads any of it, and binding it unconditionally
+ * keeps one road from the rows to the fragment rather than a branch here and a
+ * branch there. The sun/moon slot is bound at zero -- the shape a later key
+ * light lands in, costing one multiply of zero. */
+static void hwr_bind_light_uniforms(GLuint program,
+                                    const struct hwr_gl_light *light)
+{
+    hwr_uniform_2f(program, "u_room_light", light->room_gain,
+                   light->room_gamma);
+    hwr_uniform_2f(program, "u_light_limits", light->room_floor,
+                   light->world_ceiling);
+    hwr_uniform_1i(program, "u_room_ceiling_authentic",
+                   light->room_ceiling_authentic != 0);
+    hwr_uniform_1f(program, "u_distance_shading", light->distance_shading);
+    hwr_uniform_3f(program, "u_ambient_color", light->ambient_color[0],
+                   light->ambient_color[1], light->ambient_color[2]);
+    hwr_uniform_1f(program, "u_ambient_intensity", light->ambient_intensity);
+    hwr_uniform_3f(program, "u_lamp_color", light->lamp_color[0],
+                   light->lamp_color[1], light->lamp_color[2]);
+    hwr_uniform_1f(program, "u_lamp_intensity", light->lamp_intensity);
+    hwr_uniform_1f(program, "u_lamp_range", light->lamp_range);
+    hwr_uniform_1i(program, "u_lamp_scope_all", light->lamp_scope_all != 0);
+    hwr_uniform_2f(program, "u_sprite_light", light->sprite_gain,
+                   light->sprite_wrap);
+    hwr_uniform_3f(program, "u_key_dir", 0.0f, 0.0f, -1.0f);
+    hwr_uniform_3f(program, "u_key_color", 1.0f, 1.0f, 1.0f);
+    hwr_uniform_1f(program, "u_key_intensity", 0.0f);
+}
+
 /* Verifies the uploaded lookup data three ways: the texture store bytes read
  * back from the buffer object, the colormap bytes read back from the texture,
  * and a live two-pixel draw that samples both through the world pass's texture
@@ -3339,22 +3562,18 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         /* The self-test detunes the gain and nothing else, so the law it runs
          * against is whatever the settings layer asked for. */
         hwr_uniform_1i(program, "u_shading_mode",
-                       g_truecolor_want.shading_mode !=
-                               HWR_GL_SHADING_AUTHENTIC);
+                       (GLint)g_truecolor_want.shading_mode);
         hwr_uniform_1i(program, "u_shade_ramp", hwr_shade_ramp_env());
-        /* The working space, which only a departing law may be composed in: the
-         * authentic law resolves one authored colour per fragment and there is
-         * nothing to add it to. */
+        /* The working space, which only a departing law may be composed in. */
         hwr_uniform_1i(program, "u_light_linear",
-                       g_truecolor_want.shading_mode !=
-                               HWR_GL_SHADING_AUTHENTIC &&
-                       hwr_shade_linear_env());
+                       hwr_shade_linear_wanted(g_truecolor_want.shading_mode));
         hwr_uniform_1i(program, "u_shade_fixed_origin",
                        hwr_shade_origin_fixed_env());
         hwr_uniform_1i(program, "u_shade_round",
                        hwr_shade_radial_round_env());
         hwr_uniform_1i(program, "u_shade_per_fragment",
                        hwr_shade_per_fragment_env());
+        hwr_bind_light_uniforms(program, &g_truecolor_want.light);
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */

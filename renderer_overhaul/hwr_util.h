@@ -5,6 +5,13 @@
 
 int hwr_ascii_equal_ci(const char *a, const char *b);
 
+/* Cuts a configuration line at its comment and hands the line back. Both files
+ * the mod reads -- the settings it is given and the look it is described with --
+ * say a hash starts a comment, and they say it in one place so that neither can
+ * drift into meaning something else. A colour is therefore written in a file as
+ * bare hexadecimal, which is also how one is written back. */
+char *hwr_strip_comment(char *line);
+
 /* A surface normal packed into two bytes, octahedral: the direction is folded
  * onto the surface of an octahedron and that fold is unwrapped into a square,
  * which spends both bytes evenly over the sphere and lands within about a degree

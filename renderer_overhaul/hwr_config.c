@@ -6,6 +6,7 @@
 
 #include "hwr_schema.h"
 #include "hwr_settings.h"
+#include "hwr_util.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -189,7 +190,6 @@ static int hwr_config_read(struct hwr_settings *settings,
         return 0;
 
     while (fgets(line, sizeof line, file) != NULL) {
-        char *comment;
         char *equals;
         char *key;
         char *value;
@@ -218,10 +218,7 @@ static int hwr_config_read(struct hwr_settings *settings,
                 continue;
             }
         }
-        comment = strchr(line, '#');
-        if (comment != NULL)
-            *comment = 0;
-        key = hwr_trim(line);
+        key = hwr_trim(hwr_strip_comment(line));
         if (*key == 0)
             continue;
         equals = strchr(key, '=');
@@ -707,12 +704,10 @@ static uint64_t hwr_config_present_keys(void)
     if (file == NULL)
         return 0;
     while (fgets(line, sizeof line, file) != NULL) {
-        char *comment = strchr(line, '#');
         char *equals;
         int index;
 
-        if (comment != NULL)
-            *comment = 0;
+        hwr_strip_comment(line);
         equals = strchr(line, '=');
         if (equals == NULL)
             continue;

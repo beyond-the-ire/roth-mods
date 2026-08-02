@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 int hwr_ascii_equal_ci(const char *a, const char *b)
 {
@@ -13,6 +14,18 @@ int hwr_ascii_equal_ci(const char *a, const char *b)
         b++;
     }
     return *a == 0 && *b == 0;
+}
+
+char *hwr_strip_comment(char *line)
+{
+    char *comment;
+
+    if (line == NULL)
+        return line;
+    comment = strchr(line, '#');
+    if (comment != NULL)
+        *comment = 0;
+    return line;
 }
 
 /* Zero counts as positive on both sides of the fold, in C and in the shader

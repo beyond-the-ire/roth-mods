@@ -268,11 +268,46 @@ enum hwr_gl_color_format {
 /* Which law the enhanced program resolves a shaded fragment with. Authentic
  * floors the shade quantity to one colormap row, which is the picture the game
  * has always drawn; smooth keeps that quantity continuous and mixes the two rows
- * it falls between. The authentic program carries neither branch: the law is
- * selected by a uniform inside the enhanced program alone. */
+ * it falls between; modern leaves the ramp behind and multiplies the texel's own
+ * colour by the light that reaches it. The authentic program carries none of
+ * these branches: the law is selected by a uniform inside the enhanced program
+ * alone. */
 enum hwr_gl_shading_mode {
     HWR_GL_SHADING_AUTHENTIC = 0,
-    HWR_GL_SHADING_SMOOTH
+    HWR_GL_SHADING_SMOOTH,
+    HWR_GL_SHADING_MODERN
+};
+
+/* The rig the modern law composes with, as the settings layer worked it out.
+ * Colours are the values a person picked, in the display-referred space they
+ * picked them in; the intensity beside each one is light energy and multiplies
+ * whichever space the composition is running in. Keeping the two apart is what
+ * lets the working space be decided in one place -- the shader -- rather than
+ * baked into a product here. */
+struct hwr_gl_light {
+    /* The authored sector byte, as self-illumination. */
+    float room_gain;
+    float room_gamma;
+    /* Where the light total is held: the floor is the darkest anything is
+     * allowed to be, the ceiling is where it clips. */
+    float room_floor;
+    float world_ceiling;
+    /* Put the original's darkness ceiling -- a bright sector's surfaces never
+     * fading past its own clip row -- back. */
+    int room_ceiling_authentic;
+    /* How much of the original's depth law survives, zero to one. */
+    float distance_shading;
+    float ambient_color[3];
+    float ambient_intensity;
+    float lamp_color[3];
+    float lamp_intensity;
+    float lamp_range;
+    /* Nonzero lights every face rather than only the ones the map marked. */
+    int lamp_scope_all;
+    /* Props: their own gain, and how far light wraps past their terminator so a
+     * standing figure's shaded half never goes fully black. */
+    float sprite_gain;
+    float sprite_wrap;
 };
 
 /* What the settings layer has worked out about the true-colour foundation. */
@@ -295,6 +330,9 @@ struct hwr_gl_truecolor {
     /* The shading law in force. Authentic is the original picture and is what
      * every neutral state resolves to. */
     enum hwr_gl_shading_mode shading_mode;
+    /* What the modern law composes with. Read only by that law: the other two
+     * never look at it, so it costs the original picture nothing to carry. */
+    struct hwr_gl_light light;
     /* Dither the world image where it is quantized into screen colours. The
      * renderer holds it off whenever the picture is neutral, whatever this says:
      * a picture that is the authentic picture must come out as the authentic
@@ -414,8 +452,9 @@ unsigned hwr_gl_drain_errors(void);
  * same orientation as the submitted frame). Returns 0 on failure. */
 int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height);
 /* Overrides the debug visualisation mode (0=off, 1=shade rows, 2=raw texel
- * bytes, 11..13 = the three components of the surface normal a lighting law
- * would use); -1 re-reads the environment default on the next frame. */
+ * bytes, 10 = which class a lighting law sorts the fragment into, 11..13 = the
+ * three components of the surface normal it would use); -1 re-reads the
+ * environment default on the next frame. */
 void hwr_gl_set_debug_vis(int mode);
 
 #endif

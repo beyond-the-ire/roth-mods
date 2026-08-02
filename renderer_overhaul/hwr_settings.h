@@ -35,10 +35,24 @@ enum hwr_truecolor_format {
  * picture, byte for byte: the shade quantity is floored to one of the thirty-two
  * colormap rows the map authored, exactly as it always has been. Smooth keeps
  * the same quantity continuous and resolves the colour between the two rows it
- * falls between, so the authored ramp is followed without the steps. */
+ * falls between, so the authored ramp is followed without the steps. Modern
+ * stops walking the ramp altogether: the sector's authored brightness becomes
+ * light the surface gives off, a fill and the light the player carries are added
+ * to it, and distance no longer darkens anything by itself. */
 enum hwr_shading_mode {
     HWR_SHADING_AUTHENTIC = 0,
-    HWR_SHADING_SMOOTH
+    HWR_SHADING_SMOOTH,
+    HWR_SHADING_MODERN
+};
+
+/* Which faces the light the player carries reaches. The map marks the faces the
+ * original's carried light applies to, and honouring that mark is the faithful
+ * answer: a room the author never meant that light to reach keeps its own
+ * brightness. Lighting every face is the other reading and is one setting
+ * away. */
+enum hwr_light_scope {
+    HWR_LIGHT_SCOPE_TINTED = 0,
+    HWR_LIGHT_SCOPE_ALL
 };
 
 /* Whether the world image is dithered where it is finally turned into screen
@@ -98,6 +112,47 @@ struct hwr_settings {
      * both at one is the authentic picture exactly. */
     float world_brightness;
     float world_contrast;
+
+    /* The light rig the modern law composes with. Every one of these hangs off
+     * the shading law rather than off the foundation, so moving any of them
+     * while the law is the original one changes nothing and asks for nothing --
+     * which is what keeps a whole family of inert tuning dials from being an
+     * accidental trigger. All of them are per-map overridable: what a room is
+     * lit like is a property of the map, unlike the picture dials above. */
+    /* The authored sector byte as the surface's own illumination: the gain
+     * scales it, the exponent is what makes the map's common brightness steps
+     * visible at all, and the floor is how dark a surface is allowed to get
+     * where nothing reaches it. */
+    float room_light_gain;
+    float room_light_gamma;
+    float room_light_floor;
+    /* The original caps how dark a bright sector's surfaces may get, purely
+     * because it had thirty-two steps to spend. Dropping that cap is what lets
+     * a lit room read as lit beside a dark one; this puts it back. */
+    int room_light_ceiling_authentic;
+    /* Where the light total clips. Above one is headroom a floating-point world
+     * image can hold and an eight-bit one cannot. */
+    float world_light_ceiling;
+    /* How much of the original's distance darkening survives. Zero is none:
+     * distance does not darken a surface, light runs out. */
+    float world_distance_shading;
+    /* The fill: one colour everywhere, so nothing the other lights miss is
+     * absolutely black unless it is meant to be. */
+    int ambient_light;
+    uint32_t ambient_color;
+    float ambient_intensity;
+    /* The light the player carries, at the eye. It replaces the original's
+     * screen-space pool with a real one: the surface's own facing decides how
+     * much of it lands, and it ends where the range says. */
+    int player_light;
+    uint32_t player_light_color;
+    float player_light_intensity;
+    float player_light_range;
+    enum hwr_light_scope player_light_scope;
+    /* Props and figures keep their own brightness dial and their own shaded
+     * half, so a dark room never makes what is standing in it unfindable. */
+    float sprite_light_gain;
+    float sprite_light_wrap;
 };
 
 enum hwr_settings_change {

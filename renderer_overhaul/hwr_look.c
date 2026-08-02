@@ -213,7 +213,6 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
     if (stream == NULL)
         return 0;
     while (fgets(line, sizeof line, stream) != NULL) {
-        char *comment;
         char *text;
         char *equals;
         size_t i;
@@ -224,10 +223,7 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
             hash ^= (unsigned char)line[i];
             hash *= UINT64_C(1099511628211);
         }
-        comment = strchr(line, '#');
-        if (comment != NULL)
-            *comment = 0;
-        text = hwr_look_trim(line);
+        text = hwr_look_trim(hwr_strip_comment(line));
         if (*text == 0)
             continue;
         if (*text == '[') {
