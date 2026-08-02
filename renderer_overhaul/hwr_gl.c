@@ -42,8 +42,17 @@
 #ifndef GL_COLOR_ATTACHMENT2
 #define GL_COLOR_ATTACHMENT2 0x8ce2
 #endif
+#ifndef GL_COLOR_ATTACHMENT3
+#define GL_COLOR_ATTACHMENT3 0x8ce3
+#endif
 #ifndef GL_R32UI
 #define GL_R32UI 0x8236
+#endif
+#ifndef GL_R8
+#define GL_R8 0x8229
+#endif
+#ifndef GL_RED
+#define GL_RED 0x1903
 #endif
 #ifndef GL_FRAMEBUFFER_COMPLETE
 #define GL_FRAMEBUFFER_COMPLETE 0x8cd5
@@ -90,6 +99,7 @@ typedef void (APIENTRY *hwr_gl_draw_arrays_fn)(GLenum, GLint, GLsizei);
 typedef void (APIENTRY *hwr_gl_capability_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_depth_func_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_depth_mask_fn)(GLboolean);
+typedef void (APIENTRY *hwr_gl_blend_func_fn)(GLenum, GLenum);
 typedef void (APIENTRY *hwr_gl_polygon_offset_fn)(GLfloat, GLfloat);
 typedef void (APIENTRY *hwr_gl_copy_tex_sub_image_2d_fn)(GLenum, GLint, GLint,
                                                          GLint, GLint, GLint,
@@ -163,8 +173,10 @@ struct hwr_gl_functions {
     hwr_gl_capability_fn disable;
     hwr_gl_depth_func_fn depth_func;
     hwr_gl_depth_mask_fn depth_mask;
+    hwr_gl_blend_func_fn blend_func;
     hwr_gl_polygon_offset_fn polygon_offset;
     PFNGLCLEARBUFFERUIVPROC clear_buffer_uiv;
+    PFNGLCLEARBUFFERFVPROC clear_buffer_fv;
     PFNGLDRAWBUFFERSPROC draw_buffers;
     hwr_gl_copy_tex_sub_image_2d_fn copy_tex_sub_image_2d;
     hwr_gl_pixel_store_i_fn pixel_store_i;
@@ -243,6 +255,24 @@ static int g_stale_color_valid;
  * it was told anything: assume there are some. The copy is a cost, never a
  * correctness question, so the answer nobody has given yet is the safe one. */
 static int g_stale_mask_present = 1;
+/* One channel per pixel: how much of the light the player carries got past
+ * whatever the eye is looking THROUGH there. The light sits at the eye, so the
+ * ray it travels is the ray the view travels, and a plane of what the view
+ * passed through is that light's own shadow map -- exactly, for every surface
+ * the opaque pass drew. Written by one pass over the see-through geometry and
+ * read where the lamp is composed. */
+static GLuint g_transmit_texture;
+/* How much of what is behind it a blended texel lets through: the weight the
+ * map's own blend table gives its destination, measured off that table and the
+ * palette it is authored against rather than assumed. A half until a table has
+ * been measured, which is where the engine's own tables sit. */
+static float g_transmit_blend = 0.5f;
+static int g_transmit_blend_pending = 1;
+/* The blend table as the map handed it over, kept because the weight above is a
+ * property of the table and the palette together and the palette arrives with
+ * the frame rather than with the map. */
+static uint8_t g_blend_bytes[0x10000];
+static int g_blend_bytes_valid;
 /* Whether the colour plane still describes the same picture the index plane
  * does. The colour target persists exactly as the index target does -- that is
  * what makes the void, the wings and the previous frame a stale-masked wall
@@ -270,6 +300,10 @@ static int g_shade_ramp_env = -1;
 static int g_shade_origin_fixed_env = -1;
 static int g_shade_radial_round_env = -1;
 static int g_shade_per_fragment_env = -1;
+/* And the handle that puts the light the player carries back through every
+ * see-through surface whole, which is where it was before the pass that stops
+ * it existed; -1 until first read. */
+static int g_transmit_env = -1;
 /* The working space a non-authentic law composes in; -1 until first read. The
  * smooth law resolves colour between two entries of an authored ramp, which is a
  * display-space operation by definition, so it stays where the palette lives and
@@ -760,8 +794,10 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(disable, hwr_gl_capability_fn, "glDisable");
     HWR_LOAD_GL(depth_func, hwr_gl_depth_func_fn, "glDepthFunc");
     HWR_LOAD_GL(depth_mask, hwr_gl_depth_mask_fn, "glDepthMask");
+    HWR_LOAD_GL(blend_func, hwr_gl_blend_func_fn, "glBlendFunc");
     HWR_LOAD_GL(polygon_offset, hwr_gl_polygon_offset_fn, "glPolygonOffset");
     HWR_LOAD_GL(clear_buffer_uiv, PFNGLCLEARBUFFERUIVPROC, "glClearBufferuiv");
+    HWR_LOAD_GL(clear_buffer_fv, PFNGLCLEARBUFFERFVPROC, "glClearBufferfv");
     HWR_LOAD_GL(draw_buffers, PFNGLDRAWBUFFERSPROC, "glDrawBuffers");
     HWR_LOAD_GL(copy_tex_sub_image_2d, hwr_gl_copy_tex_sub_image_2d_fn, "glCopyTexSubImage2D");
     HWR_LOAD_GL(pixel_store_i, hwr_gl_pixel_store_i_fn, "glPixelStorei");
@@ -1462,6 +1498,10 @@ static const char g_geometry_fragment_body[] =
     "void emit(uint index) { out_index=index; }\n"
     "#else\n"
     "layout(location=2) out vec4 out_color;\n"
+    /* The plane the transmittance pass writes. It joins the draw buffers for
+     * that pass alone; every other pass leaves it out, so nothing else this
+     * program writes can reach it. */
+    "layout(location=3) out float out_transmit;\n"
     "uniform sampler2D u_palette;\n"
     /* The previous frame, in colour, and whether there is one. Sampled at the
      * same pixel and from the same moment as the palette-index snapshot beside
@@ -1506,6 +1546,20 @@ static const char g_geometry_fragment_body[] =
     "uniform float u_lamp_intensity;\n"
     "uniform float u_lamp_range;\n"
     "uniform int u_lamp_scope_all;\n"
+    /* What the light the player carries had to pass through to reach each
+     * pixel, written by the pass above and read here; whether this frame has
+     * such a plane at all; whether this draw is that pass; and how much of what
+     * is behind it a blended texel lets through, which is the weight the map's
+     * own blend table gives its destination. */
+    "uniform sampler2D u_transmit;\n"
+    "uniform int u_transmit_valid;\n"
+    "uniform int u_transmit_pass;\n"
+    "uniform float u_transmit_blend;\n"
+    /* And whether the draw this fragment belongs to is one the pass cast from.
+     * It is the DRAW that decides it, never the material: the pass casts from
+     * everything in the translucent range, and what a surface is made of is not
+     * what says whether it is in it. */
+    "uniform int u_transmit_receive;\n"
     "uniform vec2 u_sprite_light;\n"        /* gain, wrap */
     /* The sun/moon slot: bound, added, and zero. An enhancement ships with its
      * own key or it does not ship, so there is no row behind these yet -- what
@@ -1533,6 +1587,24 @@ static const char g_geometry_fragment_body[] =
     "bool modern_lit() {\n"
     "  if ((v_light_material.w & 64u)!=0u) return false;\n"
     "  return effective_light()!=0;\n"
+    "}\n"
+    /* How much of the light the player carries reaches this fragment.
+     *
+     * The light is at the eye, so the ray it travels is the ray the view
+     * travels: what stands between the two is exactly what the eye is looking
+     * through, and the plane the pass before this one wrote says how much of
+     * the light each of those pixels let past. For a fragment the opaque pass
+     * drew this is not an approximation -- only surfaces nearer than the opaque
+     * winner are in that plane, and the opaque winner is the fragment being
+     * lit.
+     *
+     * A surface the pass CAST from keeps the whole light: its own transmittance
+     * is in that pixel, and reading it would be a surface shadowing itself.
+     * That leaves the light on a see-through surface to the one in front of it,
+     * which is the bound this form is chosen at. */
+    "float lamp_transmittance() {\n"
+    "  if (u_transmit_valid==0 || u_transmit_receive==0) return 1.0;\n"
+    "  return texelFetch(u_transmit,ivec2(gl_FragCoord.xy),0).r;\n"
     "}\n"
     /* What reaches this fragment, as a multiplier on the colour of its texel.
      *
@@ -1582,7 +1654,7 @@ static const char g_geometry_fragment_body[] =
      * exactly where the pool ends rather than where it becomes imperceptible. */
     "      float att=max(1.0-dist/u_lamp_range,0.0);\n"
     "      total+=light_space(u_lamp_color)*u_lamp_intensity*"
-    "max(ndl,0.0)*gain*att*att;\n"
+    "max(ndl,0.0)*gain*att*att*lamp_transmittance();\n"
     "    }\n"
     "    total+=light_space(u_key_color)*u_key_intensity*"
     "max(dot(n,u_key_dir),0.0);\n"
@@ -1666,10 +1738,43 @@ static const char g_geometry_fragment_body[] =
     "    uint fx=uint(floor(gl_FragCoord.x*65536.0));\n"
     "    if (fx<v_wall_vertical.z || fx>=v_wall_vertical.w) discard;\n"
     "  }\n"
+    /* Depth-only two is the pass that lays the opaque winner's depth down for
+     * the transmittance test below, and a masked surface owns depth only where
+     * its texture is not a hole -- so it takes the same discard the colour pass
+     * takes, or the wall seen through the hole would not be the winner there.
+     * Depth-only one is the mirror plane, which is deliberately not masked. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "  if (u_depth_only==2 && (material & 1u)!=0u && sample_texel()==0u)\n"
+    "    discard;\n"
+    "#endif\n"
     /* A scheduled primary mirror is colourless but still owns depth at its
      * plane. This early exit deliberately bypasses texture masks and shading;
      * glDrawBuffers(GL_NONE) discards both outputs while depth is retained. */
     "  if (u_depth_only!=0) { emit(0u); out_floor_id=0u; return; }\n"
+    /* The transmittance pass: how much of the light the player carries survives
+     * this fragment on its way to whatever stands behind it.
+     *
+     * A hole is not a surface at all -- it discards, and the plane keeps the
+     * whole light it was cleared to. A texel the blend tables decide passes the
+     * light the map's own table gives what is behind it. Everything else is a
+     * surface the light does not get through, whether it is the opaque texel of
+     * a see-through sprite or a pane with no transparency in it.
+     *
+     * A ground shadow, a sky cap and every other surface its emitter marked as
+     * one no light reaches is not an occluder either: it is a decal drawn onto
+     * something, and darkening what is behind it would be the same darkness
+     * twice. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "  if (u_transmit_pass!=0) {\n"
+    "    uint through=sample_texel();\n"
+    "    if ((material & 1u)!=0u && through==0u) discard;\n"
+    "    if ((v_light_material.w & 64u)!=0u) discard;\n"
+    "    out_transmit=((v_light_material.w & 16u)!=0u ||\n"
+    "                  ((material & 16u)!=0u && (through & 128u)!=0u))\n"
+    "        ? u_transmit_blend : 0.0;\n"
+    "    return;\n"
+    "  }\n"
+    "#endif\n"
     /* Opaque winner identity. World flats publish FLOOR_TAG | z as before,
      * except the few that a mid-platform of their own sector has to paint over:
      * those carry a sector-scoped identity in v_wall_source.x (a flat has no
@@ -2333,6 +2438,7 @@ static void hwr_destroy_framebuffer(void)
     hwr_delete_texture(&g_stale_copy_texture);
     hwr_delete_texture(&g_color_texture);
     hwr_delete_texture(&g_stale_color_texture);
+    hwr_delete_texture(&g_transmit_texture);
     g_stale_color_valid = 0;
     if (g_depth_buffer != 0) {
         g_gl.delete_renderbuffers(1, &g_depth_buffer);
@@ -2566,6 +2672,19 @@ static int hwr_shade_per_fragment_env(void)
         g_shade_per_fragment_env = setting != NULL && setting[0] == '0' ? 0 : 1;
     }
     return g_shade_per_fragment_env;
+}
+
+/* HWR_LAMP_TRANSMIT=0 lets the light the player carries through every
+ * see-through surface whole, which is where it was before the pass that stops
+ * it existed. The same kind of handle as the three above: what the eye can see
+ * through is part of the law the mode selects, not a choice of its own. */
+static int hwr_transmit_env(void)
+{
+    if (g_transmit_env < 0) {
+        const char *setting = getenv("HWR_LAMP_TRANSMIT");
+        g_transmit_env = setting != NULL && setting[0] == '0' ? 0 : 1;
+    }
+    return g_transmit_env;
 }
 
 /* Unlike the three above this one is off unless it is asked for: the law that
@@ -2832,6 +2951,68 @@ int hwr_gl_color_format_available(enum hwr_gl_color_format format)
     return 1;
 }
 
+/* Whether the frame stops the light the player carries at what it can see
+ * through. Every condition is a reason there would be nothing to stop: no
+ * composed picture, no plane to write it in, a law that has no such light, the
+ * handle held off, or the light itself turned all the way down. */
+static int hwr_transmit_wanted(void)
+{
+    return g_truecolor_active && g_transmit_texture != 0 &&
+           g_truecolor_want.shading_mode == HWR_GL_SHADING_MODERN &&
+           g_truecolor_want.light.lamp_intensity > 0.0f &&
+           g_truecolor_want.light.lamp_range > 0.0f &&
+           hwr_transmit_env();
+}
+
+/* The weight the map's own blend table gives its destination: how much of what
+ * is behind a blended texel survives it, and therefore how much of the light
+ * the player carries has to reach that far. Least squares over every pair the
+ * table holds, in the palette's own colours -- which is the space the table was
+ * authored in and the only space its "half of each" means anything in.
+ *
+ * The textured writer's rule is the one measured: the table is uploaded row
+ * major, so its texel (source, destination) is the index that pair resolves to.
+ * The solid-colour writer reads the transpose of it, and on a table that mixes
+ * its two arguments evenly the two answers are one answer. */
+static void hwr_transmit_measure_blend(void)
+{
+    double numerator = 0.0;
+    double denominator = 0.0;
+    unsigned destination;
+
+    if (!g_blend_bytes_valid || !g_base_palette_valid)
+        return;
+    for (destination = 0; destination < 256u; destination++) {
+        unsigned source;
+
+        for (source = 0; source < 256u; source++) {
+            unsigned mixed = g_blend_bytes[destination * 256u + source];
+            unsigned channel;
+
+            for (channel = 0; channel < 3u; channel++) {
+                double behind = (double)g_base_palette_bytes[destination * 4u +
+                                                             channel];
+                double front = (double)g_base_palette_bytes[source * 4u +
+                                                            channel];
+                double result = (double)g_base_palette_bytes[mixed * 4u +
+                                                             channel];
+
+                numerator += (behind - front) * (result - front);
+                denominator += (behind - front) * (behind - front);
+            }
+        }
+    }
+    g_transmit_blend_pending = 0;
+    if (denominator <= 0.0)
+        return;
+    numerator /= denominator;
+    if (numerator < 0.0)
+        numerator = 0.0;
+    if (numerator > 1.0)
+        numerator = 1.0;
+    g_transmit_blend = (float)numerator;
+}
+
 enum hwr_gl_color_format hwr_gl_color_format_in_use(void)
 {
     return g_color_texture != 0 ? g_truecolor_format : HWR_GL_COLOR_AUTO;
@@ -2902,6 +3083,37 @@ static int hwr_truecolor_attach(uint32_t width, uint32_t height,
                           NULL);
         g_gl.bind_texture(GL_TEXTURE_2D, 0);
         g_stale_color_valid = 0;
+        /* And the plane that says what the light the player carries got past on
+         * its way to each pixel. One channel and eight bits of it: what it
+         * holds is a fraction of a light, and it joins the draw buffers for the
+         * one pass that writes it and no other.
+         *
+         * It is an attachment of the same framebuffer, so a frame that cannot
+         * have it keeps everything else: the transmittance is refused and the
+         * light goes through what it always went through. */
+        g_gl.active_texture(GL_TEXTURE0);
+        g_gl.gen_textures(1, &g_transmit_texture);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_transmit_texture);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)width,
+                          (GLsizei)height, 0, GL_RED, GL_UNSIGNED_BYTE, NULL);
+        g_gl.bind_texture(GL_TEXTURE_2D, 0);
+        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3,
+                                    GL_TEXTURE_2D, g_transmit_texture, 0);
+        if (g_gl.check_framebuffer_status(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE || hwr_gl_drain_errors() != 0) {
+            g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3,
+                                        GL_TEXTURE_2D, 0, 0);
+            hwr_delete_texture(&g_transmit_texture);
+            fprintf(stderr, "[renderer_overhaul] this driver will not take the"
+                            " one-channel plane the light at the eye is stopped"
+                            " in; it passes through everything\n");
+        }
         return 1;
     }
     g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
@@ -2919,9 +3131,12 @@ static void hwr_truecolor_release(void)
         g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
         g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
                                     GL_TEXTURE_2D, 0, 0);
+        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3,
+                                    GL_TEXTURE_2D, 0, 0);
     }
     hwr_delete_texture(&g_color_texture);
     hwr_delete_texture(&g_stale_color_texture);
+    hwr_delete_texture(&g_transmit_texture);
     g_stale_color_valid = 0;
     g_color_prime_pending = 1;
     hwr_delete_texture(&g_base_palette_texture);
@@ -2960,10 +3175,12 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
         hwr_set_sampler(g_truecolor_program, "u_dst", 5);
         hwr_set_sampler(g_truecolor_program, "u_stale", 6);
         hwr_set_sampler(g_truecolor_program, "u_floor_id", 7);
-        /* The world pass already spends units 0-7; the palette joins on 8 and
-         * the previous frame's colour on 9. */
+        /* The world pass already spends units 0-7; the palette joins on 8, the
+         * previous frame's colour on 9 and what the light at the eye got past
+         * on 10. */
         hwr_set_sampler(g_truecolor_program, "u_palette", 8);
         hwr_set_sampler(g_truecolor_program, "u_stale_color", 9);
+        hwr_set_sampler(g_truecolor_program, "u_transmit", 10);
         g_gl.use_program(0);
     }
     if (g_truecolor_resolve_program == 0) {
@@ -2998,9 +3215,12 @@ static int hwr_truecolor_ensure(uint32_t width, uint32_t height)
             g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
             g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
                                         GL_TEXTURE_2D, 0, 0);
+            g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3,
+                                        GL_TEXTURE_2D, 0, 0);
         }
         hwr_delete_texture(&g_color_texture);
         hwr_delete_texture(&g_stale_color_texture);
+        hwr_delete_texture(&g_transmit_texture);
         g_stale_color_valid = 0;
         g_truecolor_format = HWR_GL_COLOR_AUTO;
         g_truecolor_logged = 0;
@@ -3123,6 +3343,17 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
                       GL_RED_INTEGER, glow);
     hwr_texture_2d_u8(&g_blend_texture, 256, 256, GL_R8UI,
                       GL_RED_INTEGER, blend);
+    /* And a copy of that table on this side, because how much of what is behind
+     * a blended surface survives it is a property of the table and the palette
+     * together, and the palette arrives with the frame rather than with the
+     * map. */
+    if (blend != NULL) {
+        memcpy(g_blend_bytes, blend, sizeof g_blend_bytes);
+        g_blend_bytes_valid = 1;
+    } else {
+        g_blend_bytes_valid = 0;
+    }
+    g_transmit_blend_pending = 1;
     hwr_texture_2d_u8(&g_palette_texture, 256, 1, GL_RGBA8, GL_RGBA, NULL);
 
     g_gl.gen_vertex_arrays(1, &g_scene_vao);
@@ -3353,6 +3584,8 @@ static void hwr_bind_scene_textures(void)
         g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
         g_gl.active_texture(GL_TEXTURE0 + 9);
         g_gl.bind_texture(GL_TEXTURE_2D, g_stale_color_texture);
+        g_gl.active_texture(GL_TEXTURE0 + 10);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_transmit_texture);
     }
     /* The final pass of the previous frame leaves the index framebuffer's
      * color attachment bound to unit 0's two-dimensional slot. Sampling
@@ -3801,6 +4034,9 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     GLuint program = g_truecolor_active ? g_truecolor_program
                                         : g_geometry_program;
     GLint blend_location;
+    /* Whether this view has a plane saying what the light the player carries
+     * got past, which is the question the lamp asks before it reads one. */
+    int transmit_active = 0;
 
     g_gl.bind_vertex_array(g_scene_vao);
     g_gl.bind_buffer(GL_ARRAY_BUFFER, g_scene_vbo);
@@ -3898,6 +4134,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
             contrast = 1.0f;
         hwr_set_sampler(program, "u_palette", 8);
         hwr_set_sampler(program, "u_stale_color", 9);
+        hwr_set_sampler(program, "u_transmit", 10);
         /* Whether there is a previous frame in colour to read. Where there is
          * not -- the original law, a frame with no surface that reads one, the
          * first frame after the target came into existence -- the class falls
@@ -3922,6 +4159,10 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                        hwr_shade_radial_round_env());
         hwr_uniform_1i(program, "u_shade_per_fragment",
                        hwr_shade_per_fragment_env());
+        /* What a blended texel lets through, as the map's own table has it. */
+        hwr_uniform_1f(program, "u_transmit_blend", g_transmit_blend);
+        hwr_uniform_1i(program, "u_transmit_pass", 0);
+        hwr_uniform_1i(program, "u_transmit_receive", 1);
         hwr_bind_light_uniforms(program, &g_truecolor_want.light);
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
@@ -3999,6 +4240,117 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     blend_location = g_gl.get_uniform_location(program, "u_blend_pass");
     if (blend_location >= 0)
         g_gl.uniform_1i(blend_location, 0);
+    /* What the light the player carries has to pass through to reach what it
+     * lights.
+     *
+     * That light is at the eye, so it casts no shadow on anything you can see:
+     * everything visible is unoccluded along the view ray, and for a light at
+     * the eye the view ray IS the light ray. The one case left is a surface the
+     * eye can see THROUGH -- a grate, a pane, a see-through figure -- which the
+     * eye passes and the light must not pass whole. Because the two rays are
+     * the same ray, a plane of what the view passed through is that light's own
+     * shadow map, and it is exact rather than approximate for every fragment
+     * the opaque pass drew: only surfaces NEARER than the opaque winner are in
+     * it, and the opaque winner is the fragment being lit.
+     *
+     * The order that forces is the whole of this block. The test is against the
+     * opaque winner's depth, so that depth has to stand before the pass runs;
+     * and the lamp is composed where the opaque winner is DRAWN, so the pass
+     * has to be finished before that. The depth is therefore laid down first
+     * with nothing written but depth -- the same draws, in the same order, at
+     * the same offsets, as the ones below that write it for real -- and the
+     * frame's own depth starts again from nothing behind it.
+     *
+     * Every surface that can stop the light is in the translucent range: a
+     * masked surface that OWNS depth is either the fragment being lit (its own
+     * texel) or a hole the light goes straight through, so there is nothing it
+     * can shadow -- the same geometry, once more, that puts no shadow on
+     * anything a light at the eye can see. */
+    if (hwr_transmit_wanted() && translucent_vertices != 0) {
+        static const GLenum no_buffers[1] = { GL_NONE };
+        static const GLenum transmit_only[4] =
+            { GL_NONE, GL_NONE, GL_NONE, GL_COLOR_ATTACHMENT3 };
+        static const GLfloat clear_transmit[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        size_t opaque_main = opaque_vertices >= flat_vertices
+                           ? opaque_vertices - flat_vertices : opaque_vertices;
+        size_t world_vertices =
+            opaque_main - opaque_mesh_vertices - opaque_billboard_vertices;
+
+        transmit_active = 1;
+        /* Nothing samples the plane while it is being written. */
+        g_gl.active_texture(GL_TEXTURE0 + 10);
+        g_gl.bind_texture(GL_TEXTURE_2D, 0);
+        g_gl.active_texture(GL_TEXTURE0);
+        /* The light gets through everywhere nothing is drawn. */
+        g_gl.draw_buffers(4, transmit_only);
+        g_gl.clear_buffer_fv(GL_COLOR, 3, clear_transmit);
+        /* The depth, with nothing written but depth. */
+        g_gl.draw_buffers(1, no_buffers);
+        g_gl.enable(GL_DEPTH_TEST);
+        g_gl.depth_func(GL_LESS);
+        g_gl.depth_mask(GL_TRUE);
+        if (sky_vertices != 0 && g_sky_occlude) {
+            g_gl.enable(GL_POLYGON_OFFSET_FILL);
+            g_gl.polygon_offset(1.0f, 1.0f);
+            hwr_uniform_1i(program, "u_sky_occlusion_pass", 1);
+            g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)sky_vertices);
+            hwr_uniform_1i(program, "u_sky_occlusion_pass", 0);
+            g_gl.polygon_offset(0.0f, 0.0f);
+            g_gl.disable(GL_POLYGON_OFFSET_FILL);
+        }
+        if (mirror_depth_vertices != 0) {
+            hwr_uniform_1i(program, "u_depth_only", 1);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                             (GLint)(sky_vertices + opaque_vertices +
+                                     translucent_vertices),
+                             (GLsizei)mirror_depth_vertices);
+        }
+        /* Two rather than one: the mirror plane above is deliberately not
+         * masked, and this geometry has to be, or a grate would own the depth
+         * of the wall seen through its holes. */
+        hwr_uniform_1i(program, "u_depth_only", 2);
+        if (world_vertices != 0)
+            g_gl.draw_arrays(GL_TRIANGLES, (GLint)sky_vertices,
+                             (GLsizei)world_vertices);
+        if (opaque_mesh_vertices != 0) {
+            g_gl.enable(GL_POLYGON_OFFSET_FILL);
+            g_gl.polygon_offset(-1.0f, -1.0f);
+            g_gl.draw_arrays(GL_TRIANGLES,
+                             (GLint)(sky_vertices + world_vertices),
+                             (GLsizei)opaque_mesh_vertices);
+            g_gl.polygon_offset(0.0f, 0.0f);
+            g_gl.disable(GL_POLYGON_OFFSET_FILL);
+        }
+        if (opaque_billboard_vertices != 0)
+            g_gl.draw_arrays(GL_TRIANGLES,
+                             (GLint)(sky_vertices + world_vertices +
+                                     opaque_mesh_vertices),
+                             (GLsizei)opaque_billboard_vertices);
+        hwr_uniform_1i(program, "u_depth_only", 0);
+        /* And the pass itself: what each see-through surface lets past, one
+         * plane, multiplied together where two of them stand in the same pixel.
+         * A product is the same product in any order, so the whole range goes
+         * in one draw whatever the runs the painter order needs are. */
+        g_gl.draw_buffers(4, transmit_only);
+        g_gl.depth_mask(GL_FALSE);
+        g_gl.enable(GL_BLEND);
+        g_gl.blend_func(GL_ZERO, GL_SRC_COLOR);
+        hwr_uniform_1i(program, "u_transmit_pass", 1);
+        g_gl.draw_arrays(GL_TRIANGLES,
+                         (GLint)(sky_vertices + opaque_vertices),
+                         (GLsizei)translucent_vertices);
+        hwr_uniform_1i(program, "u_transmit_pass", 0);
+        g_gl.disable(GL_BLEND);
+        /* The frame's own depth starts again from nothing, exactly as it stood
+         * when this block was entered. */
+        g_gl.depth_mask(GL_TRUE);
+        g_gl.clear(GL_DEPTH_BUFFER_BIT);
+        hwr_draw_buffers_world();
+        g_gl.active_texture(GL_TEXTURE0 + 10);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_transmit_texture);
+        g_gl.active_texture(GL_TEXTURE0);
+    }
+    hwr_uniform_1i(program, "u_transmit_valid", transmit_active);
     /* Sky background candidate: colour only, no depth interaction.  Every cap
      * contributes colour here; the occlusion pass below is the selective one. */
     g_gl.disable(GL_DEPTH_TEST);
@@ -4160,6 +4512,9 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                                   trans_main_vertices);
             if (blend_location >= 0)
                 g_gl.uniform_1i(blend_location, 1);
+            /* Drawn from the range the pass cast from, so it reads none of what
+             * it cast. */
+            hwr_uniform_1i(program, "u_transmit_receive", 0);
             g_gl.active_texture(GL_TEXTURE5);
             g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
             if (translucent_runs == NULL || shadow_run_count == 0) {
@@ -4176,6 +4531,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                     first += (GLint)translucent_runs[run];
                 }
             }
+            hwr_uniform_1i(program, "u_transmit_receive", 1);
         }
         if (opaque_billboard_vertices != 0 &&
             opaque_main >= opaque_billboard_vertices) {
@@ -4216,6 +4572,10 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         g_gl.depth_func(GL_LEQUAL);
         if (blend_location >= 0)
             g_gl.uniform_1i(blend_location, 1);
+        /* Every one of these is a surface the transmittance pass cast from, so
+         * none of them reads the plane it cast into: a surface stopping the
+         * light does not stop it on its way to itself. */
+        hwr_uniform_1i(program, "u_transmit_receive", 0);
         /* The opaque/shadow exception block above is allowed to be absent in a
          * scene containing only translucent pickups. Bind the floor identity
          * target independently for this path instead of inheriting unit 7. */
@@ -4267,6 +4627,7 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                 first += (GLint)translucent_runs[run];
             }
         }
+        hwr_uniform_1i(program, "u_transmit_receive", 1);
         g_gl.depth_func(GL_LESS);
         g_gl.depth_mask(GL_TRUE);
     }
@@ -4777,9 +5138,21 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         g_gl.bind_texture(GL_TEXTURE_2D, g_base_palette_texture);
         g_gl.tex_sub_image_2d(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
                               GL_RGBA, GL_UNSIGNED_BYTE, palette->base_rgba);
+        /* What a blended texel lets through is a property of the map's blend
+         * table and the colours it is authored against, so a palette that has
+         * moved is a weight that has to be measured again. */
+        if (!g_base_palette_valid ||
+            memcmp(g_base_palette_bytes, palette->base_rgba,
+                   sizeof g_base_palette_bytes) != 0)
+            g_transmit_blend_pending = 1;
         memcpy(g_base_palette_bytes, palette->base_rgba,
                sizeof g_base_palette_bytes);
         g_base_palette_valid = 1;
+        /* Measured only where something is going to read it, which is once per
+         * map for a picture composing with a light at the eye and never at all
+         * for any other. */
+        if (g_transmit_blend_pending && hwr_transmit_wanted())
+            hwr_transmit_measure_blend();
     }
     g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.viewport(0, 0, (GLsizei)width, (GLsizei)height);
