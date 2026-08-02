@@ -486,6 +486,22 @@ static size_t hwr_portal_roots(const struct hwr_world *world,
     return root_count;
 }
 
+int hwr_camera_sector(const struct hwr_world *world,
+                      const struct roth_api_v1 *api)
+{
+    uint16_t offset;
+    uint16_t index;
+
+    if (world == NULL || !world->valid || api == NULL ||
+        api->game_ram == NULL || world->sector_offset_to_index == NULL)
+        return -1;
+    offset = api->game_ram->u16(VA_G_PLAYER_SECTOR);
+    index = world->sector_offset_to_index[offset];
+    if (index == UINT16_MAX || index >= world->sector_count)
+        return -1;
+    return (int)index;
+}
+
 int hwr_compute_portal_pvs(const struct hwr_world *world,
                            const struct hwr_gl_camera *camera,
                            const struct roth_api_v1 *api,

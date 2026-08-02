@@ -90,6 +90,19 @@ enum hwr_room_anchor {
     HWR_ROOM_ANCHOR_MANUAL
 };
 
+/* Where the colour of a light that is not at the eye comes from.
+ *
+ * A torch is fire and a sigil is not, and the sprite the map drew for each of
+ * them already says which: reading the colour off the thing that emits it makes
+ * a derived light look like it belongs to its own source rather than pasted on.
+ * The other value is one colour for every such light, which is less true and
+ * more controllable -- and is what a map wants where its own art is not the
+ * colour of what it is meant to be giving off. */
+enum hwr_point_color_source {
+    HWR_POINT_COLOR_SPRITE = 0,
+    HWR_POINT_COLOR_FIXED
+};
+
 /* Whether the world image is dithered where it is finally turned into screen
  * colours. Near-black is where eight bits run out: a ramp too shallow to change
  * a level from one pixel to the next lands as flat plateaus with a visible step
@@ -227,6 +240,44 @@ struct hwr_settings {
      * half, so a dark room never makes what is standing in it unfindable. */
     float sprite_light_gain;
     float sprite_light_wrap;
+
+    /* The lights that are NOT at the eye: a torch on a wall, a candle on a
+     * table, a lit sigil. Which objects are those is not a list somebody keeps
+     * -- it is the map's own mark for a thing that gives light rather than
+     * takes it, so a map nobody has ever seen brings its own.
+     *
+     * The family enable and the class behind it, which are two switches on
+     * purpose: one is "no lights of this kind at all", the other is "not from
+     * that source", and a later source is a third switch rather than a change
+     * to either. */
+    int point_light;
+    int point_light_objects;
+    /* How many the world pass carries at once. It is a quality dial rather
+     * than a limit somebody should have to think about: what is dropped is
+     * always the light contributing least where the eye is. */
+    uint32_t point_light_max;
+    /* The strength and the reach every one of them starts at, before the map's
+     * own word about either. The reach is where the pool ENDS, not where it
+     * becomes hard to see, so it also bounds how far a light with nothing to
+     * stop it can spill. */
+    float point_light_intensity;
+    float point_light_range;
+    enum hwr_point_color_source point_light_color_source;
+    uint32_t point_light_color;
+    /* How much of the map's own candle word these take, exactly as the light
+     * the player carries takes it: at nothing the two rows above are the whole
+     * answer, at one the map's word is read whole. */
+    float point_light_glow_scale;
+    /* The containments, which are not shadows and are not sold as any.
+     *
+     * How many doorways from the room the eye is in a light may still be
+     * seeded from; how far above a room's ceiling and below its floor its own
+     * lights may reach before they are faded out, which is what stops a torch
+     * lighting the storey above it; and how long a light dropped for want of a
+     * slot takes to go out, so a set that changes never does it in one frame. */
+    uint32_t point_light_hops;
+    float point_light_z_slack;
+    float point_light_fade;
 };
 
 enum hwr_settings_change {

@@ -112,6 +112,33 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
 - `sprite_light_gain`: how bright people, creatures and things you can pick up are, from 0 through
   4. Raise it if a dark room makes them hard to find.
 
+Torches, candles and lit sigils give light of their own under `modern`. Which things those are is
+the map's own answer rather than a list: the game already marks the objects that are never to be
+darkened, and those are exactly the ones that are giving light. Nothing has to be listed for a map
+to work, custom maps included.
+
+**These lights cast no shadows**, so one beside a doorway spills a little onto the far side of it
+and one behind a thin partition lights both faces. Four things keep that local: a light in a room
+you cannot see is not there at all, a light more than `point_light_hops` doorways away is dropped,
+a light cannot reach past its own room's floor and ceiling by more than `point_light_z_slack`, and
+its pool ends where `point_light_range` says rather than fading away for ever.
+
+- `point_light`: whether they light anything at all. `point_light_objects` is where they come from;
+  turning it off leaves the family on with nothing seeding it.
+- `point_light_max`: how many light the picture at once, from 1 through 16. What is dropped is
+  always whatever is contributing least where you are standing, and it fades out over
+  `point_light_fade` seconds rather than vanishing.
+- `point_light_intensity`, `point_light_range`: how bright one is, from 0 through 4, and where its
+  pool ends in world units, from 100 through 2000. A fixed torch reads tighter than the light you
+  carry.
+- `point_light_color_source`, `point_light_color`: `sprite` reads the colour off the thing itself,
+  so fire throws fire-coloured light and a cold sigil throws cold light; `fixed` uses the one
+  colour beside it, as six bare hexadecimal digits.
+- `point_light_glow_scale`: how much of the map's own word about its lantern these take, from 0
+  through 2, exactly as the light you carry takes it.
+- `point_light_hops`, `point_light_z_slack`: the two containments above, from 0 through 3 doorways
+  and from 0 through 512 world units.
+
 A resolution change can cause a one-frame hitch while the render targets are resized.
 
 ## Per-map look file
@@ -135,6 +162,27 @@ The file ships with a `day` and a `night` profile and nothing pointed at them, s
 to read and change without pre-judging any map. A row a map answers for is marked on the settings
 screen with what the map says, because moving that setting will not change the picture where you
 are standing.
+
+It also has one section of a different kind. `[lights]` says what particular THINGS give off, keyed
+by the graphic the map draws them with, where a single setting for the whole map is not enough — a
+brazier brighter than a candle, or a glowing decal that is plainly not a light at all. It follows
+the same three-section chain, and `[profile.NAME.lights]` and `[map.NAME.lights]` are its profile
+and per-map forms:
+
+```
+[lights]
+; graphic = strength, reach, colour     a dash keeps whatever was set before it
+0x0412 = 1.6, 520, ffb46e               ; a wall torch
+0x0455 = 0.6, 260, -                    ; a table candle, its colour left alone
+0x0301 = off                            ; not a light, whatever the map marks it
+
+[map.STUDY1.lights]
+0x0412 = 2.0, -, -                      ; this map's torches read brighter
+```
+
+Each field is composed on its own, so a map may raise a strength without restating the colour the
+global section gave it. Colours here are six bare hexadecimal digits like every other colour in
+this file.
 
 ## Requirements
 

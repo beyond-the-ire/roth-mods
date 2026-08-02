@@ -82,6 +82,14 @@ int hwr_compute_reflection_pvs(const struct hwr_world *world,
                                struct hwr_sector_xspan *spans,
                                size_t span_count);
 
+/* The sector the engine says the player is standing in, as an index into the
+ * mod's own table, or -1 where there is no map or the engine's own word does
+ * not resolve to one. It is the root of every portal walk here and it is what
+ * "how far away is this room" is counted from, so it is answered in the one
+ * file that already knows where the engine keeps it. */
+int hwr_camera_sector(const struct hwr_world *world,
+                      const struct roth_api_v1 *api);
+
 /* Returns non-zero unless the sector portal-window clip for billboards is
  * switched off through HWR_PORTAL_CLIP=0. Read once and cached. When off, the
  * billboard layer never narrows a sprite to its sector's screen-X window

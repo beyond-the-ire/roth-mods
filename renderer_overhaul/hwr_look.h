@@ -28,6 +28,16 @@
  * table here: adding a look key is adding one flag to one row, and the two can
  * never drift apart. A line this file cannot use costs that line and a note,
  * never the file -- it is written by hand, unlike the settings file.
+ *
+ * And one section of a different kind, because it is keyed by something that is
+ * not a settings row:
+ *
+ *   [lights]            what particular THINGS give off, keyed by the graphic
+ *   [profile.X.lights]  the map draws them with. A settings row is one value
+ *   [map.X.lights]      for a whole map; this says a brazier is brighter than
+ *                       a candle, and that one fullbright decal is not a light
+ *                       at all. It follows exactly the same three-section
+ *                       precedence chain, field by field.
  */
 
 /* Reads the file beside the settings file, if there is one. */
@@ -50,6 +60,31 @@ union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
 /* Whether the current map overrides this row, for anything that wants to say
  * so. */
 int hwr_look_overrides(const struct hwr_setting_desc *desc);
+
+/* What the look file says about one object graphic's own light.
+ *
+ * Every field is separately present or absent, because the file writes a
+ * dash for one it is saying nothing about and because the three sections
+ * compose FIELD BY FIELD: a map may make its torches brighter without
+ * restating the colour the global section already gave them. `off` is the
+ * whole entry rather than a field: a thing the map marks unshaded that is
+ * plainly not a light -- a glowing decal, a bright pickup -- is refused
+ * outright, and nothing else in the entry matters. */
+struct hwr_look_light {
+    int off;
+    int has_intensity;
+    float intensity;
+    int has_range;
+    float range;
+    int has_color;
+    uint32_t color;
+};
+
+/* Fills `out` from the entry in force for this graphic and returns nonzero
+ * when there is one. A graphic nobody named leaves `out` cleared, which is
+ * every field absent -- the settings rows answer for it whole. */
+int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out);
+
 void hwr_look_clear(void);
 
 #endif

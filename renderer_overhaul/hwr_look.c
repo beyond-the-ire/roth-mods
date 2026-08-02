@@ -17,25 +17,43 @@
 #define HWR_LOOK_MAX_PROFILES 16u
 #define HWR_LOOK_MAX_MAPS 64u
 #define HWR_LOOK_NAME 64u
+/* How many graphics one section may say something about. A map has a handful
+ * of things that give light; this is room for a map that is nothing but. */
+#define HWR_LOOK_MAX_LIGHTS 64u
 
 struct hwr_look_values {
     struct hwr_row_set present;
     union hwr_value value[HWR_LOOK_MAX_ROWS];
 };
 
+/* One `graphic = intensity, range, colour` line, kept with each field's own
+ * presence so that composing two sections is per field rather than per line. */
+struct hwr_look_light_entry {
+    uint16_t graphic_id;
+    struct hwr_look_light light;
+};
+
+struct hwr_look_lights {
+    struct hwr_look_light_entry items[HWR_LOOK_MAX_LIGHTS];
+    size_t count;
+};
+
 struct hwr_look_profile {
     char name[HWR_LOOK_NAME];
     struct hwr_look_values values;
+    struct hwr_look_lights lights;
 };
 
 struct hwr_look_map {
     char name[HWR_LOOK_NAME];
     char profile[HWR_LOOK_NAME];
     struct hwr_look_values values;
+    struct hwr_look_lights lights;
 };
 
 struct hwr_look_file {
     struct hwr_look_values global;
+    struct hwr_look_lights lights;
     struct hwr_look_profile profiles[HWR_LOOK_MAX_PROFILES];
     size_t profile_count;
     struct hwr_look_map maps[HWR_LOOK_MAX_MAPS];
@@ -46,6 +64,7 @@ static char g_look_path[2600];
 static struct hwr_look_file g_look;
 static int g_look_present;
 static struct hwr_look_values g_effective;
+static struct hwr_look_lights g_effective_lights;
 static char g_look_map[HWR_LOOK_NAME];
 static uint64_t g_look_hash;
 static uint64_t g_look_candidate_hash;
@@ -132,6 +151,205 @@ static void hwr_look_merge(struct hwr_look_values *into,
     }
 }
 
+/* The entry for one graphic in one section, created where there is not one.
+ * NULL means the section is already carrying as many graphics as it may. */
+static struct hwr_look_light_entry *hwr_look_light_entry(
+    struct hwr_look_lights *lights, uint16_t graphic_id)
+{
+    size_t i;
+
+    for (i = 0; i < lights->count; i++) {
+        if (lights->items[i].graphic_id == graphic_id)
+            return &lights->items[i];
+    }
+    if (lights->count >= HWR_LOOK_MAX_LIGHTS)
+        return NULL;
+    memset(&lights->items[lights->count], 0, sizeof lights->items[0]);
+    lights->items[lights->count].graphic_id = graphic_id;
+    return &lights->items[lights->count++];
+}
+
+/* One section's entries over another's, FIELD by field. A map raising the
+ * strength of a graphic the global section already coloured keeps that colour,
+ * which is the same rule the settings rows compose by and the reason the file
+ * can write a dash for a field it is saying nothing about. */
+static void hwr_look_lights_merge(struct hwr_look_lights *into,
+                                  const struct hwr_look_lights *from)
+{
+    size_t i;
+
+    for (i = 0; i < from->count; i++) {
+        const struct hwr_look_light_entry *source = &from->items[i];
+        struct hwr_look_light_entry *target =
+            hwr_look_light_entry(into, source->graphic_id);
+
+        if (target == NULL)
+            continue;
+        if (source->light.off)
+            target->light.off = 1;
+        if (source->light.has_intensity) {
+            target->light.has_intensity = 1;
+            target->light.intensity = source->light.intensity;
+        }
+        if (source->light.has_range) {
+            target->light.has_range = 1;
+            target->light.range = source->light.range;
+        }
+        if (source->light.has_color) {
+            target->light.has_color = 1;
+            target->light.color = source->light.color;
+        }
+    }
+}
+
+/* A field of a lights line. A dash -- or nothing at all -- says this line is
+ * not answering for that field, which is not the same as answering zero. */
+static int hwr_look_light_field(const char *text, double *out)
+{
+    char *end = NULL;
+    double value;
+
+    if (text == NULL || text[0] == 0 || (text[0] == '-' && text[1] == 0))
+        return 0;
+    value = strtod(text, &end);
+    if (end == text)
+        return -1;
+    while (*end != 0 && isspace((unsigned char)*end))
+        end++;
+    if (*end != 0)
+        return -1;
+    *out = value;
+    return 1;
+}
+
+/* Six bare hexadecimal digits, the way every other colour in this file is
+ * written: a hash starts a comment here, so a colour can never carry one. */
+static int hwr_look_light_color(const char *text, uint32_t *out)
+{
+    uint32_t value = 0;
+    size_t i;
+
+    for (i = 0; i < 6u; i++) {
+        int digit = text[i];
+
+        if (digit >= '0' && digit <= '9')
+            digit -= '0';
+        else if (digit >= 'a' && digit <= 'f')
+            digit -= 'a' - 10;
+        else if (digit >= 'A' && digit <= 'F')
+            digit -= 'A' - 10;
+        else
+            return 0;
+        value = (value << 4) | (uint32_t)digit;
+    }
+    if (text[6] != 0)
+        return 0;
+    *out = value;
+    return 1;
+}
+
+/* One `graphic = off` or `graphic = intensity, range, colour` line. The key is
+ * the graphic id the map draws the thing with, in whatever base it is written
+ * in, so the hexadecimal an editor shows can be pasted straight in. */
+static int hwr_look_accept_light(char *key, char *value,
+                                 struct hwr_look_lights *into,
+                                 unsigned line_number, int report)
+{
+    struct hwr_look_light_entry *entry;
+    struct hwr_look_light parsed;
+    unsigned long graphic;
+    char *end = NULL;
+    char *cursor = value;
+    int field;
+
+    graphic = strtoul(key, &end, 0);
+    if (end == key || *hwr_look_trim(end) != 0 || graphic > 0xffffuL) {
+        if (report)
+            fprintf(stderr, "[renderer_overhaul] %s:%u: '%s' is not a graphic "
+                            "number; ignored\n",
+                    g_look_path, line_number, key);
+        return 0;
+    }
+    memset(&parsed, 0, sizeof parsed);
+    if (hwr_ascii_equal_ci(value, "off")) {
+        parsed.off = 1;
+    } else {
+        static const char *const names[3] = { "strength", "reach", "colour" };
+
+        for (field = 0; field < 3; field++) {
+            char *comma = strchr(cursor, ',');
+            char *text;
+            double number = 0.0;
+            int have;
+
+            if (comma != NULL)
+                *comma = 0;
+            text = hwr_look_trim(cursor);
+            if (field == 2) {
+                uint32_t rgb;
+
+                if (text[0] != 0 &&
+                    !(text[0] == '-' && text[1] == 0)) {
+                    if (!hwr_look_light_color(text, &rgb)) {
+                        if (report)
+                            fprintf(stderr, "[renderer_overhaul] %s:%u: '%s': "
+                                            "the colour is six hexadecimal "
+                                            "digits; ignored\n",
+                                    g_look_path, line_number, key);
+                        return 0;
+                    }
+                    parsed.has_color = 1;
+                    parsed.color = rgb;
+                }
+            } else {
+                have = hwr_look_light_field(text, &number);
+                if (have < 0) {
+                    if (report)
+                        fprintf(stderr, "[renderer_overhaul] %s:%u: '%s': the "
+                                        "%s is not a number; ignored\n",
+                                g_look_path, line_number, key, names[field]);
+                    return 0;
+                }
+                if (have > 0) {
+                    if (field == 0) {
+                        parsed.has_intensity = 1;
+                        parsed.intensity = (float)number;
+                    } else {
+                        parsed.has_range = 1;
+                        parsed.range = (float)number;
+                    }
+                }
+            }
+            if (comma == NULL)
+                break;
+            cursor = comma + 1;
+        }
+    }
+    entry = hwr_look_light_entry(into, (uint16_t)graphic);
+    if (entry == NULL) {
+        if (report)
+            fprintf(stderr, "[renderer_overhaul] %s:%u: too many lights in one "
+                            "section; ignored\n",
+                    g_look_path, line_number);
+        return 0;
+    }
+    if (parsed.off)
+        entry->light.off = 1;
+    if (parsed.has_intensity) {
+        entry->light.has_intensity = 1;
+        entry->light.intensity = parsed.intensity;
+    }
+    if (parsed.has_range) {
+        entry->light.has_range = 1;
+        entry->light.range = parsed.range;
+    }
+    if (parsed.has_color) {
+        entry->light.has_color = 1;
+        entry->light.color = parsed.color;
+    }
+    return 1;
+}
+
 static const struct hwr_look_profile *hwr_look_find_profile(
     const struct hwr_look_file *file, const char *name)
 {
@@ -207,6 +425,10 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
     unsigned line_number = 0;
     uint64_t hash = UINT64_C(1469598103934665603);
     struct hwr_look_values *section = &file->global;
+    /* A section says either what a whole map looks like or what particular
+     * things in it give off, never both, so exactly one of these is set while
+     * any line is being read. */
+    struct hwr_look_lights *lights_section = NULL;
     struct hwr_look_map *map_section = NULL;
 
     memset(file, 0, sizeof *file);
@@ -241,6 +463,79 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
             *close = 0;
             name = hwr_look_trim(text + 1);
             map_section = NULL;
+            lights_section = NULL;
+            /* A trailing ".lights" turns whichever section this is into the
+             * lights table of that same section, so [map.STUDY1.lights] is the
+             * lights of STUDY1 rather than a map named "STUDY1.lights". It is
+             * taken off BEFORE the name is read, because reducing the name
+             * first would silently make one of those the other. */
+            {
+                size_t length = strlen(name);
+                int wants_lights = 0;
+
+                if (length >= 7u &&
+                    hwr_ascii_equal_ci(name + length - 7u, ".lights")) {
+                    name[length - 7u] = 0;
+                    wants_lights = 1;
+                }
+                if (hwr_ascii_equal_ci(name, "lights")) {
+                    name[0] = 0;
+                    wants_lights = 1;
+                }
+                if (wants_lights && name[0] == 0) {
+                    section = NULL;
+                    lights_section = &file->lights;
+                    continue;
+                }
+                if (wants_lights && hwr_look_prefix_ci(name, "profile.")) {
+                    const struct hwr_look_profile *found =
+                        hwr_look_find_profile(file, name + 8);
+
+                    section = NULL;
+                    if (found != NULL)
+                        lights_section = &file->profiles[
+                            (size_t)(found - file->profiles)].lights;
+                    else if (report)
+                        fprintf(stderr, "[renderer_overhaul] %s:%u: the lights "
+                                        "of profile '%s', which has no section "
+                                        "of its own; ignored\n",
+                                g_look_path, line_number, name + 8);
+                    continue;
+                }
+                if (wants_lights && hwr_look_prefix_ci(name, "map.")) {
+                    char reduced[HWR_LOOK_NAME];
+                    const struct hwr_look_map *found;
+
+                    hwr_look_map_name(reduced, HWR_LOOK_NAME, name + 4);
+                    found = hwr_look_find_map(file, reduced);
+                    section = NULL;
+                    if (found != NULL) {
+                        lights_section = &file->maps[
+                            (size_t)(found - file->maps)].lights;
+                    } else if (file->map_count >= HWR_LOOK_MAX_MAPS) {
+                        if (report)
+                            fprintf(stderr, "[renderer_overhaul] %s:%u: too "
+                                            "many maps; ignored\n",
+                                    g_look_path, line_number);
+                    } else {
+                        /* A map whose only section is its lights is still a
+                         * map: it gets one, with no row overrides in it. */
+                        snprintf(file->maps[file->map_count].name,
+                                 HWR_LOOK_NAME, "%s", reduced);
+                        lights_section = &file->maps[file->map_count].lights;
+                        file->map_count++;
+                    }
+                    continue;
+                }
+                if (wants_lights) {
+                    if (report)
+                        fprintf(stderr, "[renderer_overhaul] %s:%u: '%s' is "
+                                        "not a look section; ignored\n",
+                                g_look_path, line_number, name);
+                    section = NULL;
+                    continue;
+                }
+            }
             if (hwr_ascii_equal_ci(name, "look")) {
                 section = &file->global;
             } else if (hwr_look_prefix_ci(name, "profile.")) {
@@ -257,6 +552,19 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
                          HWR_LOOK_NAME, "%s", name + 8);
                 file->profile_count++;
             } else if (hwr_look_prefix_ci(name, "map.")) {
+                char reduced[HWR_LOOK_NAME];
+                const struct hwr_look_map *found;
+
+                hwr_look_map_name(reduced, HWR_LOOK_NAME, name + 4);
+                found = hwr_look_find_map(file, reduced);
+                /* A map whose lights arrived before its keys already has a
+                 * section; a second one would leave the earlier one's lights
+                 * behind the later one's keys. */
+                if (found != NULL) {
+                    map_section = &file->maps[(size_t)(found - file->maps)];
+                    section = &map_section->values;
+                    continue;
+                }
                 if (file->map_count >= HWR_LOOK_MAX_MAPS) {
                     if (report)
                         fprintf(stderr, "[renderer_overhaul] %s:%u: too many "
@@ -267,7 +575,7 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
                 }
                 map_section = &file->maps[file->map_count];
                 section = &map_section->values;
-                hwr_look_map_name(map_section->name, HWR_LOOK_NAME, name + 4);
+                snprintf(map_section->name, HWR_LOOK_NAME, "%s", reduced);
                 file->map_count++;
             } else {
                 if (report)
@@ -291,6 +599,11 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
             char *key = hwr_look_trim(text);
             char *value = hwr_look_trim(equals + 1);
 
+            if (lights_section != NULL) {
+                hwr_look_accept_light(key, value, lights_section, line_number,
+                                      report);
+                continue;
+            }
             if (section == NULL)
                 continue;
             if (map_section != NULL && hwr_ascii_equal_ci(key, "profile")) {
@@ -308,14 +621,17 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
 /* The overrides in force for one map, lowest precedence first. */
 static void hwr_look_compose(const struct hwr_look_file *file,
                              const char *map_name,
-                             struct hwr_look_values *out)
+                             struct hwr_look_values *out,
+                             struct hwr_look_lights *out_lights)
 {
     const struct hwr_look_map *map;
 
     memset(out, 0, sizeof *out);
+    memset(out_lights, 0, sizeof *out_lights);
     if (!g_look_present)
         return;
     hwr_look_merge(out, &file->global);
+    hwr_look_lights_merge(out_lights, &file->lights);
     map = hwr_look_find_map(file, map_name);
     if (map == NULL)
         return;
@@ -323,24 +639,36 @@ static void hwr_look_compose(const struct hwr_look_file *file,
         const struct hwr_look_profile *profile =
             hwr_look_find_profile(file, map->profile);
 
-        if (profile != NULL)
+        if (profile != NULL) {
             hwr_look_merge(out, &profile->values);
-        else
+            hwr_look_lights_merge(out_lights, &profile->lights);
+        } else {
             fprintf(stderr, "[renderer_overhaul] %s: map '%s' selects the "
                             "unknown profile '%s'; ignored\n",
                     g_look_path, map->name, map->profile);
+        }
     }
     hwr_look_merge(out, &map->values);
+    hwr_look_lights_merge(out_lights, &map->lights);
 }
 
 /* Publishes a freshly composed override set and reports what moved, so the rows
  * that changed value are applied and nothing else is disturbed. */
-static void hwr_look_publish(const struct hwr_look_values *next)
+static void hwr_look_publish(const struct hwr_look_values *next,
+                             const struct hwr_look_lights *next_lights)
 {
     uint32_t changed = 0;
     size_t count = hwr_schema_count();
     size_t i;
 
+    /* The lights table is not a row and raises no row's bit of its own, so it
+     * raises the rig's: what it changes is what the lights that are not at the
+     * eye are worth, which is the same thing every row of that family changes. */
+    if (next_lights->count != g_effective_lights.count ||
+        memcmp(next_lights->items, g_effective_lights.items,
+               next_lights->count * sizeof next_lights->items[0]) != 0)
+        changed |= HWR_CHANGE_TRUECOLOR;
+    g_effective_lights = *next_lights;
     for (i = 0; i < count; i++) {
         int had = hwr_row_set_has(&g_effective.present, (int)i);
         int has = hwr_row_set_has(&next->present, (int)i);
@@ -380,9 +708,11 @@ void hwr_look_load(const char *plugin_dir)
          * until something else happened to move. On the first load there is
          * nothing to publish and this costs nothing. */
         struct hwr_look_values empty;
+        struct hwr_look_lights no_lights;
 
         memset(&empty, 0, sizeof empty);
-        hwr_look_publish(&empty);
+        memset(&no_lights, 0, sizeof no_lights);
+        hwr_look_publish(&empty, &no_lights);
         fprintf(stderr, "[renderer_overhaul] no look file at %s; the settings "
                         "in force describe every map\n", g_look_path);
         return;
@@ -461,11 +791,13 @@ void hwr_look_drain_request(void)
             /* The file was there and is not any more: the global look goes with
              * it rather than standing over a file nobody has. */
             struct hwr_look_values empty;
+            struct hwr_look_lights no_lights;
 
             memset(&empty, 0, sizeof empty);
+            memset(&no_lights, 0, sizeof no_lights);
             memset(&g_look, 0, sizeof g_look);
             g_look_present = 0;
-            hwr_look_publish(&empty);
+            hwr_look_publish(&empty, &no_lights);
             fprintf(stderr, "[renderer_overhaul] look file %s is gone; the "
                             "settings in force describe every map\n",
                     g_look_path);
@@ -484,10 +816,11 @@ void hwr_look_drain_request(void)
 void hwr_look_select_map(const char *map_name)
 {
     struct hwr_look_values next;
+    struct hwr_look_lights next_lights;
 
     hwr_look_map_name(g_look_map, HWR_LOOK_NAME, map_name);
-    hwr_look_compose(&g_look, g_look_map, &next);
-    hwr_look_publish(&next);
+    hwr_look_compose(&g_look, g_look_map, &next, &next_lights);
+    hwr_look_publish(&next, &next_lights);
 }
 
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
@@ -507,10 +840,27 @@ int hwr_look_overrides(const struct hwr_setting_desc *desc)
     return index >= 0 && hwr_row_set_has(&g_effective.present, index);
 }
 
+int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out)
+{
+    size_t i;
+
+    if (out == NULL)
+        return 0;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < g_effective_lights.count; i++) {
+        if (g_effective_lights.items[i].graphic_id != graphic_id)
+            continue;
+        *out = g_effective_lights.items[i].light;
+        return 1;
+    }
+    return 0;
+}
+
 void hwr_look_clear(void)
 {
     memset(&g_look, 0, sizeof g_look);
     memset(&g_effective, 0, sizeof g_effective);
+    memset(&g_effective_lights, 0, sizeof g_effective_lights);
     g_look_present = 0;
     g_look_path[0] = 0;
     g_look_map[0] = 0;

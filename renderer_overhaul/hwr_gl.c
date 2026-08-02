@@ -1617,12 +1617,14 @@ static const char g_geometry_fragment_body[] =
      * direction above is: a reflected view carries its own camera and the term
      * is evaluated against it, so a mirror needs no rule of its own.
      *
-     * How many are live is a uniform, and it is zero until something seeds one.
-     * The law that reads them lands with the seeding. */
+     * How many are live is a uniform, and it is zero where nothing seeded one:
+     * a map with no torch in view costs this exactly one comparison. */
     "uniform vec4 u_point_a[16];\n"         /* position.xyz, where it ends */
     "uniform vec4 u_point_b[16];\n"         /* colour.rgb, energy */
     "uniform vec2 u_point_z[16];\n"         /* the world-Z window it stays in */
     "uniform int u_point_count;\n"
+    /* How softly that window's two edges fade, in world units. */
+    "uniform float u_point_z_edge;\n"
     /* The three classes the modern law must not touch, and why each one would be
      * a disaster if it did.
      *
@@ -1664,6 +1666,51 @@ static const char g_geometry_fragment_body[] =
     "float lamp_transmittance() {\n"
     "  if (u_transmit_valid==0 || u_transmit_receive==0) return 1.0;\n"
     "  return texelFetch(u_transmit,ivec2(gl_FragCoord.xy),0).r;\n"
+    "}\n"
+    /* How much of a light that is NOT at the eye reaches this fragment, given
+     * where the fragment is and which way it faces.
+     *
+     * It is the light at the eye's own term, line for line, with three
+     * differences and no fourth: the direction runs from the fragment TO the
+     * light instead of to the eye; there is no transmittance factor, because
+     * the plane that carries one is exact only for a light sharing the view's
+     * ray and a torch on a wall shares none; and the vertical window below.
+     *
+     * The window is the one containment that costs nothing. The projection
+     * defines the view position's third component as the drop from the eye, so
+     * the fragment's own height in the world is the eye's height less it --
+     * exactly, with no new vertex data and no new varying. Each light carries
+     * its own room's floor and ceiling with slack either side, and outside that
+     * band it fades to nothing over the slack. That is what stops a torch
+     * lighting the storey above it, and it is not a shadow and is not sold as
+     * one. */
+    "vec3 point_light_term(int i, vec3 p, vec3 n, bool figure) {\n"
+    "  vec3 d=u_point_a[i].xyz-p;\n"
+    "  float r=length(d);\n"
+    "  float reach=u_point_a[i].w;\n"
+    "  if (r>=reach || reach<=0.0) return vec3(0.0);\n"
+    "  vec3 l=r>0.0 ? d/r : vec3(0.0,-1.0,0.0);\n"
+    "  float ndl=dot(n,l);\n"
+    "  float gain=1.0;\n"
+    /* A standing figure is not a wall here either: the same wrap and the same
+     * dial, because what makes a figure a figure is the figure, not which
+     * light is falling on it. */
+    "  if (figure) {\n"
+    "    ndl=(ndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
+    "    gain=u_sprite_light.x;\n"
+    "  }\n"
+    "  if (ndl<=0.0) return vec3(0.0);\n"
+    "  float zw=float(u_eye_z)-p.z;\n"
+    "  float edge=max(u_point_z_edge,0.03125);\n"
+    "  float window=smoothstep(u_point_z[i].x,u_point_z[i].x+edge,zw)*\n"
+    "               (1.0-smoothstep(u_point_z[i].y-edge,u_point_z[i].y,zw));\n"
+    "  if (window<=0.0) return vec3(0.0);\n"
+    /* A windowed quadratic, exactly as the light at the eye falls off, so the
+     * reach is where the pool ENDS rather than where it stops being visible --
+     * which is also what makes the reach a bound on the leaking. */
+    "  float att=1.0-r/reach;\n"
+    "  return light_space(u_point_b[i].rgb)*u_point_b[i].w*ndl*gain*att*att*\n"
+    "         window;\n"
     "}\n"
     /* What reaches this fragment, as a multiplier on the colour of its texel.
      *
@@ -1741,6 +1788,16 @@ static const char g_geometry_fragment_body[] =
     "    }\n"
     "    total+=light_space(u_key_color)*u_key_intensity*"
     "max(dot(n,u_key_dir),0.0);\n"
+    /* And the lights that are not at the eye. They are inside this branch on
+     * purpose and it is the whole of their class rule: the one normal every law
+     * here reads is zero for the surfaces no light may reach -- a ground shadow
+     * above all, which is a DARKENING decal that any light at all would turn
+     * into a bright oval under the figure it belongs to. A torch is refused by
+     * the same gate that already refuses the light the player carries, so this
+     * round introduces no class rule of its own. The count is zero wherever
+     * nothing seeded a light, which is every frame of every other law. */
+    "    for (int i=0;i<u_point_count;i++)\n"
+    "      total+=point_light_term(i,view_position(),n,figure);\n"
     "  }\n"
     /* The original's depth law, at whatever weight is asked for. Its shade runs
      * from nothing to the whole ramp, so what survives is the ramp read the
@@ -2944,21 +3001,32 @@ static float hwr_lamp_random(void)
  * ignored and the rows are the whole answer, at one it is read whole. The
  * bounds are the ones the reading was worked out with, and the brightest maps in
  * the game land exactly on both of them. */
-static void hwr_lamp_glow(uint16_t candle_glow, float weight)
+void hwr_gl_glow_factors(uint16_t candle_glow, float weight,
+                         float *intensity, float *range)
 {
     float factor;
 
-    g_lamp_glow_intensity = 1.0f;
-    g_lamp_glow_range = 1.0f;
+    if (intensity != NULL)
+        *intensity = 1.0f;
+    if (range != NULL)
+        *range = 1.0f;
     if (candle_glow == 0u || weight == 0.0f)
         return;
     factor = (float)candle_glow / 6.0f;
     if (factor < 0.25f)
         factor = 0.25f;
-    g_lamp_glow_intensity =
-        hwr_lamp_clamp(1.0f + (factor - 1.0f) * weight, 0.25f, 4.0f);
-    g_lamp_glow_range =
-        hwr_lamp_clamp(1.0f + (sqrtf(factor) - 1.0f) * weight, 0.3125f, 2.0f);
+    if (intensity != NULL)
+        *intensity = hwr_lamp_clamp(1.0f + (factor - 1.0f) * weight, 0.25f,
+                                    4.0f);
+    if (range != NULL)
+        *range = hwr_lamp_clamp(1.0f + (sqrtf(factor) - 1.0f) * weight,
+                                0.3125f, 2.0f);
+}
+
+static void hwr_lamp_glow(uint16_t candle_glow, float weight)
+{
+    hwr_gl_glow_factors(candle_glow, weight, &g_lamp_glow_intensity,
+                        &g_lamp_glow_range);
 }
 
 /* One step of the flame. It is reached for rather than jumped to, which is what
@@ -3846,6 +3914,10 @@ static void hwr_bind_light_uniforms(GLuint program,
     hwr_uniform_3f(program, "u_key_dir", 0.0f, 0.0f, -1.0f);
     hwr_uniform_3f(program, "u_key_color", 1.0f, 1.0f, 1.0f);
     hwr_uniform_1f(program, "u_key_intensity", 0.0f);
+    /* The softness of the vertical window every light that is not at the eye is
+     * held inside. The window travels with each light; this is one row, so it
+     * is one uniform beside the rig rather than a third component per light. */
+    hwr_uniform_1f(program, "u_point_z_edge", light->point_z_edge);
 }
 
 /* The geometry stage's own world-to-view transform, in C, for a position that is

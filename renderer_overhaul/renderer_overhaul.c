@@ -5,6 +5,7 @@
 #include "roth_sdk.h"
 
 #include "hwr_gl.h"
+#include "hwr_lights.h"
 #include "hwr_backdrop.h"
 #include "hwr_das.h"
 #include "hwr_settings.h"
@@ -2273,6 +2274,12 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     /* A fresh sector table means the light instrument's held state describes a
      * map that is no longer loaded, so the next look writes a census. */
     hwr_objects_dump_lights_reset();
+    /* And the same for the lights that are not at the eye: what stood in the
+     * old map's sector 12 is not what stands in this one's, and the colours
+     * read off the old map's archive are not this map's colours. Both are
+     * forgotten rather than carried, so nothing here fades out of a room that
+     * no longer exists. */
+    hwr_lights_reset();
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent

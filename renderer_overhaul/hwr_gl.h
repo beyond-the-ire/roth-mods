@@ -340,6 +340,12 @@ struct hwr_gl_light {
      * standing figure's shaded half never goes fully black. */
     float sprite_gain;
     float sprite_wrap;
+    /* How wide the band is that a light which is not at the eye fades out
+     * across, above its own room's ceiling and below its own floor. The window
+     * itself is per light and travels with it; this is the softness of its two
+     * edges, and it is the same softness for all of them because it is one
+     * row. Zero is a hard edge. */
+    float point_z_edge;
 };
 
 /* How many lights that are NOT at the eye the world pass carries at once. Two
@@ -509,6 +515,17 @@ void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
                          uint64_t now_ns);
 /* Puts the flame back where it starts and forgets both clocks. */
 void hwr_gl_lamp_reset(void);
+/* What a map's own candle word makes of a light's strength and its reach, at
+ * whatever weight is being given to that word. Both come back at exactly one
+ * where the map has no such word or nobody is reading it.
+ *
+ * It is out here, rather than inside the light it was written for, because the
+ * lights that are NOT at the eye take the same word through the same recipe: a
+ * map's own authoring should move the light the player carries and the torches
+ * on its walls together, and two copies of one recipe are two things that can
+ * drift apart without either side noticing. */
+void hwr_gl_glow_factors(uint16_t candle_glow, float weight,
+                         float *intensity, float *range);
 /* Hands over the lights that are not at the eye for the frame about to be
  * submitted. The set is replaced whole, once a frame, and every view of that
  * frame -- a mirror's included -- is lit from it, so a light is a property of

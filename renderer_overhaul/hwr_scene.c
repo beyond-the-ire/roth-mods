@@ -6207,6 +6207,23 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         memset(&frame, 0, sizeof frame);
         frame.world = world;
         frame.objects = objects;
+        frame.api = api;
+        frame.map_archive = scene->map_archive;
+        frame.shared_archive = scene->shared_archive;
+        frame.view_yaw = api->game_ram->u16(VA_G_SKY_YAW);
+        /* The primary view's own visibility, which is the frame's: one light
+         * set serves every view, so what a mirror shows is lit by the lights of
+         * the rooms the player can see rather than by a second walk of its own.
+         * That is the same reason the array is in world space to begin with. */
+        frame.visible = scene->visible;
+        frame.visible_count = scene->visible_count;
+        frame.pvs_valid = scene->pvs_valid;
+        frame.camera_sector = hwr_camera_sector(world, api);
+        frame.view_offset_x = camera.view_offset_x;
+        frame.view_offset_y = camera.view_offset_y;
+        frame.eye_z = camera.eye_z;
+        frame.candle_glow = world->luts.candle_glow;
+        frame.now_ns = hwr_perf_now_ns();
         count = hwr_lights_build(&frame, lights, HWR_GL_POINT_LIGHT_MAX);
         hwr_gl_set_point_lights(lights, count);
     }

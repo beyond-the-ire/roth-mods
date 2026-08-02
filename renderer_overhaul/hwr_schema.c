@@ -75,6 +75,11 @@ static const struct hwr_enum_value HWR_LIGHT_SCOPE_VALUES[] = {
     { "all",    HWR_LIGHT_SCOPE_ALL,    "Everywhere" }
 };
 
+static const struct hwr_enum_value HWR_POINT_COLOR_VALUES[] = {
+    { "sprite", HWR_POINT_COLOR_SPRITE, "The colour of the thing itself" },
+    { "fixed",  HWR_POINT_COLOR_FIXED,  "One colour for all of them" }
+};
+
 static const struct hwr_enum_value HWR_SHADING_DITHER_VALUES[] = {
     { "auto", HWR_SHADING_DITHER_AUTO, "Follow the shading" },
     { "off",  HWR_SHADING_DITHER_OFF,  "Off" },
@@ -1306,6 +1311,270 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "How far light carries around a figure past the edge it "
                 "would stop at, so the side away from you is shaded rather "
                 "than black."
+    },
+    /* The lights that are not at the eye.
+     *
+     * Which things are lights is the map's own answer, not a list kept here:
+     * the game already marks the torches, candles and lit sigils as things
+     * never to be darkened, and that mark is what these read. So the family
+     * needs no per-map table to work at all -- and the look file has one
+     * anyway, for the map that wants a particular brazier brighter or a
+     * fullbright decal left alone.
+     *
+     * Every row is a MAP_OVERRIDE and hangs off the shading law, like the rest
+     * of the rig: moving any of them while the picture is the original one
+     * changes nothing and asks for nothing. */
+    {
+        .key = "point_light",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .b = 1 },
+        .original = { .b = 1 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Torches and candles give light",
+        .help = "Lets the torches, candles and lit sigils a map places "
+                "actually light what is around them. They cast no shadows, so "
+                "one beside a doorway spills a little onto the far side of it."
+    },
+    {
+        .key = "point_light_objects",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_objects),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .b = 1 },
+        .original = { .b = 1 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Light from things the map marks",
+        .help = "Where those lights come from: the things a map marks as "
+                "giving light of their own. Turning this off leaves the "
+                "setting above on with nothing seeding it."
+    },
+    {
+        .key = "point_light_max",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_max),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 8u },
+        .original = { .u = 8u },
+        .min = { .u = 1u },
+        .max = { .u = 16u },
+        .step = { .u = 1u },
+        .page_step = { .u = 4u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How many light at once",
+        .help = "How many of them may light the picture at the same time. "
+                "What is dropped is always whatever is contributing least "
+                "where you are standing, and it fades out rather than "
+                "vanishing."
+    },
+    {
+        .key = "point_light_intensity",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_intensity),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How bright a torch is",
+        .help = "How much light one of them gives off."
+    },
+    {
+        .key = "point_light_range",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_range),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 450.0f },
+        .original = { .f = 450.0f },
+        .min = { .f = 100.0f },
+        .max = { .f = 2000.0f },
+        .step = { .f = 25.0f },
+        .page_step = { .f = 100.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How far a torch reaches",
+        .help = "Where the pool around one of them ends, in world units. A "
+                "fixed torch reads tighter than the light you carry, and a "
+                "shorter reach is also less of it spilling where it should "
+                "not."
+    },
+    {
+        .key = "point_light_color_source",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_color_source),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .e = HWR_POINT_COLOR_SPRITE },
+        .original = { .e = HWR_POINT_COLOR_SPRITE },
+        .values = HWR_POINT_COLOR_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_POINT_COLOR_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "What colour a torch throws",
+        .help = "Reading it from the thing itself means fire throws "
+                "fire-coloured light and a cold sigil throws cold light. One "
+                "chosen colour is more uniform and more controllable."
+    },
+    {
+        .key = "point_light_color",
+        .type = HWR_VT_COLOR,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_color),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .rgb = 0x00ffb46eu },
+        .original = { .rgb = 0x00ffb46eu },
+        .min = { .rgb = 0x00000000u },
+        .max = { .rgb = 0x00ffffffu },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "The one torch colour",
+        .help = "The colour used when the setting above is not reading it "
+                "from the thing itself. Warmer than the light you carry, "
+                "because a wall torch is fire and a carried lamp is not."
+    },
+    {
+        .key = "point_light_glow_scale",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_glow_scale),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 2.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How much the map's own word counts",
+        .help = "Every map carries a word saying how strong its own lantern "
+                "was meant to be. This is how much notice these lights take "
+                "of it, exactly as the light you carry takes it."
+    },
+    {
+        .key = "point_light_hops",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_hops),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 1u },
+        .original = { .u = 1u },
+        .min = { .u = 0u },
+        .max = { .u = 3u },
+        .step = { .u = 1u },
+        .page_step = { .u = 1u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How far away a light may be",
+        .help = "How many doorways from the room you are in a light may still "
+                "be lighting it. Since these lights cast no shadows, a lower "
+                "number is less of one reaching round a corner it should not."
+    },
+    {
+        .key = "point_light_z_slack",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_z_slack),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 64.0f },
+        .original = { .f = 64.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 512.0f },
+        .step = { .f = 8.0f },
+        .page_step = { .f = 32.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How far above and below a room",
+        .help = "How far past its own room's floor and ceiling a light may "
+                "still reach, in world units, before it fades out. It is what "
+                "stops a torch lighting the storey above it."
+    },
+    {
+        .key = "point_light_fade",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_fade),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.25f },
+        .original = { .f = 0.25f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How gently one comes and goes",
+        .help = "How long, in seconds, a light takes to come up or go out "
+                "when there is no longer room for it. Nothing appears or "
+                "disappears in a single frame."
     },
     /* Reported state. These rows hold no value of their own and no key: each
      * one asks the renderer or the host what is actually happening and answers
