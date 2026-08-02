@@ -589,8 +589,12 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
      * foundation, so a dial moved while the shading is Original neither brings
      * the colour world image into existence nor moves a single byte of the
      * picture -- without that, a whole family of inert tuning dials would each
-     * be an accidental trigger. All of them may be set per map: how a place is
-     * lit belongs to the place. */
+     * be an accidental trigger. Each also names Modern as the one value of that
+     * law it is live at, rather than settling for "anything but Original":
+     * Smooth is the original law with its steps taken out and reads none of
+     * these, so a rig dial offered under Smooth would be a control that does
+     * nothing. All of them may be set per map: how a place is lit belongs to
+     * the place. */
     {
         .key = "room_light_gain",
         .type = HWR_VT_F32,
@@ -599,7 +603,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, room_light_gain),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 1.0f },
         .original = { .f = 1.0f },
         .min = { .f = 0.0f },
@@ -608,6 +613,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Room brightness",
         .help = "How much light a room gives off from the brightness it was "
                 "built with. Lower makes the world darker everywhere without "
@@ -621,7 +627,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, room_light_gamma),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 2.2f },
         .original = { .f = 2.2f },
         .min = { .f = 1.0f },
@@ -630,6 +637,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.5f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Room brightness curve",
         .help = "How steeply a room's built-in brightness turns into light. "
                 "The map's values are shades rather than light, and this is "
@@ -643,7 +651,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, room_light_floor),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.0f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
@@ -652,6 +661,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.05f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Never darker than",
         .help = "The least light any surface receives, so nowhere is ever "
                 "completely black. Zero is honest darkness."
@@ -665,11 +675,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings,
                            room_light_ceiling_authentic),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .b = 0 },
         .original = { .b = 0 },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Keep the original's darkness limit",
         .help = "The original stops a bright room's surfaces from ever fading "
                 "past a certain shade. Keeping that limit preserves its "
@@ -684,7 +696,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, world_light_ceiling),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 1.0f },
         .original = { .f = 1.0f },
         .min = { .f = 1.0f },
@@ -693,6 +706,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.5f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Brightest a surface may be",
         .help = "Where the light landing on a surface stops counting. One is "
                 "as bright as the picture the texture was drawn at."
@@ -705,7 +719,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, world_distance_shading),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.0f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
@@ -714,6 +729,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Distance darkening",
         .help = "How much walking away from something darkens it all by "
                 "itself, the way the original does. Zero lets the light run "
@@ -727,11 +743,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, ambient_light),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .b = 0 },
         .original = { .b = 0 },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Ambient fill",
         .help = "A little light everywhere, so what nothing else reaches is "
                 "still faintly visible."
@@ -744,13 +762,15 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, ambient_color),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .rgb = 0x00666666u },
         .original = { .rgb = 0x00666666u },
         .min = { .rgb = 0x00000000u },
         .max = { .rgb = 0x00ffffffu },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Ambient colour",
         .help = "The colour of that fill. A neutral grey by day, something "
                 "cooler at night."
@@ -763,7 +783,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, ambient_intensity),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.0f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
@@ -772,6 +793,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Ambient strength",
         .help = "How much of that fill there is."
     },
@@ -783,11 +805,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .b = 0 },
         .original = { .b = 0 },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light",
         .help = "A real light where you are standing, in place of the "
                 "original's pool on the screen. Surfaces facing you catch it "
@@ -801,13 +825,15 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_color),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .rgb = 0x00ffede0u },
         .original = { .rgb = 0x00ffede0u },
         .min = { .rgb = 0x00000000u },
         .max = { .rgb = 0x00ffffffu },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light colour",
         .help = "The colour of the light you carry. A warm white reads as a "
                 "flame."
@@ -820,7 +846,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_intensity),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.0f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
@@ -829,6 +856,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light strength",
         .help = "How bright the light you carry is."
     },
@@ -840,7 +868,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_range),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 800.0f },
         .original = { .f = 800.0f },
         .min = { .f = 100.0f },
@@ -849,6 +878,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 200.0f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light reach",
         .help = "How far the light you carry reaches before it runs out. "
                 "Smaller is a tighter pool around you."
@@ -861,13 +891,15 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_scope),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .e = HWR_LIGHT_SCOPE_TINTED },
         .original = { .e = HWR_LIGHT_SCOPE_TINTED },
         .values = HWR_LIGHT_SCOPE_VALUES,
         .value_count = HWR_COUNT_OF(HWR_LIGHT_SCOPE_VALUES),
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light reaches",
         .help = "The map marks which surfaces the light you carry is meant to "
                 "matter on. Honouring that mark is the faithful answer; the "
@@ -881,7 +913,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_glow_scale),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.0f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
@@ -890,6 +923,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Follow the map's lantern",
         .help = "Every map says how strong its own lantern was meant to be. "
                 "This is how much notice the light you carry takes of that: "
@@ -904,11 +938,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_flicker),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .b = 0 },
         .original = { .b = 0 },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light flickers",
         .help = "Lets the light you carry breathe the way a flame does. It is "
                 "held well clear of going out, so it never gutters or strobes."
@@ -921,7 +957,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_flicker_amount),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.30f },
         .original = { .f = 0.30f },
         .min = { .f = 0.0f },
@@ -930,6 +967,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Flicker depth",
         .help = "How far the flame swings either side of the strength you set."
     },
@@ -941,7 +979,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, player_light_flicker_speed),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 1.80f },
         .original = { .f = 1.80f },
         .min = { .f = 0.1f },
@@ -950,6 +989,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.5f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Flicker speed",
         .help = "How quickly the flame's wave runs."
     },
@@ -961,7 +1001,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, sprite_light_gain),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 1.0f },
         .original = { .f = 1.0f },
         .min = { .f = 0.0f },
@@ -970,6 +1011,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Item and figure brightness",
         .help = "How bright people, creatures and things you can pick up are: "
                 "both the light they show of their own and the light you carry "
@@ -984,7 +1026,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, sprite_light_wrap),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE,
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 0.5f },
         .original = { .f = 0.5f },
         .min = { .f = 0.0f },
@@ -993,6 +1036,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .page_step = { .f = 0.25f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Item and figure softness",
         .help = "How far light carries around a figure past the edge it "
                 "would stop at, so the side away from you is shaded rather "
@@ -1149,6 +1193,20 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .apply_kind = HWR_APPLY_NONE,
         .offset = HWR_SCHEMA_NO_FIELD,
         .depends_on = -1,
+        .label = "World image storage in use",
+        .help = "How the world image is being kept, which is what the storage "
+                "setting's Automatic became. None means the world is drawn in "
+                "the original palette, which is what the original picture "
+                "needs.",
+        .read_info = hwr_sysinfo_read_color_format
+    },
+    {
+        .key = NULL,
+        .category = HWR_CAT_SYSTEM,
+        .exposure = HWR_EXP_READONLY,
+        .apply_kind = HWR_APPLY_NONE,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .depends_on = -1,
         .label = "Last message",
         .help = "The last thing the settings screen reported, kept here once "
                 "it has left the line below the settings.",
@@ -1204,23 +1262,65 @@ int hwr_schema_depends_on(const struct hwr_setting_desc *desc)
     return desc->depends_on;
 }
 
-int hwr_schema_is_original(const struct hwr_setting_desc *desc,
-                           union hwr_value value)
+int hwr_schema_value_same(const struct hwr_setting_desc *desc,
+                          union hwr_value a, union hwr_value b)
 {
     if (desc == NULL)
         return 1;
     switch (desc->type) {
     case HWR_VT_BOOL:
-        return (value.b != 0) == (desc->original.b != 0);
+        return (a.b != 0) == (b.b != 0);
     case HWR_VT_U32:
     case HWR_VT_COLOR:
-        return value.u == desc->original.u;
+        return a.u == b.u;
     case HWR_VT_F32:
-        return value.f == desc->original.f;
+        return a.f == b.f;
     case HWR_VT_ENUM:
-        return value.e == desc->original.e;
+        return a.e == b.e;
     }
     return 1;
+}
+
+int hwr_schema_dependency_met(const struct hwr_setting_desc *desc,
+                              const struct hwr_settings *settings)
+{
+    const struct hwr_setting_desc *parent;
+    union hwr_value value;
+    int index;
+
+    if (desc == NULL || settings == NULL)
+        return 1;
+    index = hwr_schema_depends_on(desc);
+    if (index < 0)
+        return 1;
+    parent = hwr_schema_at((size_t)index);
+    if (parent == NULL)
+        return 1;
+    value = hwr_schema_get(settings, parent);
+    if ((desc->flags & HWR_SF_DEPENDS_ON_VALUE) != 0)
+        return hwr_schema_value_same(parent, value, desc->depends_on_value);
+    /* A parent with two states is met by not being in its first one, which is
+     * the off of a switch and the Original of everything else that has one. */
+    switch (parent->type) {
+    case HWR_VT_BOOL:
+        return value.b != 0;
+    case HWR_VT_U32:
+    case HWR_VT_COLOR:
+        return value.u != 0u;
+    case HWR_VT_F32:
+        return value.f != 0.0f;
+    case HWR_VT_ENUM:
+        return value.e != 0;
+    }
+    return 1;
+}
+
+int hwr_schema_is_original(const struct hwr_setting_desc *desc,
+                           union hwr_value value)
+{
+    if (desc == NULL)
+        return 1;
+    return hwr_schema_value_same(desc, value, desc->original);
 }
 
 static void hwr_schema_error(char *err, size_t err_size, const char *format,
@@ -1311,7 +1411,13 @@ static void hwr_schema_range_error(const struct hwr_setting_desc *desc,
 {
     const char *zero = (desc->flags & HWR_SF_ZERO_IS_AUTO) != 0 ? "0 or " : "";
 
-    if (desc->type == HWR_VT_F32)
+    /* A colour's range is six hexadecimal digits, and saying so in decimal
+     * would be an answer nobody can act on. */
+    if (desc->type == HWR_VT_COLOR)
+        hwr_schema_error(err, err_size,
+                         "expected a colour as six hexadecimal digits, such as "
+                         "806040");
+    else if (desc->type == HWR_VT_F32)
         hwr_schema_error(err, err_size, "expected %s%s%g through %g", zero,
                          (desc->flags & HWR_SF_EXCLUSIVE_MIN) != 0
                              ? "more than " : "",
@@ -1431,7 +1537,9 @@ int hwr_schema_parse(const struct hwr_setting_desc *desc, const char *text,
         if (text[0] == '#')
             text++;
         if (!hwr_parse_u32(text, 16, UINT32_MAX, &value.rgb)) {
-            hwr_schema_error(err, err_size, "expected a hexadecimal color");
+            hwr_schema_error(err, err_size,
+                             "expected a colour as six hexadecimal digits, "
+                             "such as 806040");
             return 0;
         }
         break;

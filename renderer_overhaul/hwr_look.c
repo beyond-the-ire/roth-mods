@@ -366,7 +366,6 @@ void hwr_look_load(const char *plugin_dir)
     uint64_t hash = 0;
 
     memset(&g_look, 0, sizeof g_look);
-    memset(&g_effective, 0, sizeof g_effective);
     g_look_present = 0;
     g_look_map[0] = 0;
     if (plugin_dir == NULL)
@@ -374,6 +373,15 @@ void hwr_look_load(const char *plugin_dir)
     snprintf(g_look_path, sizeof g_look_path, "%s/renderer_look.cfg",
              plugin_dir);
     if (!hwr_look_read(&g_look, &hash, 1)) {
+        /* Whatever was in force came from a file that is not being read, so it
+         * is published away rather than dropped where it stands: emptying the
+         * set in silence would leave every row that had an override holding it
+         * until something else happened to move. On the first load there is
+         * nothing to publish and this costs nothing. */
+        struct hwr_look_values empty;
+
+        memset(&empty, 0, sizeof empty);
+        hwr_look_publish(&empty);
         fprintf(stderr, "[renderer_overhaul] no look file at %s; the settings "
                         "in force describe every map\n", g_look_path);
         return;

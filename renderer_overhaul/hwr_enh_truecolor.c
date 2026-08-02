@@ -77,14 +77,21 @@ static int hwr_truecolor_previewed(const struct hwr_setting_desc *desc)
            desc != hwr_schema_find(HWR_FORMAT_ROW);
 }
 
-/* What a row is worth to the renderer right now: the panel's draft while a
- * picture dial is being moved, the map's override where the look configuration
- * gives one, and the value in force otherwise. */
+/* What a row is worth to the renderer right now: the map's override where the
+ * look configuration gives one, and otherwise the panel's draft while a dial is
+ * being moved or the value in force when no panel is open.
+ *
+ * The draft stands in for the settings rather than over the map, which is the
+ * same precedence a saved configuration meets: the look file's answer for a map
+ * wins wherever it gives one. Previewing over the map instead would make every
+ * opening of the settings screen a visible change of light in any room a map
+ * describes for itself -- and would then put it back on Apply, which is the one
+ * thing a preview must never do. */
 static union hwr_value hwr_truecolor_effective(
     const struct hwr_setting_desc *desc, const struct hwr_settings *settings)
 {
     if (hwr_truecolor_previewed(desc))
-        return hwr_schema_get(&g_preview, desc);
+        return hwr_look_effective(desc, &g_preview);
     return hwr_look_effective(desc, settings);
 }
 

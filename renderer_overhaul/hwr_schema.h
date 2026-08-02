@@ -57,7 +57,10 @@ enum {
     HWR_SF_ZERO_IS_AUTO  = 1u << 1, /* zero is legal and means "follow" */
     HWR_SF_MAP_OVERRIDE  = 1u << 2, /* a per-map profile may override it */
     HWR_SF_RESTART_FREE  = 1u << 3, /* takes effect without a restart */
-    HWR_SF_EXCLUSIVE_MIN = 1u << 4  /* the minimum itself is not accepted */
+    HWR_SF_EXCLUSIVE_MIN = 1u << 4, /* the minimum itself is not accepted */
+    /* The row is live at one particular value of the row it hangs off, which
+     * depends_on_value names, rather than at any value but that row's off. */
+    HWR_SF_DEPENDS_ON_VALUE = 1u << 5
 };
 
 /* A NULL label means the token is presentable as it stands. */
@@ -102,6 +105,10 @@ struct hwr_setting_desc {
      * happens to put it -- the true-colour foundation, for one. It wins over
      * the index above when both are given. */
     const char *depends_on_key;
+    /* Which value of that row brings this one to life, for a parent that is
+     * more than a switch. Read only with HWR_SF_DEPENDS_ON_VALUE, so a row
+     * whose enabling value happens to be a zero still says so. */
+    union hwr_value depends_on_value;
     enum hwr_widget widget;
     const char *label;
     const char *help;
@@ -121,6 +128,16 @@ const struct hwr_setting_desc *hwr_schema_find(const char *key);
 int hwr_schema_index_of(const struct hwr_setting_desc *desc);
 /* The row this one hangs off, however it named it, or -1 when it stands alone. */
 int hwr_schema_depends_on(const struct hwr_setting_desc *desc);
+/* Whether that row is at a value which gives this one something to do: the one
+ * value it names where it names one, and anything but the parent's own off
+ * otherwise. A row that hangs off nothing is always live. This is what tells a
+ * dial that reaches only one shading law from one that reaches every law. */
+int hwr_schema_dependency_met(const struct hwr_setting_desc *desc,
+                              const struct hwr_settings *settings);
+/* Two values of one row compared as that row's type, which is the only way two
+ * of them can be compared: the union alone does not say which member is live. */
+int hwr_schema_value_same(const struct hwr_setting_desc *desc,
+                          union hwr_value a, union hwr_value b);
 /* Whether a value is the one the Original preset holds for its row, which is
  * what "neutral" means for every row the authentic picture depends on. */
 int hwr_schema_is_original(const struct hwr_setting_desc *desc,

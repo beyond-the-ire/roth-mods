@@ -318,6 +318,36 @@ int hwr_sysinfo_read_graphics(const struct roth_api_v1 *api, char *out,
     return 1;
 }
 
+/* Where the world image is actually being kept. The storage setting offers
+ * Automatic, so the value in force is a request rather than an answer, and the
+ * answer depends on the shading law and on what the driver would give: this row
+ * is the one place the two can be told apart. No colour image at all is the
+ * original picture drawn straight into palette indices, which is not a refusal
+ * and says so. */
+int hwr_sysinfo_read_color_format(const struct roth_api_v1 *api, char *out,
+                                  size_t out_size)
+{
+    enum hwr_gl_color_format format = hwr_gl_color_format_in_use();
+
+    (void)api;
+    switch (format) {
+    case HWR_GL_COLOR_RGBA8:
+        snprintf(out, out_size, "%s",
+                 hwr_sysinfo_enum_label("truecolor_format",
+                                        HWR_TRUECOLOR_FORMAT_RGBA8));
+        return 1;
+    case HWR_GL_COLOR_RGBA16F:
+        snprintf(out, out_size, "%s",
+                 hwr_sysinfo_enum_label("truecolor_format",
+                                        HWR_TRUECOLOR_FORMAT_RGBA16F));
+        return 1;
+    case HWR_GL_COLOR_AUTO:
+        break;
+    }
+    snprintf(out, out_size, "None: the world image is the original palette");
+    return 1;
+}
+
 int hwr_sysinfo_read_message(const struct roth_api_v1 *api, char *out,
                              size_t out_size)
 {

@@ -68,6 +68,7 @@ enum {
     HWR_W_NUMBER,
     HWR_W_RESOLUTION,
     HWR_W_KEY,
+    HWR_W_COLOR,
     HWR_W_INFO
 };
 
@@ -430,9 +431,17 @@ static int hwr_overlay_widget_of(const struct hwr_setting_desc *desc)
     case HWR_VT_F32:
         return HWR_W_NUMBER;
     case HWR_VT_COLOR:
-        break;
+        return HWR_W_COLOR;
     }
     return HWR_W_INFO;
+}
+
+/* Whether the row's control is one that steps: a value with two ends and an
+ * order between them, which is what the < and > either side of it mean. A
+ * colour has neither, so it is typed rather than stepped. */
+static int hwr_overlay_widget_steps(int widget)
+{
+    return widget != HWR_W_COLOR && widget != HWR_W_INFO;
 }
 
 /* A row whose parent is off in the draft is shown and never taken: a dependency
@@ -440,7 +449,6 @@ static int hwr_overlay_widget_of(const struct hwr_setting_desc *desc)
 static int hwr_overlay_row_enabled(const struct hwr_setting_desc *desc)
 {
     const struct hwr_setting_desc *parent;
-    union hwr_value value;
     int parent_index;
 
     if (desc->available != NULL && !desc->available())
@@ -455,19 +463,10 @@ static int hwr_overlay_row_enabled(const struct hwr_setting_desc *desc)
      * it is unavailable. */
     if (parent == NULL || parent->exposure != HWR_EXP_CONSUMER)
         return 1;
-    value = hwr_schema_get(&g_draft, parent);
-    switch (parent->type) {
-    case HWR_VT_BOOL:
-        return value.b != 0;
-    case HWR_VT_U32:
-    case HWR_VT_COLOR:
-        return value.u != 0;
-    case HWR_VT_F32:
-        return value.f != 0.0f;
-    case HWR_VT_ENUM:
-        return value.e != 0;
-    }
-    return 1;
+    /* What "on" means for that parent is the table's to say, not the panel's:
+     * a switch has one off, and a parent with more than two states says which
+     * of them this row has anything to do with. */
+    return hwr_schema_dependency_met(desc, &g_draft);
 }
 
 static void hwr_overlay_build_rows(void)
@@ -547,6 +546,35 @@ static int hwr_overlay_is_auto(const struct hwr_setting_desc *desc,
     return desc->type == HWR_VT_F32 ? value.f == 0.0f : value.u == 0u;
 }
 
+/* One value of one row in the words the panel shows it in, which are not always
+ * the words the settings file spells it with: a switch is On or Off, an
+ * enumeration is its own label, and a zero that means "follow" says so. */
+static void hwr_overlay_format_value(const struct hwr_setting_desc *desc,
+                                     union hwr_value value, char *out,
+                                     size_t out_size)
+{
+    out[0] = 0;
+    if (desc == NULL)
+        return;
+    if (hwr_overlay_is_auto(desc, value)) {
+        snprintf(out, out_size, "%s",
+                 desc->auto_label != NULL ? desc->auto_label : "Automatic");
+        return;
+    }
+    switch (desc->type) {
+    case HWR_VT_BOOL:
+        snprintf(out, out_size, "%s", value.b != 0 ? "On" : "Off");
+        return;
+    case HWR_VT_ENUM:
+        snprintf(out, out_size, "%s", hwr_overlay_enum_text(desc, value));
+        return;
+    default:
+        break;
+    }
+    if (!hwr_schema_format(desc, value, out, out_size))
+        snprintf(out, out_size, "?");
+}
+
 static void hwr_overlay_value_text(const struct roth_api_v1 *api, int row,
                                    char *out, size_t out_size)
 {
@@ -573,23 +601,21 @@ static void hwr_overlay_value_text(const struct roth_api_v1 *api, int row,
             snprintf(out, out_size, "%u x %u", value.u, other.u);
         return;
     }
-    if (hwr_overlay_is_auto(desc, value)) {
-        snprintf(out, out_size, "%s",
-                 desc->auto_label != NULL ? desc->auto_label : "Automatic");
-        return;
-    }
-    switch (desc->type) {
-    case HWR_VT_BOOL:
-        snprintf(out, out_size, "%s", value.b != 0 ? "On" : "Off");
-        return;
-    case HWR_VT_ENUM:
-        snprintf(out, out_size, "%s", hwr_overlay_enum_text(desc, value));
-        return;
-    default:
-        break;
-    }
-    if (!hwr_schema_format(desc, value, out, out_size))
-        snprintf(out, out_size, "?");
+    hwr_overlay_format_value(desc, value, out, out_size);
+}
+
+/* What the map being played says this row is worth, when it says anything. The
+ * look file's per-map answers sit above the settings the panel edits, so a dial
+ * moved here can be perfectly correct and still change nothing in this room --
+ * the row says so rather than leaving the player to wonder. */
+static int hwr_overlay_map_text(const struct hwr_setting_desc *desc, char *out,
+                                size_t out_size)
+{
+    if (desc == NULL || !hwr_look_overrides(desc))
+        return 0;
+    hwr_overlay_format_value(desc, hwr_look_effective(desc, hwr_settings_get()),
+                             out, out_size);
+    return out[0] != 0;
 }
 
 /* A row the player has moved away from what the store holds. */
@@ -910,7 +936,14 @@ static void hwr_overlay_begin_edit(int row)
     } else {
         hwr_schema_format(desc, hwr_schema_get(&g_draft, desc), g_edit_text,
                           sizeof g_edit_text);
-        hwr_overlay_status("Type a value. Enter accepts, Esc cancels.", 0);
+        /* A colour is six hexadecimal digits, red then green then blue, which
+         * is the one value on this screen whose spelling has to be said. */
+        if (desc->type == HWR_VT_COLOR)
+            hwr_overlay_status("Type a colour as six hexadecimal digits, red "
+                               "green blue, such as 806040. Enter accepts, Esc "
+                               "cancels.", 0);
+        else
+            hwr_overlay_status("Type a value. Enter accepts, Esc cancels.", 0);
     }
     g_edit_length = strlen(g_edit_text);
     g_edit = HWR_EDIT_TEXT;
@@ -1024,23 +1057,6 @@ static void hwr_overlay_reset_draft(void)
     g_redraw = 1;
 }
 
-static int hwr_overlay_value_same(const struct hwr_setting_desc *desc,
-                                  union hwr_value a, union hwr_value b)
-{
-    switch (desc->type) {
-    case HWR_VT_BOOL:
-        return (a.b != 0) == (b.b != 0);
-    case HWR_VT_U32:
-    case HWR_VT_COLOR:
-        return a.u == b.u;
-    case HWR_VT_F32:
-        return a.f == b.f;
-    case HWR_VT_ENUM:
-        return a.e == b.e;
-    }
-    return 1;
-}
-
 /* Whether the draft says anything the settings in force do not. Rows the panel
  * never shows count too: the draft carries the whole configuration, so a value
  * only the file has is still something to be asked about before it is lost. */
@@ -1055,8 +1071,8 @@ static int hwr_overlay_draft_dirty(void)
 
         if (desc->offset == HWR_SCHEMA_NO_FIELD)
             continue;
-        if (!hwr_overlay_value_same(desc, hwr_schema_get(&g_draft, desc),
-                                    hwr_schema_get(saved, desc)))
+        if (!hwr_schema_value_same(desc, hwr_schema_get(&g_draft, desc),
+                                   hwr_schema_get(saved, desc)))
             return 1;
     }
     return 0;
@@ -1077,8 +1093,8 @@ static int hwr_overlay_confirm_needed(void)
         if ((desc->flags & HWR_SF_NEEDS_CONFIRM) == 0 ||
             desc->offset == HWR_SCHEMA_NO_FIELD)
             continue;
-        if (!hwr_overlay_value_same(desc, hwr_schema_get(&g_draft, desc),
-                                    hwr_schema_get(saved, desc)))
+        if (!hwr_schema_value_same(desc, hwr_schema_get(&g_draft, desc),
+                                   hwr_schema_get(saved, desc)))
             return 1;
     }
     return 0;
@@ -1440,17 +1456,22 @@ static void hwr_overlay_draw_row(const struct roth_api_v1 *api,
         hwr_overlay_value_text(api, row, value, sizeof value);
         /* What the setting asks for and what it is getting are not always the
          * same thing: a size the host would not give, a synchronization this
-         * system does not have, a renderer that had to stand down. The row says
-         * both rather than quietly showing the request as though it were the
-         * answer. */
+         * system does not have, a renderer that had to stand down, a map with
+         * its own answer for how it is lit. The row says both rather than
+         * quietly showing the request as though it were the answer. */
         used = strlen(value);
         if (g_rows[row].widget != HWR_W_INFO && used + 8u < sizeof value &&
             hwr_sysinfo_active_text(api, desc, hwr_settings_get(), active,
                                     sizeof active))
             snprintf(value + used, sizeof value - used, "  (in use: %s)",
                      active);
+        used = strlen(value);
+        if (g_rows[row].widget != HWR_W_INFO && used + 12u < sizeof value &&
+            hwr_overlay_map_text(desc, active, sizeof active))
+            snprintf(value + used, sizeof value - used, "  (this map: %s)",
+                     active);
     }
-    if (g_rows[row].widget != HWR_W_INFO && g_rows[row].selectable) {
+    if (hwr_overlay_widget_steps(g_rows[row].widget) && g_rows[row].selectable) {
         uint32_t marker_w = 8u;
 
         hwr_overlay_draw_text(api, canvas, layout->value_x, y + layout->scale,
@@ -1741,6 +1762,7 @@ static void hwr_overlay_activate(int row)
         return;
     case HWR_W_NUMBER:
     case HWR_W_RESOLUTION:
+    case HWR_W_COLOR:
         hwr_overlay_begin_edit(row);
         return;
     case HWR_W_KEY:
@@ -1939,7 +1961,8 @@ static int hwr_overlay_hit(const struct hwr_overlay_layout *layout, int32_t x,
         i = g_scroll + (int)((py - layout->rows_y0) / layout->row_h);
         if (i >= 0 && i < g_row_count) {
             *index = i;
-            if (!g_rows[i].selectable)
+            if (!g_rows[i].selectable ||
+                !hwr_overlay_widget_steps(g_rows[i].widget))
                 return HWR_HIT_ROW;
             if (px >= layout->value_x && px < layout->value_x + 12u)
                 return HWR_HIT_DECREASE;

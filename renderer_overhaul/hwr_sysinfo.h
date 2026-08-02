@@ -69,6 +69,8 @@ int hwr_sysinfo_read_present_limit(const struct roth_api_v1 *api, char *out,
                                    size_t out_size);
 int hwr_sysinfo_read_graphics(const struct roth_api_v1 *api, char *out,
                               size_t out_size);
+int hwr_sysinfo_read_color_format(const struct roth_api_v1 *api, char *out,
+                                  size_t out_size);
 int hwr_sysinfo_read_message(const struct roth_api_v1 *api, char *out,
                              size_t out_size);
 
