@@ -45,11 +45,17 @@ enum hwr_shading_mode {
     HWR_SHADING_MODERN
 };
 
-/* Which faces the light the player carries reaches. The map marks the faces the
- * original's carried light applies to, and honouring that mark is the faithful
- * answer: a room the author never meant that light to reach keeps its own
- * brightness. Lighting every face is the other reading and is one setting
- * away. */
+/* Which faces the light the player carries reaches. Everything it can see is
+ * the answer, because a light somebody is holding does not consult the room.
+ *
+ * The other value confines it to the faces carrying the candle-tinted mark, and
+ * that mark is worth being exact about: it is not the author's word about where
+ * a carried light belongs, it is the engine's LIVE word about whether a room's
+ * own fixtures are out. A light switch clears it across the room it raises and
+ * sets it across the room it lowers, so confining the carried light to it puts
+ * that light out in precisely the rooms that have just been lit. The value stays
+ * available for anyone who wants the original's own scoping; it is neither the
+ * default nor the faithful reading. */
 enum hwr_light_scope {
     HWR_LIGHT_SCOPE_TINTED = 0,
     HWR_LIGHT_SCOPE_ALL

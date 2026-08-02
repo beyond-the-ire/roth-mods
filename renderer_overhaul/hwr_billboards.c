@@ -1366,16 +1366,17 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         /* Shade seed compose (renderer.c:6180-6182): the +8 seed, biased by the
          * owner sector's light when both are nonzero, else passed through. The
          * composed value stands in as the billboard's effective light (a neutral
-         * 0x80 seed reduces to the sector light, exactly like a wall). */
+         * 0x80 seed reduces to the sector light, exactly like a wall). The rule
+         * itself lives beside the object record it belongs to, because the
+         * composed byte is also the map's own mark for a surface that gives
+         * light, and one rule read two ways is a rule that can drift. */
         if (o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
             o->sector_index < world->sector_count) {
             sector_light = world->sectors[o->sector_index].light;
             sector_flags = world->sectors[o->sector_index].flags;
         }
         seed = o->seed;
-        composed = (seed != 0 && sector_light != 0)
-                 ? (uint8_t)((uint8_t)(seed - 0x80u) + sector_light)
-                 : seed;
+        composed = hwr_object_composed_light(seed, sector_light);
 
         /* World size at 2 world units per texel -- the same density the wall
          * driver maps (texel = world_distance >> 1). Horizontal spans

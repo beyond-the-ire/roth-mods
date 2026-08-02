@@ -341,6 +341,13 @@ int hwr_objects_rebuild(struct hwr_objects *objects, const struct hwr_world *wor
     return 0;
 }
 
+uint8_t hwr_object_composed_light(uint8_t seed, uint8_t sector_light)
+{
+    return (seed != 0 && sector_light != 0)
+         ? (uint8_t)((uint8_t)(seed - 0x80u) + sector_light)
+         : seed;
+}
+
 static const char *hwr_objects_source_name(uint8_t source)
 {
     static const char *const names[HWR_OBJECT_SOURCE_COUNT] = {
@@ -396,4 +403,168 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
     }
     fclose(file);
     rename(temp_path, path);
+}
+
+/* The two sector bytes the engine rewrites while the world is running, held
+ * from one dump to the next so a block is written only where one of them moved.
+ * Packed as (flags << 8) | light, one entry per sector. */
+static uint16_t *g_light_state;
+static size_t g_light_state_count;
+/* The set of objects the map marks unshaded, as a hash of the records the block
+ * would print, so a light appearing or leaving is noticed without keeping the
+ * list. */
+static uint32_t g_light_unshaded_hash;
+static size_t g_light_unshaded_count;
+static int g_light_census_written;
+static unsigned long g_light_frame;
+
+/* Sector flags: bit 0x02 is the candle-tinted mark, which the engine CLEARS on
+ * a room whose light switch has finished raising it and SETS on one it has
+ * finished lowering; bit 0x40 marks an emissive face's sector. */
+#define HWR_LIGHT_FLAG_TINT 0x02u
+#define HWR_LIGHT_FLAG_GLOW 0x40u
+
+static uint32_t hwr_light_mix(uint32_t hash, uint32_t value)
+{
+    hash ^= value;
+    return hash * 16777619u;
+}
+
+void hwr_objects_dump_lights_reset(void)
+{
+    free(g_light_state);
+    g_light_state = NULL;
+    g_light_state_count = 0;
+    g_light_unshaded_hash = 0;
+    g_light_unshaded_count = 0;
+    g_light_census_written = 0;
+    g_light_frame = 0;
+}
+
+void hwr_objects_dump_lights(const struct hwr_objects *objects,
+                             const struct hwr_world *world, const char *path)
+{
+    uint32_t unshaded_hash = 2166136261u;
+    size_t unshaded_count = 0;
+    size_t moved = 0;
+    size_t i;
+    FILE *file;
+
+    if (objects == NULL || world == NULL || !world->valid || path == NULL ||
+        path[0] == 0)
+        return;
+    g_light_frame++;
+    /* A new map's sector 12 is not the old map's sector 12, and a census is the
+     * only honest thing to write when the table underneath has been replaced. */
+    if (g_light_state_count != world->sector_count) {
+        free(g_light_state);
+        g_light_state = (uint16_t *)calloc(world->sector_count == 0 ? 1u
+                                                                   : world->sector_count,
+                                           sizeof *g_light_state);
+        if (g_light_state == NULL) {
+            g_light_state_count = 0;
+            return;
+        }
+        g_light_state_count = world->sector_count;
+        g_light_census_written = 0;
+    }
+    for (i = 0; i < objects->count; i++) {
+        const struct hwr_object *o = &objects->items[i];
+        uint8_t sector_light = 0;
+
+        if (o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+            o->sector_index < world->sector_count)
+            sector_light = world->sectors[o->sector_index].light;
+        if (hwr_object_composed_light(o->seed, sector_light) != 0)
+            continue;
+        unshaded_count++;
+        unshaded_hash = hwr_light_mix(unshaded_hash, o->graphic_id);
+        unshaded_hash = hwr_light_mix(unshaded_hash, o->seed);
+        unshaded_hash = hwr_light_mix(unshaded_hash, o->sector_index);
+    }
+    if (g_light_census_written) {
+        for (i = 0; i < world->sector_count; i++) {
+            const struct hwr_sector *s = &world->sectors[i];
+            uint16_t now = (uint16_t)(((uint16_t)s->flags << 8) | s->light);
+
+            if (now != g_light_state[i])
+                moved++;
+        }
+        if (moved == 0 && unshaded_hash == g_light_unshaded_hash &&
+            unshaded_count == g_light_unshaded_count)
+            return;
+    }
+    file = fopen(path, "a");
+    if (file == NULL)
+        return;
+    if (!g_light_census_written) {
+        fprintf(file, "census frame=%lu sectors=%zu objects=%zu unshaded=%zu\n",
+                g_light_frame, world->sector_count, objects->count,
+                unshaded_count);
+        for (i = 0; i < world->sector_count; i++) {
+            const struct hwr_sector *s = &world->sectors[i];
+
+            fprintf(file, "sector %zu flags=%#04x tint=%d glow=%d light=%u\n", i,
+                    s->flags, (s->flags & HWR_LIGHT_FLAG_TINT) != 0 ? 1 : 0,
+                    (s->flags & HWR_LIGHT_FLAG_GLOW) != 0 ? 1 : 0, s->light);
+        }
+        for (i = 0; i < objects->count; i++) {
+            const struct hwr_object *o = &objects->items[i];
+            uint8_t sector_light = 0;
+
+            if (o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+                o->sector_index < world->sector_count)
+                sector_light = world->sectors[o->sector_index].light;
+            fprintf(file,
+                    "object %s graphic=%#06x seed=%u composed=%u sector=%u\n",
+                    hwr_objects_source_name(o->source), o->graphic_id, o->seed,
+                    hwr_object_composed_light(o->seed, sector_light),
+                    o->sector_index);
+        }
+    } else {
+        fprintf(file, "frame %lu moved=%zu unshaded=%zu\n", g_light_frame, moved,
+                unshaded_count);
+        for (i = 0; i < world->sector_count; i++) {
+            const struct hwr_sector *s = &world->sectors[i];
+            uint16_t was = g_light_state[i];
+            uint16_t now = (uint16_t)(((uint16_t)s->flags << 8) | s->light);
+
+            if (now == was)
+                continue;
+            fprintf(file,
+                    "sector %zu flags=%#04x->%#04x tint=%d->%d glow=%d->%d "
+                    "light=%u->%u\n", i, (unsigned)(was >> 8), s->flags,
+                    ((was >> 8) & HWR_LIGHT_FLAG_TINT) != 0 ? 1 : 0,
+                    (s->flags & HWR_LIGHT_FLAG_TINT) != 0 ? 1 : 0,
+                    ((was >> 8) & HWR_LIGHT_FLAG_GLOW) != 0 ? 1 : 0,
+                    (s->flags & HWR_LIGHT_FLAG_GLOW) != 0 ? 1 : 0,
+                    (unsigned)(was & 0xffu), s->light);
+        }
+        if (unshaded_hash != g_light_unshaded_hash ||
+            unshaded_count != g_light_unshaded_count) {
+            for (i = 0; i < objects->count; i++) {
+                const struct hwr_object *o = &objects->items[i];
+                uint8_t sector_light = 0;
+
+                if (o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+                    o->sector_index < world->sector_count)
+                    sector_light = world->sectors[o->sector_index].light;
+                if (hwr_object_composed_light(o->seed, sector_light) != 0)
+                    continue;
+                fprintf(file,
+                        "unshaded %s graphic=%#06x seed=%u sector=%u\n",
+                        hwr_objects_source_name(o->source), o->graphic_id,
+                        o->seed, o->sector_index);
+            }
+        }
+    }
+    fclose(file);
+    for (i = 0; i < world->sector_count; i++) {
+        const struct hwr_sector *s = &world->sectors[i];
+
+        g_light_state[i] = (uint16_t)(((uint16_t)s->flags << 8) | s->light);
+    }
+    g_light_unshaded_hash = unshaded_hash;
+    g_light_unshaded_count = unshaded_count;
+    g_light_census_written = 1;
 }

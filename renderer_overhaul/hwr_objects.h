@@ -82,6 +82,19 @@ struct hwr_object {
 /* Sentinel owner-sector value for objects with no owning sector. */
 #define HWR_OBJECT_NO_SECTOR 0xffffu
 
+/* An object's effective shade byte, composed the way the engine's own type-1
+ * billboard path composes it (renderer.c:6180-6182): the record's seed biased
+ * by its owner sector's light where both are nonzero, and the seed alone
+ * otherwise. A neutral 0x80 seed reduces to the sector's light, exactly like a
+ * wall.
+ *
+ * Zero is the author's unshaded class -- fullbright at every distance -- which
+ * is also the map's own mark for a surface that gives light rather than takes
+ * it. Whatever reads that mark and the emitter that draws by it compose it HERE,
+ * in one place: a mark read from a transcription of the rule is a mark that can
+ * drift away from the rule without anything noticing. */
+uint8_t hwr_object_composed_light(uint8_t seed, uint8_t sector_light);
+
 struct hwr_objects {
     struct hwr_object *items;
     size_t count;
@@ -108,6 +121,30 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
                       const struct roth_api_v1 *api,
                       struct hwr_das_archive *map_archive,
                       struct hwr_das_archive *shared_archive);
+
+/* The light-state instrument (HWR_LIGHT_DUMP=<path>).
+ *
+ * A map's lighting is not authoring alone: the engine rewrites a sector's light
+ * byte while a switch ramps and rewrites the same record's flags byte when the
+ * ramp finishes, and both are read fresh out of the sector table every frame.
+ * This writes what those two bytes are doing, so a claim about them is a
+ * measurement rather than a reading of the engine's source.
+ *
+ * The first call after a map load appends a full census -- every sector's
+ * flags and light, and every enumerated object's identity, seed, composed byte
+ * and owner sector. Every call after that appends a block ONLY when something
+ * moved: a sector whose flags or light changed since the previous call, or a
+ * change in the set of objects the map marks unshaded. A map on which no light
+ * command runs therefore produces a census and nothing else, however long it is
+ * watched, which is what makes "nothing moved" readable rather than inferred.
+ *
+ * Diagnostic only: it appends to a file and touches no renderer state. */
+void hwr_objects_dump_lights(const struct hwr_objects *objects,
+                             const struct hwr_world *world, const char *path);
+
+/* Forgets the previous light state, so the next dump writes a census. Called
+ * when a map is staged: a new map's sector 12 is not the old map's sector 12. */
+void hwr_objects_dump_lights_reset(void);
 
 void hwr_objects_clear(struct hwr_objects *objects);
 

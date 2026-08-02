@@ -185,6 +185,14 @@ static int g_billboard_stats_pending;
  * list (atomically, via rename) for offline inspection. */
 static char g_obj_dump_path[2600];
 static uint32_t g_obj_dump_counter;
+/* The light-state instrument: HWR_LIGHT_DUMP=<path> appends what the engine is
+ * doing to the sector light and flags bytes, and to the set of objects the map
+ * marks unshaded. HWR_LIGHT_DUMP_EVERY=<n> thins it to one look per n frames; a
+ * look that finds nothing moved writes nothing, so watching every frame is what
+ * it does by default and a ramp is seen step by step. */
+static char g_light_dump_path[2600];
+static uint32_t g_light_dump_counter;
+static uint32_t g_light_dump_every = 1;
 /* DAS-file persistence. The shared DAS is the same file for the whole game, and
  * the map DAS is shared by every map that names it -- the engine itself skips
  * its own DAS swap when the basename is unchanged -- so a transition that keeps
@@ -1003,6 +1011,9 @@ static void hwr_run_object_layer(const struct roth_api_v1 *api)
     if (g_obj_dump_path[0] != 0 && ((g_obj_dump_counter++) % 30u) == 0)
         hwr_objects_dump(&g_objects, g_obj_dump_path, api, &g_map_archive,
                          &g_shared_archive);
+    if (g_light_dump_path[0] != 0 &&
+        ((g_light_dump_counter++) % g_light_dump_every) == 0)
+        hwr_objects_dump_lights(&g_objects, &g_world, g_light_dump_path);
 }
 
 static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
@@ -1941,6 +1952,8 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
         const char *compare = getenv("HWR_COMPARE");
         const char *objects = getenv("HWR_OBJECTS");
         const char *obj_dump = getenv("HWR_OBJ_DUMP");
+        const char *light_dump = getenv("HWR_LIGHT_DUMP");
+        const char *light_every = getenv("HWR_LIGHT_DUMP_EVERY");
         if (dump != NULL)
             snprintf(g_dump_path, sizeof g_dump_path, "%s", dump);
         if (compare != NULL)
@@ -1948,6 +1961,14 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
         g_objects_enabled = !(objects != NULL && objects[0] == '0');
         if (obj_dump != NULL)
             snprintf(g_obj_dump_path, sizeof g_obj_dump_path, "%s", obj_dump);
+        if (light_dump != NULL)
+            snprintf(g_light_dump_path, sizeof g_light_dump_path, "%s",
+                     light_dump);
+        if (light_every != NULL) {
+            long every = strtol(light_every, NULL, 10);
+
+            g_light_dump_every = every > 0 ? (uint32_t)every : 1u;
+        }
     }
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     hwr_ownership_init(&g_ownership);
@@ -2240,6 +2261,9 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         goto failed;
     }
     hwr_perf_phase("geometry");
+    /* A fresh sector table means the light instrument's held state describes a
+     * map that is no longer loaded, so the next look writes a census. */
+    hwr_objects_dump_lights_reset();
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent

@@ -61,7 +61,7 @@ static const struct hwr_enum_value HWR_SHADING_MODE_VALUES[] = {
 };
 
 static const struct hwr_enum_value HWR_LIGHT_SCOPE_VALUES[] = {
-    { "tinted", HWR_LIGHT_SCOPE_TINTED, "Where the map says" },
+    { "tinted", HWR_LIGHT_SCOPE_TINTED, "Only where the fixtures are out" },
     { "all",    HWR_LIGHT_SCOPE_ALL,    "Everywhere" }
 };
 
@@ -893,17 +893,20 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_scope),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .e = HWR_LIGHT_SCOPE_TINTED },
-        .original = { .e = HWR_LIGHT_SCOPE_TINTED },
+        .def = { .e = HWR_LIGHT_SCOPE_ALL },
+        .original = { .e = HWR_LIGHT_SCOPE_ALL },
         .values = HWR_LIGHT_SCOPE_VALUES,
         .value_count = HWR_COUNT_OF(HWR_LIGHT_SCOPE_VALUES),
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light reaches",
-        .help = "The map marks which surfaces the light you carry is meant to "
-                "matter on. Honouring that mark is the faithful answer; the "
-                "other lights everything you can see."
+        .help = "A room whose own lamps and candles are out is marked as such "
+                "while they are out, and the game clears that mark the moment "
+                "someone turns the lights on. The light you carry is yours, so "
+                "it lights everywhere you can see; the other setting confines "
+                "it to the rooms left dark, which is dimmer in exactly the "
+                "rooms that were just lit."
     },
     {
         .key = "player_light_glow_scale",

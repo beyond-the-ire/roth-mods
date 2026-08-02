@@ -1646,8 +1646,16 @@ static const char g_geometry_fragment_body[] =
     "  total+=light_space(u_ambient_color)*u_ambient_intensity;\n"
     "  vec3 n=surface_normal();\n"
     "  if (n!=vec3(0.0)) {\n"
-    /* The light at the eye. The map marks which faces the light the player
-     * carries is meant to matter on, and honouring that mark is the default. */
+    /* The light at the eye, which by default reaches everything it can see.
+     *
+     * The mark it can be confined to instead is not the author's word about
+     * where a carried light matters: it is the engine's LIVE word about whether
+     * a room's own fixtures are lit, cleared across a room the moment a switch
+     * finishes raising it and set again when one lowers it. Confining the
+     * carried light to it therefore put that light out in exactly the rooms
+     * that had just been lit, which is the one case where the room's own byte
+     * cannot make up the difference. The mark is still read, because it says
+     * something true and useful; it is no longer what the carried light asks. */
     "    if (u_lamp_scope_all!=0 || tinted) {\n"
     "      vec3 p=view_position();\n"
     "      float dist=length(p);\n"

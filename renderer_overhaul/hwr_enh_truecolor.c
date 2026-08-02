@@ -194,9 +194,14 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
             : 0.0f;
     light->lamp_range = hwr_truecolor_row_float(HWR_PLAYER_RANGE_ROW, settings,
                                                 800.0f);
+    /* The light the player carries is a light the player carries: it reaches
+     * whatever it can see. The mark it used to be confined to is the engine's
+     * live word for "this room's own fixtures are out", which it clears the
+     * moment a switch raises the room -- so confining the carried light to it
+     * put the light out in exactly the rooms that had just been lit. */
     light->lamp_scope_all =
         hwr_truecolor_row_enum(HWR_PLAYER_SCOPE_ROW, settings,
-                               HWR_LIGHT_SCOPE_TINTED) == HWR_LIGHT_SCOPE_ALL;
+                               HWR_LIGHT_SCOPE_ALL) == HWR_LIGHT_SCOPE_ALL;
     light->lamp_glow_scale = hwr_truecolor_row_float(HWR_PLAYER_GLOW_ROW,
                                                      settings, 0.0f);
     /* The flame's switch is carried rather than spent into a strength the way
