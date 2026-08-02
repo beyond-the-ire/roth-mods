@@ -971,9 +971,10 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .label = "Item and figure brightness",
-        .help = "How much of the light you carry lands on people, creatures "
-                "and things you can pick up. Raise it if a dark room makes "
-                "them hard to find."
+        .help = "How bright people, creatures and things you can pick up are: "
+                "both the light they show of their own and the light you carry "
+                "landing on them. Raise it if a dark room makes them hard to "
+                "find."
     },
     {
         .key = "sprite_light_wrap",

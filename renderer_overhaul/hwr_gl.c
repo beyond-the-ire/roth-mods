@@ -1514,7 +1514,17 @@ static const char g_geometry_fragment_body[] =
      * which is the point: distance does not darken a surface, light runs out. */
     "vec3 modern_light(bool tinted, float amount) {\n"
     "  int light=effective_light();\n"
-    "  vec3 total=vec3(u_room_light.x*pow(float(light)/128.0,u_room_light.y));\n"
+    /* A figure is a person, a creature or something to be picked up, and what a
+     * dark room must not do is make one unfindable. Its own dial is on the light
+     * it MAKES of its own as well as the light it takes from the one the player
+     * carries: an environment can be very dark while the things standing in it
+     * stay readable, which is the whole reason the two are separate dials rather
+     * than one. The fill is not in it -- that is the room's light, not the
+     * figure's -- and a figure the author declared unshaded never arrives here
+     * at all. */
+    "  bool figure=(v_light_material.w & 32u)!=0u;\n"
+    "  vec3 total=vec3(u_room_light.x*pow(float(light)/128.0,u_room_light.y)"
+    "*(figure ? u_sprite_light.x : 1.0));\n"
     "  total+=light_space(u_ambient_color)*u_ambient_intensity;\n"
     "  vec3 n=surface_normal();\n"
     "  if (n!=vec3(0.0)) {\n"
@@ -1529,7 +1539,7 @@ static const char g_geometry_fragment_body[] =
     /* A standing figure is not a wall: light wraps past the edge it would stop
      * at, so its far side is shaded rather than black, and it keeps its own
      * brightness dial so a dark room never makes it unfindable. */
-    "      if ((v_light_material.w & 32u)!=0u) {\n"
+    "      if (figure) {\n"
     "        ndl=(ndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
     "        gain=u_sprite_light.x;\n"
     "      }\n"

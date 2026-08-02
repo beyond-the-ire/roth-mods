@@ -1,7 +1,9 @@
 #include "hwr_billboards.h"
 
 #include "hwr_sprites.h"
+#include "hwr_util.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -65,6 +67,10 @@ struct hwr_bb_trans {
     uint32_t floor_id;
     /* This quad's owner-sector portal window(s); applied when it is laid out. */
     struct hwr_bb_clip clip;
+    /* Fixed-orientation wall art rather than a camera-facing quad. Carried this
+     * far because what a quad's plane is, is decided where it is built and the
+     * direction it faces is authored where it is laid out. */
+    uint8_t fixed;
 };
 
 static uint16_t hwr_bb_u16(const uint8_t *bytes)
@@ -773,6 +779,85 @@ static void hwr_bb_mark_unlit(struct hwr_gl_vertex *vertices, size_t count)
     }
 }
 
+/* Which of the two answers an emitted range's direction is, and the whole of the
+ * decision between them.
+ *
+ * A camera-facing quad is rebuilt around the eye every frame, so the direction
+ * it faces is a property of where the fragment is and is derived there: it
+ * carries the class bit that says so and no direction of its own. That is the
+ * right answer for a standing figure, and it is the answer this file gives every
+ * quad but one.
+ *
+ * Fixed-orientation wall art is the exception: it lies in the plane the map's
+ * own facing byte authored and stays pinned to its wall as the view moves. The
+ * derived direction would light a painting as though it turned to follow the
+ * player around the room, and would hand it a figure's own dials as well, so the
+ * direction is authored here instead -- where the world orientation is known.
+ *
+ * The plane is read back off the corners the emitter has just placed: the quad's
+ * horizontal axis is what the facing produced and it stands upright, so the
+ * direction it faces is that axis turned a quarter turn and level. Every window
+ * a portal cut the quad into keeps the original world corners, so one range has
+ * one direction however many sub-quads it became -- the same rule the world
+ * surfaces are authored under.
+ *
+ * Which of the two sides that is, is settled against the eye, exactly as an
+ * object face's is. A decal is not a boundary: it has no inside for the map to
+ * name, and the wall it is pasted on is what makes its other side unreachable,
+ * so the side being drawn is the side of the room it belongs to. That is NOT
+ * reasoning an ordinary wall may use -- its two sides belong to different
+ * sectors and only the map knows which one it faces. */
+static void hwr_bb_apply_quad_class(struct hwr_gl_vertex *vertices,
+                                    size_t count, int fixed,
+                                    const struct hwr_gl_camera *camera)
+{
+    double ax;
+    double ay;
+    double nx;
+    double ny;
+    double length;
+    double ex;
+    double ey;
+    uint8_t packed_x = 0;
+    uint8_t packed_y = 0;
+    size_t i;
+
+    if (!hwr_gl_shading_normals())
+        return;                        /* the off state authors nothing at all */
+    if (!fixed || count < 2u || camera == NULL)
+        return;                     /* the class the quad already carries stands */
+    /* The corners are modular map coordinates, so both the span between them and
+     * their offset from the eye are taken in the sixteen bits the world is
+     * authored in: a quad that straddles the wrap is a small quad, not a
+     * map-wide one. */
+    ax = (double)(int16_t)((uint16_t)vertices[1].x - (uint16_t)vertices[0].x);
+    ay = (double)(int16_t)((uint16_t)vertices[1].y - (uint16_t)vertices[0].y);
+    length = sqrt(ax * ax + ay * ay);
+    if (!(length > 0.0))
+        return;                          /* edge-on to nothing: no plane to face */
+    nx = ay / length;
+    ny = -ax / length;
+    ex = 0.5 * ((double)(int16_t)((uint16_t)vertices[0].x +
+                                  (uint16_t)camera->view_offset_x) +
+                (double)(int16_t)((uint16_t)vertices[1].x +
+                                  (uint16_t)camera->view_offset_x));
+    ey = 0.5 * ((double)(int16_t)((uint16_t)vertices[0].y +
+                                  (uint16_t)camera->view_offset_y) +
+                (double)(int16_t)((uint16_t)vertices[1].y +
+                                  (uint16_t)camera->view_offset_y));
+    if (nx * -ex + ny * -ey < 0.0) {
+        nx = -nx;
+        ny = -ny;
+    }
+    hwr_normal_encode((float)nx, (float)ny, 0.0f, &packed_x, &packed_y);
+    for (i = 0; i < count; i++) {
+        vertices[i].normal_x = packed_x;
+        vertices[i].normal_y = packed_y;
+        vertices[i].wall_wrap_flags = (uint8_t)(
+            vertices[i].wall_wrap_flags & ~(unsigned)HWR_GL_NORMAL_BILLBOARD);
+    }
+}
+
 static int16_t hwr_bb_clamp_i16(int32_t v)
 {
     if (v < INT16_MIN)
@@ -982,6 +1067,7 @@ static int hwr_bb_push_shadow(struct hwr_billboards *bb, const struct hwr_object
     t->light = 0;                                          /* engine draws the shadow at shade 0 */
     t->sector_flags = sflags;
     t->floor_id = floor_id;
+    t->fixed = 0;                          /* a shadow is rebuilt to face the eye */
     if (clip != NULL)
         t->clip = *clip;
     else
@@ -1453,12 +1539,16 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             struct hwr_gl_vertex **dst = is_flat ? &bb->flat : &bb->opaque;
             size_t *cnt = is_flat ? &bb->flat_count : &bb->opaque_count;
             size_t *cap = is_flat ? &bb->flat_capacity : &bb->opaque_capacity;
+            size_t before = *cnt;
             if (hwr_bb_emit_quad(dst, cnt, cap, xl, yl, xr, yr,
                                  hwr_bb_clamp_i16(z_top), hwr_bb_clamp_i16(z_bottom),
                                  offset, tw, th, (float)(2u * th), (float)(2u * tw),
                                  material, composed, sector_flags,
-                                 obj_floor_id, camera, &clip) > 0)
+                                 obj_floor_id, camera, &clip) > 0) {
+                hwr_bb_apply_quad_class(*dst + before, *cnt - before,
+                                        is_flat, camera);
                 bb->stat_emitted++;
+            }
         } else {
             struct hwr_bb_trans *t;
             if (pending_count == pending_capacity) {
@@ -1484,6 +1574,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             t->sector_flags = sector_flags;
             t->floor_id = obj_floor_id;
             t->clip = clip;                 /* owner-sector portal window */
+            t->fixed = (uint8_t)(is_flat != 0);
             bb->stat_emitted++;
         }
     }
@@ -1514,10 +1605,14 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                                  &bb->translucent_capacity, t->xl, t->yl, t->xr,
                                  t->yr, t->z_top, t->z_bottom, t->offset, t->tw,
                                  t->th, t->smax, t->tmax, t->material, t->light,
-                                 t->sector_flags, t->floor_id, camera, &t->clip) > 0)
+                                 t->sector_flags, t->floor_id, camera, &t->clip) > 0) {
+                hwr_bb_apply_quad_class(bb->translucent + before,
+                                        bb->translucent_count - before,
+                                        t->fixed, camera);
                 if (hwr_bb_push_run(bb,
                         (uint32_t)(bb->translucent_count - before)) != 0)
                     break;
+            }
         }
         for (i = 0; i < pending_shadow_count; i++) {
             const struct hwr_bb_trans *t = &pending_shadow[i];
