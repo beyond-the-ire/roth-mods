@@ -727,8 +727,7 @@ static int hwr_load_gl_functions(void)
 
 #undef HWR_LOAD_GL
 
-static const char g_geometry_vertex_shader[] =
-    "#version 330 core\n"
+static const char g_geometry_vertex_body[] =
     "layout(location=0) in ivec3 a_pos;\n"
     "layout(location=1) in vec2 a_wall;\n"
     "layout(location=2) in uint a_offset;\n"
@@ -736,8 +735,13 @@ static const char g_geometry_vertex_shader[] =
     "layout(location=4) in uint a_aux;\n"
     "layout(location=5) in uvec4 a_pan_scale_flags;\n"
     "layout(location=6) in uvec4 a_light_material;\n"
-    "layout(location=7) in uint a_wall_shade_endpoint;\n"
-    "layout(location=15) in uint a_wall_shade_top;\n"
+    /* The BOTTOM-edge and TOP-edge corner words are adjacent in the record, so
+     * one two-component attribute carries the pair and the slot the second one
+     * used to hold is free for the normal below. The two halves are read exactly
+     * where they were read before -- .x is the bottom word, .y the top -- and
+     * both programs declare this the same way, because they share one array
+     * object and a format is a property of the array, not of a program. */
+    "layout(location=7) in uvec2 a_wall_shade;\n"
     /* .x = the tinted-wall depth-bias adjust, .y = the legacy flat escape. */
     "layout(location=13) in uvec2 a_tint_adjust_taint;\n"
     "layout(location=14) in vec2 a_pos_frac;\n"
@@ -773,6 +777,32 @@ static const char g_geometry_vertex_shader[] =
     "noperspective out float v_wall_shade_top;\n"
     "flat out uint v_wall_tint_adjust;\n"
     "flat out uint v_flat_taint;\n"
+    /* The normal declaration and everything that reads it exist only in the
+     * enhanced program, which is why this stage is chunked the way the fragment
+     * stage already is: one body compiled twice, and the authentic program's
+     * preprocessed text carries no normal at all. What the two programs then
+     * share is the geometry, which is the point -- the array object is one
+     * object, and the picture the off state draws is held to the byte. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "layout(location=15) in uvec2 a_normal;\n"
+    /* View space, in the basis the fragment tail reconstructs its own position
+     * in: x to the right, y forward, z downward from the eye. A face has one
+     * normal, so it is not interpolated. All zero says the vertex carries none,
+     * which is every class a light never touches and every vertex of the
+     * original picture. */
+    "flat out vec3 v_normal;\n"
+    /* The fold's inverse. Zero counts as positive on both branches, so an
+     * axis-aligned direction keeps the fold it was packed on; the language's own
+     * sign() answers zero for zero and would lose it. */
+    "vec3 hwr_normal_decode(uvec2 packed_normal) {\n"
+    "  vec2 p=(vec2(packed_normal)-128.0)/127.0;\n"
+    "  vec3 n=vec3(p,1.0-abs(p.x)-abs(p.y));\n"
+    "  if (n.z<0.0)\n"
+    "    n=vec3((1.0-abs(p.y))*(p.x>=0.0 ? 1.0 : -1.0),\n"
+    "           (1.0-abs(p.x))*(p.y>=0.0 ? 1.0 : -1.0), n.z);\n"
+    "  return normalize(n);\n"
+    "}\n"
+    "#endif\n"
     "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
     "void main() {\n"
     "  int dx=wrap16(a_pos.x+u_view_offset.x);\n"
@@ -805,17 +835,32 @@ static const char g_geometry_vertex_shader[] =
     "  v_wall_source=a_wall_source; v_wall_rows=a_wall_rows;\n"
     "  v_wall_span=a_wall_span;\n"
     "  v_wall_vertical=a_wall_vertical;\n"
-    "  v_wall_shade_endpoint=float(a_wall_shade_endpoint);\n"
-    "  v_wall_shade_top=float(a_wall_shade_top);\n"
+    "  v_wall_shade_endpoint=float(a_wall_shade.x);\n"
+    "  v_wall_shade_top=float(a_wall_shade.y);\n"
     "  v_wall_tint_adjust=a_tint_adjust_taint.x;\n"
     "  v_flat_taint=a_tint_adjust_taint.y;\n"
+    "#ifdef HWR_TRUECOLOR\n"
+    /* The normal is authored in world space and turned into the view's own
+     * space by the same basis and the same mirror the position takes: a
+     * direction skips the translation, and a mirror is its own inverse
+     * transpose, so flipping the sideways component is all a reflected view
+     * needs. World z is up and the view's third axis points down from the eye,
+     * which is the axis the fragment tail rebuilds its position on. */
+    "  if (a_normal.x==0u && a_normal.y==0u) v_normal=vec3(0.0);\n"
+    "  else {\n"
+    "    vec3 wn=hwr_normal_decode(a_normal);\n"
+    "    float rx=s*wn.x+c*wn.y;\n"
+    "    if (u_x_flip != 0) rx=-rx;\n"
+    "    v_normal=vec3(rx,s*wn.y-c*wn.x,-wn.z);\n"
+    "  }\n"
+    "#endif\n"
     "}\n";
 
 /* The version directive and the optional true-colour define are separate source
- * chunks so ONE body can be compiled twice: once with an empty define chunk,
- * whose concatenated text is character for character the source the authentic
- * program has always been built from, and once with the define, which adds a
- * colour output inside emit() and changes nothing anywhere else. */
+ * chunks so ONE body per stage can be compiled twice: once with an empty define
+ * chunk, whose concatenated text is the authentic program and carries no trace
+ * of anything the enhancement adds, and once with the define, which adds a
+ * colour output inside emit(), a surface normal, and nothing else. */
 static const char g_glsl_version[] = "#version 330 core\n";
 static const char g_truecolor_define[] = "#define HWR_TRUECOLOR 1\n";
 
@@ -1305,6 +1350,43 @@ static const char g_geometry_fragment_body[] =
     "  r=float(depth)/float(16*dividend)-float(bias);\n"
     "  return clamp(r,0.0,float(min(scale,31)));\n"
     "}\n"
+    "flat in vec3 v_normal;\n"
+    /* The fragment's position relative to the eye, in world units, in the view's
+     * own space -- which is the space every reflected view already lives in, so
+     * a term written against it is right in a mirror with no reflection rule.
+     * The projection is invertible and the depth varying is perspective correct,
+     * so this is the exact position rather than an interpolation of one, and it
+     * costs no vertex bytes and no CPU work. */
+    "vec3 view_position() {\n"
+    "  float d=v_depth_fixed;\n"
+    "  return vec3((gl_FragCoord.x-u_center.x)*d/u_focal.x, d,\n"
+    "              (gl_FragCoord.y-u_center.y)*d/u_focal.y);\n"
+    "}\n"
+    /* What a lighting law is to use as this fragment's normal. Three answers:
+     * the class says no light reaches here; the class says the surface is a
+     * standing figure, so the normal is upright and faces the eye wherever the
+     * fragment is; or the emitter authored one and it is in the vertices. All
+     * zero means there is none, and every law has to read that as unlit rather
+     * than as a direction. */
+    "vec3 surface_normal() {\n"
+    "  uint cls=v_light_material.w;\n"
+    "  if ((cls & 64u)!=0u) return vec3(0.0);\n"
+    "  if ((cls & 32u)!=0u) {\n"
+    "    vec2 h=view_position().xy;\n"
+    "    float len=length(h);\n"
+    "    return len>0.0 ? vec3(-h/len,0.0) : vec3(0.0,-1.0,0.0);\n"
+    "  }\n"
+    "  return v_normal;\n"
+    "}\n"
+    /* One component of that normal as a palette index, for reading a class's
+     * normals back off a rendered frame: 128 is zero, 1 and 255 are the two
+     * ends, and 0 is reserved for a fragment no light reaches, which is the
+     * value the index would never otherwise take. */
+    "uint normal_component_index(vec3 n, int axis) {\n"
+    "  if (n==vec3(0.0)) return 0u;\n"
+    "  float c=axis==0 ? n.x : (axis==1 ? n.y : n.z);\n"
+    "  return uint(clamp(floor(c*127.0+128.5),1.0,255.0));\n"
+    "}\n"
     "#endif\n"
     "uniform int u_debug_vis;\n"
     "uniform int u_depth_only;\n"
@@ -1421,7 +1503,11 @@ static const char g_geometry_fragment_body[] =
      * translucent pass writes colour with depth-write off, so under any probe
      * mode (2 and up) drop translucent fragments and let the recorded index
      * stay whatever opaque geometry owns the pixel. */
-    "  if (u_debug_vis>=2 && (material & 16u)!=0u) discard;\n"
+    /* The normal modes are the exception: what they ask about is the surface
+     * that is there, and the two classes a light must never reach -- a ground
+     * shadow and a see-through pane -- are both translucent, so dropping them
+     * would hide exactly the fragments worth checking. */
+    "  if (u_debug_vis>=2 && u_debug_vis<11 && (material & 16u)!=0u) discard;\n"
     /* Sky-cap fragment: fill the column with the screen-space skybox texel and
      * stop.  The math is a verbatim port of the retired sky prepass shader; the
      * cap geometry is what limits it to the region above each sky wall and lets
@@ -1437,6 +1523,12 @@ static const char g_geometry_fragment_body[] =
      * letting it write depth would hide the geometry seen through the arch. */
     "    if (u_sky_occlusion_pass!=0 && (material & 64u)==0u) discard;\n"
     "    if (u_sky_valid==0) discard;\n"
+    /* A sky cap answers the normal modes too, and its answer is that no light
+     * reaches it -- which is what the class bit its emitter set says. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "    if (u_debug_vis>=11 && u_debug_vis<=13)"
+    " { emit(normal_component_index(surface_normal(),u_debug_vis-11)); return; }\n"
+    "#endif\n"
     "    int tx=source_column(); int ty=int(gl_FragCoord.y);\n"
     "    float source_x=float(u_source_center.x)+"
     " (float(tx)-u_center.x)*float(u_source_focal.x)/u_focal.x;\n"
@@ -1507,6 +1599,13 @@ static const char g_geometry_fragment_body[] =
     "  if (u_debug_vis==7) { emit(v_dims.x & 255u); return; }\n"
     "  if (u_debug_vis==8) { emit(uint(dbg_ix) & 255u); return; }\n"
     "  if (u_debug_vis==9) { emit(uint(dbg_iy) & 255u); return; }\n"
+    /* Modes 11, 12 and 13 report the three components of the normal a lighting
+     * law would use here, one per capture. They exist only where a normal does:
+     * in the authentic program they fall through and the fragment is shaded. */
+    "#ifdef HWR_TRUECOLOR\n"
+    "  if (u_debug_vis>=11 && u_debug_vis<=13)"
+    " { emit(normal_component_index(surface_normal(),u_debug_vis-11)); return; }\n"
+    "#endif\n"
     /* A one-sided wall with a block-transparent texture: the engine's masked
      * writer skips index-0 texels, and no traversal ever paints behind a
      * one-sided wall, so the skipped pixel keeps what the PREVIOUS frame left
@@ -1810,12 +1909,13 @@ static GLuint hwr_compile_shader_sources(GLenum type,
     return shader;
 }
 
-static GLuint hwr_link_program_sources(const char *vertex_source,
+static GLuint hwr_link_program_sources(const char *const *vertex_sources,
+                                       GLsizei vertex_count,
                                        const char *const *fragment_sources,
                                        GLsizei fragment_count)
 {
     GLuint vertex = hwr_compile_shader_sources(GL_VERTEX_SHADER,
-                                               &vertex_source, 1);
+                                               vertex_sources, vertex_count);
     GLuint fragment;
     GLuint program;
     GLint status = 0;
@@ -1848,19 +1948,25 @@ static GLuint hwr_link_program_sources(const char *vertex_source,
 static GLuint hwr_link_program(const char *vertex_source,
                                const char *fragment_source)
 {
-    return hwr_link_program_sources(vertex_source, &fragment_source, 1);
+    return hwr_link_program_sources(&vertex_source, 1, &fragment_source, 1);
 }
 
-/* The world pass's program, built from the shared body with the given define
- * chunk. An empty chunk yields the authentic program: the three strings
- * concatenate to exactly the text this shader has always been compiled from. */
+/* The world pass's program, built from the shared bodies with the given define
+ * chunk. An empty chunk yields the authentic program, whose two stages then
+ * carry nothing the enhanced one adds. The vertex stage is chunked for the same
+ * reason the fragment stage already was: it has declarations only one of the two
+ * programs may see, and a define chunk is how one body serves both. */
 static GLuint hwr_link_geometry_program(const char *define_chunk)
 {
+    const char *vertex_sources[3];
     const char *sources[3];
+    vertex_sources[0] = g_glsl_version;
+    vertex_sources[1] = define_chunk;
+    vertex_sources[2] = g_geometry_vertex_body;
     sources[0] = g_glsl_version;
     sources[1] = define_chunk;
     sources[2] = g_geometry_fragment_body;
-    return hwr_link_program_sources(g_geometry_vertex_shader, sources, 3);
+    return hwr_link_program_sources(vertex_sources, 3, sources, 3);
 }
 
 static void hwr_delete_texture(GLuint *texture)
@@ -2220,6 +2326,17 @@ int hwr_gl_truecolor_active(void)
     return g_truecolor_active;
 }
 
+/* Read from what the settings layer has ASKED for rather than from what the
+ * last frame linked, because the emitters run before the frame does. Both
+ * conditions are deliberate: a law that reads a normal cannot be in force
+ * without the foundation under it, and with nothing asking, the vertices an
+ * emitter produces have to be the vertices it produced before this existed. */
+int hwr_gl_shading_normals(void)
+{
+    return g_truecolor_want.required != 0 &&
+           g_truecolor_want.shading_mode != HWR_GL_SHADING_AUTHENTIC;
+}
+
 int hwr_gl_color_format_available(enum hwr_gl_color_format format)
 {
     if (format == HWR_GL_COLOR_RGBA16F)
@@ -2515,8 +2632,12 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(6);
     g_gl.vertex_attrib_i_pointer(6, 4, GL_UNSIGNED_BYTE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, light));
+    /* The bottom-edge and top-edge shade words are adjacent, so one
+     * two-component attribute carries both and leaves slot 15 for the surface
+     * normal -- the format stays inside the sixteen guaranteed vertex
+     * attributes with a normal in it, which is why the normal is free. */
     g_gl.enable_vertex_attrib_array(7);
-    g_gl.vertex_attrib_i_pointer(7, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
+    g_gl.vertex_attrib_i_pointer(7, 2, GL_UNSIGNED_SHORT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint));
     /* wall_tint_adjust and flat_taint are adjacent bytes, so one two-component
      * attribute carries both and leaves slot 14 for the position remainder --
@@ -2527,9 +2648,14 @@ int hwr_gl_scene_upload(const uint8_t *texture_bytes, size_t texture_size,
     g_gl.enable_vertex_attrib_array(14);
     g_gl.vertex_attrib_pointer(14, 2, GL_FLOAT, GL_FALSE, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, pos_frac_x));
+    /* The array carries the normal whichever program is bound: an enabled
+     * attribute a program never declares is simply not read, and one array
+     * object serving both programs is what keeps the two pictures the same
+     * geometry. In the original picture these two bytes are the reserved pair
+     * on every vertex. */
     g_gl.enable_vertex_attrib_array(15);
-    g_gl.vertex_attrib_i_pointer(15, 1, GL_UNSIGNED_SHORT, (GLsizei)stride,
-        (const void *)offsetof(struct hwr_gl_vertex, wall_shade_endpoint_top));
+    g_gl.vertex_attrib_i_pointer(15, 2, GL_UNSIGNED_BYTE, (GLsizei)stride,
+        (const void *)offsetof(struct hwr_gl_vertex, normal_x));
     g_gl.enable_vertex_attrib_array(8);
     g_gl.vertex_attrib_i_pointer(8, 4, GL_UNSIGNED_INT, (GLsizei)stride,
         (const void *)offsetof(struct hwr_gl_vertex, flat_guard));
@@ -3149,9 +3275,11 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
          * scene such as the main-menu backdrop ever emits -- captured the base
          * render at the env-seeded vis, so plane 1 showed the shade-row map (the
          * palette's coincidental yellow ramp) instead of the real world. */
+        /* Read as a whole number rather than a single digit: the planes that
+         * report a surface's normal are numbered past nine. */
         g_debug_vis = (getenv("HWR_COMPARE") == NULL &&
                        vis != NULL && vis[0] >= '0' && vis[0] <= '9')
-                    ? vis[0] - '0' : 0;
+                    ? (int)strtol(vis, NULL, 10) : 0;
     }
     if (g_sky_occlude < 0) {
         /* On by default: an EDGE_MAP face is meant to hide what stands behind

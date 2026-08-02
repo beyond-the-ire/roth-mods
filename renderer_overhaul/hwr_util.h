@@ -1,7 +1,26 @@
 #ifndef HWR_UTIL_H
 #define HWR_UTIL_H
 
+#include <stdint.h>
+
 int hwr_ascii_equal_ci(const char *a, const char *b);
+
+/* A surface normal packed into two bytes, octahedral: the direction is folded
+ * onto the surface of an octahedron and that fold is unwrapped into a square,
+ * which spends both bytes evenly over the sphere and lands within about a degree
+ * of the direction it was handed -- finer than any shading law reads.
+ *
+ * Each byte holds one unwrapped component with 128 as zero and 1 and 255 as the
+ * two ends, so the six axis directions -- a floor, a ceiling, a wall on a grid,
+ * which is most of a map -- come back exactly. That spends 254 of the 256 values
+ * and leaves zero unreachable in either component, which makes the pair (0,0)
+ * the free value for "this surface carries no normal": every vertex of the
+ * original picture and every class a light never touches. */
+void hwr_normal_encode(float x, float y, float z, uint8_t *u, uint8_t *v);
+/* The inverse the geometry shader runs, in C, so what a fragment sees can be
+ * held against what an emitter meant without a screen in between. Answers
+ * (0,0,0) for the reserved pair. */
+void hwr_normal_decode(uint8_t u, uint8_t v, float *x, float *y, float *z);
 
 /* HWR_DAS_PERSIST=0 rebuilds everything a DAS file contributes on every map
  * transition: the DAS files are re-opened and re-decoded, and the whole texture

@@ -37,7 +37,16 @@ enum hwr_gl_wall_wrap_flags {
      * high-bit gate and no index-0 skip -- and it indexes the blend table by
      * the SOURCE colour first and the destination pixel second, the transpose
      * of the textured rule. */
-    HWR_GL_WALL_SOLID_BLEND   = 1u << 4
+    HWR_GL_WALL_SOLID_BLEND   = 1u << 4,
+    /* The surface's normal is not in its vertices: it is an upright normal
+     * facing the eye, derived where the fragment is. A sprite is a standing
+     * figure rather than a card, so it is lit as one from wherever it is seen,
+     * and no emitter has to re-author a direction every frame. */
+    HWR_GL_NORMAL_BILLBOARD   = 1u << 5,
+    /* The surface never enters a lighting composition at all: a ground shadow
+     * (a darkening decal, which a light would turn into a bright oval), a sky
+     * cap, and the colourless plane a mirror owns depth at. */
+    HWR_GL_NORMAL_UNLIT       = 1u << 6
 };
 
 /* Non-wall billboard marker: the fixed-orientation quad carries an owner-wall
@@ -81,6 +90,13 @@ struct hwr_gl_vertex {
      * sub-row shade interpolates bilinearly between this and the bottom-edge
      * word down each column.  Zero for flats and non-shaded geometry. */
     uint16_t wall_shade_endpoint_top;
+    /* The surface normal, octahedral, in the two bytes the alignment before the
+     * first float already reserved -- so a law that needs a direction costs the
+     * format nothing at all. Written only where the shading law asks for one;
+     * the reserved (0,0) pair is what every other vertex carries, and it says
+     * the fragment has no normal rather than one pointing somewhere. */
+    uint8_t normal_x;
+    uint8_t normal_y;
     float wall_s;
     float wall_top;
     uint32_t texture_offset;
@@ -139,6 +155,20 @@ struct hwr_gl_vertex {
     uint32_t portal_clip_left;
     uint32_t portal_clip_right;
 };
+
+/* The normal is meant to be free, and free means the format did not move: the
+ * two bytes were already there as padding and the record is the size it always
+ * was. Held here rather than in a comment because the attribute pointers below
+ * are written against these offsets. */
+_Static_assert(sizeof(struct hwr_gl_vertex) == 128,
+               "the vertex record must stay 128 bytes");
+_Static_assert(offsetof(struct hwr_gl_vertex, wall_shade_endpoint) == 6 &&
+               offsetof(struct hwr_gl_vertex, wall_shade_endpoint_top) == 8,
+               "the two shade endpoint words must stay adjacent, in that order");
+_Static_assert(offsetof(struct hwr_gl_vertex, normal_x) == 10 &&
+               offsetof(struct hwr_gl_vertex, normal_y) == 11 &&
+               offsetof(struct hwr_gl_vertex, wall_s) == 12,
+               "the normal must occupy the pad the alignment already reserved");
 
 struct hwr_gl_camera {
     int16_t view_offset_x;
@@ -351,6 +381,11 @@ void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state);
  * decides whether the submitted canvas can hold a colour the palette has no
  * entry for. */
 int hwr_gl_truecolor_active(void);
+/* Whether the emitters are to author surface normals. They are, exactly when a
+ * shading law that reads one has been asked for; with the original law in force
+ * the answer is no and every vertex leaving an emitter is byte for byte the
+ * vertex it was before normals existed. */
+int hwr_gl_shading_normals(void);
 /* Whether a colour format can be used here. Auto and eight-bit are always
  * available; a format the driver has refused is not. */
 int hwr_gl_color_format_available(enum hwr_gl_color_format format);
@@ -379,7 +414,8 @@ unsigned hwr_gl_drain_errors(void);
  * same orientation as the submitted frame). Returns 0 on failure. */
 int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height);
 /* Overrides the debug visualisation mode (0=off, 1=shade rows, 2=raw texel
- * bytes); -1 re-reads the environment default on the next frame. */
+ * bytes, 11..13 = the three components of the surface normal a lighting law
+ * would use); -1 re-reads the environment default on the next frame. */
 void hwr_gl_set_debug_vis(int mode);
 
 #endif

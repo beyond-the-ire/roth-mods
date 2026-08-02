@@ -728,6 +728,13 @@ static void hwr_bb_write_quad_st(struct hwr_gl_vertex *dst,
     corner.flat_guard = floor_id;
     if ((floor_id & 0xc0000000u) == HWR_BB_WALL_TAG)
         corner.wall_wrap_flags = HWR_GL_WALL_OWNER_OVERLAY;
+    /* A billboard's normal is not in its vertices: the quad is rebuilt to face
+     * the eye every frame, so the direction it faces is a property of where the
+     * fragment is and is derived there. The class bit is what says so; the
+     * ground shadows are taken back off it where they are streamed, being the
+     * one billboard class a light must never reach. */
+    if (hwr_gl_shading_normals())
+        corner.wall_wrap_flags |= HWR_GL_NORMAL_BILLBOARD;
     if (clip_hi > clip_lo) {
         double lo = (double)clip_lo * 65536.0;
         double hi = (double)clip_hi * 65536.0;
@@ -749,6 +756,21 @@ static void hwr_bb_write_quad_st(struct hwr_gl_vertex *dst,
     br.x = xr; br.y = yr; br.z = z_bottom; br.wall_s = s_right; br.wall_top = tmax;
     dst[0] = tl; dst[1] = tr; dst[2] = br;
     dst[3] = tl; dst[4] = br; dst[5] = bl;
+}
+
+/* Takes an emitted range off the billboard class and onto the one no light
+ * reaches. Applied where the range is streamed rather than where it is written,
+ * because what makes a quad a ground shadow is which list it went into. */
+static void hwr_bb_mark_unlit(struct hwr_gl_vertex *vertices, size_t count)
+{
+    size_t i;
+    if (!hwr_gl_shading_normals())
+        return;
+    for (i = 0; i < count; i++) {
+        vertices[i].wall_wrap_flags = (uint8_t)(
+            (vertices[i].wall_wrap_flags & ~(unsigned)HWR_GL_NORMAL_BILLBOARD) |
+            HWR_GL_NORMAL_UNLIT);
+    }
 }
 
 static int16_t hwr_bb_clamp_i16(int32_t v)
@@ -1508,6 +1530,13 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                 uint32_t v = (uint32_t)(bb->translucent_count - before);
                 if (hwr_bb_push_run(bb, v) != 0)
                     break;
+                /* A ground shadow is a darkening decal, not a surface: the
+                 * engine draws it at shade zero, and a law that reads a light
+                 * total would turn a shade-zero surface into a bright white
+                 * oval under the monster casting it. It carries the class that
+                 * keeps every light off it instead of the billboard one. */
+                hwr_bb_mark_unlit(bb->translucent + before,
+                                  bb->translucent_count - before);
                 bb->shadow_count += v;
                 bb->shadow_run_count += 1;
             }

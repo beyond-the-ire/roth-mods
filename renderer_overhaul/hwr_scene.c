@@ -11,6 +11,7 @@
 #include "hwr_util.h"
 #include "hwr_visibility.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -615,8 +616,29 @@ static int hwr_emit_doors(struct hwr_scene_mesh *mesh,
         const struct hwr_sector *sector;
         const struct hwr_sector *shade_sector;
         size_t fi;
+        int64_t leaf_area = 0;
+        uint8_t leaf_reversed;
         if (door->owner_sector_index >= world->sector_count)
             continue;
+        /* The signed area of the cycle the four faces traverse, taken from the
+         * corner the leaf starts at so a leaf authored across the coordinate
+         * wrap is still a small quad. A negative area is the handedness a
+         * sector loop has, where the perpendicular of a directed edge points
+         * INTO the loop -- and for a box, into the leaf. */
+        for (fi = 0; fi < HWR_DOOR_SURFACE_COUNT; fi++) {
+            uint8_t ea = endpoint_a[fi];
+            uint8_t eb = endpoint_b[fi];
+            int64_t ax = (int16_t)((uint16_t)door->corner_x[ea] -
+                                   (uint16_t)door->corner_x[0]);
+            int64_t ay = (int16_t)((uint16_t)door->corner_y[ea] -
+                                   (uint16_t)door->corner_y[0]);
+            int64_t bx = (int16_t)((uint16_t)door->corner_x[eb] -
+                                   (uint16_t)door->corner_x[0]);
+            int64_t by = (int16_t)((uint16_t)door->corner_y[eb] -
+                                   (uint16_t)door->corner_y[0]);
+            leaf_area += ax * by - bx * ay;
+        }
+        leaf_reversed = leaf_area < 0 ? 1u : 0u;
         sector = &world->sectors[door->owner_sector_index];
         /* The neighbor worklist always admits an active primary door; the
          * owner is only an additional admission while state bit 1 is clear.
@@ -687,6 +709,7 @@ static int hwr_emit_doors(struct hwr_scene_mesh *mesh,
             surface->neighbor_sector_index = door->neighbor_sector_index;
             surface->door_index = (uint8_t)di;
             surface->door_state_flags = door->state_flags;
+            surface->normal_reversed = leaf_reversed;
             surface->texture_id = face->texture_id;
             surface->extent = extent;
             surface->aux = face->vertical_extent;
@@ -4566,6 +4589,107 @@ static void hwr_apply_frame_clip(struct hwr_gl_vertex *vertices, size_t count,
     }
 }
 
+/* The direction a world surface faces, in the coordinates the map is authored
+ * in: x and y as the map has them, z up.
+ *
+ * A flat is the easy half -- a floor faces up, a ceiling faces down, and the
+ * mesh already records which of the two a surface is.
+ *
+ * A wall's normal is the perpendicular of its directed segment, and which of the
+ * two perpendiculars is decided by the ENGINE'S OWN visibility rule rather than
+ * by where the camera happens to be. The original admits a wall face only where
+ * its A endpoint projects left of its B endpoint; putting that condition through
+ * the view transform, the focal terms and the basis cancel and it reduces to
+ * cross(B-A, eye-A) < 0. The vector (dy,-dx) dotted with (eye-A) is exactly the
+ * negative of that cross, so (dy,-dx) points at every eye that is allowed to see
+ * the face -- which is the interior of the sector that owns it, whether or not
+ * anybody is standing there. Turning the normal to face the camera instead would
+ * light both sides of every wall in the map and put light through them.
+ *
+ * A door leaf borrows the same perpendicular but reads it the other way round
+ * where its own corner order says so: a leaf is a closed box rather than a
+ * boundary with an inside, and the side that matters is the one facing out of
+ * it. The bit was settled when the whole leaf was in hand.
+ *
+ * A sky cap has no direction at all and says so; its caller marks the class. */
+static int hwr_surface_normal(const struct hwr_scene_mesh *mesh,
+                              const struct hwr_mesh_surface *surface,
+                              float *out_x, float *out_y, float *out_z)
+{
+    const struct hwr_mesh_vertex *vertices;
+    const struct hwr_mesh_vertex *a = NULL;
+    const struct hwr_mesh_vertex *b = NULL;
+    double dx;
+    double dy;
+    double length;
+    size_t i;
+
+    if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0)
+        return 0;
+    if ((surface->flags & HWR_SURFACE_FLAT) != 0) {
+        *out_x = 0.0f;
+        *out_y = 0.0f;
+        *out_z = (surface->flags & HWR_SURFACE_FACE_DOWN) != 0 ? -1.0f : 1.0f;
+        return 1;
+    }
+    vertices = mesh->vertices + surface->first_vertex;
+    for (i = 0; i < surface->vertex_count; i++) {
+        if ((vertices[i].reserved & HWR_WALL_CORNER_END_B) != 0) {
+            if (b == NULL)
+                b = &vertices[i];
+        } else if (a == NULL) {
+            a = &vertices[i];
+        }
+    }
+    if (a == NULL || b == NULL)
+        return 0;
+    /* The endpoints are modular map coordinates, so the difference is taken in
+     * the same sixteen bits the world is authored in: a segment that spans the
+     * wrap is a short segment, not a map-wide one. */
+    dx = (double)(int16_t)((uint16_t)b->x - (uint16_t)a->x);
+    dy = (double)(int16_t)((uint16_t)b->y - (uint16_t)a->y);
+    length = sqrt(dx * dx + dy * dy);
+    if (!(length > 0.0))
+        return 0;
+    if (surface->normal_reversed != 0)
+        length = -length;
+    *out_x = (float)(dy / length);
+    *out_y = (float)(-dx / length);
+    *out_z = 0.0f;
+    return 1;
+}
+
+/* Written onto the emitted range rather than inside each emitter's inner loop:
+ * one surface has one normal however many triangles, segments or portal windows
+ * it was cut into, and one place to author it is one place to hold to the
+ * analytic answer. With the original law in force this does nothing at all and
+ * the vertices leaving here are byte for byte the vertices they were. */
+static void hwr_apply_surface_normal(const struct hwr_scene_mesh *mesh,
+                                     const struct hwr_mesh_surface *surface,
+                                     struct hwr_gl_vertex *vertices,
+                                     size_t count)
+{
+    float nx = 0.0f;
+    float ny = 0.0f;
+    float nz = 0.0f;
+    uint8_t packed_x = 0;
+    uint8_t packed_y = 0;
+    uint8_t class_bits = 0;
+    size_t i;
+
+    if (count == 0 || !hwr_gl_shading_normals())
+        return;
+    if (hwr_surface_normal(mesh, surface, &nx, &ny, &nz))
+        hwr_normal_encode(nx, ny, nz, &packed_x, &packed_y);
+    else if ((surface->flags & HWR_SURFACE_SKY_CAP) != 0)
+        class_bits = HWR_GL_NORMAL_UNLIT;
+    for (i = 0; i < count; i++) {
+        vertices[i].normal_x = packed_x;
+        vertices[i].normal_y = packed_y;
+        vertices[i].wall_wrap_flags |= class_bits;
+    }
+}
+
 static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
                                    const struct hwr_mesh_surface *surface,
                                    const struct hwr_gl_camera *camera,
@@ -4577,6 +4701,7 @@ static size_t hwr_copy_gpu_surface(struct hwr_scene *scene,
         scene, surface, camera, width, height, clip_left, clip_right,
         destination);
     hwr_apply_frame_clip(destination, count, camera, clip_left, clip_right);
+    hwr_apply_surface_normal(&scene->mesh, surface, destination, count);
     return count;
 }
 

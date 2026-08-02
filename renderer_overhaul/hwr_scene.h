@@ -84,6 +84,13 @@ struct hwr_mesh_surface {
     uint16_t wall_offset;
     uint8_t door_index;
     uint8_t door_state_flags;
+    /* A door leaf is a closed box, not a boundary with an inside, so which of
+     * the two perpendiculars of one of its faces points OUT of it depends on
+     * the order the engine authored the leaf's corners in -- and that order is
+     * the same for all four faces. Decided once, where the whole leaf is in
+     * hand, and read where the surface's normal is authored. Zero on every
+     * other surface, whose facing the map itself settles. */
+    uint8_t normal_reversed;
     enum hwr_surface_kind kind;
     int16_t texture_id;
     uint16_t extent;

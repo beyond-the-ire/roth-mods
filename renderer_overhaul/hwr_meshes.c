@@ -2,9 +2,11 @@
 
 #include "hwr_projection.h"
 #include "hwr_sprites.h"
+#include "hwr_util.h"
 #include "hwr_visibility.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -866,6 +868,73 @@ static void hwr_mesh_finish_vertex(struct hwr_gl_vertex *vertex,
     vertex->material_flags = flags;
 }
 
+/* An object face's normal, in the axes the map is authored in, taken from the
+ * winding of the corners the emitter has just placed.
+ *
+ * The side being drawn is settled before this runs -- the culler has already
+ * admitted the face, and what it admits is the side facing the eye -- so the two
+ * candidate directions are resolved against the eye rather than against a stored
+ * convention the mesh format does not carry. An object is a closed shape, so
+ * this is the outward normal of the part of it being looked at. That is NOT
+ * reasoning a wall may use: a wall is a boundary with an inside, and which side
+ * it faces has to come from the map. */
+static void hwr_mesh_apply_face_normal(struct hwr_gl_vertex *corner,
+                                       size_t count,
+                                       const struct hwr_gl_camera *camera)
+{
+    double px[4];
+    double py[4];
+    double pz[4];
+    double nx;
+    double ny;
+    double nz;
+    double length;
+    uint8_t packed_x = 0;
+    uint8_t packed_y = 0;
+    size_t i;
+
+    if (count < 3u || count > 4u || !hwr_gl_shading_normals())
+        return;
+    /* Relative to the eye: the map's x and y are modular and its z is not, so
+     * the wrap is taken on the pair that carries one. The frame is a pure
+     * translation of the world's, so a direction computed in it is a direction
+     * in the world's. */
+    for (i = 0; i < count; i++) {
+        px[i] = (double)(int16_t)((uint16_t)corner[i].x +
+                                  (uint16_t)camera->view_offset_x);
+        py[i] = (double)(int16_t)((uint16_t)corner[i].y +
+                                  (uint16_t)camera->view_offset_y);
+        pz[i] = (double)corner[i].z - (double)camera->eye_z;
+    }
+    nx = (py[1] - py[0]) * (pz[2] - pz[0]) - (pz[1] - pz[0]) * (py[2] - py[0]);
+    ny = (pz[1] - pz[0]) * (px[2] - px[0]) - (px[1] - px[0]) * (pz[2] - pz[0]);
+    nz = (px[1] - px[0]) * (py[2] - py[0]) - (py[1] - py[0]) * (px[2] - px[0]);
+    length = sqrt(nx * nx + ny * ny + nz * nz);
+    if (!(length > 0.0))
+        return;
+    if (nx * -px[0] + ny * -py[0] + nz * -pz[0] < 0.0)
+        length = -length;
+    hwr_normal_encode((float)(nx / length), (float)(ny / length),
+                      (float)(nz / length), &packed_x, &packed_y);
+    for (i = 0; i < count; i++) {
+        corner[i].normal_x = packed_x;
+        corner[i].normal_y = packed_y;
+    }
+}
+
+/* A pin is the object pipeline's own billboard: its quad is rebuilt around the
+ * view's basis every frame, so like every other camera-facing quad it carries
+ * the class whose direction is derived where the fragment is. */
+static void hwr_mesh_mark_billboard(struct hwr_gl_vertex *vertices,
+                                    size_t count)
+{
+    size_t i;
+    if (!hwr_gl_shading_normals())
+        return;
+    for (i = 0; i < count; i++)
+        vertices[i].wall_wrap_flags |= HWR_GL_NORMAL_BILLBOARD;
+}
+
 static size_t hwr_mesh_clip_count(const struct hwr_sector_xspan *clip)
 {
     return clip != NULL && clip->count != 0 &&
@@ -995,6 +1064,10 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
         hwr_mesh_finish_vertex(&corner[i], face, material, light,
                                sector_flags, s[i], t[i],
                                (face->flags & 0x1000u) == 0);
+    /* Authored on the corners rather than on the triangles: the cut into
+     * triangles and the copy into each portal window both carry it, and one
+     * face keeps one normal however many pieces it is drawn in. */
+    hwr_mesh_apply_face_normal(corner, count, camera);
     triangles[0] = corner[0];
     triangles[1] = corner[1];
     triangles[2] = corner[2];
@@ -1140,6 +1213,10 @@ static int hwr_mesh_emit_pin(struct hwr_meshes *meshes,
     tr.material_flags |= HWR_GL_MATERIAL_MASKED;
     bl.material_flags |= HWR_GL_MATERIAL_MASKED;
     br.material_flags |= HWR_GL_MATERIAL_MASKED;
+    hwr_mesh_mark_billboard(&tl, 1u);
+    hwr_mesh_mark_billboard(&tr, 1u);
+    hwr_mesh_mark_billboard(&bl, 1u);
+    hwr_mesh_mark_billboard(&br, 1u);
     triangles[0] = tl;
     triangles[1] = tr;
     triangles[2] = br;
