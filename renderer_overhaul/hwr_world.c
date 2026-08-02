@@ -167,6 +167,56 @@ static void hwr_world_collect_texture_references(struct hwr_world *world)
     }
 }
 
+/* One order statistic of the authored bytes, by nearest rank: the smallest byte
+ * whose running count reaches ceil(percent * counted / 100). Integer throughout,
+ * so the same table gives the same answer on every machine the mod builds for --
+ * a fit that drifted with the floating-point unit would move a map's whole
+ * scale between two lanes of the same picture. */
+static uint8_t hwr_light_rank(const uint32_t histogram[256], uint32_t counted,
+                              uint32_t percent)
+{
+    uint32_t wanted = (counted * percent + 99u) / 100u;
+    uint32_t running = 0;
+    unsigned value;
+
+    if (wanted == 0)
+        wanted = 1;
+    for (value = 1; value < 256u; value++) {
+        running += histogram[value];
+        if (running >= wanted)
+            return (uint8_t)value;
+    }
+    return 255u;
+}
+
+void hwr_world_light_census(const struct hwr_sector *sectors, size_t count,
+                            struct hwr_light_census *out)
+{
+    uint32_t histogram[256];
+    uint32_t counted = 0;
+    size_t i;
+
+    if (out == NULL)
+        return;
+    memset(out, 0, sizeof *out);
+    if (sectors == NULL)
+        return;
+    memset(histogram, 0, sizeof histogram);
+    for (i = 0; i < count; i++) {
+        /* Light zero is the unshaded class, not a dark sector. */
+        if (sectors[i].light == 0)
+            continue;
+        histogram[sectors[i].light]++;
+        counted++;
+    }
+    if (counted == 0)
+        return;
+    out->counted = counted;
+    out->low = hwr_light_rank(histogram, counted, 10u);
+    out->middle = hwr_light_rank(histogram, counted, 50u);
+    out->high = hwr_light_rank(histogram, counted, 95u);
+}
+
 void hwr_world_clear(struct hwr_world *world)
 {
     if (world == NULL)
@@ -422,6 +472,10 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     }
     next.world_span_colorkey = api->game_ram->u16(VA_G_WORLD_SPAN_COLORKEY);
     next.sky_fat_index = api->game_ram->u16(VA_G_SKY_FAT_INDEX);
+    /* The map's authored brightness, taken here and only here: the refresh below
+     * re-reads these same bytes every frame because the engine writes them, and
+     * a scale that followed the writes would cancel them out. */
+    hwr_world_light_census(next.sectors, next.sector_count, &next.light_census);
     hwr_world_collect_texture_references(&next);
     if (hwr_world_build_adjacency(&next) != 0) {
         hwr_world_clear(&next);
@@ -818,6 +872,9 @@ void hwr_world_summary(const struct hwr_world *world, FILE *file)
     fprintf(file, "  oddities: negative_flats=%u negative_extents=%u sky_mappings=%u\n",
             (unsigned)negative_flats, (unsigned)negative_extents,
             (unsigned)sky_mappings);
+    fprintf(file, "  authored light: lit_sectors=%u p10=%u median=%u p95=%u\n",
+            (unsigned)world->light_census.counted, world->light_census.low,
+            world->light_census.middle, world->light_census.high);
 }
 
 const char *hwr_world_error(const struct hwr_world *world)

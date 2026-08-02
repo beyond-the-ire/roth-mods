@@ -1,6 +1,8 @@
 #ifndef HWR_ENH_TRUECOLOR_H
 #define HWR_ENH_TRUECOLOR_H
 
+#include <stdint.h>
+
 /* The true-colour foundation's derived state.
  *
  * The foundation is not a setting: it is required when a dependent enhancement
@@ -48,5 +50,22 @@ int hwr_truecolor_format_offered(void);
 struct hwr_settings;
 void hwr_truecolor_preview(const struct hwr_settings *draft);
 void hwr_truecolor_preview_clear(void);
+
+/* What the map now staged was authored at: how many of its sectors carry a
+ * brightness this scale is about, and the tenth, fiftieth and ninety-fifth
+ * percentiles of those bytes.
+ *
+ * The room response places a sector between two anchors, and where those anchors
+ * sit is a property of the map rather than of the player -- one pair of numbers
+ * cannot serve a cellar and a courtyard. This is how the map's answer arrives.
+ * A count of zero says there is no map to read, and the written anchors stand
+ * alone.
+ *
+ * Called where a map is staged, on the game thread. It allocates nothing and
+ * touches no GL object: it raises the foundation's change bit and the settings
+ * pump works the rig out at the render boundary. Passing what is already held
+ * does nothing at all, so a reload of the same map is free. */
+void hwr_truecolor_set_map_lighting(uint32_t counted, uint8_t low,
+                                    uint8_t middle, uint8_t high);
 
 #endif

@@ -61,6 +61,35 @@ enum hwr_light_scope {
     HWR_LIGHT_SCOPE_ALL
 };
 
+/* How a room's authored brightness turns into light.
+ *
+ * The first law is one multiplicative gain on the whole authored range. It
+ * cannot separate "how dark is a room with its lights off" from "how bright is
+ * one with them on", because it scales both by the same factor: the RATIO
+ * between two sectors survives, and the DIFFERENCE -- which is the thing an eye
+ * reads -- shrinks with the darkness. A world dark enough to want a lamp is one
+ * where nothing a light switch or a candle does to a map's own brightness is
+ * visible any more.
+ *
+ * The second normalizes the authored byte between two anchors taken from the
+ * map's own sectors and places the result between two output levels, so the two
+ * questions are two dials and the map's brightness steps keep their share of the
+ * range whatever darkness the world is tuned to. The first stays as it was, to
+ * the bit, for anyone who wants the picture they already tuned. */
+enum hwr_room_curve {
+    HWR_ROOM_CURVE_LEGACY = 0,
+    HWR_ROOM_CURVE_ANCHORED
+};
+
+/* Where the two byte anchors come from: the map's own sectors, or two numbers
+ * somebody wrote down. Fitting them is the honest default -- one pair of numbers
+ * cannot describe a cellar and a courtyard -- and the written pair is the escape
+ * hatch for a map the fit reads wrongly. */
+enum hwr_room_anchor {
+    HWR_ROOM_ANCHOR_AUTO = 0,
+    HWR_ROOM_ANCHOR_MANUAL
+};
+
 /* Whether the world image is dithered where it is finally turned into screen
  * colours. Near-black is where eight bits run out: a ramp too shallow to change
  * a level from one pixel to the next lands as flat plateaus with a visible step
@@ -132,6 +161,34 @@ struct hwr_settings {
     float room_light_gain;
     float room_light_gamma;
     float room_light_floor;
+    /* Which law the authored byte turns into light through, and the two output
+     * levels the second one places it between: what a sector at the unlit anchor
+     * gives off, and what one at the lit anchor does. Those two are the darkness
+     * dial and the "the lights work" dial, and neither touches the other. The
+     * gain above survives as the master scale over both. */
+    enum hwr_room_curve room_light_curve;
+    float room_light_dark;
+    float room_light_lit;
+    /* The shape of the response between them. One is straight in the exponent's
+     * own space, which is where the authored byte already lives. */
+    float room_light_shape;
+    /* Where the two INPUT anchors come from, the pair used when they are
+     * written rather than fitted, and how narrow or wide a fitted pair may be.
+     * The upper bound is what carries the promise: with a window no wider than
+     * this, a nudge of a few bytes is always a visible share of the whole
+     * dark-to-lit swing, on every map and at every darkness. The lower bound
+     * stops a map whose sectors are nearly all one value from turning a
+     * one-byte rounding difference into the entire range. */
+    enum hwr_room_anchor room_light_anchor;
+    uint32_t room_light_byte_dark;
+    uint32_t room_light_byte_lit;
+    uint32_t room_light_window_min;
+    uint32_t room_light_window_max;
+    /* How much of the map's own unshaded class survives. A surface the author
+     * marked light zero is fullbright at every distance and no light command can
+     * ever touch it, which is exactly right indoors and can read as glaring in a
+     * world tuned dark. One keeps it exactly as authored. */
+    float room_light_unshaded_gain;
     /* The original caps how dark a bright sector's surfaces may get, purely
      * because it had thirty-two steps to spend. Dropping that cap is what lets
      * a lit room read as lit beside a dark one; this puts it back. */

@@ -84,10 +84,24 @@ line. Applying the settings rewrites the file with its own comments and ordering
 The light rig applies to `modern` shading only. Every one of these keys is ignored by the other two
 shadings, so setting one while the shading is `authentic` leaves the picture untouched.
 
-- `room_light_gain`: how much light a room gives off from the brightness it was built with, from 0
-  through 4. One is the brightness the map asks for.
+- `room_light_dark`, `room_light_lit`: what the dimmest rooms of a map give off by themselves, from
+  0 through 1, and what its brightest rooms do, from 0 through 5. These are the two dials that
+  matter: the first sets how dark the world is, the second sets how much turning a light on is
+  worth, and neither touches the other.
+- `room_light_gain`: a master scale over both of them, from 0 through 4. One leaves them where the
+  two rows above put them.
 - `room_light_floor`: the least light any surface receives, from 0 through 0.25. Zero is honest
   darkness.
+- `room_light_curve`: `anchored` places a room between the two levels above; `legacy` is the older
+  behaviour, one gain over the whole authored range.
+- `room_light_anchor`, `room_light_byte_dark`, `room_light_byte_lit`, `room_light_window_min`,
+  `room_light_window_max`: which of a map's own brightness values count as its dark and its lit
+  ends. Read from the map by default, which is what keeps the two dials above meaning the same
+  thing from one map to the next; the rest are for a map that reads wrongly.
+- `room_light_shape`: where the middle of a map's range sits between the two levels, from 0.25
+  through 4. One is straight.
+- `room_light_unshaded_gain`: how much of the outdoor ground and other surfaces a map marks as never
+  to be darkened stays fully bright, from 0 through 1. One is exactly as the map asks.
 - `ambient_light`, `ambient_color`, `ambient_intensity`: a little light everywhere, its colour as
   six bare hexadecimal digits, and how much of it there is from 0 through 2.
 - `player_light`, `player_light_color`, `player_light_intensity`, `player_light_range`: a real
@@ -166,8 +180,12 @@ light rather than as a jump from one shade to the next.
 
 Modern shading brings its own settings with it, all of them dimmed until it is chosen:
 
-- **Room brightness** and **Never darker than** are the two ends of how dark the world is allowed
-  to get: the first scales what rooms give off, the second is the least light any surface receives.
+- **How dark an unlit room is** and **How bright a lit room is** are the two dials that decide what
+  the world feels like. A map's own brightness values are read from the map itself and stretched
+  between them, so the difference a light switch or a candle makes stays visible however dark you
+  set the world — which is what a single brightness dial cannot do, because it shrinks that
+  difference along with everything else. **Room brightness** is a master scale over both, and
+  **Never darker than** is the least light any surface receives.
 - **Ambient fill**, with its **colour** and **strength**, is a little light everywhere, so what
   nothing else reaches is still faintly visible.
 - **Carried light**, with its **colour**, **strength** and **reach**, is a real light where you are

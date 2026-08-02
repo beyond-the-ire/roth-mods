@@ -290,6 +290,27 @@ struct hwr_gl_light {
     /* The authored sector byte, as self-illumination. */
     float room_gain;
     float room_gamma;
+    /* Whether the byte is placed BETWEEN two anchors rather than scaled by the
+     * gain alone. Zero is the older law, to the bit -- which is also what a rig
+     * nobody has filled in resolves to, so a caller that knows nothing of this
+     * gets the picture it always got. */
+    int room_anchored;
+    /* The two input anchors, already taken to the exponent above, and the two
+     * output levels the byte is placed between. The anchors are worked out where
+     * the map is known and the rows are known, so the fragment does one subtract,
+     * one divide and one mix over what it did before. */
+    float room_anchor_low;
+    float room_anchor_high;
+    float room_dark;
+    float room_lit;
+    /* The response shaping between the two levels. One is straight. */
+    float room_shape;
+    /* How far the map's unshaded class is pulled down into the room's own light.
+     * It is the COMPLEMENT of the row a person sets, which reads "how much of
+     * that class survives as authored", for one reason: a rig nobody has filled
+     * in must be the picture that class always had, and that is this at zero.
+     * At zero the class never reaches the light rig at all. */
+    float room_unshaded_pull;
     /* Where the light total is held: the floor is the darkest anything is
      * allowed to be, the ceiling is where it clips. */
     float room_floor;

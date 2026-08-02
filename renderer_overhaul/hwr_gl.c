@@ -339,6 +339,12 @@ static struct hwr_gl_truecolor g_truecolor_want = {
      * first frame rather than one whose reach is zero. Nothing reads it until a
      * law that composes with it is asked for. */
     .light = { .room_gain = 1.0f, .room_gamma = 2.2f, .world_ceiling = 1.0f,
+               /* The anchored law at the rows' own values, with the input pair
+                * the fit falls back to while no map has been read: the written
+                * anchors, taken to the exponent. */
+               .room_anchored = 1, .room_anchor_low = 0.745448649f,
+               .room_anchor_high = 2.90989566f, .room_dark = 0.02f,
+               .room_lit = 1.0f, .room_shape = 1.0f,
                .ambient_color = { 0.4f, 0.4f, 0.4f },
                .lamp_color = { 1.0f, 237.0f / 255.0f, 224.0f / 255.0f },
                .lamp_range = 800.0f, .sprite_gain = 1.0f, .sprite_wrap = 0.5f },
@@ -1548,6 +1554,26 @@ static const char g_geometry_fragment_body[] =
      * eye, and the direction slot a later key light fills; each colour and its
      * strength stay apart so the strength scales light rather than a colour. */
     "uniform vec2 u_room_light;\n"          /* gain, exponent */
+    /* The authored byte placed between two anchors instead of scaled by the
+     * gain alone: which law is in force, the two INPUT anchors (already taken to
+     * the exponent, on the side that knows the map), the two OUTPUT levels they
+     * emit, and the shaping between them.
+     *
+     * The reason this is not one multiplier is arithmetic rather than taste. One
+     * gain scales the unlit base and the lit peak by the same factor, so the
+     * ratio between two sectors survives and their DIFFERENCE -- which is what
+     * an eye reads -- collapses with the darkness. Maps are authored bright, so
+     * the gain a dark world needs is exactly the gain that flattens every light
+     * switch and every candle in it. Normalizing between the map's own anchors
+     * instead makes a step of a few bytes a fixed share of the whole dark-to-lit
+     * swing, and that share does not depend on how dark the world is set. */
+    "uniform int u_room_anchored;\n"
+    "uniform vec2 u_room_anchor;\n"         /* unlit, lit -- in the exponent's space */
+    "uniform vec2 u_room_level;\n"          /* what those two emit */
+    "uniform float u_room_shape;\n"
+    /* How far the author's unshaded class is pulled down into the room's own
+     * light. Zero leaves it exactly fullbright and it never arrives here. */
+    "uniform float u_room_unshaded;\n"
     "uniform vec2 u_light_limits;\n"        /* darkest allowed, where it clips */
     "uniform int u_room_ceiling_authentic;\n"
     "uniform float u_distance_shading;\n"
@@ -1597,7 +1623,12 @@ static const char g_geometry_fragment_body[] =
      * and never reaches the branch this is called from. */
     "bool modern_lit() {\n"
     "  if ((v_light_material.w & 64u)!=0u) return false;\n"
-    "  return effective_light()!=0;\n"
+    "  if (effective_light()!=0) return true;\n"
+    /* The unshaded class is refused whole while nothing is pulling it down,
+     * which is what keeps it fullbright to the byte rather than nearly. It is
+     * only where somebody has asked for that class to come down into a dark
+     * world that it arrives at the rig at all. */
+    "  return u_room_unshaded>0.0;\n"
     "}\n"
     /* How much of the light the player carries reaches this fragment.
      *
@@ -1641,7 +1672,23 @@ static const char g_geometry_fragment_body[] =
      * figure's -- and a figure the author declared unshaded never arrives here
      * at all. */
     "  bool figure=(v_light_material.w & 32u)!=0u;\n"
-    "  vec3 total=vec3(u_room_light.x*pow(float(light)/128.0,u_room_light.y)"
+    /* The authored byte, taken to the exponent: a ratio in the palette's own
+     * perceptual space turned into light. Both laws start here and the older one
+     * ends here, which is what makes it reproducible to the bit rather than to a
+     * tolerance -- the multiply below is the same multiply it always was. */
+    "  float u=pow(float(light)/128.0,u_room_light.y);\n"
+    "  float room=u;\n"
+    "  if (u_room_anchored!=0) {\n"
+    /* Where this sector sits between the map's own unlit and lit ends, as a
+     * fraction of the whole swing between them. A sector outside the pair is at
+     * one end of it: a map's darkest corners are all "unlit" and its brightest
+     * all "lit", which is what the two levels are for. */
+    "    float x=clamp((u-u_room_anchor.x)/"
+    "max(u_room_anchor.y-u_room_anchor.x,1e-4),0.0,1.0);\n"
+    "    if (u_room_shape!=1.0) x=pow(x,u_room_shape);\n"
+    "    room=mix(u_room_level.x,u_room_level.y,x);\n"
+    "  }\n"
+    "  vec3 total=vec3(u_room_light.x*room"
     "*(figure ? u_sprite_light.x : 1.0));\n"
     "  total+=light_space(u_ambient_color)*u_ambient_intensity;\n"
     "  vec3 n=surface_normal();\n"
@@ -1691,6 +1738,13 @@ static const char g_geometry_fragment_body[] =
     "    float rows=float(min(32-(max(light-128+4,0) >> 2),31));\n"
     "    total=max(total,vec3(pow(max(1.0-rows/32.0,0.0),u_room_light.y)));\n"
     "  }\n"
+    /* The author's unshaded class, on its way down into the room. It is reached
+     * only where something is pulling it -- with nothing pulling, the class never
+     * gets here -- and what it is pulled away from is the fullbright the author
+     * asked for, so the two ends meet: at rest this is exactly the light that
+     * class always had, and pulled the whole way it is lit like any other
+     * surface of its sector. */
+    "  if (light==0) total=mix(vec3(1.0),total,u_room_unshaded);\n"
     "  return clamp(total,vec3(u_light_limits.x),vec3(u_light_limits.y));\n"
     "}\n"
     /* The unlit texel of the ordinary tail. Every other class is unlit in the
@@ -3722,6 +3776,12 @@ static void hwr_bind_light_uniforms(GLuint program,
 {
     hwr_uniform_2f(program, "u_room_light", light->room_gain,
                    light->room_gamma);
+    hwr_uniform_1i(program, "u_room_anchored", light->room_anchored != 0);
+    hwr_uniform_2f(program, "u_room_anchor", light->room_anchor_low,
+                   light->room_anchor_high);
+    hwr_uniform_2f(program, "u_room_level", light->room_dark, light->room_lit);
+    hwr_uniform_1f(program, "u_room_shape", light->room_shape);
+    hwr_uniform_1f(program, "u_room_unshaded", light->room_unshaded_pull);
     hwr_uniform_2f(program, "u_light_limits", light->room_floor,
                    light->world_ceiling);
     hwr_uniform_1i(program, "u_room_ceiling_authentic",

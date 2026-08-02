@@ -2261,6 +2261,15 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
         goto failed;
     }
     hwr_perf_phase("geometry");
+    /* The map's own authored brightness, on its way to the light rig. The room
+     * response places a sector between two anchors and this is where those
+     * anchors come from; it is taken from the SNAPSHOT, so the scale is the
+     * map's authoring rather than whatever its switches happen to be doing. */
+    hwr_truecolor_set_map_lighting(g_world.light_census.counted,
+                                   g_world.light_census.low,
+                                   g_world.light_census.middle,
+                                   g_world.light_census.high);
+    hwr_settings_apply_pending();
     /* A fresh sector table means the light instrument's held state describes a
      * map that is no longer loaded, so the next look writes a census. */
     hwr_objects_dump_lights_reset();

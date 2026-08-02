@@ -5,6 +5,7 @@
 #include "hwr_schema.h"
 #include "hwr_settings.h"
 
+#include <math.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -36,6 +37,18 @@
 #define HWR_ROOM_GAIN_ROW "room_light_gain"
 #define HWR_ROOM_GAMMA_ROW "room_light_gamma"
 #define HWR_ROOM_FLOOR_ROW "room_light_floor"
+/* The anchored room response: which law, the two levels it places a sector
+ * between, its shaping, and where the two input anchors come from. */
+#define HWR_ROOM_CURVE_ROW "room_light_curve"
+#define HWR_ROOM_DARK_ROW "room_light_dark"
+#define HWR_ROOM_LIT_ROW "room_light_lit"
+#define HWR_ROOM_SHAPE_ROW "room_light_shape"
+#define HWR_ROOM_ANCHOR_ROW "room_light_anchor"
+#define HWR_ROOM_BYTE_DARK_ROW "room_light_byte_dark"
+#define HWR_ROOM_BYTE_LIT_ROW "room_light_byte_lit"
+#define HWR_ROOM_WINDOW_MIN_ROW "room_light_window_min"
+#define HWR_ROOM_WINDOW_MAX_ROW "room_light_window_max"
+#define HWR_ROOM_UNSHADED_ROW "room_light_unshaded_gain"
 #define HWR_ROOM_CEILING_ROW "room_light_ceiling_authentic"
 #define HWR_WORLD_CEILING_ROW "world_light_ceiling"
 #define HWR_DISTANCE_ROW "world_distance_shading"
@@ -53,6 +66,20 @@
 #define HWR_PLAYER_FLICKER_SPEED_ROW "player_light_flicker_speed"
 #define HWR_SPRITE_GAIN_ROW "sprite_light_gain"
 #define HWR_SPRITE_WRAP_ROW "sprite_light_wrap"
+
+/* What the map now loaded says about the brightness it was authored at: the
+ * count of its lit sectors and three order statistics of their bytes. Zero
+ * sectors means no map has been staged (or none of its sectors carries a byte
+ * this scale is about), and the fit then stands on the written anchors alone.
+ *
+ * It is held here rather than asked for where it is used because it moves once
+ * per map while the rig is worked out on every settings change, and because the
+ * map is a different question from the rows: the rows say what a person wants,
+ * this says what a place IS. */
+static uint32_t g_map_light_counted;
+static uint8_t g_map_light_low;
+static uint8_t g_map_light_middle;
+static uint8_t g_map_light_high;
 
 /* The settings panel's draft while it is open, and whether there is one. Only
  * the picture dials are read out of it: everything else takes effect when it is
@@ -104,6 +131,17 @@ static float hwr_truecolor_row_float(const char *key,
     if (desc == NULL)
         return fallback;
     return hwr_truecolor_effective(desc, settings).f;
+}
+
+static uint32_t hwr_truecolor_row_u32(const char *key,
+                                      const struct hwr_settings *settings,
+                                      uint32_t fallback)
+{
+    const struct hwr_setting_desc *desc = hwr_schema_find(key);
+
+    if (desc == NULL)
+        return fallback;
+    return hwr_truecolor_effective(desc, settings).u;
 }
 
 static int32_t hwr_truecolor_row_enum(const char *key,
@@ -159,6 +197,80 @@ static enum hwr_gl_shading_mode hwr_truecolor_gl_shading(
     return HWR_GL_SHADING_AUTHENTIC;
 }
 
+/* The two INPUT anchors of the anchored response, in authored bytes.
+ *
+ * Fitted, they are the map's own tenth and ninety-fifth percentiles, held
+ * between a narrowest and a widest window about its median. Both bounds earn
+ * their place on the shipped maps rather than in theory:
+ *
+ *   - most maps are built almost entirely at ONE value, so their tenth and
+ *     ninety-fifth percentiles are the same byte and the raw window is zero
+ *     wide. Without the lower bound a one-byte difference would be the entire
+ *     dark-to-lit range and every room would read as fully lit or fully unlit.
+ *   - a few are built across a wide spread. Without the upper bound the few
+ *     bytes a light switch or a candle moves would be a vanishing share of that
+ *     spread, which is the whole complaint this response exists to answer.
+ *
+ * Written, they are used exactly as written: that is what an escape hatch for a
+ * map the fit reads wrongly has to be, and it is also the only way to express
+ * the identity case -- the whole authored range mapped onto the whole output
+ * range, which is the older law written in the newer one's terms.
+ *
+ * Returns with `lit` strictly above `dark` whatever it was handed, including a
+ * map with no lit sectors at all and a pair somebody wrote backwards. */
+static void hwr_truecolor_anchor_bytes(const struct hwr_settings *settings,
+                                       float *dark, float *lit)
+{
+    long low = (long)hwr_truecolor_row_u32(HWR_ROOM_BYTE_DARK_ROW, settings,
+                                           112u);
+    long high = (long)hwr_truecolor_row_u32(HWR_ROOM_BYTE_LIT_ROW, settings,
+                                            208u);
+
+    if (hwr_truecolor_row_enum(HWR_ROOM_ANCHOR_ROW, settings,
+                               HWR_ROOM_ANCHOR_AUTO) == HWR_ROOM_ANCHOR_AUTO &&
+        g_map_light_counted != 0) {
+        long narrowest = (long)hwr_truecolor_row_u32(HWR_ROOM_WINDOW_MIN_ROW,
+                                                     settings, 24u);
+        long widest = (long)hwr_truecolor_row_u32(HWR_ROOM_WINDOW_MAX_ROW,
+                                                  settings, 96u);
+        long middle = (long)g_map_light_middle;
+        long width;
+
+        low = (long)g_map_light_low;
+        high = (long)g_map_light_high;
+        if (widest < narrowest)
+            widest = narrowest;
+        width = high - low;
+        /* Both bounds are enforced about the map's MEDIAN rather than about the
+         * middle of the raw window: the median is where the map's mass is, and
+         * widening about it keeps the commonest sector where it was instead of
+         * dragging it toward whichever tail happened to be longer. */
+        if (width < narrowest || width > widest) {
+            long wanted = width < narrowest ? narrowest : widest;
+
+            low = middle - wanted / 2;
+            high = low + wanted;
+            /* A median near either end of the byte range cannot be the centre
+             * of the window as well, so the window slides rather than shrinks;
+             * only a window wider than the range itself gives up width. */
+            if (low < 0) {
+                high -= low;
+                low = 0;
+            }
+            if (high > 255) {
+                low -= high - 255;
+                high = 255;
+                if (low < 0)
+                    low = 0;
+            }
+        }
+    }
+    if (high <= low)
+        high = low + 1;
+    *dark = (float)low;
+    *lit = (float)high;
+}
+
 /* The rig the modern law composes with, as the rows in force describe it.
  *
  * A switch that is off is spent here rather than in the shader: an unlit fill
@@ -174,6 +286,34 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
                                                 2.2f);
     light->room_floor = hwr_truecolor_row_float(HWR_ROOM_FLOOR_ROW, settings,
                                                 0.0f);
+    /* The anchored response, worked out here in full: the shader is handed two
+     * numbers it can subtract and divide, not a map and a table of rows. The
+     * input anchors are taken to the same exponent the authored byte is, which
+     * is what makes the normalization a normalization -- both sides of the
+     * fraction are in one space, and it is the space the map's own steps are
+     * perceptually even in. */
+    light->room_anchored =
+        hwr_truecolor_row_enum(HWR_ROOM_CURVE_ROW, settings,
+                               HWR_ROOM_CURVE_ANCHORED) ==
+        HWR_ROOM_CURVE_ANCHORED;
+    {
+        float dark_byte;
+        float lit_byte;
+
+        hwr_truecolor_anchor_bytes(settings, &dark_byte, &lit_byte);
+        light->room_anchor_low = powf(dark_byte / 128.0f, light->room_gamma);
+        light->room_anchor_high = powf(lit_byte / 128.0f, light->room_gamma);
+    }
+    light->room_dark = hwr_truecolor_row_float(HWR_ROOM_DARK_ROW, settings,
+                                               0.02f);
+    light->room_lit = hwr_truecolor_row_float(HWR_ROOM_LIT_ROW, settings, 1.0f);
+    light->room_shape = hwr_truecolor_row_float(HWR_ROOM_SHAPE_ROW, settings,
+                                                1.0f);
+    /* The row says how much of the unshaded class survives as authored; the rig
+     * carries how far it is pulled off that, so a rig nobody filled in is the
+     * picture that class always had. */
+    light->room_unshaded_pull =
+        1.0f - hwr_truecolor_row_float(HWR_ROOM_UNSHADED_ROW, settings, 1.0f);
     light->world_ceiling = hwr_truecolor_row_float(HWR_WORLD_CEILING_ROW,
                                                    settings, 1.0f);
     light->room_ceiling_authentic =
@@ -326,6 +466,22 @@ static void hwr_truecolor_apply(uint32_t mask,
      * the rows to the renderer rather than two. */
     hwr_truecolor_light(settings, &state.light);
     hwr_gl_set_truecolor(&state);
+}
+
+void hwr_truecolor_set_map_lighting(uint32_t counted, uint8_t low,
+                                    uint8_t middle, uint8_t high)
+{
+    if (counted == g_map_light_counted && low == g_map_light_low &&
+        middle == g_map_light_middle && high == g_map_light_high)
+        return;
+    g_map_light_counted = counted;
+    g_map_light_low = low;
+    g_map_light_middle = middle;
+    g_map_light_high = high;
+    /* The same road the look layer takes when a map changes what a row is worth
+     * without the store moving: raise the bit and let the pump work the rig out
+     * again where doing so is safe. */
+    hwr_settings_mark_changed(HWR_CHANGE_TRUECOLOR);
 }
 
 void hwr_truecolor_preview(const struct hwr_settings *draft)

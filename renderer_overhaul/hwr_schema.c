@@ -60,6 +60,16 @@ static const struct hwr_enum_value HWR_SHADING_MODE_VALUES[] = {
     { "modern",    HWR_SHADING_MODERN,    "Modern" }
 };
 
+static const struct hwr_enum_value HWR_ROOM_CURVE_VALUES[] = {
+    { "legacy",   HWR_ROOM_CURVE_LEGACY,   "One brightness dial" },
+    { "anchored", HWR_ROOM_CURVE_ANCHORED, "Separate dark and lit levels" }
+};
+
+static const struct hwr_enum_value HWR_ROOM_ANCHOR_VALUES[] = {
+    { "auto",   HWR_ROOM_ANCHOR_AUTO,   "Fitted to the map" },
+    { "manual", HWR_ROOM_ANCHOR_MANUAL, "The two values below" }
+};
+
 static const struct hwr_enum_value HWR_LIGHT_SCOPE_VALUES[] = {
     { "tinted", HWR_LIGHT_SCOPE_TINTED, "Only where the fixtures are out" },
     { "all",    HWR_LIGHT_SCOPE_ALL,    "Everywhere" }
@@ -618,6 +628,258 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "How much light a room gives off from the brightness it was "
                 "built with. Lower makes the world darker everywhere without "
                 "touching what the map says is bright and what is dim."
+    },
+    {
+        /* Which law the row above is a dial ON. It is deliberately the first of
+         * the family after the gain: everything below it either shapes the
+         * anchored response or is inert under the other one. */
+        .key = "room_light_curve",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_curve),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .e = HWR_ROOM_CURVE_ANCHORED },
+        .original = { .e = HWR_ROOM_CURVE_ANCHORED },
+        .values = HWR_ROOM_CURVE_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_ROOM_CURVE_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How a room's brightness reads",
+        .help = "Separate levels give a room with its lights off and a room "
+                "with them on their own dials, so the difference a switch or a "
+                "candle makes stays visible however dark the world is set. One "
+                "dial is the older behaviour: it scales the whole range at "
+                "once, which shrinks that difference along with everything "
+                "else."
+    },
+    {
+        .key = "room_light_dark",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_dark),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.02f },
+        .original = { .f = 0.02f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.01f },
+        .page_step = { .f = 0.05f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How dark an unlit room is",
+        .help = "What the dimmest rooms of a map give off by themselves. This "
+                "is the darkness dial, and lowering it does not touch how "
+                "bright a lit room gets."
+    },
+    {
+        .key = "room_light_lit",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_lit),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        /* The top of the range is where the whole authored byte range lands
+         * under the exponent the other row holds: a sector at 255 is worth
+         * (255/128) to the power of 2.2, which is a shade under 4.6. Stopping
+         * below that would make the one setting of this family that reproduces
+         * the older law exactly -- the whole authored range placed on the whole
+         * output range -- impossible to write down. */
+        .max = { .f = 5.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How bright a lit room is",
+        .help = "What the brightest rooms of a map give off by themselves. "
+                "Raising it makes lights worth turning on without making the "
+                "dark places any lighter."
+    },
+    {
+        .key = "room_light_shape",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_shape),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.25f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Where the middle of the range sits",
+        .help = "How a room between the two levels above is placed between "
+                "them. Above one holds the middle of a map nearer its dark "
+                "end, below one nearer its lit end."
+    },
+    {
+        .key = "room_light_anchor",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_anchor),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .e = HWR_ROOM_ANCHOR_AUTO },
+        .original = { .e = HWR_ROOM_ANCHOR_AUTO },
+        .values = HWR_ROOM_ANCHOR_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_ROOM_ANCHOR_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Which brightness counts as dark",
+        .help = "Every map is built to its own brightness, so which values "
+                "count as its dark and its lit ends is read from the map "
+                "itself. The other setting uses the two values below instead, "
+                "for a map this reads wrongly."
+    },
+    {
+        .key = "room_light_byte_dark",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_byte_dark),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 112u },
+        .original = { .u = 112u },
+        .min = { .u = 0u },
+        .max = { .u = 255u },
+        .step = { .u = 1u },
+        .page_step = { .u = 8u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "The map value counted as dark",
+        .help = "The brightness a map has to be built at for a room to read as "
+                "unlit. Used only where the setting above is not reading it "
+                "from the map, and then exactly as written."
+    },
+    {
+        .key = "room_light_byte_lit",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_byte_lit),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 208u },
+        .original = { .u = 208u },
+        .min = { .u = 0u },
+        .max = { .u = 255u },
+        .step = { .u = 1u },
+        .page_step = { .u = 8u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "The map value counted as lit",
+        .help = "The brightness a map has to be built at for a room to read as "
+                "fully lit. Used only where the setting above is not reading it "
+                "from the map, and then exactly as written."
+    },
+    {
+        .key = "room_light_window_min",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_window_min),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 24u },
+        .original = { .u = 24u },
+        .min = { .u = 4u },
+        .max = { .u = 128u },
+        .step = { .u = 1u },
+        .page_step = { .u = 8u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Narrowest range read from a map",
+        .help = "Most maps are built almost entirely at one brightness. This "
+                "is how far apart the dark and lit ends are held anyway, so a "
+                "map like that does not turn a single step into the whole "
+                "range."
+    },
+    {
+        .key = "room_light_window_max",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_window_max),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 96u },
+        .original = { .u = 96u },
+        .min = { .u = 8u },
+        .max = { .u = 255u },
+        .step = { .u = 1u },
+        .page_step = { .u = 8u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Widest range read from a map",
+        .help = "How far apart the dark and lit ends may be. Keeping them "
+                "close is what leaves a light switch or a candle a visible "
+                "share of the range on a map built across a wide spread."
+    },
+    {
+        .key = "room_light_unshaded_gain",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_unshaded_gain),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Surfaces the map never darkens",
+        .help = "Outdoor ground and other surfaces a map marks as never to be "
+                "darkened stay fully bright however far away they are, which "
+                "can glare in a dark world. One leaves them exactly as the map "
+                "asks; lower pulls them down into the room's own light with "
+                "everything else."
     },
     {
         .key = "room_light_gamma",

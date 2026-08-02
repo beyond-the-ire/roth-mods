@@ -101,6 +101,27 @@ struct hwr_door {
     int8_t angle;
 };
 
+/* What a map's own sectors say about the brightness it was authored at.
+ *
+ * Three order statistics of the authored light bytes and the count they were
+ * taken over. Only sectors carrying a NONZERO byte are counted: zero is not a
+ * point on this scale, it is the engine's unshaded class -- fullbright at every
+ * distance, and immune to every light command the engine has -- so including it
+ * would drag a map's dark anchor down to a value no surface can ever be lit
+ * from.
+ *
+ * It is taken ONCE, when the map is staged, and never refreshed. That is not an
+ * optimisation: the engine rewrites these bytes while a switch ramps, and a fit
+ * that followed them would move the whole scale under the room it is measuring,
+ * so a switched-on room would read the same as it did switched off. The scale is
+ * the map's authoring; what moves along it is the light. */
+struct hwr_light_census {
+    uint32_t counted;
+    uint8_t low;      /* the tenth percentile of the nonzero bytes */
+    uint8_t middle;   /* their median */
+    uint8_t high;     /* their ninety-fifth percentile */
+};
+
 struct hwr_luts {
     uint8_t palette[768];
     uint8_t colormap[0x2000];
@@ -159,6 +180,8 @@ struct hwr_world {
     uint8_t texture_refs[0x1600 / 8];
     struct hwr_door doors[HWR_DOOR_MAX];
     size_t door_count;
+    /* Taken at the snapshot and left alone by every refresh. */
+    struct hwr_light_census light_census;
     struct hwr_luts luts;
     int valid;
     char error[192];
@@ -170,6 +193,12 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api);
 /* Refreshes mutable geometry, material ids, and surface state. Returns a
  * hwr_world_refresh_flags mask, zero when unchanged, or -1 on failure. */
 int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api);
+
+/* Takes the authored-light census of a sector table. Exposed so the census can
+ * be taken of any table, which is what lets it be gated against one whose
+ * answer is known rather than only against the map that happens to be loaded. */
+void hwr_world_light_census(const struct hwr_sector *sectors, size_t count,
+                            struct hwr_light_census *out);
 
 /* Copies the engine-staged palette and color lookup tables into mod-owned memory. */
 int hwr_world_snapshot_luts(struct hwr_world *world, const struct roth_api_v1 *api);
