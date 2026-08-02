@@ -5947,6 +5947,15 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         return NULL;
     }
     hwr_scene_animate(scene, api);
+    /* The light the player carries, moved on for this frame: the flame in it
+     * and what this map's own candle word makes of it are both one number a
+     * frame, and this is where the frame is. It sits beside the animated
+     * surfaces on purpose -- they are driven by the same world clock, and a
+     * flame that kept moving behind a held frame while every animation in the
+     * room stopped would be the only thing in the picture still running. */
+    hwr_gl_lamp_advance(world->luts.candle_glow,
+                        api->game_ram->u16(VA_G_ANIM_CLOCK),
+                        hwr_perf_now_ns());
     hwr_read_camera(&camera, world, api);
     if (!hwr_projection_scale_camera(
             &camera, source_width, source_height, width, height,

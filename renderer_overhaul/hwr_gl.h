@@ -304,6 +304,15 @@ struct hwr_gl_light {
     float lamp_range;
     /* Nonzero lights every face rather than only the ones the map marked. */
     int lamp_scope_all;
+    /* How much of the map's own candle word the two above take: zero ignores
+     * it and one reads it whole. */
+    float lamp_glow_scale;
+    /* The flame in that light -- whether it moves, how far it may swing, and
+     * how quickly its wave runs. Zero for the first is exactly no flame, which
+     * is what leaves the light the rows describe untouched to the bit. */
+    int lamp_flicker;
+    float lamp_flicker_amount;
+    float lamp_flicker_speed;
     /* Props: their own gain, and how far light wraps past their terminator so a
      * standing figure's shaded half never goes fully black. */
     float sprite_gain;
@@ -424,6 +433,24 @@ int hwr_gl_truecolor_active(void);
  * the answer is no and every vertex leaving an emitter is byte for byte the
  * vertex it was before normals existed. */
 int hwr_gl_shading_normals(void);
+/* Moves the light the player carries on, once per rendered frame, and works out
+ * what this map's own candle word does to it. Both answers are one number a
+ * frame rather than a term per pixel, so every view of a frame -- a mirror's
+ * included -- is lit by the same flame with nothing said about reflections.
+ *
+ * `candle_glow` is the map's word, zero where there is none. `world_clock` is
+ * the engine's own animation clock: a flame moves on the frames the world's
+ * time moves and holds where it stops, exactly as an animated surface holds its
+ * frame. `now_ns` is the mod's own monotonic clock, which is what the flame
+ * actually runs on -- real time rather than a count of ticks, or it would
+ * stutter at the cadence being replaced.
+ *
+ * With the original or the continuous law in force, or with no flame asked for,
+ * this leaves the light exactly the light the rows describe. */
+void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
+                         uint64_t now_ns);
+/* Puts the flame back where it starts and forgets both clocks. */
+void hwr_gl_lamp_reset(void);
 /* Whether a colour format can be used here. Auto and eight-bit are always
  * available; a format the driver has refused is not. */
 int hwr_gl_color_format_available(enum hwr_gl_color_format format);

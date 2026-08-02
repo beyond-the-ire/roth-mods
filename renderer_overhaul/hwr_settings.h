@@ -149,6 +149,17 @@ struct hwr_settings {
     float player_light_intensity;
     float player_light_range;
     enum hwr_light_scope player_light_scope;
+    /* Every map carries a word saying how strong its own lantern was meant to
+     * be, which the game itself never looks at. This is how much notice to take
+     * of it: at nothing the two rows above are the whole answer, at one the
+     * map's word is read whole. */
+    float player_light_glow_scale;
+    /* The flame in that light: whether it moves at all, how far it may swing
+     * either side of its strength, and how quickly its wave runs. It is held
+     * well clear of going out, so it reads as a flame rather than a fault. */
+    int player_light_flicker;
+    float player_light_flicker_amount;
+    float player_light_flicker_speed;
     /* Props and figures keep their own brightness dial and their own shaded
      * half, so a dark room never makes what is standing in it unfindable. */
     float sprite_light_gain;

@@ -117,6 +117,12 @@ struct hwr_luts {
      * DAS file right after the palette). Its low byte is the flat palette index
      * the engine's all-corners-saturated wall block solid-fills with. */
     uint16_t fill_index;
+    /* The map's own word about how strong its lantern was meant to be, taken
+     * from the metadata tail every map carries (init_map_lighting_from_metadata
+     * and its startup twin copy it into a global on every load, and nothing in
+     * the game reads it back). Zero means this map has no usable word, which is
+     * what a light reading it as an authoring hint treats as no hint at all. */
+    uint16_t candle_glow;
     int valid;
 };
 

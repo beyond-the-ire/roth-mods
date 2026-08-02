@@ -18,10 +18,17 @@
 #define VA_G_SHADE_LEVEL           0x90c16u
 #define VA_G_TINT_SHADE_LEVEL      0x90c18u
 #define VA_G_DAS_FILL_INDEX        0x89f10u
+#define VA_G_CANDLE_GLOW           0x89f08u
 #define VA_G_DOOR_COUNT            0x8b3f4u
 #define VA_G_DOOR_POOL             0x8b3f8u
 
 #define HWR_SECTION_EXTENT 0x10000u
+/* The largest candle word this reads as one. Every map in the game holds eight,
+ * twelve, fifteen, sixteen or thirty-two, so a byte's worth is room for eight
+ * times the brightest map anyone shipped; past that the word is not a candle
+ * word, and a light that reads it as an authoring hint is better off with its
+ * own settings than with a number that means something else. */
+#define HWR_CANDLE_GLOW_MAX 255u
 #define HWR_NO_INDEX UINT16_MAX
 #define HWR_DOOR_STRIDE 0x1f6u
 #define HWR_DOOR_CORNER_BASE 0xb6u
@@ -667,6 +674,29 @@ int hwr_world_refresh_lut_state(struct hwr_world *world,
     world->luts.shade_level = api->game_ram->u16(VA_G_SHADE_LEVEL);
     world->luts.tint_shade_level = api->game_ram->u16(VA_G_TINT_SHADE_LEVEL);
     world->luts.fill_index = api->game_ram->u16(VA_G_DAS_FILL_INDEX);
+    /* The map's own candle word, re-read every frame for the same reason the
+     * two shade levels beside it are: it is rewritten on every map load and a
+     * value taken at one load is not this map's. A map that never wrote one
+     * leaves nothing there, and a word larger than any candle word can be is
+     * not one either; both come back as no word at all, and the light that
+     * reads it falls back on its own settings. Saying so once is enough --
+     * this runs every frame. */
+    {
+        static int reported;
+        uint16_t glow = api->game_ram->u16(VA_G_CANDLE_GLOW);
+
+        if (glow > HWR_CANDLE_GLOW_MAX) {
+            if (!reported) {
+                reported = 1;
+                fprintf(stderr, "[renderer_overhaul] the map's candle word "
+                                "reads %u, which is not one; the light you "
+                                "carry keeps its own strength and reach\n",
+                        (unsigned)glow);
+            }
+            glow = 0u;
+        }
+        world->luts.candle_glow = glow;
+    }
     /* The palette buffer is populated late on some load paths (a quickload
      * can stage frames before it lands) and screen effects rewrite it, so it
      * is re-read every frame rather than trusted from the load snapshot. */

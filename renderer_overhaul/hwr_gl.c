@@ -2507,6 +2507,202 @@ static int hwr_shade_linear_wanted(enum hwr_gl_shading_mode mode)
     return hwr_shade_linear_env();
 }
 
+/* ---------------------------------------------------------- the carried light
+ *
+ * Two things move the light the player carries that no row can say on its own:
+ * the map's own word about how strong its lantern was meant to be, and the
+ * flame in it. Both are worked out here, once per rendered frame, as plain
+ * multipliers on the strength and the reach the settings layer handed over.
+ *
+ * Doing it here rather than in the fragment tail is the whole design. A flame
+ * is one number a frame, not a term per pixel; a mirror is lit by the same
+ * flame as the view it hangs in without a word being said about reflections;
+ * and with nothing asking, both multipliers are exactly one, so the light the
+ * rows describe reaches the shader as the bits the rows describe. */
+
+/* The step the flame is advanced in. Fixing it is what makes the flame a
+ * function of how much of the world's time has passed and of nothing else: the
+ * frame rate decides how often it is looked at, never how fast it runs, and the
+ * rate the flame is retargeted at cannot saturate on a slow frame. */
+#define HWR_LAMP_STEP 0.0166666667f
+/* The most of a stopped world's time a resumed one may spend at once. A menu
+ * held open for a minute owes a minute; spending it would be a minute of flame
+ * in one frame, so the debt is forgiven past a quarter of a second. */
+#define HWR_LAMP_CATCHUP 0.25f
+/* The flame, as it was worked out and tuned: retargets a second, how fast the
+ * light reaches for the target it was given, the two waves under it, and the
+ * bounds it is held between. The floor is the whole difference between a candle
+ * and a fault -- it is what stops the light ever guttering out. */
+#define HWR_LAMP_RETARGET_RATE 14.0f
+#define HWR_LAMP_SMOOTHING 10.0f
+#define HWR_LAMP_WAVE_A_RATE 2.1f
+#define HWR_LAMP_WAVE_A_SIZE 0.06f
+#define HWR_LAMP_WAVE_B_RATE 3.7f
+#define HWR_LAMP_WAVE_B_SIZE 0.04f
+#define HWR_LAMP_WAVE_B_PHASE 1.3f
+#define HWR_LAMP_FLOOR 0.3f
+#define HWR_LAMP_CEILING 1.4f
+#define HWR_LAMP_TWO_PI 6.2831853072f
+/* Where the flame's own sequence starts. It is a fixed number rather than
+ * anything the clock or the machine supplies: a flame nobody can predict and a
+ * flame that starts in the same place every run look exactly alike, and only
+ * one of them can be measured. */
+#define HWR_LAMP_SEED 0x9e3779b9u
+
+/* What the map's word does to the strength and to the reach. */
+static float g_lamp_glow_intensity = 1.0f;
+static float g_lamp_glow_range = 1.0f;
+/* The flame: what is in force, what it is reaching for, the two waves' own
+ * phases, the time it has been given but not yet spent, and its sequence. */
+static float g_lamp_flicker = 1.0f;
+static float g_lamp_flicker_target = 1.0f;
+static float g_lamp_wave_a;
+static float g_lamp_wave_b;
+static float g_lamp_carry;
+/* How many steps the flame has been given, which is the only clock it has: a
+ * flame that is not moving is one this is not counting, whatever real time is
+ * doing beside it. */
+static uint32_t g_lamp_steps;
+static uint32_t g_lamp_random_state = HWR_LAMP_SEED;
+/* The two clocks the flame is driven by: real time, which is what it runs on,
+ * and the world's own, which is what says whether time is passing at all. */
+static uint64_t g_lamp_last_ns;
+static uint64_t g_lamp_owed_ns;
+static uint16_t g_lamp_last_world_clock;
+static int g_lamp_clocks_valid;
+
+static float hwr_lamp_clamp(float value, float low, float high)
+{
+    if (value < low)
+        return low;
+    if (value > high)
+        return high;
+    return value;
+}
+
+/* The flame's own sequence, in nought to one. */
+static float hwr_lamp_random(void)
+{
+    g_lamp_random_state = g_lamp_random_state * 1664525u + 1013904223u;
+    return (float)((g_lamp_random_state >> 8) & 0xffffffu) / 16777216.0f;
+}
+
+/* The map's word about its own lantern.
+ *
+ * The word is map metadata the engine loads into a global and then never reads,
+ * so it is free for a mod to take as the authoring hint it plainly is. It is a
+ * value rather than a flag: twenty-eight of the game's forty-four maps hold
+ * eight and the rest hold twelve, fifteen, sixteen or thirty-two. Strength
+ * follows it and reach follows its square root, so a map asking for twice the
+ * light gets twice the light over about half again the distance rather than a
+ * pool of twice the width -- which is how a brighter flame actually behaves.
+ *
+ * The dial in front of it is how much of that is wanted: at nothing the word is
+ * ignored and the rows are the whole answer, at one it is read whole. The
+ * bounds are the ones the reading was worked out with, and the brightest maps in
+ * the game land exactly on both of them. */
+static void hwr_lamp_glow(uint16_t candle_glow, float weight)
+{
+    float factor;
+
+    g_lamp_glow_intensity = 1.0f;
+    g_lamp_glow_range = 1.0f;
+    if (candle_glow == 0u || weight == 0.0f)
+        return;
+    factor = (float)candle_glow / 6.0f;
+    if (factor < 0.25f)
+        factor = 0.25f;
+    g_lamp_glow_intensity =
+        hwr_lamp_clamp(1.0f + (factor - 1.0f) * weight, 0.25f, 4.0f);
+    g_lamp_glow_range =
+        hwr_lamp_clamp(1.0f + (sqrtf(factor) - 1.0f) * weight, 0.3125f, 2.0f);
+}
+
+/* One step of the flame. It is reached for rather than jumped to, which is what
+ * keeps a retarget from reading as a switch being thrown, and it is held between
+ * its bounds BEFORE it is reached for so the light in force can never leave
+ * them. The two waves carry their own phases rather than a shared clock, so
+ * neither loses precision however long a session runs. */
+static void hwr_lamp_flicker_step(float amount, float speed)
+{
+    float wave;
+    float desired;
+
+    g_lamp_steps++;
+    g_lamp_wave_a += HWR_LAMP_STEP * speed * HWR_LAMP_WAVE_A_RATE;
+    g_lamp_wave_b += HWR_LAMP_STEP * speed * HWR_LAMP_WAVE_B_RATE;
+    while (g_lamp_wave_a >= HWR_LAMP_TWO_PI)
+        g_lamp_wave_a -= HWR_LAMP_TWO_PI;
+    while (g_lamp_wave_b >= HWR_LAMP_TWO_PI)
+        g_lamp_wave_b -= HWR_LAMP_TWO_PI;
+    if (hwr_lamp_random() < HWR_LAMP_STEP * HWR_LAMP_RETARGET_RATE)
+        g_lamp_flicker_target =
+            1.0f + (hwr_lamp_random() * 2.0f - 1.0f) * amount;
+    wave = sinf(g_lamp_wave_a) * HWR_LAMP_WAVE_A_SIZE +
+           sinf(g_lamp_wave_b + HWR_LAMP_WAVE_B_PHASE) * HWR_LAMP_WAVE_B_SIZE;
+    desired = hwr_lamp_clamp(g_lamp_flicker_target + wave, HWR_LAMP_FLOOR,
+                             HWR_LAMP_CEILING);
+    g_lamp_flicker += (desired - g_lamp_flicker) *
+                      (1.0f - expf(-HWR_LAMP_STEP * HWR_LAMP_SMOOTHING));
+}
+
+void hwr_gl_lamp_reset(void)
+{
+    g_lamp_flicker = 1.0f;
+    g_lamp_flicker_target = 1.0f;
+    g_lamp_wave_a = 0.0f;
+    g_lamp_wave_b = 0.0f;
+    g_lamp_carry = 0.0f;
+    g_lamp_steps = 0;
+    g_lamp_random_state = HWR_LAMP_SEED;
+    g_lamp_last_ns = 0;
+    g_lamp_owed_ns = 0;
+    g_lamp_last_world_clock = 0;
+    g_lamp_clocks_valid = 0;
+}
+
+void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
+                         uint64_t now_ns)
+{
+    const struct hwr_gl_light *light = &g_truecolor_want.light;
+    float owed;
+
+    hwr_lamp_glow(candle_glow, light->lamp_glow_scale);
+    /* No flame is asked for, or the law in force has no light at the eye to put
+     * one in. Either way what reaches the shader is the strength the rows hold,
+     * multiplied by exactly one. */
+    if (g_truecolor_want.shading_mode != HWR_GL_SHADING_MODERN ||
+        light->lamp_flicker == 0) {
+        hwr_gl_lamp_reset();
+        return;
+    }
+    if (!g_lamp_clocks_valid) {
+        g_lamp_clocks_valid = 1;
+        g_lamp_last_ns = now_ns;
+        g_lamp_last_world_clock = world_clock;
+        return;
+    }
+    /* Real time is what the flame runs on, and every frame's worth of it is
+     * counted -- but it is only SPENT on the frames the world's own clock has
+     * moved. A frame drawn while the world is held owes its time and pays
+     * nothing, which is what holds the flame still behind a menu the same way an
+     * animated surface holds its frame. */
+    if (now_ns > g_lamp_last_ns)
+        g_lamp_owed_ns += now_ns - g_lamp_last_ns;
+    g_lamp_last_ns = now_ns;
+    if (world_clock == g_lamp_last_world_clock)
+        return;
+    g_lamp_last_world_clock = world_clock;
+    owed = (float)((double)g_lamp_owed_ns / 1000000000.0);
+    g_lamp_owed_ns = 0;
+    g_lamp_carry += owed < HWR_LAMP_CATCHUP ? owed : HWR_LAMP_CATCHUP;
+    while (g_lamp_carry >= HWR_LAMP_STEP) {
+        g_lamp_carry -= HWR_LAMP_STEP;
+        hwr_lamp_flicker_step(light->lamp_flicker_amount,
+                              light->lamp_flicker_speed);
+    }
+}
+
 void hwr_gl_set_truecolor(const struct hwr_gl_truecolor *state)
 {
     if (state == NULL)
@@ -3117,8 +3313,14 @@ static void hwr_bind_light_uniforms(GLuint program,
     hwr_uniform_1f(program, "u_ambient_intensity", light->ambient_intensity);
     hwr_uniform_3f(program, "u_lamp_color", light->lamp_color[0],
                    light->lamp_color[1], light->lamp_color[2]);
-    hwr_uniform_1f(program, "u_lamp_intensity", light->lamp_intensity);
-    hwr_uniform_1f(program, "u_lamp_range", light->lamp_range);
+    /* The strength and the reach the rows hold, times what the map's own candle
+     * word and this frame's flame make of them. With neither asking both are
+     * exactly one, so the two uniforms carry the rows' own bits. */
+    hwr_uniform_1f(program, "u_lamp_intensity",
+                   light->lamp_intensity * g_lamp_glow_intensity *
+                   g_lamp_flicker);
+    hwr_uniform_1f(program, "u_lamp_range",
+                   light->lamp_range * g_lamp_glow_range);
     hwr_uniform_1i(program, "u_lamp_scope_all", light->lamp_scope_all != 0);
     hwr_uniform_2f(program, "u_sprite_light", light->sprite_gain,
                    light->sprite_wrap);

@@ -47,6 +47,10 @@
 #define HWR_PLAYER_INTENSITY_ROW "player_light_intensity"
 #define HWR_PLAYER_RANGE_ROW "player_light_range"
 #define HWR_PLAYER_SCOPE_ROW "player_light_scope"
+#define HWR_PLAYER_GLOW_ROW "player_light_glow_scale"
+#define HWR_PLAYER_FLICKER_ROW "player_light_flicker"
+#define HWR_PLAYER_FLICKER_AMOUNT_ROW "player_light_flicker_amount"
+#define HWR_PLAYER_FLICKER_SPEED_ROW "player_light_flicker_speed"
 #define HWR_SPRITE_GAIN_ROW "sprite_light_gain"
 #define HWR_SPRITE_WRAP_ROW "sprite_light_wrap"
 
@@ -186,6 +190,19 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
     light->lamp_scope_all =
         hwr_truecolor_row_enum(HWR_PLAYER_SCOPE_ROW, settings,
                                HWR_LIGHT_SCOPE_TINTED) == HWR_LIGHT_SCOPE_ALL;
+    light->lamp_glow_scale = hwr_truecolor_row_float(HWR_PLAYER_GLOW_ROW,
+                                                     settings, 0.0f);
+    /* The flame's switch is carried rather than spent into a strength the way
+     * the fills above are: what it turns off is a clock, not a term, and the
+     * two dials beside it describe the shape of a flame rather than how much of
+     * one there is -- the same reading as the lamp's own reach, which is what
+     * it is whether or not the lamp is lit. */
+    light->lamp_flicker =
+        hwr_truecolor_row_bool(HWR_PLAYER_FLICKER_ROW, settings, 0);
+    light->lamp_flicker_amount =
+        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_AMOUNT_ROW, settings, 0.30f);
+    light->lamp_flicker_speed =
+        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_SPEED_ROW, settings, 1.80f);
     light->sprite_gain = hwr_truecolor_row_float(HWR_SPRITE_GAIN_ROW, settings,
                                                  1.0f);
     light->sprite_wrap = hwr_truecolor_row_float(HWR_SPRITE_WRAP_ROW, settings,
