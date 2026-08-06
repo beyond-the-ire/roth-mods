@@ -1,6 +1,7 @@
 #include "hwr_enh_truecolor.h"
 
 #include "hwr_gl.h"
+#include "hwr_lights.h"
 #include "hwr_look.h"
 #include "hwr_schema.h"
 #include "hwr_settings.h"
@@ -66,6 +67,22 @@
 #define HWR_PLAYER_FLICKER_SPEED_ROW "player_light_flicker_speed"
 #define HWR_SPRITE_GAIN_ROW "sprite_light_gain"
 #define HWR_SPRITE_WRAP_ROW "sprite_light_wrap"
+/* The lights that are not at the eye. Two of these reach the shader -- the
+ * softness of each light's vertical window, and nothing else -- and the rest
+ * reach the seeding, which is a walk over the world rather than a uniform. Both
+ * are published from here for the same reason the rig is: this is where a row's
+ * effective value is known, map override and live preview included. */
+#define HWR_POINT_ROW "point_light"
+#define HWR_POINT_OBJECTS_ROW "point_light_objects"
+#define HWR_POINT_MAX_ROW "point_light_max"
+#define HWR_POINT_INTENSITY_ROW "point_light_intensity"
+#define HWR_POINT_RANGE_ROW "point_light_range"
+#define HWR_POINT_COLOR_SOURCE_ROW "point_light_color_source"
+#define HWR_POINT_COLOR_ROW "point_light_color"
+#define HWR_POINT_GLOW_ROW "point_light_glow_scale"
+#define HWR_POINT_HOPS_ROW "point_light_hops"
+#define HWR_POINT_Z_SLACK_ROW "point_light_z_slack"
+#define HWR_POINT_FADE_ROW "point_light_fade"
 
 /* What the map now loaded says about the brightness it was authored at: the
  * count of its lit sectors and three order statistics of their bytes. Zero
@@ -359,11 +376,55 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
                                                  1.0f);
     light->sprite_wrap = hwr_truecolor_row_float(HWR_SPRITE_WRAP_ROW, settings,
                                                  0.5f);
+    light->point_z_edge = hwr_truecolor_row_float(HWR_POINT_Z_SLACK_ROW,
+                                                 settings, 64.0f);
     /* A reach of nothing would divide the falloff by zero; the row's own
      * minimum is well clear of it and this is what holds a value that arrived
      * some other way. */
     if (!(light->lamp_range > 1.0f))
         light->lamp_range = 1.0f;
+}
+
+/* What the seeding is asked for, from the same rows and by the same road.
+ *
+ * The whole family is spent HERE where it is off, exactly as an unlit fill is
+ * spent into a strength of zero rather than into a branch in the fragment: a
+ * class nobody asked for is a class the walk never looks for, so a frame drawn
+ * with the original picture does not go looking through a map for torches.
+ *
+ * Which is also why the shading law is read here. These lights exist under the
+ * modern law alone -- the other two resolve their colour from the map's own
+ * ramp and have nothing for a light to add to -- so under either of them the
+ * mask is empty and the seeding costs one comparison a frame. */
+static void hwr_truecolor_points(const struct hwr_settings *settings,
+                                 enum hwr_gl_shading_mode mode)
+{
+    struct hwr_lights_settings points;
+    uint32_t rgb;
+
+    memset(&points, 0, sizeof points);
+    if (mode == HWR_GL_SHADING_MODERN &&
+        hwr_truecolor_row_bool(HWR_POINT_ROW, settings, 1) &&
+        hwr_truecolor_row_bool(HWR_POINT_OBJECTS_ROW, settings, 1))
+        points.classes |= 1u << HWR_LIGHT_CLASS_OBJECT;
+    points.max = hwr_truecolor_row_u32(HWR_POINT_MAX_ROW, settings, 8u);
+    points.intensity = hwr_truecolor_row_float(HWR_POINT_INTENSITY_ROW,
+                                               settings, 1.0f);
+    points.range = hwr_truecolor_row_float(HWR_POINT_RANGE_ROW, settings,
+                                           450.0f);
+    points.color_from_sprite =
+        hwr_truecolor_row_enum(HWR_POINT_COLOR_SOURCE_ROW, settings,
+                               HWR_POINT_COLOR_SPRITE) == HWR_POINT_COLOR_SPRITE;
+    rgb = 0x00ffb46eu;
+    hwr_truecolor_row_color(HWR_POINT_COLOR_ROW, settings, rgb, points.color);
+    points.glow_scale = hwr_truecolor_row_float(HWR_POINT_GLOW_ROW, settings,
+                                                0.0f);
+    points.hops = hwr_truecolor_row_u32(HWR_POINT_HOPS_ROW, settings, 1u);
+    points.z_slack = hwr_truecolor_row_float(HWR_POINT_Z_SLACK_ROW, settings,
+                                             64.0f);
+    points.fade_seconds = hwr_truecolor_row_float(HWR_POINT_FADE_ROW, settings,
+                                                  0.25f);
+    hwr_lights_set_settings(&points);
 }
 
 /* Automatic follows the law: the original picture is a palette picture and every
@@ -465,6 +526,7 @@ static void hwr_truecolor_apply(uint32_t mask,
      * modern law reads it, and deriving it unconditionally keeps one road from
      * the rows to the renderer rather than two. */
     hwr_truecolor_light(settings, &state.light);
+    hwr_truecolor_points(settings, state.shading_mode);
     hwr_gl_set_truecolor(&state);
 }
 
