@@ -118,6 +118,12 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
 - `sprite_light_gain`: how bright people, creatures and things you can pick up are, from 0 through
   4. Raise it if a dark room makes them hard to find.
 
+The seven keys that only `anchored` reads are not offered on the settings screen and are not written
+into a new settings file. They are still read, and a file that already carries one keeps it through
+every save, so a look tuned on that response goes on working. Under `engine` a map's brightness
+values are also no longer counted or scaled when it loads: the value each room carries means the
+same thing on every map, so there is nothing to fit.
+
 Torches, candles and lit sigils give light of their own under `modern`. Which things those are is
 the map's own answer rather than a list: the game already marks the objects that are never to be
 darkened, and those are exactly the ones that are giving light. Nothing has to be listed for a map
@@ -172,6 +178,12 @@ The file ships with a `day` and a `night` profile and nothing pointed at them, s
 to read and change without pre-judging any map. A row a map answers for is marked on the settings
 screen with what the map says, because moving that setting will not change the picture where you
 are standing.
+
+A section written for `room_light_curve = anchored` — one that sets `room_light_dark`,
+`room_light_lit`, or any of the anchor and window keys, without saying which response it means — is
+read with that response, so it goes on looking as it did, and the game says so once when it reads
+the file. Naming `room_light_curve` in that section is what takes the note away and reads the rest
+of it with the response you named.
 
 It also has one section of a different kind. `[lights]` says what particular THINGS give off, keyed
 by the graphic the map draws them with, where a single setting for the whole map is not enough — a

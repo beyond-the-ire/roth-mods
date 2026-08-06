@@ -217,6 +217,47 @@ void hwr_world_light_census(const struct hwr_sector *sectors, size_t count,
     out->high = hwr_light_rank(histogram, counted, 95u);
 }
 
+/* Whether anything reads the census, whether a staged map is owed one, and how
+ * many walks have been taken. Held here rather than asked for at the staging
+ * point because the answer belongs to the response in force, which moves with
+ * the settings and not with the map. */
+static int g_light_census_wanted;
+static int g_light_census_due;
+static unsigned long g_light_census_walks;
+
+void hwr_world_set_light_census_wanted(int wanted)
+{
+    g_light_census_wanted = wanted != 0;
+}
+
+int hwr_world_light_census_due(void)
+{
+    return g_light_census_wanted && g_light_census_due;
+}
+
+unsigned long hwr_world_light_census_walks(void)
+{
+    return g_light_census_walks;
+}
+
+void hwr_world_take_light_census(const struct hwr_sector *sectors, size_t count,
+                                 struct hwr_light_census *out)
+{
+    if (out == NULL)
+        return;
+    memset(out, 0, sizeof *out);
+    if (!g_light_census_wanted) {
+        /* Nothing is reading it, so no sector table is walked for it -- and the
+         * map staged without one is remembered, so a response asked for later
+         * gets its scale rather than waiting for the next map. */
+        g_light_census_due = 1;
+        return;
+    }
+    g_light_census_due = 0;
+    g_light_census_walks++;
+    hwr_world_light_census(sectors, count, out);
+}
+
 void hwr_world_clear(struct hwr_world *world)
 {
     if (world == NULL)
@@ -474,8 +515,10 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
     next.sky_fat_index = api->game_ram->u16(VA_G_SKY_FAT_INDEX);
     /* The map's authored brightness, taken here and only here: the refresh below
      * re-reads these same bytes every frame because the engine writes them, and
-     * a scale that followed the writes would cancel them out. */
-    hwr_world_light_census(next.sectors, next.sector_count, &next.light_census);
+     * a scale that followed the writes would cancel them out. Taken through the
+     * gate, so a response with nothing to fit costs no walk at all. */
+    hwr_world_take_light_census(next.sectors, next.sector_count,
+                                &next.light_census);
     hwr_world_collect_texture_references(&next);
     if (hwr_world_build_adjacency(&next) != 0) {
         hwr_world_clear(&next);

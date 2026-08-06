@@ -200,6 +200,30 @@ int hwr_world_refresh(struct hwr_world *world, const struct roth_api_v1 *api);
 void hwr_world_light_census(const struct hwr_sector *sectors, size_t count,
                             struct hwr_light_census *out);
 
+/* Whether anything is reading that census at all.
+ *
+ * One room response fits a scale to each map's own authored bytes, and it is the
+ * only thing the census exists for. The response that ships reads a room's byte
+ * as the distance its light carries -- one law on every map, with nothing to fit
+ * -- so under it the whole walk is work nobody collects, and it is not done.
+ *
+ * A response asked for after a map was staged is still owed one, and that is
+ * what "due" says: the walk is a per-map quantity taken while the map is being
+ * staged, and a look file or a settings change naming the fitted response later
+ * must not have to wait for the next map to get its scale. */
+void hwr_world_set_light_census_wanted(int wanted);
+int hwr_world_light_census_due(void);
+
+/* How many census walks have been taken. A claim that a map load walks no
+ * sector table is a claim about something that did not happen, and only a
+ * counter can state one. */
+unsigned long hwr_world_light_census_walks(void);
+
+/* The census as the SNAPSHOT takes it: the walk above where something reads it,
+ * an empty answer and a note that one is owed where nothing does. */
+void hwr_world_take_light_census(const struct hwr_sector *sectors, size_t count,
+                                 struct hwr_light_census *out);
+
 /* Copies the engine-staged palette and color lookup tables into mod-owned memory. */
 int hwr_world_snapshot_luts(struct hwr_world *world, const struct roth_api_v1 *api);
 

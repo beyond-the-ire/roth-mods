@@ -659,8 +659,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "light carries, and the default reads it as exactly that: a "
                 "room lights its surfaces until its light runs out, as the "
                 "original does. The other two read it as one flat level for the "
-                "whole room, either scaled by one dial or placed between the "
-                "two levels below."
+                "whole room, either scaled by one dial or placed between two "
+                "levels of their own."
     },
     {
         .key = "room_light_reach",
@@ -688,10 +688,17 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "long before it touches a lit one."
     },
     {
+        /* The two levels the anchored response mixes between, and the five rows
+         * below them that say which authored values it mixes over. They are the
+         * whole of that response and are read by nothing else, so under the one
+         * that ships -- which reads a room's own value as the distance its light
+         * carries -- they are off the settings screen and out of the settings
+         * file, while a file that already carries one goes on being read and
+         * goes on being written back. */
         .key = "room_light_dark",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
+        .exposure = HWR_EXP_ADVANCED,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, room_light_dark),
@@ -707,15 +714,16 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "How dark an unlit room is",
-        .help = "What the dimmest rooms of a map give off by themselves. This "
-                "is the darkness dial, and lowering it does not touch how "
-                "bright a lit room gets."
+        .help = "What the dimmest rooms of a map give off by themselves. Read "
+                "only where a room's brightness is placed between two levels; "
+                "the response that ships reads it as a distance instead and "
+                "never asks for this."
     },
     {
         .key = "room_light_lit",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
+        .exposure = HWR_EXP_ADVANCED,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, room_light_lit),
@@ -738,8 +746,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "How bright a lit room is",
         .help = "What the brightest rooms of a map give off by themselves. "
-                "Raising it makes lights worth turning on without making the "
-                "dark places any lighter."
+                "Read only where a room's brightness is placed between two "
+                "levels; the response that ships reads it as a distance "
+                "instead and never asks for this."
     },
     {
         .key = "room_light_shape",
@@ -760,10 +769,11 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Where the middle of the range sits",
-        .help = "How a room between the two levels above is placed between "
-                "them. Above one holds the middle of a map nearer its dark "
-                "end, below one nearer its lit end."
+        .label = "How steep the falloff is",
+        .help = "How steeply a room's light runs out over the distance it "
+                "carries. One is the map's own falloff. Where a room's "
+                "brightness is placed between two levels instead, this is "
+                "where the middle of the range sits between them."
     },
     {
         .key = "room_light_anchor",
@@ -783,10 +793,11 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Which brightness counts as dark",
-        .help = "Every map is built to its own brightness, so which values "
-                "count as its dark and its lit ends is read from the map "
-                "itself. The other setting uses the two values below instead, "
-                "for a map this reads wrongly."
+        .help = "Where a room's brightness is placed between two levels, which "
+                "values count as a map's dark and lit ends is read from the "
+                "map itself. The other setting uses the two values below "
+                "instead, for a map this reads wrongly. The response that "
+                "ships reads no map this way and counts nothing."
     },
     {
         .key = "room_light_byte_dark",
@@ -809,8 +820,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "The map value counted as dark",
         .help = "The brightness a map has to be built at for a room to read as "
-                "unlit. Used only where the setting above is not reading it "
-                "from the map, and then exactly as written."
+                "unlit. Read only where a room's brightness is placed between "
+                "two levels and the setting above is not reading the map, and "
+                "then exactly as written."
     },
     {
         .key = "room_light_byte_lit",
@@ -833,8 +845,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "The map value counted as lit",
         .help = "The brightness a map has to be built at for a room to read as "
-                "fully lit. Used only where the setting above is not reading it "
-                "from the map, and then exactly as written."
+                "fully lit. Read only where a room's brightness is placed "
+                "between two levels and the setting above is not reading the "
+                "map, and then exactly as written."
     },
     {
         .key = "room_light_window_min",
@@ -859,7 +872,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "Most maps are built almost entirely at one brightness. This "
                 "is how far apart the dark and lit ends are held anyway, so a "
                 "map like that does not turn a single step into the whole "
-                "range."
+                "range. Read only where a room's brightness is placed between "
+                "two levels."
     },
     {
         .key = "room_light_window_max",
@@ -883,7 +897,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "Widest range read from a map",
         .help = "How far apart the dark and lit ends may be. Keeping them "
                 "close is what leaves a light switch or a candle a visible "
-                "share of the range on a map built across a wide spread."
+                "share of the range on a map built across a wide spread. Read "
+                "only where a room's brightness is placed between two levels."
     },
     {
         .key = "room_light_unshaded_gain",

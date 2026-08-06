@@ -5,6 +5,7 @@
 #include "hwr_look.h"
 #include "hwr_schema.h"
 #include "hwr_settings.h"
+#include "hwr_world.h"
 
 #include <math.h>
 #include <stddef.h>
@@ -89,6 +90,9 @@
  * count of its lit sectors and three order statistics of their bytes. Zero
  * sectors means no map has been staged (or none of its sectors carries a byte
  * this scale is about), and the fit then stands on the written anchors alone.
+ * It is also what the anchored response's own reader is handed under every
+ * other response: nothing counts a map's bytes for a law that has no scale to
+ * fit them to, so there is no per-map fit under the response that ships.
  *
  * It is held here rather than asked for where it is used because it moves once
  * per map while the rig is worked out on every settings change, and because the
@@ -552,6 +556,14 @@ static void hwr_truecolor_apply(uint32_t mask,
      * modern law reads it, and deriving it unconditionally keeps one road from
      * the rows to the renderer rather than two. */
     hwr_truecolor_light(settings, &state.light);
+    /* And whether a map's own authored bytes are worth counting. The fitted
+     * response is the only thing that reads that count; the response that ships
+     * reads each room's byte as the reach the engine stores it as, which is one
+     * law on every map and has no scale to fit. So the walk is asked for here,
+     * by the response that would consume it, rather than taken of every map on
+     * the chance that something might. */
+    hwr_world_set_light_census_wanted(
+        state.light.room_curve == HWR_GL_ROOM_CURVE_ANCHORED);
     hwr_truecolor_points(settings, state.shading_mode);
     hwr_gl_set_truecolor(&state);
 }

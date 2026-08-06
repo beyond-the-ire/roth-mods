@@ -618,6 +618,59 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
     return 1;
 }
 
+/* A look written for the room response that places a room's brightness between
+ * two levels, read by a build whose default reads it as a reach instead.
+ *
+ * Those keys describe that response and nothing else: the two levels it mixes
+ * between, and where the pair of authored values it normalizes over comes from.
+ * A file carrying one of them was written to be read by that response, and the
+ * values in it mean something else under any other -- so where such a file does
+ * not say which response it means, it is read by the one it was written for,
+ * and the reader is told so. Naming the response in the file is what turns the
+ * note off and takes the keys at their new meaning.
+ *
+ * The check is on the COMPOSED answer for a map, so a global block and a
+ * profile are covered by the same rule the map's own keys are. */
+static void hwr_look_migrate_curve(struct hwr_look_values *values,
+                                   const char *map_name)
+{
+    static const char *const anchored_only[] = {
+        "room_light_dark",     "room_light_lit",
+        "room_light_anchor",   "room_light_byte_dark",
+        "room_light_byte_lit", "room_light_window_min",
+        "room_light_window_max"
+    };
+    const struct hwr_setting_desc *curve = hwr_schema_find("room_light_curve");
+    union hwr_value anchored;
+    int curve_index = hwr_look_row_index(curve);
+    size_t i;
+
+    if (curve == NULL || curve_index < 0)
+        return;
+    /* A file that names the response is a file that means what it says. */
+    if (hwr_row_set_has(&values->present, curve_index))
+        return;
+    for (i = 0; i < sizeof anchored_only / sizeof anchored_only[0]; i++) {
+        const struct hwr_setting_desc *desc =
+            hwr_schema_find(anchored_only[i]);
+        int index = hwr_look_row_index(desc);
+
+        if (desc == NULL || index < 0 ||
+            !hwr_row_set_has(&values->present, index))
+            continue;
+        anchored.e = (int32_t)HWR_ROOM_CURVE_ANCHORED;
+        hwr_look_set(values, curve_index, anchored);
+        fprintf(stderr, "[renderer_overhaul] %s: '%s' describes the room "
+                        "brightness response that places a room between two "
+                        "levels; %s%s is being read with that response. Set "
+                        "room_light_curve to choose one yourself.\n",
+                g_look_path, anchored_only[i],
+                map_name != NULL && map_name[0] != 0 ? "map " : "every map",
+                map_name != NULL && map_name[0] != 0 ? map_name : "");
+        return;
+    }
+}
+
 /* The overrides in force for one map, lowest precedence first. */
 static void hwr_look_compose(const struct hwr_look_file *file,
                              const char *map_name,
@@ -633,23 +686,27 @@ static void hwr_look_compose(const struct hwr_look_file *file,
     hwr_look_merge(out, &file->global);
     hwr_look_lights_merge(out_lights, &file->lights);
     map = hwr_look_find_map(file, map_name);
-    if (map == NULL)
-        return;
-    if (map->profile[0] != 0) {
-        const struct hwr_look_profile *profile =
-            hwr_look_find_profile(file, map->profile);
+    if (map != NULL) {
+        if (map->profile[0] != 0) {
+            const struct hwr_look_profile *profile =
+                hwr_look_find_profile(file, map->profile);
 
-        if (profile != NULL) {
-            hwr_look_merge(out, &profile->values);
-            hwr_look_lights_merge(out_lights, &profile->lights);
-        } else {
-            fprintf(stderr, "[renderer_overhaul] %s: map '%s' selects the "
-                            "unknown profile '%s'; ignored\n",
-                    g_look_path, map->name, map->profile);
+            if (profile != NULL) {
+                hwr_look_merge(out, &profile->values);
+                hwr_look_lights_merge(out_lights, &profile->lights);
+            } else {
+                fprintf(stderr, "[renderer_overhaul] %s: map '%s' selects the "
+                                "unknown profile '%s'; ignored\n",
+                        g_look_path, map->name, map->profile);
+            }
         }
+        hwr_look_merge(out, &map->values);
+        hwr_look_lights_merge(out_lights, &map->lights);
     }
-    hwr_look_merge(out, &map->values);
-    hwr_look_lights_merge(out_lights, &map->lights);
+    /* Last, on the whole composed answer: a file that says which response it
+     * means says it here too, and one that does not is read by the response its
+     * keys were written for. */
+    hwr_look_migrate_curve(out, map_name);
 }
 
 /* Publishes a freshly composed override set and reports what moved, so the rows

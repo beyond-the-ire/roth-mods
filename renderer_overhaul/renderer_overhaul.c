@@ -563,6 +563,20 @@ static void hwr_settings_pump(const struct roth_api_v1 *api)
      * consume them run. */
     hwr_look_drain_request();
     hwr_settings_apply_pending();
+    /* A response that fits a scale to the map's own authored brightness may
+     * have been asked for after the map was staged -- by a look file, or by the
+     * settings screen. The count it reads is a per-map quantity taken while the
+     * map is being staged, so one owed is taken here rather than left until the
+     * next map. Where nothing reads it this is one comparison. */
+    if (hwr_world_light_census_due() && g_world.valid) {
+        hwr_world_take_light_census(g_world.sectors, g_world.sector_count,
+                                    &g_world.light_census);
+        hwr_truecolor_set_map_lighting(g_world.light_census.counted,
+                                       g_world.light_census.low,
+                                       g_world.light_census.middle,
+                                       g_world.light_census.high);
+        hwr_settings_apply_pending();
+    }
     hwr_apply_window_requests(api);
 }
 
