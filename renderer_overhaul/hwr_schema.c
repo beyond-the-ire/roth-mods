@@ -992,16 +992,25 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                  HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 1.0f },
         .original = { .f = 1.0f },
-        .min = { .f = 1.0f },
-        .max = { .f = 4.0f },
-        .step = { .f = 0.1f },
-        .page_step = { .f = 0.5f },
+        /* One is where light stops adding up at the picture's own brightest,
+         * which is what this row always did and is what it ships at. Below one
+         * it is a knee instead: the light past it is eased toward that
+         * brightest rather than cut off at it, so two rooms that both overrun
+         * stay two rooms. Above one there is nothing to keep -- an eight-bit
+         * canvas has no headroom to spend, and every value past the brightest
+         * arrives as the same white. */
+        .min = { .f = 0.4f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.1f },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Brightest a surface may be",
-        .help = "Where the light landing on a surface stops counting. One is "
-                "as bright as the picture the texture was drawn at."
+        .label = "Where brightness levels off",
+        .help = "Where the light landing on a surface stops adding up. One cuts "
+                "it off at the brightest the picture can be drawn; lower eases "
+                "it in instead, so two rooms brighter than that still read as "
+                "two rooms rather than as one flat white."
     },
     {
         .key = "world_distance_shading",

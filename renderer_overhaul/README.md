@@ -91,6 +91,10 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
   it where the map put it.
 - `room_light_floor`: the least light any surface receives, from 0 through 0.25. Zero is honest
   darkness.
+- `world_light_ceiling`: where the light landing on a surface stops adding up, from 0.4 through 1.
+  One cuts it off at the brightest the picture can be drawn, which is what the world image is read
+  back into; lower eases it in over the last stretch instead, so two rooms that are both brighter
+  than that still read as two rooms rather than as one flat white.
 - `room_light_curve`: `engine` reads a map's own brightness value as what the game stores it as —
   the distance that room's light reaches — so a room lights its surfaces until its light runs out.
   `anchored` and `legacy` read it as one flat level for the whole room instead, the first placed

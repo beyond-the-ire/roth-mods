@@ -228,8 +228,12 @@ struct hwr_settings {
      * because it had thirty-two steps to spend. Dropping that cap is what lets
      * a lit room read as lit beside a dark one; this puts it back. */
     int room_light_ceiling_authentic;
-    /* Where the light total clips. Above one is headroom a floating-point world
-     * image can hold and an eight-bit one cannot. */
+    /* Where the light total stops adding up. Nothing downstream carries a value
+     * past the picture's own brightest back into the range, so a cut there does
+     * not merely bound two bright surfaces -- it paints them the same value. One
+     * is that cut, which is what this ships at and what it has always been;
+     * below one the light past it is eased toward the brightest instead, and the
+     * order between two rooms that both overrun survives. */
     float world_light_ceiling;
     /* How much of the original's distance darkening survives. Zero is none:
      * distance does not darken a surface, light runs out. */

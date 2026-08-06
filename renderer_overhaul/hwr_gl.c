@@ -1641,7 +1641,11 @@ static const char g_geometry_fragment_body[] =
     /* How far the author's unshaded class is pulled down into the room's own
      * light. Zero leaves it exactly fullbright and it never arrives here. */
     "uniform float u_room_unshaded;\n"
-    "uniform vec2 u_light_limits;\n"        /* darkest allowed, where it clips */
+    /* The two ends of what a fragment may receive: the darkest anything is
+     * allowed to be, and where light stops adding up -- the second as the knee
+     * light_knee() eases into rather than a cut, which at one is the same
+     * picture the cut drew. */
+    "uniform vec2 u_light_limits;\n"
     "uniform int u_room_ceiling_authentic;\n"
     "uniform float u_distance_shading;\n"
     "uniform vec3 u_ambient_color;\n"
@@ -1775,6 +1779,36 @@ static const char g_geometry_fragment_body[] =
     "  return light_space(u_point_b[i].rgb)*u_point_b[i].w*ndl*gain*att*att*\n"
     "         window;\n"
     "}\n"
+    /* Where the light landing on a surface stops adding up, as a knee rather
+     * than as a cut.
+     *
+     * Nothing downstream maps a value above the picture's own brightest back
+     * into the range: the world image is multiplied by the texel's own colour
+     * and read back into eight bits, so everything past that arrives as the same
+     * white. A cut therefore does not merely stop the brightest surfaces getting
+     * brighter, it makes them EQUAL -- two rooms a map states differently, and a
+     * near wall and a far one, painted the same value with no way to tell them
+     * apart. The room's own light running out keeps most of a world clear of
+     * that, and a person turning the whole rig up walks straight into it.
+     *
+     * So above the threshold the total is eased toward one instead of clipped
+     * at it: the curve leaves the identity with the same slope it arrives with,
+     * approaches one from below without meeting it, and rises the whole way --
+     * strictly, for as long as the arithmetic can still hold the gap it leaves
+     * below one. That is the property that matters, because an ORDER that
+     * survives is what lets two bright rooms still read as two rooms.
+     *
+     * At a threshold of one and above there is nothing left to ease into and the
+     * curve IS the cut, to the bit: the branch below returns the threshold, and
+     * the picture a threshold of one draws is exactly the picture the cut drew.
+     * That is the identity this is written around, since one is what the row
+     * holds as it ships. */
+    "float light_knee(float x, float k) {\n"
+    "  if (x<=k) return x;\n"
+    "  float h=1.0-k;\n"
+    "  if (h<=0.0) return k;\n"
+    "  return k+h*(1.0-exp(-(x-k)/h));\n"
+    "}\n"
     /* What reaches this fragment, as a multiplier on the colour of its texel.
      *
      * The authored byte is a ratio in the palette's own perceptual space, so the
@@ -1904,7 +1938,15 @@ static const char g_geometry_fragment_body[] =
      * class always had, and pulled the whole way it is lit like any other
      * surface of its sector. */
     "  if (light==0) total=mix(vec3(1.0),total,u_room_unshaded);\n"
-    "  return clamp(total,vec3(u_light_limits.x),vec3(u_light_limits.y));\n"
+    /* And the two ends of the total. The floor is a floor and nothing else --
+     * the least light any surface receives. The other end is the knee above,
+     * which at the threshold the row ships at is the clip this was written as,
+     * operation for operation: the floor taken first, the threshold taken
+     * second, exactly as one clamp took them. */
+    "  total=max(total,vec3(u_light_limits.x));\n"
+    "  return vec3(light_knee(total.r,u_light_limits.y),\n"
+    "              light_knee(total.g,u_light_limits.y),\n"
+    "              light_knee(total.b,u_light_limits.y));\n"
     "}\n"
     /* The unlit texel of the ordinary tail. Every other class is unlit in the
      * original and stays unlit here, and says so by leaving this unset. */

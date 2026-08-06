@@ -335,7 +335,10 @@ struct hwr_gl_light {
      * At zero the class never reaches the light rig at all. */
     float room_unshaded_pull;
     /* Where the light total is held: the floor is the darkest anything is
-     * allowed to be, the ceiling is where it clips. */
+     * allowed to be, and the ceiling is where it stops adding up -- a KNEE the
+     * light is eased into rather than a cut, so two surfaces past it keep their
+     * order. At one and above there is nothing left to ease into and it is the
+     * cut it always was, to the bit. */
     float room_floor;
     float world_ceiling;
     /* Put the original's darkness ceiling -- a bright sector's surfaces never
