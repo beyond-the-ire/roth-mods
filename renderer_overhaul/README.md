@@ -84,22 +84,24 @@ line. Applying the settings rewrites the file with its own comments and ordering
 The light rig applies to `modern` shading only. Every one of these keys is ignored by the other two
 shadings, so setting one while the shading is `authentic` leaves the picture untouched.
 
-- `room_light_dark`, `room_light_lit`: what the dimmest rooms of a map give off by themselves, from
-  0 through 1, and what its brightest rooms do, from 0 through 5. These are the two dials that
-  matter: the first sets how dark the world is, the second sets how much turning a light on is
-  worth, and neither touches the other.
-- `room_light_gain`: a master scale over both of them, from 0 through 4. One leaves them where the
-  two rows above put them.
+- `room_light_reach`: how far a room's own light carries, against the distance the map authored for
+  it, from 0.4 through 2. One is the map exactly as written; lower is a darker world, and it
+  darkens a dim room long before it touches a lit one. This is the darkness dial.
+- `room_light_gain`: a master scale over the light a room gives off, from 0 through 4. One leaves
+  it where the map put it.
 - `room_light_floor`: the least light any surface receives, from 0 through 0.25. Zero is honest
   darkness.
-- `room_light_curve`: `anchored` places a room between the two levels above; `legacy` is the older
-  behaviour, one gain over the whole authored range.
+- `room_light_curve`: `engine` reads a map's own brightness value as what the game stores it as —
+  the distance that room's light reaches — so a room lights its surfaces until its light runs out.
+  `anchored` and `legacy` read it as one flat level for the whole room instead, the first placed
+  between the two levels below and the second scaled by the gain above.
+- `room_light_dark`, `room_light_lit`: under `anchored` only, what the dimmest rooms of a map give
+  off by themselves, from 0 through 1, and what its brightest rooms do, from 0 through 5.
 - `room_light_anchor`, `room_light_byte_dark`, `room_light_byte_lit`, `room_light_window_min`,
-  `room_light_window_max`: which of a map's own brightness values count as its dark and its lit
-  ends. Read from the map by default, which is what keeps the two dials above meaning the same
-  thing from one map to the next; the rest are for a map that reads wrongly.
-- `room_light_shape`: where the middle of a map's range sits between the two levels, from 0.25
-  through 4. One is straight.
+  `room_light_window_max`: under `anchored` only, which of a map's own brightness values count as
+  its dark and its lit ends. Read from the map by default; the rest are for a map that reads
+  wrongly.
+- `room_light_shape`: how steep the falloff is, from 0.25 through 4. One is the map's own.
 - `room_light_unshaded_gain`: how much of the outdoor ground and other surfaces a map marks as never
   to be darkened stays fully bright, from 0 through 1. One is exactly as the map asks.
 - `ambient_light`, `ambient_color`, `ambient_intensity`: a little light everywhere, its colour as
@@ -226,18 +228,20 @@ original with the bands taken out of it, and with nothing else taken out of it.
 
 **Modern** lights the world instead of shading it. Each room glows with the brightness it was built
 with, so a room the map calls bright is bright and one it calls dim is dim; a fill and the light
-you carry are added to that; and distance stops darkening anything by itself. Light switches,
-weapon flashes and everything else the map does to a room's brightness still work, and read as
-light rather than as a jump from one shade to the next.
+you carry are added to that. Light switches, weapon flashes and everything else the map does to a
+room's brightness still work, and read as light rather than as a jump from one shade to the next.
 
 Modern shading brings its own settings with it, all of them dimmed until it is chosen:
 
-- **How dark an unlit room is** and **How bright a lit room is** are the two dials that decide what
-  the world feels like. A map's own brightness values are read from the map itself and stretched
-  between them, so the difference a light switch or a candle makes stays visible however dark you
-  set the world — which is what a single brightness dial cannot do, because it shrinks that
-  difference along with everything else. **Room brightness** is a master scale over both, and
-  **Never darker than** is the least light any surface receives.
+- **How far a room's light carries** is the dial that decides what the world feels like. The value a
+  map stores for each of its rooms is not a brightness: it is a distance, the range that room's own
+  light reaches before it gives out. Read that way, a room lights its surfaces until its light runs
+  out — so a corridor's far end goes dark while the wall in front of you does not, and a room whose
+  lights are on stays bright down its whole length. At one the map is read exactly as written, which
+  is the original's own picture; turning it down takes the dim rooms into darkness long before it
+  touches the lit ones, which is what a single brightness dial cannot do because it shrinks the
+  difference between them along with everything else. **Room brightness** is a master scale over the
+  whole of it, and **Never darker than** is the least light any surface receives.
 - **Ambient fill**, with its **colour** and **strength**, is a little light everywhere, so what
   nothing else reaches is still faintly visible.
 - **Carried light**, with its **colour**, **strength** and **reach**, is a real light where you are

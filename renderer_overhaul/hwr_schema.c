@@ -62,7 +62,8 @@ static const struct hwr_enum_value HWR_SHADING_MODE_VALUES[] = {
 
 static const struct hwr_enum_value HWR_ROOM_CURVE_VALUES[] = {
     { "legacy",   HWR_ROOM_CURVE_LEGACY,   "One brightness dial" },
-    { "anchored", HWR_ROOM_CURVE_ANCHORED, "Separate dark and lit levels" }
+    { "anchored", HWR_ROOM_CURVE_ANCHORED, "Separate dark and lit levels" },
+    { "engine",   HWR_ROOM_CURVE_ENGINE,   "A room's light runs out" }
 };
 
 static const struct hwr_enum_value HWR_ROOM_ANCHOR_VALUES[] = {
@@ -494,9 +495,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "exactly as the game always has. Smooth follows the same "
                 "shades continuously, so a wall or a floor darkens evenly "
                 "instead of in bands. Modern lights the world instead: each "
-                "room glows with the brightness it was built with, a fill and "
-                "the light you carry are added to it, and distance stops "
-                "darkening anything on its own."
+                "room lights its own surfaces as far as the map says its light "
+                "carries, and a fill and the light you carry are added to it."
     },
     {
         /* Where the picture is finally quantized into screen colours, and the
@@ -647,20 +647,45 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, room_light_curve),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .e = HWR_ROOM_CURVE_ANCHORED },
-        .original = { .e = HWR_ROOM_CURVE_ANCHORED },
+        .def = { .e = HWR_ROOM_CURVE_ENGINE },
+        .original = { .e = HWR_ROOM_CURVE_ENGINE },
         .values = HWR_ROOM_CURVE_VALUES,
         .value_count = HWR_COUNT_OF(HWR_ROOM_CURVE_VALUES),
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "How a room's brightness reads",
-        .help = "Separate levels give a room with its lights off and a room "
-                "with them on their own dials, so the difference a switch or a "
-                "candle makes stays visible however dark the world is set. One "
-                "dial is the older behaviour: it scales the whole range at "
-                "once, which shrinks that difference along with everything "
-                "else."
+        .help = "A map stores each room's brightness as the distance its own "
+                "light carries, and the default reads it as exactly that: a "
+                "room lights its surfaces until its light runs out, as the "
+                "original does. The other two read it as one flat level for the "
+                "whole room, either scaled by one dial or placed between the "
+                "two levels below."
+    },
+    {
+        .key = "room_light_reach",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_reach),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.4f },
+        .max = { .f = 2.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How far a room's light carries",
+        .help = "How far into a room its own light reaches, against the "
+                "distance the map authored for it. One is the map exactly as "
+                "written; lower is a darker world, and it darkens a dim room "
+                "long before it touches a lit one."
     },
     {
         .key = "room_light_dark",

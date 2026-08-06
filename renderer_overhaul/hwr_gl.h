@@ -286,15 +286,38 @@ enum hwr_gl_shading_mode {
  * whichever space the composition is running in. Keeping the two apart is what
  * lets the working space be decided in one place -- the shader -- rather than
  * baked into a product here. */
+/* Which law turns a room's authored brightness into light.
+ *
+ * The first scales the byte by one gain. The second places it between two
+ * anchors taken from the map's own sectors, so a light switch keeps its share
+ * of the range however dark the world is set. The third reads the byte for what
+ * the engine reads it as -- a REACH, the distance at which that room's light
+ * runs out -- and takes the room's brightness from the engine's own shade at
+ * the fragment's depth. Only the third can tell the far end of a corridor from
+ * the wall in front of the player: the other two are functions of the sector
+ * alone and give both the same number.
+ *
+ * Zero is the oldest of them, which is also what a rig nobody has filled in
+ * resolves to, so a caller that knows nothing of any of this gets the picture
+ * it always got. */
+enum hwr_gl_room_curve {
+    HWR_GL_ROOM_CURVE_LEGACY = 0,
+    HWR_GL_ROOM_CURVE_ANCHORED,
+    HWR_GL_ROOM_CURVE_ENGINE
+};
+
 struct hwr_gl_light {
     /* The authored sector byte, as self-illumination. */
     float room_gain;
     float room_gamma;
-    /* Whether the byte is placed BETWEEN two anchors rather than scaled by the
-     * gain alone. Zero is the older law, to the bit -- which is also what a rig
-     * nobody has filled in resolves to, so a caller that knows nothing of this
-     * gets the picture it always got. */
-    int room_anchored;
+    /* Which of the three laws above the byte is read through. */
+    int room_curve;
+    /* How far a room's own light carries, as a multiplier on the reach its
+     * authored byte states. One is the map read exactly as written, which under
+     * the engine law is the original's own picture; below one every room goes
+     * dark nearer its own beginning. Read by that law alone, and it divides by
+     * it, so it is never zero. */
+    float room_reach;
     /* The two input anchors, already taken to the exponent above, and the two
      * output levels the byte is placed between. The anchors are worked out where
      * the map is known and the rows are known, so the fragment does one subtract,

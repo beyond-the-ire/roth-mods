@@ -341,10 +341,13 @@ static struct hwr_gl_truecolor g_truecolor_want = {
      * first frame rather than one whose reach is zero. Nothing reads it until a
      * law that composes with it is asked for. */
     .light = { .room_gain = 1.0f, .room_gamma = 2.2f, .world_ceiling = 1.0f,
-               /* The anchored law at the rows' own values, with the input pair
-                * the fit falls back to while no map has been read: the written
-                * anchors, taken to the exponent. */
-               .room_anchored = 1, .room_anchor_low = 0.745448649f,
+               /* The engine law at the rows' own values, which is the map read
+                * exactly as authored. The anchored law's own state is carried
+                * beside it at the pair the fit falls back to while no map has
+                * been read -- the written anchors, taken to the exponent -- so
+                * selecting it needs nothing filled in first. */
+               .room_curve = HWR_GL_ROOM_CURVE_ENGINE, .room_reach = 1.0f,
+               .room_anchor_low = 0.745448649f,
                .room_anchor_high = 2.90989566f, .room_dark = 0.02f,
                .room_lit = 1.0f, .room_shape = 1.0f,
                .ambient_color = { 0.4f, 0.4f, 0.4f },
@@ -1454,6 +1457,54 @@ static const char g_geometry_fragment_body[] =
     "  r=float(depth)/float(16*dividend)-float(bias);\n"
     "  return clamp(r,0.0,float(min(scale,31)));\n"
     "}\n"
+    /* The room's own light, as the map states it: a REACH rather than a level.
+     *
+     * The authored sector byte is the engine's depth bias -- bias = light - 120
+     * -- and its whole job is to say WHERE a room starts going dark, not how
+     * bright its surfaces are. At the player's feet nearly every sector of a map
+     * is drawn at its class's brightest row whatever its byte says; the byte
+     * only separates two rooms once you back away from them. So a room term that
+     * reads the byte alone reads the one place the byte says nothing, and the
+     * quantity to read instead is the engine's own shade.
+     *
+     * This is shade_amount() with the candle taken out of it: the same class
+     * selection, the same divisor, the same bias, the same clip ceiling and the
+     * same clamps, evaluated on depth alone. What is left out is left out on
+     * purpose. The screen-space radial and the receding-wall penalty are the
+     * candle -- a light the modern rig carries as a real one at the eye -- and a
+     * room's own light neither flickers with a lantern nor cares which way a
+     * wall faces. The flat path's edge bias is left out for the same reason: it
+     * carries the player light's own live strength.
+     *
+     * The tinted class keeps the eight rows the engine's tinted law subtracts
+     * (u_wd_bias, that constant scaled down with the class's own shade level,
+     * exactly as its shift is) and keeps its floor of one row: a candle-lit
+     * surface is never quite fullbright in the original either.
+     *
+     * Wall and flat need no branch here: the standard wall's divisor
+     * 16*(2<<level) IS the flat's shift 1<<(5+level), the same number written
+     * two ways. */
+    "float room_amount(int selected_level, bool tinted) {\n"
+    "  int level=selected_level; int shr=5+level;\n"
+    "  int light=effective_light();\n"
+    "  if (light==0) return 0.0;\n"
+    "  int axv=light-128;\n"
+    "  int bias=8+axv;\n"
+    "  int scale=32-(max(axv+4,0) >> 2);\n"
+    "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
+    "  int depth=(transformed >> 8) & 65535;\n"
+    "  float r=float(depth)/float(1 << shr)-float(bias);\n"
+    /* The candle-lit class's floor is taken the way the row law takes it: a term
+     * at or below the floor is that floor whatever the sector's clip ceiling
+     * says, rather than the two clamped in the other order. The two agree
+     * everywhere but at a sector bright enough for its ceiling to fall below one
+     * row, where the original draws the near field one row down and everything
+     * past it fullbright -- and reproducing the original includes reproducing
+     * that. */
+    "  if (tinted) { r-=float(u_wd_bias);\n"
+    "    return r<1.0 ? 1.0 : min(r,float(min(scale,31))); }\n"
+    "  return clamp(r,0.0,float(min(scale,31)));\n"
+    "}\n"
     "flat in vec3 v_normal;\n"
     /* The fragment's position relative to the eye, in world units, in the view's
      * own space -- which is the space every reflected view already lives in, so
@@ -1571,10 +1622,22 @@ static const char g_geometry_fragment_body[] =
      * switch and every candle in it. Normalizing between the map's own anchors
      * instead makes a step of a few bytes a fixed share of the whole dark-to-lit
      * swing, and that share does not depend on how dark the world is set. */
-    "uniform int u_room_anchored;\n"
+    /* Which of the three laws is in force: 0 the gain alone, 1 the anchored
+     * pair, 2 the engine's own. Zero is what a rig nobody has filled in
+     * resolves to, so the oldest law is still the one a caller that knows
+     * nothing of any of this gets. */
+    "uniform int u_room_curve;\n"
     "uniform vec2 u_room_anchor;\n"         /* unlit, lit -- in the exponent's space */
     "uniform vec2 u_room_level;\n"          /* what those two emit */
     "uniform float u_room_shape;\n"
+    /* How far a room's own light carries, as a multiplier on the reach the map
+     * authored. One is the map read as written, which is the original's own
+     * picture; below one every room goes dark nearer its own start, so a dim
+     * room is black long before a bright one has noticed. It is the darkness
+     * dial of the engine law, and it is a dial no setting of the older ones
+     * could be: one gain scales a lit room and an unlit one by the same factor,
+     * so it moves the whole picture down without ever separating them. */
+    "uniform float u_room_reach;\n"
     /* How far the author's unshaded class is pulled down into the room's own
      * light. Zero leaves it exactly fullbright and it never arrives here. */
     "uniform float u_room_unshaded;\n"
@@ -1725,7 +1788,7 @@ static const char g_geometry_fragment_body[] =
      * `amount` is the continuous shade the original's own depth law would have
      * produced. Nothing uses it unless the distance dial is moved off zero,
      * which is the point: distance does not darken a surface, light runs out. */
-    "vec3 modern_light(bool tinted, float amount) {\n"
+    "vec3 modern_light(bool tinted, float amount, int level) {\n"
     "  int light=effective_light();\n"
     /* A figure is a person, a creature or something to be picked up, and what a
      * dark room must not do is make one unfindable. Its own dial is on the light
@@ -1736,21 +1799,43 @@ static const char g_geometry_fragment_body[] =
      * figure's -- and a figure the author declared unshaded never arrives here
      * at all. */
     "  bool figure=(v_light_material.w & 32u)!=0u;\n"
+    /* What the room gives off, by one of three laws. Only the newest of them
+     * reads where the surface IS; the two below it are functions of the sector
+     * and are left expression for expression as they were, which is what keeps
+     * them reproducible to the bit rather than to a tolerance. */
+    "  float room;\n"
+    /* The engine's own law, which is a windowed power falloff with a per-sector
+     * reach: the room's shade read through the ramp the colormap is built on,
+     * which is (1 - row/32) to the gamma for every table the game ships. At
+     * gain one, reach one and shape one this IS the original's picture -- the
+     * same quantity, the same ramp, with the thirty-two steps taken out of it --
+     * so the law has a known-good starting point and every dial is a departure
+     * from a picture rather than from a guess.
+     *
+     * The shaping row multiplies the exponent here rather than bending a
+     * fraction between two levels: on this law the exponent IS the shape of the
+     * falloff, and one leaves the map's own. */
+    "  if (u_room_curve==2) {\n"
+    "    room=pow(max(1.0-room_amount(level,tinted)/(32.0*u_room_reach),0.0),\n"
+    "             u_room_light.y*u_room_shape);\n"
+    "  } else {\n"
     /* The authored byte, taken to the exponent: a ratio in the palette's own
-     * perceptual space turned into light. Both laws start here and the older one
-     * ends here, which is what makes it reproducible to the bit rather than to a
-     * tolerance -- the multiply below is the same multiply it always was. */
-    "  float u=pow(float(light)/128.0,u_room_light.y);\n"
-    "  float room=u;\n"
-    "  if (u_room_anchored!=0) {\n"
+     * perceptual space turned into light. The oldest law ends here, and the
+     * anchored one places that between two levels. Both are written exactly as
+     * they were written, one indent further in and not one operation
+     * different. */
+    "    float u=pow(float(light)/128.0,u_room_light.y);\n"
+    "    room=u;\n"
+    "    if (u_room_curve==1) {\n"
     /* Where this sector sits between the map's own unlit and lit ends, as a
      * fraction of the whole swing between them. A sector outside the pair is at
      * one end of it: a map's darkest corners are all "unlit" and its brightest
      * all "lit", which is what the two levels are for. */
-    "    float x=clamp((u-u_room_anchor.x)/"
+    "      float x=clamp((u-u_room_anchor.x)/"
     "max(u_room_anchor.y-u_room_anchor.x,1e-4),0.0,1.0);\n"
-    "    if (u_room_shape!=1.0) x=pow(x,u_room_shape);\n"
-    "    room=mix(u_room_level.x,u_room_level.y,x);\n"
+    "      if (u_room_shape!=1.0) x=pow(x,u_room_shape);\n"
+    "      room=mix(u_room_level.x,u_room_level.y,x);\n"
+    "    }\n"
     "  }\n"
     "  vec3 total=vec3(u_room_light.x*room"
     "*(figure ? u_sprite_light.x : 1.0));\n"
@@ -2135,7 +2220,7 @@ static const char g_geometry_fragment_body[] =
     "        if (modern_lit()) {\n"
     "          vec3 art=light_space("
     "texelFetch(u_palette,ivec2(int(texel),0),0).rgb);\n"
-    "          g_light_total=modern_light(tinted,amount);\n"
+    "          g_light_total=modern_light(tinted,amount,level);\n"
     "          g_light_total_set=true;\n"
     "          g_shade_color=art*g_light_total;\n"
     "          g_shade_linear=u_light_linear!=0;\n"
@@ -3884,11 +3969,16 @@ static void hwr_bind_light_uniforms(GLuint program,
 {
     hwr_uniform_2f(program, "u_room_light", light->room_gain,
                    light->room_gamma);
-    hwr_uniform_1i(program, "u_room_anchored", light->room_anchored != 0);
+    hwr_uniform_1i(program, "u_room_curve", (GLint)light->room_curve);
     hwr_uniform_2f(program, "u_room_anchor", light->room_anchor_low,
                    light->room_anchor_high);
     hwr_uniform_2f(program, "u_room_level", light->room_dark, light->room_lit);
     hwr_uniform_1f(program, "u_room_shape", light->room_shape);
+    /* A reach of nothing is not a darkness, it is a division: the engine law
+     * divides by it. The row's own range is well clear of zero and this is what
+     * holds a value that arrived some other way. */
+    hwr_uniform_1f(program, "u_room_reach",
+                   light->room_reach > 0.0f ? light->room_reach : 1.0f);
     hwr_uniform_1f(program, "u_room_unshaded", light->room_unshaded_pull);
     hwr_uniform_2f(program, "u_light_limits", light->room_floor,
                    light->world_ceiling);

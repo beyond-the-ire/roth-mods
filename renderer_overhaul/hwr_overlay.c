@@ -52,7 +52,12 @@ enum {
 #define HWR_PANEL_PCT_H 82u
 
 enum { HWR_RING_SIZE = 32u };
-enum { HWR_OVERLAY_MAX_ROWS = 24 };
+/* How many rows one section may put in front of a player. It bounds the array
+ * below rather than the panel -- the panel scrolls -- and it has to stand clear
+ * of the largest section the schema holds, because a section that reaches it
+ * loses its LAST rows and says nothing. The enhancements section is the
+ * largest, and adding the room's reach to it took that section to twenty-five. */
+enum { HWR_OVERLAY_MAX_ROWS = 40 };
 /* One key of the ring carries whether shift was down with it. */
 #define HWR_RING_SHIFT 0x80u
 

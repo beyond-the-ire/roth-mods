@@ -41,6 +41,7 @@
 /* The anchored room response: which law, the two levels it places a sector
  * between, its shaping, and where the two input anchors come from. */
 #define HWR_ROOM_CURVE_ROW "room_light_curve"
+#define HWR_ROOM_REACH_ROW "room_light_reach"
 #define HWR_ROOM_DARK_ROW "room_light_dark"
 #define HWR_ROOM_LIT_ROW "room_light_lit"
 #define HWR_ROOM_SHAPE_ROW "room_light_shape"
@@ -200,6 +201,24 @@ static void hwr_truecolor_row_color(const char *key,
     out[2] = (float)(rgb & 0xffu) / 255.0f;
 }
 
+/* The row's own value as the renderer names it. The two enumerations are
+ * written down twice on purpose: one belongs to the settings a person edits and
+ * the other to the rig a fragment reads, and a translation is what keeps either
+ * free to gain a value without the other having to agree first. */
+static enum hwr_gl_room_curve hwr_truecolor_gl_room_curve(
+    enum hwr_room_curve curve)
+{
+    switch (curve) {
+    case HWR_ROOM_CURVE_LEGACY:
+        return HWR_GL_ROOM_CURVE_LEGACY;
+    case HWR_ROOM_CURVE_ANCHORED:
+        return HWR_GL_ROOM_CURVE_ANCHORED;
+    case HWR_ROOM_CURVE_ENGINE:
+        break;
+    }
+    return HWR_GL_ROOM_CURVE_ENGINE;
+}
+
 static enum hwr_gl_shading_mode hwr_truecolor_gl_shading(
     enum hwr_shading_mode mode)
 {
@@ -309,10 +328,17 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
      * is what makes the normalization a normalization -- both sides of the
      * fraction are in one space, and it is the space the map's own steps are
      * perceptually even in. */
-    light->room_anchored =
-        hwr_truecolor_row_enum(HWR_ROOM_CURVE_ROW, settings,
-                               HWR_ROOM_CURVE_ANCHORED) ==
-        HWR_ROOM_CURVE_ANCHORED;
+    light->room_curve = (int)hwr_truecolor_gl_room_curve(
+        (enum hwr_room_curve)hwr_truecolor_row_enum(HWR_ROOM_CURVE_ROW,
+                                                    settings,
+                                                    HWR_ROOM_CURVE_ENGINE));
+    /* The reach the engine law divides by. The row's own floor is well clear of
+     * zero; this is what holds a value that arrived some other way, exactly as
+     * the lamp's own reach is held below. */
+    light->room_reach = hwr_truecolor_row_float(HWR_ROOM_REACH_ROW, settings,
+                                                1.0f);
+    if (!(light->room_reach > 0.0f))
+        light->room_reach = 1.0f;
     {
         float dark_byte;
         float lit_byte;

@@ -75,10 +75,26 @@ enum hwr_light_scope {
  * map's own sectors and places the result between two output levels, so the two
  * questions are two dials and the map's brightness steps keep their share of the
  * range whatever darkness the world is tuned to. The first stays as it was, to
- * the bit, for anyone who wants the picture they already tuned. */
+ * the bit, for anyone who wants the picture they already tuned.
+ *
+ * Both of those, though, are functions of the SECTOR: every surface of a room
+ * comes out at one brightness, so the far end of a corridor is painted exactly
+ * as brightly as the wall in front of the player and no dial can separate them.
+ * And the value they read was never a brightness. The game stores each room's
+ * number as a REACH -- it says how far you can see into that room before it goes
+ * black, and at the player's own feet nearly every room of a map is drawn at the
+ * same brightness whatever its number is.
+ *
+ * The third law reads it as that. The room's brightness becomes the game's own
+ * shading at the surface's own distance, read through the curve its colour
+ * tables are built on, so a room's light RUNS OUT over the distance the map
+ * authored for it. With every dial at its own default that is the original
+ * picture; turning the reach down darkens the dim rooms long before it touches
+ * the lit ones, which is the one thing the other two cannot do. */
 enum hwr_room_curve {
     HWR_ROOM_CURVE_LEGACY = 0,
-    HWR_ROOM_CURVE_ANCHORED
+    HWR_ROOM_CURVE_ANCHORED,
+    HWR_ROOM_CURVE_ENGINE
 };
 
 /* Where the two byte anchors come from: the map's own sectors, or two numbers
@@ -180,6 +196,12 @@ struct hwr_settings {
      * dial and the "the lights work" dial, and neither touches the other. The
      * gain above survives as the master scale over both. */
     enum hwr_room_curve room_light_curve;
+    /* How far a room's own light carries, as a multiplier on the reach the map
+     * authored for it. It is the darkness dial of the law above that reads the
+     * map's number as a reach: one is the map exactly as written, and lower
+     * pulls every room's darkness in toward the player -- a dim room reaching
+     * only a few paces while a lit one still carries down its whole length. */
+    float room_light_reach;
     float room_light_dark;
     float room_light_lit;
     /* The shape of the response between them. One is straight in the exponent's
