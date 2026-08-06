@@ -103,6 +103,24 @@ static uint8_t g_map_light_low;
 static uint8_t g_map_light_middle;
 static uint8_t g_map_light_high;
 
+/* And what the map now loaded says about the light a person carries through it.
+ *
+ * The map states the shade level its CANDLE-LIT surfaces are drawn at, and that
+ * level is a distance: a candle-lit room spends one shade row every
+ * (1 << (5 + level)) world units. Such a room has spent the whole ramp -- the
+ * thirty-two rows of it, plus the eight the candle-lit class is given on top --
+ * at forty of those units, and that is the range the map itself authored for
+ * the light in it. Zero, which is what forty-six of the game's forty-eight maps
+ * hold, is 1 280 world units.
+ *
+ * It is held here for the same two reasons the census above is: it moves once
+ * per map while the rig is worked out on every settings change, and it is a
+ * statement about a PLACE rather than about what a person wants. Zero is the
+ * commonest map's answer and is what stands with no map staged. */
+#define HWR_TRUECOLOR_CANDLE_ROWS 40u
+#define HWR_TRUECOLOR_TINT_LEVEL_MAX 2u
+static uint16_t g_map_tint_shade_level;
+
 /* The settings panel's draft while it is open, and whether there is one. Only
  * the picture dials are read out of it: everything else takes effect when it is
  * applied, as it always has. */
@@ -311,6 +329,15 @@ static void hwr_truecolor_anchor_bytes(const struct hwr_settings *settings,
     *lit = (float)high;
 }
 
+float hwr_truecolor_candle_reach(void)
+{
+    unsigned level = g_map_tint_shade_level < HWR_TRUECOLOR_TINT_LEVEL_MAX
+                         ? g_map_tint_shade_level
+                         : HWR_TRUECOLOR_TINT_LEVEL_MAX;
+
+    return (float)((1u << (5u + level)) * HWR_TRUECOLOR_CANDLE_ROWS);
+}
+
 /* The rig the modern law composes with, as the rows in force describe it.
  *
  * A switch that is off is spent here rather than in the shader: an unlit fill
@@ -379,8 +406,14 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
         hwr_truecolor_row_bool(HWR_PLAYER_LIGHT_ROW, settings, 0)
             ? hwr_truecolor_row_float(HWR_PLAYER_INTENSITY_ROW, settings, 0.0f)
             : 0.0f;
+    /* The reach the carried light is given, and where nothing written means the
+     * map's own answer rather than no light at all. The row's own floor is
+     * zero, so this is the whole of that reading; a value written arrives here
+     * as written and is used as written. */
     light->lamp_range = hwr_truecolor_row_float(HWR_PLAYER_RANGE_ROW, settings,
-                                                800.0f);
+                                                0.0f);
+    if (!(light->lamp_range > 0.0f))
+        light->lamp_range = hwr_truecolor_candle_reach();
     /* The light the player carries is a light the player carries: it reaches
      * whatever it can see. The mark it used to be confined to is the engine's
      * live word for "this room's own fixtures are out", which it clears the
@@ -581,6 +614,16 @@ void hwr_truecolor_set_map_lighting(uint32_t counted, uint8_t low,
     /* The same road the look layer takes when a map changes what a row is worth
      * without the store moving: raise the bit and let the pump work the rig out
      * again where doing so is safe. */
+    hwr_settings_mark_changed(HWR_CHANGE_TRUECOLOR);
+}
+
+void hwr_truecolor_set_map_candle(uint16_t tint_shade_level)
+{
+    if (tint_shade_level == g_map_tint_shade_level)
+        return;
+    g_map_tint_shade_level = tint_shade_level;
+    /* The same road the census takes: raise the bit and let the settings pump
+     * work the rig out again where doing so is safe. */
     hwr_settings_mark_changed(HWR_CHANGE_TRUECOLOR);
 }
 

@@ -2284,6 +2284,10 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
                                    g_world.light_census.low,
                                    g_world.light_census.middle,
                                    g_world.light_census.high);
+    /* And what the same metadata says about the light carried THROUGH it: the
+     * shade level its candle-lit surfaces are drawn at, which is the distance a
+     * carried light with no reach written for it is given. */
+    hwr_truecolor_set_map_candle(g_world.luts.tint_shade_level);
     hwr_settings_apply_pending();
     /* A fresh sector table means the light instrument's held state describes a
      * map that is no longer loaded, so the next look writes a census. */

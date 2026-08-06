@@ -111,8 +111,12 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
 - `ambient_light`, `ambient_color`, `ambient_intensity`: a little light everywhere, its colour as
   six bare hexadecimal digits, and how much of it there is from 0 through 2.
 - `player_light`, `player_light_color`, `player_light_intensity`, `player_light_range`: a real
-  light where you are standing, in place of the original's pool on the screen. The reach is in
-  world units, from 100 through 4000; smaller is a tighter pool.
+  light where you are standing, in place of the original's pool on the screen. It ships lit,
+  because the room response above lets a room's own light run out and a person then needs one of
+  their own. The reach is in world units up to 4000; **zero, which is what it ships at, follows
+  the reach the map itself authored for its own candlelight** — every map states the shade level
+  its candle-lit surfaces are drawn at, and that level is a distance. Smaller is a tighter pool,
+  and the settings screen shows what the map is actually giving you.
 - `player_light_flicker`, `player_light_flicker_amount`, `player_light_flicker_speed`: let that
   light breathe the way a flame does. It is held well clear of going out, so it never gutters.
 - `sprite_light_gain`: how bright people, creatures and things you can pick up are, from 0 through
@@ -174,10 +178,13 @@ Only the settings that describe how a place looks may appear: the shading, the l
 world gain. A line the file cannot use costs that line and nothing more, and the game reports it
 when it reads the file. **Reload From File** on the settings screen reads this file again too.
 
-The file ships with a `day` and a `night` profile and nothing pointed at them, so the pair is there
-to read and change without pre-judging any map. A row a map answers for is marked on the settings
-screen with what the map says, because moving that setting will not change the picture where you
-are standing.
+The file ships with an `authentic`, a `moody` and a `dark` profile and nothing pointed at any of
+them, so the set is there to read and change without pre-judging any map. All three say the same
+three things — how far a room's light carries, the room brightness over it, and where brightness
+levels off — and differ only in the first: `authentic` is the map exactly as it was authored,
+`moody` is a step away from it, and `dark` is two. A row a map answers for is marked on the
+settings screen with what the map says, because moving that setting will not change the picture
+where you are standing.
 
 A section written for `room_light_curve = anchored` — one that sets `room_light_dark`,
 `room_light_lit`, or any of the anchor and window keys, without saying which response it means — is
@@ -242,10 +249,19 @@ lands on a whole shade the two are the same picture exactly. Nothing else about 
 changes: the light you carry keeps its own shape, its own flicker and its own place. Smooth is the
 original with the bands taken out of it, and with nothing else taken out of it.
 
-**Modern** lights the world instead of shading it. Each room glows with the brightness it was built
-with, so a room the map calls bright is bright and one it calls dim is dim; a fill and the light
-you carry are added to that. Light switches, weapon flashes and everything else the map does to a
-room's brightness still work, and read as light rather than as a jump from one shade to the next.
+**Modern** lights the world instead of shading it. The value a map stores for each of its rooms is
+not a brightness — it is a distance, the range that room's own light reaches before it gives out —
+and Modern reads it as exactly that, so a room lights its surfaces until its light runs out. A
+corridor's far end goes dark while the wall in front of you does not; a room whose lights are on
+stays bright down its whole length; the light you carry, a fill, and the map's own torches are
+added to that. Light switches, weapon flashes and everything else the map does to a room still
+work, and read as light rather than as a jump from one shade to the next — a light switch moves the
+room's own reach AND takes it out of the candle model, which is why a room reads properly lit when
+it comes on rather than one step brighter.
+
+At its own defaults — the reach at one, the brightness at one — Modern draws the map exactly as it
+was authored, which is the original's own picture with the thirty-two steps taken out of it and a
+light where you are standing. Every dial is a departure from that rather than from a guess.
 
 Modern shading brings its own settings with it, all of them dimmed until it is chosen:
 
@@ -262,9 +278,13 @@ Modern shading brings its own settings with it, all of them dimmed until it is c
   nothing else reaches is still faintly visible.
 - **Carried light**, with its **colour**, **strength** and **reach**, is a real light where you are
   standing rather than a pool painted on the screen: surfaces facing you catch it, surfaces turned
-  away do not, and it is correct in a mirror without being told anything about one. **Flickers**,
-  with its **depth** and **speed**, lets it breathe like a flame; it is held well clear of going
-  out, so it never gutters or strobes.
+  away do not, and it is correct in a mirror without being told anything about one. It is on by
+  default under Modern, because a room's own light now runs out with distance and what is left when
+  it does should be the light you brought. Its reach follows the map unless you set one, and its
+  strength ships low on purpose: near you the picture is already as bright as it can be drawn, so a
+  stronger carried light does not brighten that near field, it flattens it. Raise it if you want a
+  brighter pool at the cost of some of that. **Flickers**, with its **depth** and **speed**, lets it
+  breathe like a flame; it is held well clear of going out, so it never gutters or strobes.
 - **Item and figure brightness** is people, creatures and things you can pick up, on a dial of
   their own so they never disappear in a dark room.
 

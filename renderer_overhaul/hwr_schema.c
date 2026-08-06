@@ -1114,6 +1114,17 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "How much of that fill there is."
     },
     {
+        /* The one row of this family whose default is not its Original.
+         *
+         * The original's own candle is a pool painted on the SCREEN, and the
+         * room response that ships leaves it out on purpose: it reads a room's
+         * value as the distance that room's light carries, evaluated on depth
+         * alone. So a world lit that way has nothing at the eye until this is
+         * on, and what a player selecting Modern gets by touching nothing
+         * should be a lit world rather than one waiting for a second setting.
+         *
+         * Original still holds it off, which is what keeps that preset the
+         * original picture -- the same split the render size ships with. */
         .key = "player_light",
         .type = HWR_VT_BOOL,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -1123,7 +1134,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .b = 0 },
+        .def = { .b = 1 },
         .original = { .b = 0 },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
@@ -1164,7 +1175,20 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_intensity),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 0.0f },
+        /* What the light above is worth as it ships, and it is deliberately a
+         * long way under what a light can be set to.
+         *
+         * A room read as the distance its own light carries is already drawn at
+         * the brightest the picture HAS wherever that light still reaches --
+         * the world image multiplies the map's own unshaded colour, so there is
+         * no headroom above it anywhere near the player. A carried light strong
+         * enough to be felt there would therefore not brighten the near field,
+         * it would FLATTEN it: two rooms the map states differently, painted
+         * the same white. This is the strongest value that paints nothing alike
+         * that the room's own light separates by an amount an eye reads, and it
+         * is where the light is worth having anyway -- in the dark, where the
+         * room's own has run out. Original holds it at nothing. */
+        .def = { .f = 0.15f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
         .max = { .f = 2.0f },
@@ -1174,7 +1198,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light strength",
-        .help = "How bright the light you carry is."
+        .help = "How bright the light you carry is. It shows most where a "
+                "room's own light has run out; near you the picture is already "
+                "as bright as it can be drawn."
     },
     {
         .key = "player_light_range",
@@ -1186,9 +1212,19 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_range),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 800.0f },
-        .original = { .f = 800.0f },
-        .min = { .f = 100.0f },
+        /* Nothing is the map's own answer rather than no reach at all.
+         *
+         * Every map states the shade level its candle-lit surfaces are drawn
+         * at, and that level IS a distance: it says how many world units a
+         * candle-lit room spends per shade row, so the range where such a room
+         * has spent the whole ramp is the reach the map itself authored for the
+         * light in it. One number, read off the map, in the units the map is
+         * built in -- which no single value written here can be on every map.
+         * A value written stands exactly as written, for the player who wants a
+         * tighter pool than the map asks for. */
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
         .max = { .f = 4000.0f },
         .step = { .f = 50.0f },
         .page_step = { .f = 200.0f },
@@ -1196,8 +1232,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light reach",
-        .help = "How far the light you carry reaches before it runs out. "
-                "Smaller is a tighter pool around you."
+        .help = "How far the light you carry reaches before it runs out, in "
+                "world units. Zero follows the reach the map itself authored "
+                "for its own candlelight. Smaller is a tighter pool around you."
     },
     {
         .key = "player_light_scope",

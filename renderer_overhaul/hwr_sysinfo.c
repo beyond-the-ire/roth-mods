@@ -1,5 +1,6 @@
 #include "hwr_sysinfo.h"
 
+#include "hwr_enh_truecolor.h"
 #include "hwr_gl.h"
 #include "hwr_schema.h"
 #include "hwr_settings.h"
@@ -419,6 +420,17 @@ int hwr_sysinfo_active_text(const struct roth_api_v1 *api,
             return 0;
         snprintf(out, out_size, "%s",
                  hwr_sysinfo_present_mode_text(state.present_mode));
+        return 1;
+    }
+    /* The reach of the light a person carries, where the row is left at
+     * nothing and the map's own answer is what is running. It is the one row of
+     * the light rig with an answer of that kind, and a number the player cannot
+     * see is a number they cannot judge the dial beside it by. */
+    if (strcmp(desc->key, "player_light_range") == 0) {
+        if (saved->player_light_range > 0.0f)
+            return 0;
+        snprintf(out, out_size, "%u, this map's own candlelight",
+                 (unsigned)hwr_truecolor_candle_reach());
         return 1;
     }
     if (strcmp(desc->key, "fps_cap") == 0) {

@@ -68,4 +68,20 @@ void hwr_truecolor_preview_clear(void);
 void hwr_truecolor_set_map_lighting(uint32_t counted, uint8_t low,
                                     uint8_t middle, uint8_t high);
 
+/* And what the map now staged says about the light a person carries through it:
+ * the shade level its candle-lit surfaces are drawn at.
+ *
+ * That level is a distance -- the world units such a room spends on one shade
+ * row -- so it is what the reach of a carried light is derived from wherever
+ * nobody has written one. Called where a map is staged, on the game thread,
+ * beside the call above and under the same rules: it allocates nothing,
+ * touches no GL object, and passing what is already held does nothing at all. */
+void hwr_truecolor_set_map_candle(uint16_t tint_shade_level);
+
+/* The reach that map authored for its own candlelight, in world units, which is
+ * what a carried light with no reach written for it is given. It is out here
+ * rather than only inside the rig because the settings screen says what a row is
+ * actually running at, and a row left at nothing is exactly such a row. */
+float hwr_truecolor_candle_reach(void);
+
 #endif
