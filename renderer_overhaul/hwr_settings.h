@@ -271,10 +271,15 @@ struct hwr_settings {
     /* The containments, which are not shadows and are not sold as any.
      *
      * How many doorways from the room the eye is in a light may still be
-     * seeded from; how far above a room's ceiling and below its floor its own
-     * lights may reach before they are faded out, which is what stops a torch
-     * lighting the storey above it; and how long a light dropped for want of a
-     * slot takes to go out, so a set that changes never does it in one frame. */
+     * seeded from WHERE THE FRAME HAS NO DRAWN SET -- with one, whether a
+     * light's own room is on the screen is the containment and this stands
+     * down, because a light going out as somebody walks away from the room it
+     * is lighting would be a light following the player rather than one
+     * standing in a room; how far above a room's ceiling and below its floor
+     * its own lights may reach before they are faded out, which is what stops a
+     * torch lighting the storey above it; and how long a light dropped for want
+     * of a slot takes to go out, so a set that changes never does it in one
+     * frame. */
     uint32_t point_light_hops;
     float point_light_z_slack;
     float point_light_fade;

@@ -1525,8 +1525,10 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "How far away a light may be",
         .help = "How many doorways from the room you are in a light may still "
-                "be lighting it. Since these lights cast no shadows, a lower "
-                "number is less of one reaching round a corner it should not."
+                "be lighting it. A light normally goes on lighting its own "
+                "room for as long as that room is on screen whatever this "
+                "says; it is the limit that comes into force only when the "
+                "renderer cannot tell which rooms are being drawn."
     },
     {
         .key = "point_light_z_slack",

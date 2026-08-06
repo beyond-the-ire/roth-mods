@@ -34,10 +34,17 @@
  *   the portal walk   a light in a room the engine's own walk did not draw is
  *                     not seeded at all. This is free -- the walk has already
  *                     run -- and it removes the worst class outright: light
- *                     from a room that cannot be seen from here.
- *   the hop cap       a light more than so many doorways from the room the eye
- *                     is in is dropped, which removes what is visible round a
- *                     corner but has no business lighting this wall.
+ *                     from a room that cannot be seen from here. It is also the
+ *                     only one of the four that decides whether a light EXISTS,
+ *                     which is a ruling rather than an implementation: a light
+ *                     whose room is on the screen is lighting that room, however
+ *                     far away the person looking at it happens to be standing.
+ *   the hop cap       and where there is no drawn set at all -- the visibility
+ *                     pass switched off, or a draw list that could not be read
+ *                     -- a light more than so many doorways from the room the
+ *                     eye is in is dropped instead. It is the containment of
+ *                     last resort and nothing more: how far the eye is from a
+ *                     light orders the CAP and never decides existence.
  *   the world-Z window  a light reaches only its own room's floor and ceiling
  *                     with slack either side, so a torch cannot light the
  *                     storey above it. The fragment reconstructs its own world
@@ -235,7 +242,10 @@ static int hwr_light_sprite_color(const struct hwr_lights_frame *frame,
  *
  * How many doorways a sector is from the room the eye is in, counted over the
  * map's own topology. Nothing about the camera but its room enters it, so it is
- * a flood over static data with one queue and one depth array. */
+ * a flood over static data with one queue and one depth array.
+ *
+ * Only reached where the frame has no drawn set to contain by; see the seeding
+ * below for why that is the whole of its job. */
 
 static uint8_t *g_hop_depth;
 static uint32_t *g_hop_queue;
@@ -572,11 +582,38 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
     if (frame->objects == NULL || !frame->objects->valid)
         return 0;
     /* CONTAINMENT: the hop cap, worked out once for the frame rather than per
-     * candidate. A camera whose room the engine has not named leaves it
-     * unenforced -- the portal walk above is still in force, and refusing every
-     * light because one word was not read would be a blackout, not a
-     * containment. */
-    if (frame->camera_sector >= 0)
+     * candidate -- AND ONLY WHERE THERE IS NO DRAWN SET TO CONTAIN BY.
+     *
+     * Which room a light is in is a fact about the map. Which room the eye is in
+     * is a fact about where somebody is standing, and it changes every time they
+     * take a step. So the two are not the same kind of rule: the drawn set says
+     * whether a light's room is ON THE SCREEN, and a light whose room is on the
+     * screen has to be lighting it. Counting doorways from the eye instead
+     * DELETES that light -- while its room is still in view -- and what that
+     * looks like is a pool on a wall going out as you walk away from it. A light
+     * that follows the player is not a containment; it is a different bug.
+     *
+     * The doorway count is therefore the containment of LAST RESORT. Where the
+     * engine's own walk gave an answer, that answer is the containment and this
+     * one stands down. Where it did not -- the visibility pass switched off, or
+     * a draw list that could not be read -- every room is a room that might be
+     * on the screen, and then the eye's own room is the only thing left to count
+     * from. A camera whose room the engine has not named leaves even that
+     * unenforced: refusing every light because one word was not read would be a
+     * blackout, not a containment.
+     *
+     * Rooting the walk at the light rather than at the eye is NOT the fix and is
+     * worth saying so once: the portal graph is walked both ways, so the count
+     * between two rooms is the same number whichever end it starts from. What
+     * had to change is what that number is allowed to decide.
+     *
+     * A cull set that does not answer for every room of the map is not a drawn
+     * set either: the gate above lets a room past the end of it through, so
+     * standing the last resort down on one would leave those rooms with no
+     * containment at all. Named here rather than assumed. */
+    if (frame->camera_sector >= 0 &&
+        !(frame->pvs_valid && frame->visible != NULL &&
+          frame->visible_count >= frame->world->sector_count))
         hop = hwr_lights_hop_map(frame->world, frame->camera_sector,
                                  g_settings.hops);
     for (i = 0; i < frame->objects->count && count < max; i++) {

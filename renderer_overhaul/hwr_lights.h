@@ -54,9 +54,10 @@ struct hwr_lights_settings {
     /* How much of the map's own candle word the two above take. */
     float glow_scale;
     /* The containments. Doorways from the eye's own room a light may still be
-     * seeded across; how far past its room's floor and ceiling it reaches
-     * before it is faded out; and how long a light dropped for want of a slot
-     * takes to go out. */
+     * seeded across WHERE THERE IS NO DRAWN SET -- with one, the drawn set is
+     * the containment and this stands down; how far past its room's floor and
+     * ceiling a light reaches before it is faded out; and how long a light
+     * dropped for want of a slot takes to go out. */
     unsigned hops;
     float z_slack;
     float fade_seconds;
@@ -92,7 +93,9 @@ struct hwr_lights_frame {
     size_t visible_count;
     int pvs_valid;
     /* The room the eye is in, or -1 where the engine has not said. The hop cap
-     * is counted from here. */
+     * is counted from here -- and only where the three above give no cull set to
+     * contain by, because where a light stands is a fact about the map and where
+     * the eye stands is not. */
     int camera_sector;
     /* The primary view's own world-to-view offset and eye height, which is all
      * a distance to the eye needs: the rotation that follows cannot change a

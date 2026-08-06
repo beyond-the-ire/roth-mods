@@ -118,10 +118,11 @@ darkened, and those are exactly the ones that are giving light. Nothing has to b
 to work, custom maps included.
 
 **These lights cast no shadows**, so one beside a doorway spills a little onto the far side of it
-and one behind a thin partition lights both faces. Four things keep that local: a light in a room
-you cannot see is not there at all, a light more than `point_light_hops` doorways away is dropped,
-a light cannot reach past its own room's floor and ceiling by more than `point_light_z_slack`, and
-its pool ends where `point_light_range` says rather than fading away for ever.
+and one behind a thin partition lights both faces. Three things keep that local: a light in a room
+you cannot see is not there at all, a light cannot reach past its own room's floor and ceiling by
+more than `point_light_z_slack`, and its pool ends where `point_light_range` says rather than
+fading away for ever. A light in a room you CAN see goes on lighting it however far off you walk;
+how far away you are only stands it further down the queue for one of the slots.
 
 - `point_light`: whether they light anything at all. `point_light_objects` is where they come from;
   turning it off leaves the family on with nothing seeding it.
@@ -136,8 +137,11 @@ its pool ends where `point_light_range` says rather than fading away for ever.
   colour beside it, as six bare hexadecimal digits.
 - `point_light_glow_scale`: how much of the map's own word about its lantern these take, from 0
   through 2, exactly as the light you carry takes it.
-- `point_light_hops`, `point_light_z_slack`: the two containments above, from 0 through 3 doorways
-  and from 0 through 512 world units.
+- `point_light_z_slack`: the vertical containment above, from 0 through 512 world units.
+- `point_light_hops`: how many doorways from the room you are in a light may still be lighting it,
+  from 0 through 3. A light normally goes on lighting its own room for as long as that room is on
+  screen whatever this says; it is the limit that comes into force only when the renderer cannot
+  tell which rooms are being drawn.
 
 A resolution change can cause a one-frame hitch while the render targets are resized.
 
