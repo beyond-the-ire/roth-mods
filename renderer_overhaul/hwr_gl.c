@@ -1376,6 +1376,13 @@ static const char g_geometry_fragment_body[] =
      * beside the origin it moves. The laws that read the engine's own origin
      * never see it. */
     "uniform ivec2 u_cone_wander;\n"
+    /* The screen row the fixed centre sits on: the view centre BEFORE the
+     * pitch shift. The engine adds its pitch term to the horizon but not to
+     * the candle origin's anchor (renderer.c:13411-13426 against the horizon
+     * staging), so the pool stays with the gaze while the world pitches
+     * under it -- looking down lights the near floor, looking up the
+     * ceiling. Level, this row IS the horizon. */
+    "uniform int u_cone_center_y;\n"
     /* How softly the candle's cone goes over from light to dark. Zero is the
      * engine's own edge, exactly, and it is the whole dial's identity: the
      * softened radial below is not evaluated at all. */
@@ -1391,7 +1398,13 @@ static const char g_geometry_fragment_body[] =
      * and that dance is the flicker. A law whose light does not dance measures
      * from the view centre itself -- the place the dance is a dance around --
      * which leaves the pool where it always was, without inventing a light
-     * position the map never had. The flicker switch puts the dance back:
+     * position the map never had. That centre is the UNPITCHED one: the
+     * engine adds its pitch shift to the horizon and never to this anchor,
+     * so the pool is screen-fixed and pitching the view slides the world
+     * under it -- the light follows the gaze onto the near floor or
+     * ceiling, which an anchor at the pitched horizon would not do (it
+     * would stay glued to the world's horizon and leave the gaze
+     * unlit). The flicker switch puts the dance back:
      * u_cone_wander is the flame's own paced wander of that centre, zero at
      * rest, so a still flame is the fixed centre to the bit and a lit one
      * moves the pool the way the engine's own candle moves.
@@ -1407,7 +1420,8 @@ static const char g_geometry_fragment_body[] =
      * would have clamped into darkness, and wrapping it lands a bright ring in
      * the dark instead. */
     "float candle_edge_depth(int depth) {\n"
-    "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i+u_cone_wander"
+    "  ivec2 origin=u_shade_fixed_origin!=0"
+    " ? ivec2(u_center_i.x,u_cone_center_y)+u_cone_wander"
     " : u_shade_origin;\n"
     "  int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "  int px=(abs(wrap16(source_column()-origin.x)) * sx) >> 8;\n"
@@ -1435,7 +1449,8 @@ static const char g_geometry_fragment_body[] =
      * whole answer, exactly. */
     "float cone_edge_depth(int depth, int shr) {\n"
     "  if (u_cone_penumbra<=0.0) return candle_edge_depth(depth);\n"
-    "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i+u_cone_wander"
+    "  ivec2 origin=u_shade_fixed_origin!=0"
+    " ? ivec2(u_center_i.x,u_cone_center_y)+u_cone_wander"
     " : u_shade_origin;\n"
     "  int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "  int px=(abs(wrap16(source_column()-origin.x)) * sx) >> 8;\n"
@@ -5080,6 +5095,11 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                                  (float)camera->focal_x / 16.0f),
                    (GLint)lrintf(g_lamp_wander_y *
                                  (float)camera->focal_y / 16.0f));
+    /* The fixed centre's own row: the view centre before the pitch shift,
+     * which is where the engine anchors its candle origin -- the horizon
+     * carries the pitch term, this anchor never does, so the pool follows
+     * the gaze when the view pitches. */
+    hwr_uniform_1i(program, "u_cone_center_y", camera->cone_center_y);
     hwr_uniform_1i(program, "u_flat_edge_bias", camera->flat_edge_bias);
     hwr_uniform_2f(program, "u_viewport", (GLfloat)width, (GLfloat)height);
     hwr_uniform_2i(program, "u_source_viewport",

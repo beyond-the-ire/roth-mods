@@ -2115,6 +2115,13 @@ int hwr_scene_rebuild(struct hwr_scene *scene, const struct hwr_world *world,
 #define VA_G_RENDER_TICK         0x90c0au
 #define VA_G_FRAME_TIME_SCALE    0x85324u
 #define VA_G_ANIM_CLOCK          0x8532au
+/* The view centre row before the pitch shift. The engine stages its horizon
+ * as pitch term + this word (render_world.c, the frame-context commit), but
+ * anchors the candle origin's jitter at this word alone
+ * (renderer.c:13411-13426) -- the pool is screen-fixed while the world
+ * pitches under it. The modern cone's fixed centre reads it for the same
+ * behaviour. */
+#define VA_G_UNPITCHED_CENTER_Y  0x8532cu
 
 static void hwr_read_camera(struct hwr_gl_camera *camera,
                             const struct hwr_world *world,
@@ -2131,6 +2138,8 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
     camera->focal_y = api->game_ram->u16(VA_G_FOCAL_Y);
     camera->center_x = (int32_t)api->game_ram->u32(VA_G_CENTER_X);
     camera->horizon = (int32_t)api->game_ram->u32(VA_G_HORIZON);
+    camera->cone_center_y =
+        (int16_t)api->game_ram->u16(VA_G_UNPITCHED_CENTER_Y);
     camera->shade_origin_x = (int16_t)api->game_ram->u16(VA_G_SHADE_ORIGIN_X);
     camera->shade_origin_y = (int16_t)api->game_ram->u16(VA_G_SHADE_ORIGIN_Y);
     camera->shade_level = (uint8_t)world->luts.shade_level;

@@ -33,6 +33,7 @@ int hwr_projection_scale_camera(struct hwr_gl_camera *camera,
     int64_t focal_y;
     int64_t center_x;
     int64_t horizon;
+    int64_t cone_center_y;
     int64_t shade_x;
     int64_t shade_y;
     double fov_scale = 1.0;
@@ -47,6 +48,7 @@ int hwr_projection_scale_camera(struct hwr_gl_camera *camera,
     camera->source_focal_y = camera->focal_y;
     camera->source_center_x = camera->center_x;
     camera->source_horizon = camera->horizon;
+    camera->source_cone_center_y = camera->cone_center_y;
     camera->source_shade_origin_x = camera->shade_origin_x;
     camera->source_shade_origin_y = camera->shade_origin_y;
 
@@ -78,6 +80,9 @@ int hwr_projection_scale_camera(struct hwr_gl_camera *camera,
     horizon = hwr_scale_about_midpoint(
         camera->source_horizon, source_height, target_height,
         target_height, source_height);
+    cone_center_y = hwr_scale_about_midpoint(
+        camera->source_cone_center_y, source_height, target_height,
+        target_height, source_height);
     shade_x = hwr_scale_about_midpoint(
         camera->shade_origin_x, source_width, target_width,
         target_height, source_height);
@@ -88,6 +93,7 @@ int hwr_projection_scale_camera(struct hwr_gl_camera *camera,
         focal_y <= 0 || focal_y > UINT16_MAX ||
         center_x < INT32_MIN || center_x > INT32_MAX ||
         horizon < INT32_MIN || horizon > INT32_MAX ||
+        cone_center_y < INT32_MIN || cone_center_y > INT32_MAX ||
         shade_x < INT16_MIN || shade_x > INT16_MAX ||
         shade_y < INT16_MIN || shade_y > INT16_MAX)
         return 0;
@@ -95,6 +101,7 @@ int hwr_projection_scale_camera(struct hwr_gl_camera *camera,
     camera->focal_y = (uint16_t)focal_y;
     camera->center_x = (int32_t)center_x;
     camera->horizon = (int32_t)horizon;
+    camera->cone_center_y = (int32_t)cone_center_y;
     camera->shade_origin_x = (int16_t)shade_x;
     camera->shade_origin_y = (int16_t)shade_y;
     return 1;

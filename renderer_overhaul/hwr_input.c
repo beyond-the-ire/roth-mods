@@ -165,6 +165,9 @@ int hwr_input_prepare_route(const struct roth_api_v1 *api,
     camera.focal_y = api->game_ram->u16(VA_G_FOCAL_Y);
     camera.center_x = (int32_t)(source_width / 2u);
     camera.horizon = (int32_t)(source_height / 2u);
+    /* Level for a picking route; nothing here shades, but the field should
+     * not be left meaning row zero. */
+    camera.cone_center_y = camera.horizon;
     if (camera.focal_x == 0 || camera.focal_y == 0 ||
         !hwr_projection_scale_camera(
             &camera, source_width, source_height,

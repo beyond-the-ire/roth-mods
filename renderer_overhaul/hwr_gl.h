@@ -180,6 +180,14 @@ struct hwr_gl_camera {
     uint16_t focal_y;
     int32_t center_x;
     int32_t horizon;
+    /* The view centre row BEFORE the pitch shift. The engine's horizon is
+     * this row plus the pitch term, but the candle origin's anchor is this
+     * row alone (renderer.c:13411-13426 against the horizon staging in
+     * render_world.c), so pitching the view slides the world under a
+     * screen-fixed pool and the pool follows the gaze onto the near floor
+     * or ceiling. The modern cone's fixed centre anchors here for the same
+     * reason; level, it is the horizon exactly. */
+    int32_t cone_center_y;
     /* Engine-space projection retained when the target framebuffer differs
      * from the engine viewport. Portal windows and intrinsic object sizes are
      * authored in this source space. */
@@ -187,6 +195,7 @@ struct hwr_gl_camera {
     uint16_t source_focal_y;
     int32_t source_center_x;
     int32_t source_horizon;
+    int32_t source_cone_center_y;
     uint16_t source_width;
     uint16_t source_height;
     int16_t shade_origin_x;
