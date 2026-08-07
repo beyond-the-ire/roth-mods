@@ -89,8 +89,15 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
   darkens a dim room long before it touches a lit one. This is the darkness dial.
 - `room_light_gain`: a master scale over the light a room gives off, from 0 through 4. One leaves
   it where the map put it.
-- `room_light_floor`: the least light any surface receives, from 0 through 0.25. Zero is honest
-  darkness.
+- `room_light_floor`: the least any surface is ever left showing, from 0 through 0.25, as a share
+  of the brightest the picture can be drawn — a hundredth is about two levels out of 255, a tenth
+  about twenty-five. It lifts what has no light and leaves what has alone, so a dark room stays
+  dark and stays readable rather than going to one flat wash. Zero is honest darkness.
+- `room_light_shoulder`: how softly a room's light ends, in shade steps, from 0 through 4. A
+  room's light has to stop somewhere, and stopping it dead draws a rim around you at the distance
+  it stops; this fades the last of it out instead. One step, which is what it ships at, is the
+  largest that is provably never reached when the reach above is one — so it costs the map read as
+  written nothing and eases exactly what a shortened reach made. Zero is the hard stop.
 - `world_light_ceiling`: where the light landing on a surface stops adding up, from 0.4 through 1.
   One cuts it off at the brightest the picture can be drawn, which is what the world image is read
   back into; lower eases it in over the last stretch instead, so two rooms that are both brighter
@@ -109,7 +116,10 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
 - `room_light_unshaded_gain`: how much of the outdoor ground and other surfaces a map marks as never
   to be darkened stays fully bright, from 0 through 1. One is exactly as the map asks.
 - `ambient_light`, `ambient_color`, `ambient_intensity`: a little light everywhere, its colour as
-  six bare hexadecimal digits, and how much of it there is from 0 through 2.
+  six bare hexadecimal digits, and how much of it there is from 0 through 2. What it was for is
+  what `room_light_floor` does now, and does without lifting the lit end of the picture with it, so
+  it is off the settings screen; it stays here for the one thing it can still say that a floor
+  cannot, which is what colour a darkness is.
 - `player_light`, `player_light_color`, `player_light_intensity`, `player_light_range`: a real
   light where you are standing, in place of the original's pool on the screen. It ships lit,
   because the room response above lets a room's own light run out and a person then needs one of
@@ -117,6 +127,14 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
   the reach the map itself authored for its own candlelight** — every map states the shade level
   its candle-lit surfaces are drawn at, and that level is a distance. Smaller is a tighter pool,
   and the settings screen shows what the map is actually giving you.
+- `player_light_forward`: how far in front of you that light sits, as a share of how far it
+  reaches, from 0 through 0.5. The game's own candlelight is not a point on top of you: it is
+  measured on the screen from an origin about the middle of the view, which makes it a cone about
+  the direction you are looking, fourteen degrees wide on every map the game ships. Aiming the pool
+  forward is that geometry rather than a departure from it — the light carries further down the
+  corridor you are facing and less to either side. What moves is where the pool falls off from; the
+  light is still held where you are, so the wall two paces in front of you is lit rather than lit
+  from behind. Zero puts it back on top of you.
 - `player_light_flicker`, `player_light_flicker_amount`, `player_light_flicker_speed`: let that
   light breathe the way a flame does. It is held well clear of going out, so it never gutters.
 - `sprite_light_gain`: how bright people, creatures and things you can pick up are, from 0 through
@@ -275,9 +293,13 @@ Modern shading brings its own settings with it, all of them dimmed until it is c
   is the original's own picture; turning it down takes the dim rooms into darkness long before it
   touches the lit ones, which is what a single brightness dial cannot do because it shrinks the
   difference between them along with everything else. **Room brightness** is a master scale over the
-  whole of it, and **Never darker than** is the least light any surface receives.
-- **Ambient fill**, with its **colour** and **strength**, is a little light everywhere, so what
-  nothing else reaches is still faintly visible.
+  whole of it.
+- **Never darker than** is the least any surface is ever left showing, as a share of the brightest
+  the picture can be drawn: a hundredth is about two levels out of 255 and a tenth about
+  twenty-five, so what you set is what you get whatever the texture underneath happens to be. It
+  lifts what has no light and leaves what has alone, which is what keeps a dark room dark and still
+  walkable — a floor that simply cut everything off at a level would paint every dark surface the
+  same value, and a room with no differences in it is a room you cannot find your way across.
 - **Carried light**, with its **colour**, **strength** and **reach**, is a real light where you are
   standing rather than a pool painted on the screen: surfaces facing you catch it, surfaces turned
   away do not, and it is correct in a mirror without being told anything about one. It is on by
@@ -287,6 +309,11 @@ Modern shading brings its own settings with it, all of them dimmed until it is c
   stronger carried light does not brighten that near field, it flattens it. Raise it if you want a
   brighter pool at the cost of some of that. **Flickers**, with its **depth** and **speed**, lets it
   breathe like a flame; it is held well clear of going out, so it never gutters or strobes.
+  **Carried light aims ahead** puts the pool a little way in front of you instead of on top of you,
+  which is what the game's own candlelight does: it is measured on the screen rather than in the
+  world, which makes it a cone about the direction you are looking. The light carries further down
+  the corridor you are facing and a little less onto the ground at your feet. The light itself is
+  still in your hand, so nothing in front of you is ever lit from behind.
 - **Your light lights candlelit rooms** is the other half of that light, and the half the game
   itself already had a word for. A room the map marks candlelit is drawn by the game at its own
   distance law less a fixed number of shade steps, and those steps are the candle rather than the

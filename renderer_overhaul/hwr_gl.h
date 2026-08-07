@@ -318,6 +318,14 @@ struct hwr_gl_light {
      * dark nearer its own beginning. Read by that law alone, and it divides by
      * it, so it is never zero. */
     float room_reach;
+    /* And how softly it ends, in the ramp's own steps. A room's light running
+     * out at a finite distance arrives at nothing with a slope and stops
+     * there, and the corner between the two is the rim a person reads as a
+     * wall; above nothing the last of that light decays toward nothing rather
+     * than arriving at it. One step is the largest height the row law's own
+     * ceiling never reaches at a reach of one, so it costs the original's
+     * picture nothing at all. */
+    float room_shoulder;
     /* The two input anchors, already taken to the exponent above, and the two
      * output levels the byte is placed between. The anchors are worked out where
      * the map is known and the rows are known, so the fragment does one subtract,
@@ -351,6 +359,11 @@ struct hwr_gl_light {
     float lamp_color[3];
     float lamp_intensity;
     float lamp_range;
+    /* How far along the view axis the pool's own centre sits, as a share of
+     * that reach. The original's candle is a cone about the direction the
+     * player is looking rather than a point on top of him, so forward is the
+     * faithful reading; nothing is the pool at the eye. */
+    float lamp_forward;
     /* Nonzero lights every face rather than only the ones the map marked. */
     int lamp_scope_all;
     /* How much of the map's own candle word the two above take: zero ignores

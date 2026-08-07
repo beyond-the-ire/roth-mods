@@ -688,6 +688,45 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "long before it touches a lit one."
     },
     {
+        /* How the row above ENDS, and the reason a shortened reach draws a rim.
+         *
+         * A room's light running out at a finite distance arrives at nothing
+         * with a slope and then stops: a straight line, a flat zero, and a
+         * corner between them, which is exactly the shape an eye reads as an
+         * edge. Above nothing the last of that light decays toward nothing
+         * instead of arriving at it.
+         *
+         * One step is the default and it is the largest height that is INERT
+         * at the map read as written: the row law's own ceiling of thirty-one
+         * steps leaves a room's quantity a step above nothing and never below
+         * it, so at a reach of one the easing is never reached and the
+         * original's picture is unmoved to the bit. What this eases is what
+         * the reach dial made. */
+        .key = "room_light_shoulder",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, room_light_shoulder),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.25f },
+        .page_step = { .f = 1.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How softly a room's light ends",
+        .help = "A room's light has to stop somewhere, and stopping it dead "
+                "draws a rim around you at the distance it stops. This fades "
+                "the last of it out instead, in shades of the ramp. Zero is "
+                "the hard stop."
+    },
+    {
         /* The two levels the anchored response mixes between, and the five rows
          * below them that say which authored values it mixes over. They are the
          * whole of that response and are read by nothing else, so under the one
@@ -951,6 +990,21 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "what makes the difference between two nearby ones visible."
     },
     {
+        /* The least a surface may be left showing, and it is a statement about
+         * the SURFACE rather than about the light landing on it.
+         *
+         * Stated on the light it was a floor on a MULTIPLIER: a hundredth of
+         * the light is a seventh of the display, and then a fraction of that
+         * again depending on how dark the texture underneath happened to be --
+         * so the number predicted nothing, and a dark texture in a dark room
+         * read as black whatever it was set to. Stated on the surface a
+         * hundredth is a hundredth of the picture's own brightest, two and a
+         * half levels of two hundred and fifty-five, and every step of the row
+         * is worth the same two and a half wherever it is taken.
+         *
+         * And it is a floor rather than a cut, for the reason the ceiling
+         * stopped being one: a cut paints everything under it the same value,
+         * which is the one thing a dark room must not do to be navigable. */
         .key = "room_light_floor",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -970,8 +1024,12 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Never darker than",
-        .help = "The least light any surface receives, so nowhere is ever "
-                "completely black. Zero is honest darkness."
+        .help = "The least any surface is ever left showing, as a share of the "
+                "brightest the picture can be drawn: a hundredth is about two "
+                "levels out of two hundred and fifty-five, a tenth is about "
+                "twenty-five. It lifts what has no light and leaves what has "
+                "alone, so a dark room stays dark and stays readable. Zero is "
+                "honest darkness."
     },
     {
         .key = "room_light_ceiling_authentic",
@@ -1052,10 +1110,20 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "out on its own instead."
     },
     {
+        /* The fill, and the three rows of it, off the settings screen.
+         *
+         * What it was for -- that what nothing else reaches is still faintly
+         * visible -- is what the floor above does now, and does better: a fill
+         * adds its own light everywhere, so it lifts a lit room by exactly as
+         * much as it lifts a dark corner and washes the whole picture to buy
+         * the corner; the floor lifts only what has nothing. Two dials for one
+         * job, and this is the one that costs the picture. It stays reachable
+         * for the one thing it can still say that the floor cannot -- what
+         * COLOUR a darkness is -- and it stays out of the way. */
         .key = "ambient_light",
         .type = HWR_VT_BOOL,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
+        .exposure = HWR_EXP_ADVANCED,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, ambient_light),
@@ -1074,7 +1142,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .key = "ambient_color",
         .type = HWR_VT_COLOR,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
+        .exposure = HWR_EXP_ADVANCED,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, ambient_color),
@@ -1095,7 +1163,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .key = "ambient_intensity",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
+        .exposure = HWR_EXP_ADVANCED,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, ambient_intensity),
@@ -1235,6 +1303,56 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "How far the light you carry reaches before it runs out, in "
                 "world units. Zero follows the reach the map itself authored "
                 "for its own candlelight. Smaller is a tighter pool around you."
+    },
+    {
+        /* Where that light is CARRIED, and it is the original's own geometry
+         * rather than a liberty taken with it.
+         *
+         * The original's candle is measured on the screen, from an origin that
+         * dances about the middle of the view, and the screen arm it measures
+         * is an angle off the view axis: the row law adds 1024*tan(theta) to
+         * the depth, so the candle is worth its whole amplitude straight ahead
+         * and nothing at all past tan(theta) = C*unit/1024 -- a cone about the
+         * direction the player is LOOKING, of half angle fourteen degrees, and
+         * the same fourteen on every map the game ships, because C*unit is 256
+         * at every shade level of it. A point of light sitting on top of the
+         * player was the simplification; forward is what the original says.
+         *
+         * What moves is what the pool falls off FROM, not where the light is
+         * held: a surface the player is facing is lit by the thing in his
+         * hand, and treating the aim as a position would light everything past
+         * it from behind and leave the wall two paces ahead of him dark.
+         *
+         * The default is the furthest aim that still leaves the ground at his
+         * own feet with four fifths of the light a pool at the eye gives it
+         * (0.660 against 0.788) while carrying half again as much onto the
+         * wall he is walking toward (0.562 against 0.360 at five hundred
+         * units). Original holds the same value: the light this shapes does
+         * not exist at the Original at all, and where it does exist the
+         * original's own candle is aimed. */
+        .key = "player_light_forward",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_forward),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.15f },
+        .original = { .f = 0.15f },
+        .min = { .f = 0.0f },
+        .max = { .f = 0.5f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.10f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Carried light aims ahead",
+        .help = "How far in front of you the light you carry sits, as a share "
+                "of how far it reaches. The game's own candlelight is aimed "
+                "where you are looking rather than pooled at your feet. Zero "
+                "puts it back on top of you."
     },
     {
         .key = "player_light_scope",

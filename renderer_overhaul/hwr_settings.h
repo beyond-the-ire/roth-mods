@@ -202,6 +202,14 @@ struct hwr_settings {
      * pulls every room's darkness in toward the player -- a dim room reaching
      * only a few paces while a lit one still carries down its whole length. */
     float room_light_reach;
+    /* And how softly that light ends, in the shade ramp's own steps. A room's
+     * light running out at a finite distance arrives at nothing with a slope
+     * and then stops, and the corner between the two is what an eye reads as a
+     * wall around the player. One step is the largest height that is inert at
+     * the map read as written, so the setting costs the original's own picture
+     * nothing and acts exactly where the reach above has pulled a room's light
+     * in. */
+    float room_light_shoulder;
     float room_light_dark;
     float room_light_lit;
     /* The shape of the response between them. One is straight in the exponent's
@@ -250,6 +258,11 @@ struct hwr_settings {
     uint32_t player_light_color;
     float player_light_intensity;
     float player_light_range;
+    /* How far ahead of the eye the pool's own centre sits, as a share of that
+     * reach. The original's candle is a cone about the direction the player is
+     * looking, so a light aimed forward is the faithful reading of it and a
+     * point sitting on top of him was the simplification. */
+    float player_light_forward;
     enum hwr_light_scope player_light_scope;
     /* Every map carries a word saying how strong its own lantern was meant to
      * be, which the game itself never looks at. This is how much notice to take

@@ -51,6 +51,7 @@
 #define HWR_ROOM_BYTE_LIT_ROW "room_light_byte_lit"
 #define HWR_ROOM_WINDOW_MIN_ROW "room_light_window_min"
 #define HWR_ROOM_WINDOW_MAX_ROW "room_light_window_max"
+#define HWR_ROOM_SHOULDER_ROW "room_light_shoulder"
 #define HWR_ROOM_UNSHADED_ROW "room_light_unshaded_gain"
 #define HWR_ROOM_CEILING_ROW "room_light_ceiling_authentic"
 #define HWR_WORLD_CEILING_ROW "world_light_ceiling"
@@ -62,6 +63,7 @@
 #define HWR_PLAYER_COLOR_ROW "player_light_color"
 #define HWR_PLAYER_INTENSITY_ROW "player_light_intensity"
 #define HWR_PLAYER_RANGE_ROW "player_light_range"
+#define HWR_PLAYER_FORWARD_ROW "player_light_forward"
 #define HWR_PLAYER_SCOPE_ROW "player_light_scope"
 #define HWR_PLAYER_GLOW_ROW "player_light_glow_scale"
 #define HWR_PLAYER_CANDLE_ROW "player_light_candle"
@@ -372,6 +374,13 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
                                                 1.0f);
     if (!(light->room_reach > 0.0f))
         light->room_reach = 1.0f;
+    /* And how softly it ends. The row's own floor is zero, which is the hard
+     * stop this eased; this is what holds a value that arrived some other
+     * way. */
+    light->room_shoulder = hwr_truecolor_row_float(HWR_ROOM_SHOULDER_ROW,
+                                                   settings, 1.0f);
+    if (!(light->room_shoulder > 0.0f))
+        light->room_shoulder = 0.0f;
     {
         float dark_byte;
         float lit_byte;
@@ -416,6 +425,16 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
                                                 0.0f);
     if (!(light->lamp_range > 0.0f))
         light->lamp_range = hwr_truecolor_candle_reach();
+    /* How far along the view axis the pool's own centre is carried, as a share
+     * of the reach above. The row's own bounds are a share and this is what
+     * holds a value that arrived some other way: behind the eye is not a place
+     * a carried light can be, and past its own reach is not one either. */
+    light->lamp_forward = hwr_truecolor_row_float(HWR_PLAYER_FORWARD_ROW,
+                                                  settings, 0.15f);
+    if (!(light->lamp_forward > 0.0f))
+        light->lamp_forward = 0.0f;
+    if (light->lamp_forward > 1.0f)
+        light->lamp_forward = 1.0f;
     /* The light the player carries is a light the player carries: it reaches
      * whatever it can see. The mark it used to be confined to is the engine's
      * live word for "this room's own fixtures are out", which it clears the

@@ -1646,6 +1646,11 @@ static const char g_geometry_fragment_body[] =
      * could be: one gain scales a lit room and an unlit one by the same factor,
      * so it moves the whole picture down without ever separating them. */
     "uniform float u_room_reach;\n"
+    /* And how softly that light ends, in the ramp's own steps. Nothing is the
+     * straight cut this replaced; one step is the largest height the row law's
+     * own ceiling never reaches at the map read as written, so it is the
+     * largest that leaves the original's picture where it is. */
+    "uniform float u_room_shoulder;\n"
     /* How far the author's unshaded class is pulled down into the room's own
      * light. Zero leaves it exactly fullbright and it never arrives here. */
     "uniform float u_room_unshaded;\n"
@@ -1661,6 +1666,10 @@ static const char g_geometry_fragment_body[] =
     "uniform vec3 u_lamp_color;\n"
     "uniform float u_lamp_intensity;\n"
     "uniform float u_lamp_range;\n"
+    /* And how far along the view axis it is carried, as a share of that reach.
+     * Nothing puts it on top of the player, which is where the pool was; the
+     * original's own candle is a cone about the direction he is looking. */
+    "uniform float u_lamp_forward;\n"
     "uniform int u_lamp_scope_all;\n"
     /* And the other half of that light, which is the half the map already had a
      * word for. How much of a candle-lit room's OWN candle the light in the
@@ -1750,6 +1759,116 @@ static const char g_geometry_fragment_body[] =
     "  if (u_transmit_valid==0 || u_transmit_receive==0) return 1.0;\n"
     "  return texelFetch(u_transmit,ivec2(gl_FragCoord.xy),0).r;\n"
     "}\n"
+    /* How a light ENDS.
+     *
+     * A quantity that runs out at a finite distance arrives at nothing with a
+     * slope, and the slope stops there: the value is a straight line and then
+     * it is a flat zero, and the corner between the two is a first-derivative
+     * discontinuity. An eye reads exactly that as an edge -- it is what a Mach
+     * band is made of -- so a room whose light runs out draws a rim around the
+     * player at the distance it runs out at, and the rim is the picture's only
+     * feature there. It is the "black fog wall at the bounds of the light
+     * bubble" said in arithmetic.
+     *
+     * Below the shoulder's own height the quantity decays toward nothing
+     * instead of arriving at it: an exponential, leaving the identity with the
+     * identity's own slope so there is no corner where the two meet, and with
+     * a slope proportional to what is left so it vanishes with it. The value
+     * is never exactly zero and does not need to be -- it is under a step of
+     * an eight-bit canvas long before the room's own reach is spent.
+     *
+     * A shoulder of nothing is max(x,0), to the bit, which is the expression
+     * this replaced. */
+    "float light_shoulder(float x, float s) {\n"
+    "  if (s<=0.0 || x>=s) return max(x,0.0);\n"
+    "  return s*exp((x-s)/s);\n"
+    "}\n"
+    /* How a light in the WORLD falls off, in the one place all three of them
+     * say it: the light at the eye, the candle-lit class's own rows, and every
+     * torch on a wall.
+     *
+     * It is a windowed quadratic and it stays one. The same corner the room's
+     * own reach draws is formally here too -- the display value is the linear
+     * one to the one over gamma, whose slope at nothing is unbounded -- but
+     * the window is squared, so what is left over the last stretch is below a
+     * step of the canvas long before the bound arrives: for the strength the
+     * rows ship at, the last 0.65% of the reach is under one level of 255,
+     * which is eight world units of a reach of 1280. There is no edge there to
+     * ease, and a shoulder wide enough to be worth having would leave a
+     * PEDESTAL at the reach instead -- the bound cuts, and what it cuts is
+     * then visible. The two cannot be had at once from one falloff, and the
+     * bound is the one worth keeping, because it is what says how far a light
+     * with nothing in its way can spill. */
+    "float light_falloff(float r, float reach) {\n"
+    "  float a=max(1.0-r/reach,0.0);\n"
+    "  return a*a;\n"
+    "}\n"
+    /* The least light a surface may be left with, as a floor rather than as a
+     * cut.
+     *
+     * A cut has the ceiling's own fault upside down (and the ceiling stopped
+     * being one for exactly this reason): everything under it is painted the
+     * SAME value, so the darkest part of a world becomes one flat wash with no
+     * order in it at all -- which is the opposite of what a floor is asked
+     * for. What makes a dark room navigable is not that it is above black, it
+     * is that two surfaces in it are still two surfaces.
+     *
+     * So the floor is added where there is nothing and vanishes where there is
+     * light: it is exactly f where the surface receives none, it is the
+     * surface itself wherever the surface is well past f, it is strictly
+     * increasing everywhere between, and it has no corner anywhere. A floor of
+     * nothing is max(x,0), to the bit. */
+    "vec3 light_floor(vec3 x, float f) {\n"
+    "  x=max(x,vec3(0.0));\n"
+    "  if (f<=0.0) return x;\n"
+    "  return f*exp(-x/f)+x;\n"
+    "}\n"
+    /* What a surface actually shows: its own colour, times the light that
+     * reaches it, held at or above the least a person is willing to lose.
+     *
+     * The floor is stated in the space a person READS -- a hundredth means a
+     * hundredth of the picture's own brightest, which is two and a half levels
+     * of two hundred and fifty-five, and every step of the row is worth the
+     * same two and a half wherever it is taken. Stated on the light instead it
+     * meant nothing anybody could predict: a hundredth of the light is a
+     * seventh of the display, and then a fraction of that again depending on
+     * how dark the texture underneath happened to be.
+     *
+     * A floor of nothing is the multiply this replaced, to the bit. */
+    "vec3 lit_surface(vec3 art, vec3 total) {\n"
+    "  float f=u_light_limits.x;\n"
+    "  if (f>0.0 && u_light_linear!=0) f=pow(f,u_room_light.y);\n"
+    "  return light_floor(art*total,f);\n"
+    "}\n"
+    /* Where the light the player carries actually sits.
+     *
+     * The original's candle is measured on the SCREEN, from an origin that
+     * dances about the middle of the view, and the screen arm it measures is
+     * an angle off the view axis: the row law adds 1024*tan(theta) to the
+     * depth, so the candle is worth its whole amplitude straight ahead and
+     * nothing at all past tan(theta) = C*unit/1024 -- a cone about the
+     * direction the player is LOOKING, of half angle fourteen degrees, and the
+     * same fourteen on every map because C*unit is 256 at every shade level
+     * the game ships. Aiming the pool forward is therefore the original's own
+     * semantics rather than a departure from them; a point of light sitting on
+     * top of the player was the simplification.
+     *
+     * A cone with no distance falloff is not a thing this rig can hold, so
+     * what it takes from the original is the AIM: the pool's own centre moves
+     * along the view axis, as a share of the light's own reach, and what falls
+     * off with distance falls off from THERE. So the light carries further
+     * down the corridor the player is facing and less to either side of him,
+     * which is what aiming a lantern does.
+     *
+     * What does NOT move is the direction the light arrives from. A light the
+     * player carries is at the player, and a surface he is looking at is a
+     * surface facing him; treating the aim as a position instead would light
+     * everything past the aim from behind and leave the wall two paces in
+     * front of him unlit, which is not a lantern, it is a lamp standing in the
+     * room. The aim shapes the pool; the eye still holds the light. */
+    "vec3 lamp_position() {\n"
+    "  return vec3(0.0,u_lamp_forward*u_lamp_range,0.0);\n"
+    "}\n"
     /* How much of a light that is NOT at the eye reaches this fragment, given
      * where the fragment is and which way it faces.
      *
@@ -1788,12 +1907,12 @@ static const char g_geometry_fragment_body[] =
     "  float window=smoothstep(u_point_z[i].x,u_point_z[i].x+edge,zw)*\n"
     "               (1.0-smoothstep(u_point_z[i].y-edge,u_point_z[i].y,zw));\n"
     "  if (window<=0.0) return vec3(0.0);\n"
-    /* A windowed quadratic, exactly as the light at the eye falls off, so the
-     * reach is where the pool ENDS rather than where it stops being visible --
-     * which is also what makes the reach a bound on the leaking. */
-    "  float att=1.0-r/reach;\n"
-    "  return light_space(u_point_b[i].rgb)*u_point_b[i].w*ndl*gain*att*att*\n"
-    "         window;\n"
+    /* The same falloff the light at the eye takes, from the one place all of
+     * them take it, so the reach is where the pool ENDS rather than where it
+     * stops being visible -- which is also what makes the reach a bound on the
+     * leaking. */
+    "  return light_space(u_point_b[i].rgb)*u_point_b[i].w*ndl*gain*\n"
+    "         light_falloff(r,reach)*window;\n"
     "}\n"
     /* Where the light landing on a surface stops adding up, as a knee rather
      * than as a cut.
@@ -1854,17 +1973,19 @@ static const char g_geometry_fragment_body[] =
     "  float rows=float(u_wd_bias)*u_candle_amount;\n"
     "  if (u_candle_pool<=0.0) return rows;\n"
     "  vec3 p=view_position();\n"
-    "  float dist=length(p);\n"
-    /* The same windowed quadratic and the same reach the light's other half
-     * falls off by, so the two describe one light rather than two. */
-    "  float att=max(1.0-dist/u_lamp_range,0.0);\n"
-    "  float shape=att*att;\n"
+    /* The same falloff and the same reach the light's other half takes, so the
+     * two describe one light rather than two -- and measured from where the
+     * light is AIMED, which is a little way along the view axis, while the
+     * direction it arrives from is still the eye that holds it. */
+    "  float dist=length(p-lamp_position());\n"
+    "  float eye=length(p);\n"
+    "  float shape=light_falloff(dist,u_lamp_range);\n"
     "  vec3 n=surface_normal();\n"
     /* A surface with no direction of its own -- a mesh flat the emitter left
      * without one -- takes the distance term alone rather than nothing at all:
      * an absent normal is a missing answer, not an answer of "away". */
     "  if (n!=vec3(0.0)) {\n"
-    "    vec3 l=dist>0.0 ? -p/dist : vec3(0.0,-1.0,0.0);\n"
+    "    vec3 l=eye>0.0 ? -p/eye : vec3(0.0,-1.0,0.0);\n"
     "    float ndl=dot(n,l);\n"
     "    if ((v_light_material.w & 32u)!=0u)\n"
     "      ndl=(ndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
@@ -1914,8 +2035,18 @@ static const char g_geometry_fragment_body[] =
      * fraction between two levels: on this law the exponent IS the shape of the
      * falloff, and one leaves the map's own. */
     "  if (u_room_curve==2) {\n"
-    "    room=pow(max(1.0-room_amount(level,tinted,candle_rows(tinted))/"
-    "(32.0*u_room_reach),0.0),\n"
+    /* And how that light ENDS, which is the shoulder above. The room's own
+     * quantity runs out at the reach the map authored, and the shoulder's own
+     * height is stated in the ramp's own steps -- so it scales with the reach
+     * the way the picture does, and one step is the largest height that is
+     * INERT at the map read as written: the row law's own ceiling of
+     * thirty-one rows leaves the quantity at a step above nothing there and
+     * never below it, so at a reach of one the branch above is never taken and
+     * the picture is the original's to the bit. It is the shortening that
+     * makes the rim, and this is a property of the shortening. */
+    "    float span=32.0*u_room_reach;\n"
+    "    float rows=room_amount(level,tinted,candle_rows(tinted));\n"
+    "    room=pow(light_shoulder(1.0-rows/span,u_room_shoulder/span),\n"
     "             u_room_light.y*u_room_shape);\n"
     "  } else {\n"
     /* The authored byte, taken to the exponent: a ratio in the palette's own
@@ -1953,8 +2084,9 @@ static const char g_geometry_fragment_body[] =
      * something true and useful; it is no longer what the carried light asks. */
     "    if (u_lamp_scope_all!=0 || tinted) {\n"
     "      vec3 p=view_position();\n"
-    "      float dist=length(p);\n"
-    "      vec3 l=dist>0.0 ? -p/dist : vec3(0.0,-1.0,0.0);\n"
+    "      float dist=length(p-lamp_position());\n"
+    "      float eye=length(p);\n"
+    "      vec3 l=eye>0.0 ? -p/eye : vec3(0.0,-1.0,0.0);\n"
     "      float ndl=dot(n,l);\n"
     "      float gain=1.0;\n"
     /* A standing figure is not a wall: light wraps past the edge it would stop
@@ -1965,10 +2097,15 @@ static const char g_geometry_fragment_body[] =
     "        gain=u_sprite_light.x;\n"
     "      }\n"
     /* A windowed quadratic rather than a true inverse square, so the reach is
-     * exactly where the pool ends rather than where it becomes imperceptible. */
-    "      float att=max(1.0-dist/u_lamp_range,0.0);\n"
+     * exactly where the pool ends rather than where it becomes imperceptible.
+     *
+     * The plane that says what the light had to pass through is the EYE's ray,
+     * and the light is now a little way along it. What stands between the
+     * light and a fragment is therefore a subset of what stands between the
+     * eye and it -- the plane can over-shadow and never under-shadow, and only
+     * for something nearer than the pool's own centre. */
     "      total+=light_space(u_lamp_color)*u_lamp_intensity*"
-    "max(ndl,0.0)*gain*att*att*lamp_transmittance();\n"
+    "max(ndl,0.0)*gain*light_falloff(dist,u_lamp_range)*lamp_transmittance();\n"
     "    }\n"
     "    total+=light_space(u_key_color)*u_key_intensity*"
     "max(dot(n,u_key_dir),0.0);\n"
@@ -2003,12 +2140,16 @@ static const char g_geometry_fragment_body[] =
      * class always had, and pulled the whole way it is lit like any other
      * surface of its sector. */
     "  if (light==0) total=mix(vec3(1.0),total,u_room_unshaded);\n"
-    /* And the two ends of the total. The floor is a floor and nothing else --
-     * the least light any surface receives. The other end is the knee above,
-     * which at the threshold the row ships at is the clip this was written as,
-     * operation for operation: the floor taken first, the threshold taken
-     * second, exactly as one clamp took them. */
-    "  total=max(total,vec3(u_light_limits.x));\n"
+    /* And the far end of the total, which is the knee above -- at the
+     * threshold the row ships at, the clip this was written as, operation for
+     * operation.
+     *
+     * The near end is no longer here. A floor on the LIGHT is a floor on a
+     * multiplier: what it promises is a share of the colour a surface already
+     * has, so a dark texture in a dark room keeps whatever fraction of dark it
+     * started with and a person reads it as black anyway. What a floor is
+     * asked for is that nothing is lost, and that is a statement about the
+     * SURFACE. It is taken there, in lit_surface(), where it can be one. */
     "  return vec3(light_knee(total.r,u_light_limits.y),\n"
     "              light_knee(total.g,u_light_limits.y),\n"
     "              light_knee(total.b,u_light_limits.y));\n"
@@ -2329,7 +2470,7 @@ static const char g_geometry_fragment_body[] =
     "texelFetch(u_palette,ivec2(int(texel),0),0).rgb);\n"
     "          g_light_total=modern_light(tinted,amount,level);\n"
     "          g_light_total_set=true;\n"
-    "          g_shade_color=art*g_light_total;\n"
+    "          g_shade_color=lit_surface(art,g_light_total);\n"
     "          g_shade_linear=u_light_linear!=0;\n"
     "        } else {\n"
     "          g_shade_color_set=false;\n"
@@ -2399,8 +2540,8 @@ static const char g_geometry_fragment_body[] =
      * had: the colour its blended index resolves to. */
     "  if (blended) {\n"
     "    if (g_light_total_set) {\n"
-    "      g_shade_color=light_space("
-    "texelFetch(u_palette,ivec2(int(mapped),0),0).rgb)*g_light_total;\n"
+    "      g_shade_color=lit_surface(light_space("
+    "texelFetch(u_palette,ivec2(int(mapped),0),0).rgb),g_light_total);\n"
     "      g_shade_linear=u_light_linear!=0;\n"
     "    } else {\n"
     "      g_shade_color_set=false;\n"
@@ -4086,6 +4227,7 @@ static void hwr_bind_light_uniforms(GLuint program,
      * holds a value that arrived some other way. */
     hwr_uniform_1f(program, "u_room_reach",
                    light->room_reach > 0.0f ? light->room_reach : 1.0f);
+    hwr_uniform_1f(program, "u_room_shoulder", light->room_shoulder);
     hwr_uniform_1f(program, "u_room_unshaded", light->room_unshaded_pull);
     hwr_uniform_2f(program, "u_light_limits", light->room_floor,
                    light->world_ceiling);
@@ -4105,6 +4247,10 @@ static void hwr_bind_light_uniforms(GLuint program,
                    g_lamp_flicker);
     hwr_uniform_1f(program, "u_lamp_range",
                    light->lamp_range * g_lamp_glow_range);
+    /* A share of that reach rather than a distance, so a light the map asks to
+     * carry further is carried further ahead in the same proportion and the
+     * pool keeps its shape. */
+    hwr_uniform_1f(program, "u_lamp_forward", light->lamp_forward);
     hwr_uniform_1i(program, "u_lamp_scope_all", light->lamp_scope_all != 0);
     /* The rows of a candle-lit room's own candle the light supplies, through the
      * same two factors its strength goes through -- so the flame reaches the
