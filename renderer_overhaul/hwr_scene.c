@@ -2149,6 +2149,13 @@ static void hwr_read_camera(struct hwr_gl_camera *camera,
             ? hwr_scene_read_u16((const uint8_t *)params + 0x1c) : 0;
         camera->flat_edge_bias = (uint16_t)(view_bias +
             api->game_ram->u16(VA_G_PLAYER_LIGHT_BIAS));
+        /* The engine stages ONE word into both of its edge projectors: the
+         * view record's own candle word plus the player-state term (zero in
+         * the candle-lit class, minus thirteen outside it). The wall model
+         * reads it signed; the flat path keeps its historical unsigned form,
+         * whose 16-bit wrap lands the same rows. */
+        camera->wall_edge_bias = (int16_t)camera->flat_edge_bias;
+        camera->candle_word = (int16_t)view_bias;
     }
     camera->shade_depth_scale = hwr_settings_get()->shade_depth_scale;
 }

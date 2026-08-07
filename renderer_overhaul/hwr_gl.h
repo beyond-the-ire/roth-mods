@@ -207,6 +207,17 @@ struct hwr_gl_camera {
      * solid-filled (all-corners-saturated) tinted wall block outputs directly. */
     uint8_t solid_fill_index;
     uint16_t flat_edge_bias;
+    /* The same staged word, signed, for the wall model: the original writes
+     * ONE bias into its wall and flat edge projectors alike each frame -- the
+     * map's own candle word plus nothing when the player stands in the
+     * candle-lit class and minus thirteen when he does not -- so a candle-lit
+     * room seen from outside the class is drawn markedly darker. Negative in
+     * exactly that state. */
+    int16_t wall_edge_bias;
+    /* And the map's word alone, without the player-state term: the candle's
+     * own amplitude, which is the poolable half of what the player's light
+     * supplies to a candle-lit room. */
+    int16_t candle_word;
     float shade_depth_scale;
     uint32_t sky_texture_offset;
     uint32_t sky_projection_offset;

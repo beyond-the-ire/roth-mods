@@ -1467,31 +1467,47 @@ static const char g_geometry_fragment_body[] =
      * reads the byte alone reads the one place the byte says nothing, and the
      * quantity to read instead is the engine's own shade.
      *
-     * This is shade_amount() with the candle taken out of it: the same class
-     * selection, the same divisor, the same bias, the same clip ceiling and the
-     * same clamps, evaluated on depth alone. What is left out is left out on
-     * purpose. The screen-space radial and the receding-wall penalty are the
-     * candle -- a light the modern rig carries as a real one at the eye -- and a
-     * room's own light neither flickers with a lantern nor cares which way a
-     * wall faces. The flat path's edge bias is left out for the same reason: it
-     * carries the player light's own live strength.
+     * This is shade_amount() with the candle's own amplitude taken out of it:
+     * the same class selection, the same divisor, the same bias, the same
+     * screen radial, the same receding-wall penalty, the same clip ceiling and
+     * the same clamps. Only the staged candle word leaves.
+     *
+     * The radial and the penalty STAY, because they are the candle-lit CLASS's
+     * own metric rather than the candle's light. The original keeps both with
+     * no candle in hand at all: standing in a standard sector it stages
+     * C = word - 13 (renderer.c:9385-9391, collision_physics.c:1774-1778) --
+     * a NEGATIVE candle -- and still measures every candle-lit face by
+     * (depth + radial)/unit - bias + adjust - C (renderer.c:12285-12301,
+     * 4322-4340). A room of this class goes dark by two distances at once:
+     * how far away a surface is, and how far it sits from the middle of the
+     * view -- a cone about the view axis, roughly fourteen degrees to its
+     * edge, that darkens the ground at the player's own feet and everything
+     * off to the sides. Dropping the radial here drew all of that at the
+     * view-centre value: brighter than the original everywhere off the axis,
+     * by up to half the display range at the screen's edge.
+     *
+     * The radial is read through candle_edge_depth() -- the fixed centre and
+     * the round metric this law already declares for its shade rows -- so the
+     * room darkens by the same measure the rows beside it are taken by. The
+     * round metric is at most a sixth of a row wider than the engine's square
+     * one on either screen axis and +5.2 rows at the extreme corner, which is
+     * the documented cost of a pool without square corners. The receding-wall
+     * penalty (v_wall_tint_adjust) applies to wall fragments; the engine's
+     * flat projector has no such term, and a flat's byte is 8 there.
      *
      * The candle-lit class's OWN rows arrive as `candle`, from the light the
-     * player carries, rather than being spent here. The engine's candle-lit law
-     * is its depth law less a constant number of rows and less a screen-radial
-     * term, and that constant is the candle's own amplitude -- the same word the
-     * engine stages for its wall and flat edge projectors alike, from the view
-     * record and the player's own sector. So a room whose faces the map marks
-     * candle-lit is a room whose near field the ORIGINAL draws with the light in
-     * the player's hand; handing those rows to the room made every such room
-     * paint its own near field at the candle's brightness whether or not there
-     * was a candle. What is left here is the room's own authored statement --
-     * where its light starts to go -- and the class's floor of one row, which is
-     * taken on the SUM exactly where the engine takes it.
+     * player carries, rather than being spent here. That constant is the
+     * candle's own amplitude -- the word the engine stages for its wall and
+     * flat edge projectors alike, from the view record and the player's own
+     * sector -- so a room whose faces the map marks candle-lit keeps its
+     * near-field brightness only while there is a light in the hand supplying
+     * it. What is left here is the room's own authored statement, its class's
+     * whole metric, and the floor of one row, which is taken on the SUM
+     * exactly where the engine takes it.
      *
-     * Wall and flat need no branch here: the standard wall's divisor
-     * 16*(2<<level) IS the flat's shift 1<<(5+level), the same number written
-     * two ways. */
+     * The standard class needs no branch between wall and flat: the standard
+     * wall's divisor 16*(2<<level) IS the flat's shift 1<<(5+level), the same
+     * number written two ways. */
     "float room_amount(int selected_level, bool tinted, float candle) {\n"
     "  int level=selected_level; int shr=5+level;\n"
     "  int light=effective_light();\n"
@@ -1501,7 +1517,6 @@ static const char g_geometry_fragment_body[] =
     "  int scale=32-(max(axv+4,0) >> 2);\n"
     "  int transformed=int(floor(max(v_depth_fixed*u_depth_scale,0.0)*256.0));\n"
     "  int depth=(transformed >> 8) & 65535;\n"
-    "  float r=float(depth)/float(1 << shr)-float(bias);\n"
     /* The candle-lit class's floor is taken the way the row law takes it: a term
      * at or below the floor is that floor whatever the sector's clip ceiling
      * says, rather than the two clamped in the other order. The two agree
@@ -1509,8 +1524,13 @@ static const char g_geometry_fragment_body[] =
      * row, where the original draws the near field one row down and everything
      * past it fullbright -- and reproducing the original includes reproducing
      * that. */
-    "  if (tinted) { r-=candle;\n"
-    "    return r<1.0 ? 1.0 : min(r,float(min(scale,31))); }\n"
+    "  if (tinted) {\n"
+    "    int adj=(v_light_material.y & 8u)!=0u ? 0 : int(v_wall_tint_adjust);\n"
+    "    float r=candle_edge_depth(depth)/float(1 << shr)-float(bias-adj)"
+    "-candle;\n"
+    "    return r<1.0 ? 1.0 : min(r,float(min(scale,31)));\n"
+    "  }\n"
+    "  float r=float(depth)/float(1 << shr)-float(bias);\n"
     "  return clamp(r,0.0,float(min(scale,31)));\n"
     "}\n"
     "flat in vec3 v_normal;\n"
@@ -1679,6 +1699,15 @@ static const char g_geometry_fragment_body[] =
      * first, so a fragment reads one number for both. */
     "uniform float u_candle_amount;\n"
     "uniform float u_candle_pool;\n"
+    /* The two halves of the engine's staged word, split where the split
+     * can use them: the map's own candle amplitude (poolable, the light in
+     * the hand), and the player-state term -- zero with the player standing
+     * in the candle-lit class, minus thirteen rows times the candle dial
+     * when he is not, exactly the step the original draws at a doorway
+     * between the classes. The state is a statement about the whole room,
+     * so no pool shapes it. */
+    "uniform int u_candle_word;\n"
+    "uniform float u_candle_state;\n"
     /* What the light the player carries had to pass through to reach each
      * pixel, written by the pass above and read here; whether this frame has
      * such a plane at all; whether this draw is that pass; and how much of what
@@ -1970,8 +1999,8 @@ static const char g_geometry_fragment_body[] =
      * is a picture the original could not draw. */
     "float candle_rows(bool tinted) {\n"
     "  if (!tinted || u_candle_amount<=0.0) return 0.0;\n"
-    "  float rows=float(u_wd_bias)*u_candle_amount;\n"
-    "  if (u_candle_pool<=0.0) return rows;\n"
+    "  float rows=float(u_candle_word)*u_candle_amount;\n"
+    "  if (u_candle_pool<=0.0) return rows+u_candle_state;\n"
     "  vec3 p=view_position();\n"
     /* The same falloff and the same reach the light's other half takes, so the
      * two describe one light rather than two -- and measured from where the
@@ -1991,7 +2020,7 @@ static const char g_geometry_fragment_body[] =
     "      ndl=(ndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
     "    shape*=max(ndl,0.0);\n"
     "  }\n"
-    "  return rows*mix(1.0,shape,u_candle_pool);\n"
+    "  return rows*mix(1.0,shape,u_candle_pool)+u_candle_state;\n"
     "}\n"
     /* What reaches this fragment, as a multiplier on the colour of its texel.
      *
@@ -4889,10 +4918,20 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
     hwr_uniform_1i(program, "u_light_bias", camera->global_light_bias);
     hwr_uniform_1i(program, "u_fill_index",
                    camera->solid_fill_index);
-    /* wd_project's own bias term (SMC in the engine, 8 at shade level 0),
-     * scaled down with the shade level the same way its shift is. */
-    hwr_uniform_1i(program, "u_wd_bias",
-                   8 >> camera->tint_shade_level);
+    /* wd_project's own bias term, LIVE: the engine stages one word into
+     * both of its edge projectors every frame -- the map's candle word plus
+     * the player-state term, zero with the player in the candle-lit class
+     * and minus thirteen outside it (renderer.c:9385-9391,
+     * collision_physics.c:1774-1778). Modelling it as a constant 8 scaled by
+     * the shade level erased that state: a candle-lit room read the same
+     * from either side of its own doorway. */
+    hwr_uniform_1i(program, "u_wd_bias", (GLint)camera->wall_edge_bias);
+    hwr_uniform_1i(program, "u_candle_word", (GLint)camera->candle_word);
+    /* The out-of-class step, behind the candle dial and outside the flame:
+     * the flame breathes the light in the hand, not the absence of one. */
+    hwr_uniform_1f(program, "u_candle_state",
+                   (GLfloat)(camera->wall_edge_bias - camera->candle_word) *
+                   g_truecolor_want.light.candle_amount);
     hwr_uniform_1i(program, "u_glow_phase", camera->glow_phase);
     {
         /* Feed the sky-cap fragment branch the same inputs the retired
