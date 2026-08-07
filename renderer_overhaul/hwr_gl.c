@@ -3262,16 +3262,26 @@ static int hwr_shade_linear_wanted(enum hwr_gl_shading_mode mode)
  * held open for a minute owes a minute; spending it would be a minute of flame
  * in one frame, so the debt is forgiven past a quarter of a second. */
 #define HWR_LAMP_CATCHUP 0.25f
-/* The flame, as it was worked out and tuned: retargets a second, how fast the
- * light reaches for the target it was given, the two waves under it, and the
- * bounds it is held between. The floor is the whole difference between a candle
- * and a fault -- it is what stops the light ever guttering out. */
-#define HWR_LAMP_RETARGET_RATE 14.0f
-#define HWR_LAMP_SMOOTHING 10.0f
+/* The flame: retargets a second, how fast the light reaches for the target it
+ * was given, the two waves under it, and the bounds it is held between. The
+ * floor is the whole difference between a candle and a fault -- it is what
+ * stops the light ever guttering out.
+ *
+ * The two dials own the whole of it. Speed scales every RATE -- the retarget
+ * lottery, the waves' pace and the reach toward each target -- and depth
+ * scales every AMPLITUDE, the waves' beside the targets'. It was not always
+ * so: the lottery first ran at a fixed fourteen a second with the speed dial
+ * on the waves alone, which put the flame's real motion where no dial could
+ * reach it and its energy in the band an eye reads as a strobe. Three a
+ * second is where a flame lives; the wave sizes are stated at a depth of ONE
+ * and the shipped depth of 0.3 lands them where the old fixed sizes sat, so
+ * the default flame moves as it always did, minus the strobe. */
+#define HWR_LAMP_RETARGET_RATE 3.0f
+#define HWR_LAMP_SMOOTHING 6.0f
 #define HWR_LAMP_WAVE_A_RATE 2.1f
-#define HWR_LAMP_WAVE_A_SIZE 0.06f
+#define HWR_LAMP_WAVE_A_SIZE 0.20f
 #define HWR_LAMP_WAVE_B_RATE 3.7f
-#define HWR_LAMP_WAVE_B_SIZE 0.04f
+#define HWR_LAMP_WAVE_B_SIZE 0.12f
 #define HWR_LAMP_WAVE_B_PHASE 1.3f
 #define HWR_LAMP_FLOOR 0.3f
 #define HWR_LAMP_CEILING 1.4f
@@ -3366,7 +3376,11 @@ static void hwr_lamp_glow(uint16_t candle_glow, float weight)
  * keeps a retarget from reading as a switch being thrown, and it is held between
  * its bounds BEFORE it is reached for so the light in force can never leave
  * them. The two waves carry their own phases rather than a shared clock, so
- * neither loses precision however long a session runs. */
+ * neither loses precision however long a session runs.
+ *
+ * Speed multiplies the lottery, the reach and the waves' pace alike, so one
+ * dial slows or hurries the whole flame; depth multiplies the waves beside
+ * the targets, so a depth of nothing is a flame that is perfectly still. */
 static void hwr_lamp_flicker_step(float amount, float speed)
 {
     float wave;
@@ -3379,15 +3393,17 @@ static void hwr_lamp_flicker_step(float amount, float speed)
         g_lamp_wave_a -= HWR_LAMP_TWO_PI;
     while (g_lamp_wave_b >= HWR_LAMP_TWO_PI)
         g_lamp_wave_b -= HWR_LAMP_TWO_PI;
-    if (hwr_lamp_random() < HWR_LAMP_STEP * HWR_LAMP_RETARGET_RATE)
+    if (hwr_lamp_random() < HWR_LAMP_STEP * HWR_LAMP_RETARGET_RATE * speed)
         g_lamp_flicker_target =
             1.0f + (hwr_lamp_random() * 2.0f - 1.0f) * amount;
-    wave = sinf(g_lamp_wave_a) * HWR_LAMP_WAVE_A_SIZE +
-           sinf(g_lamp_wave_b + HWR_LAMP_WAVE_B_PHASE) * HWR_LAMP_WAVE_B_SIZE;
+    wave = (sinf(g_lamp_wave_a) * HWR_LAMP_WAVE_A_SIZE +
+            sinf(g_lamp_wave_b + HWR_LAMP_WAVE_B_PHASE) *
+                HWR_LAMP_WAVE_B_SIZE) * amount;
     desired = hwr_lamp_clamp(g_lamp_flicker_target + wave, HWR_LAMP_FLOOR,
                              HWR_LAMP_CEILING);
     g_lamp_flicker += (desired - g_lamp_flicker) *
-                      (1.0f - expf(-HWR_LAMP_STEP * HWR_LAMP_SMOOTHING));
+                      (1.0f - expf(-HWR_LAMP_STEP * HWR_LAMP_SMOOTHING *
+                                   speed));
 }
 
 void hwr_gl_lamp_reset(void)

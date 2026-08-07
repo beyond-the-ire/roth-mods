@@ -674,7 +674,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                  HWR_SF_DEPENDS_ON_VALUE,
         .def = { .f = 1.0f },
         .original = { .f = 1.0f },
-        .min = { .f = 0.4f },
+        /* The floor is a tenth rather than the 0.4 it began at: the dial's
+         * whole use is a darker world than the map's, and 0.4 left a person
+         * standing on the bottom of the range. A tenth of the map's reach is
+         * three shade rows of span -- almost everything black almost at once
+         * -- and past any dark anybody has asked for; the response divides by
+         * the reach, so the floor stays well clear of nothing. */
+        .min = { .f = 0.1f },
         .max = { .f = 2.0f },
         .step = { .f = 0.05f },
         .page_step = { .f = 0.25f },
@@ -1518,7 +1524,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Flicker depth",
-        .help = "How far the flame swings either side of the strength you set."
+        .help = "How far the flame swings either side of the strength you "
+                "set. It scales the whole of the flame's motion, and at "
+                "nothing the flame is perfectly still."
     },
     {
         .key = "player_light_flicker_speed",
@@ -1530,8 +1538,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_flicker_speed),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 1.80f },
-        .original = { .f = 1.80f },
+        /* One is the flame's own pace now that the dial commands the whole of
+         * its motion; the 1.8 it shipped at belongs to the older reading,
+         * where the dial ran only the two small waves and the flame's real
+         * movement -- the retargets -- ran at one fixed rate whatever it
+         * said. */
+        .def = { .f = 1.00f },
+        .original = { .f = 1.00f },
         .min = { .f = 0.1f },
         .max = { .f = 5.0f },
         .step = { .f = 0.1f },
@@ -1540,7 +1553,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Flicker speed",
-        .help = "How quickly the flame's wave runs."
+        .help = "How quickly the whole flame moves: the pace it wanders to "
+                "new strengths, and how briskly it settles on each."
     },
     {
         .key = "sprite_light_gain",

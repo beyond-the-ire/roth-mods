@@ -466,7 +466,7 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
     light->lamp_flicker_amount =
         hwr_truecolor_row_float(HWR_PLAYER_FLICKER_AMOUNT_ROW, settings, 0.30f);
     light->lamp_flicker_speed =
-        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_SPEED_ROW, settings, 1.80f);
+        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_SPEED_ROW, settings, 1.00f);
     light->sprite_gain = hwr_truecolor_row_float(HWR_SPRITE_GAIN_ROW, settings,
                                                  1.0f);
     light->sprite_wrap = hwr_truecolor_row_float(HWR_SPRITE_WRAP_ROW, settings,
