@@ -1476,15 +1476,23 @@ static const char g_geometry_fragment_body[] =
      * wall faces. The flat path's edge bias is left out for the same reason: it
      * carries the player light's own live strength.
      *
-     * The tinted class keeps the eight rows the engine's tinted law subtracts
-     * (u_wd_bias, that constant scaled down with the class's own shade level,
-     * exactly as its shift is) and keeps its floor of one row: a candle-lit
-     * surface is never quite fullbright in the original either.
+     * The candle-lit class's OWN rows arrive as `candle`, from the light the
+     * player carries, rather than being spent here. The engine's candle-lit law
+     * is its depth law less a constant number of rows and less a screen-radial
+     * term, and that constant is the candle's own amplitude -- the same word the
+     * engine stages for its wall and flat edge projectors alike, from the view
+     * record and the player's own sector. So a room whose faces the map marks
+     * candle-lit is a room whose near field the ORIGINAL draws with the light in
+     * the player's hand; handing those rows to the room made every such room
+     * paint its own near field at the candle's brightness whether or not there
+     * was a candle. What is left here is the room's own authored statement --
+     * where its light starts to go -- and the class's floor of one row, which is
+     * taken on the SUM exactly where the engine takes it.
      *
      * Wall and flat need no branch here: the standard wall's divisor
      * 16*(2<<level) IS the flat's shift 1<<(5+level), the same number written
      * two ways. */
-    "float room_amount(int selected_level, bool tinted) {\n"
+    "float room_amount(int selected_level, bool tinted, float candle) {\n"
     "  int level=selected_level; int shr=5+level;\n"
     "  int light=effective_light();\n"
     "  if (light==0) return 0.0;\n"
@@ -1501,7 +1509,7 @@ static const char g_geometry_fragment_body[] =
      * row, where the original draws the near field one row down and everything
      * past it fullbright -- and reproducing the original includes reproducing
      * that. */
-    "  if (tinted) { r-=float(u_wd_bias);\n"
+    "  if (tinted) { r-=candle;\n"
     "    return r<1.0 ? 1.0 : min(r,float(min(scale,31))); }\n"
     "  return clamp(r,0.0,float(min(scale,31)));\n"
     "}\n"
@@ -1654,6 +1662,14 @@ static const char g_geometry_fragment_body[] =
     "uniform float u_lamp_intensity;\n"
     "uniform float u_lamp_range;\n"
     "uniform int u_lamp_scope_all;\n"
+    /* And the other half of that light, which is the half the map already had a
+     * word for. How much of a candle-lit room's OWN candle the light in the
+     * player's hand supplies, and how much of what it supplies is shaped like a
+     * pool at the eye rather than filling the room the way the original's does.
+     * The flame and the map's own lantern word are already spent into the
+     * first, so a fragment reads one number for both. */
+    "uniform float u_candle_amount;\n"
+    "uniform float u_candle_pool;\n"
     /* What the light the player carries had to pass through to reach each
      * pixel, written by the pass above and read here; whether this frame has
      * such a plane at all; whether this draw is that pass; and how much of what
@@ -1809,6 +1825,53 @@ static const char g_geometry_fragment_body[] =
     "  if (h<=0.0) return k;\n"
     "  return k+h*(1.0-exp(-(x-k)/h));\n"
     "}\n"
+    /* The rows the light a person carries takes off a candle-lit room's shade.
+     *
+     * The original's candle-lit law is its depth law less a CONSTANT number of
+     * rows and less a screen-radial term measured from an origin that dances --
+     * and that constant is the candle's own amplitude, staged for the wall and
+     * the flat edge projectors alike from the view record and the player's own
+     * sector. The room never authored it; the light in the hand did. So it is
+     * spent from here, where a light's own switch, strength, flame and the map's
+     * own lantern word can all reach it, rather than from the room's term where
+     * nothing could.
+     *
+     * Its amount is the map's own number of rows at full, so at full the sum of
+     * this and the room IS the original's candle-lit picture, term for term, and
+     * a person who turns the light down or out is left with what the room itself
+     * states. That is the whole of the split: the same picture at rest, and a
+     * dial on the half of it the map says belongs to the candle.
+     *
+     * Its SHAPE is the one departure and it is a dial of its own. The original's
+     * candle is measured in screen space, so at the middle of the view it is
+     * worth the same at every distance -- it fills a candle-lit room rather than
+     * pooling in it. At nothing this reproduces that exactly, which is why that
+     * is where it rests; wound up, the amount falls off with the light's own
+     * reach and with which way a surface faces, which is a pool at the eye and
+     * is a picture the original could not draw. */
+    "float candle_rows(bool tinted) {\n"
+    "  if (!tinted || u_candle_amount<=0.0) return 0.0;\n"
+    "  float rows=float(u_wd_bias)*u_candle_amount;\n"
+    "  if (u_candle_pool<=0.0) return rows;\n"
+    "  vec3 p=view_position();\n"
+    "  float dist=length(p);\n"
+    /* The same windowed quadratic and the same reach the light's other half
+     * falls off by, so the two describe one light rather than two. */
+    "  float att=max(1.0-dist/u_lamp_range,0.0);\n"
+    "  float shape=att*att;\n"
+    "  vec3 n=surface_normal();\n"
+    /* A surface with no direction of its own -- a mesh flat the emitter left
+     * without one -- takes the distance term alone rather than nothing at all:
+     * an absent normal is a missing answer, not an answer of "away". */
+    "  if (n!=vec3(0.0)) {\n"
+    "    vec3 l=dist>0.0 ? -p/dist : vec3(0.0,-1.0,0.0);\n"
+    "    float ndl=dot(n,l);\n"
+    "    if ((v_light_material.w & 32u)!=0u)\n"
+    "      ndl=(ndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
+    "    shape*=max(ndl,0.0);\n"
+    "  }\n"
+    "  return rows*mix(1.0,shape,u_candle_pool);\n"
+    "}\n"
     /* What reaches this fragment, as a multiplier on the colour of its texel.
      *
      * The authored byte is a ratio in the palette's own perceptual space, so the
@@ -1841,16 +1904,18 @@ static const char g_geometry_fragment_body[] =
     /* The engine's own law, which is a windowed power falloff with a per-sector
      * reach: the room's shade read through the ramp the colormap is built on,
      * which is (1 - row/32) to the gamma for every table the game ships. At
-     * gain one, reach one and shape one this IS the original's picture -- the
-     * same quantity, the same ramp, with the thirty-two steps taken out of it --
-     * so the law has a known-good starting point and every dial is a departure
-     * from a picture rather than from a guess.
+     * gain one, reach one, shape one and the candle-lit class's own rows carried
+     * whole by the light in the player's hand, this IS the original's picture --
+     * the same quantity, the same ramp, with the thirty-two steps taken out of
+     * it -- so the law has a known-good starting point and every dial is a
+     * departure from a picture rather than from a guess.
      *
      * The shaping row multiplies the exponent here rather than bending a
      * fraction between two levels: on this law the exponent IS the shape of the
      * falloff, and one leaves the map's own. */
     "  if (u_room_curve==2) {\n"
-    "    room=pow(max(1.0-room_amount(level,tinted)/(32.0*u_room_reach),0.0),\n"
+    "    room=pow(max(1.0-room_amount(level,tinted,candle_rows(tinted))/"
+    "(32.0*u_room_reach),0.0),\n"
     "             u_room_light.y*u_room_shape);\n"
     "  } else {\n"
     /* The authored byte, taken to the exponent: a ratio in the palette's own
@@ -4041,6 +4106,16 @@ static void hwr_bind_light_uniforms(GLuint program,
     hwr_uniform_1f(program, "u_lamp_range",
                    light->lamp_range * g_lamp_glow_range);
     hwr_uniform_1i(program, "u_lamp_scope_all", light->lamp_scope_all != 0);
+    /* The rows of a candle-lit room's own candle the light supplies, through the
+     * same two factors its strength goes through -- so the flame reaches the
+     * near field the original lights this way, and a map asking for a brighter
+     * lantern gets one there too. With neither asking both are exactly one, so
+     * at full amount the shader subtracts the map's own row count to the bit and
+     * the sum is the original's picture. */
+    hwr_uniform_1f(program, "u_candle_amount",
+                   light->candle_amount * g_lamp_glow_intensity *
+                   g_lamp_flicker);
+    hwr_uniform_1f(program, "u_candle_pool", light->candle_pool);
     hwr_uniform_2f(program, "u_sprite_light", light->sprite_gain,
                    light->sprite_wrap);
     hwr_uniform_3f(program, "u_key_dir", 0.0f, 0.0f, -1.0f);

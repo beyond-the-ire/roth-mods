@@ -1287,6 +1287,81 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "brighter a map asks for, the further its light throws."
     },
     {
+        .key = "player_light_candle",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_candle),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        /* Full is the map read exactly as written, and that is where it rests.
+         *
+         * The game draws a candle-lit room at its own depth law less a fixed
+         * number of shade rows, and those rows are the CANDLE: the amount is
+         * staged from the view record and from whether the player is standing
+         * in such a room at all, and it is the same word the wall and the flat
+         * edge projectors both subtract. Handing it to the room instead made
+         * every candle-lit room paint its own near field at the candle's
+         * brightness whether or not there was a candle in it -- the one thing
+         * no dial could reach, because the room term had no dial that WAS the
+         * candle. At full this supplies exactly the rows the map states and the
+         * picture is the original's; below it a candle-lit room keeps only what
+         * it states for itself, which is the darkness this dial is for. */
+        .def = { .f = 1.0f },
+        .original = { .f = 1.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 2.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Your light lights candlelit rooms",
+        .help = "Rooms lit by candlelight are lit by YOUR light in this game: "
+                "the room says how far its own light carries and the candle "
+                "you hold supplies the rest. This is how much of that your "
+                "light gives. Full is the game's own candle. Turn it down and "
+                "candlelit rooms go dark around you, leaving only the light "
+                "the room itself has."
+    },
+    {
+        .key = "player_light_candle_pool",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_candle_pool),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        /* Nothing is the game's own shape.
+         *
+         * Its candle is measured in SCREEN space -- the distance from a dancing
+         * origin near the middle of the view -- so at the middle of the view it
+         * is worth the same at every distance, and it FILLS a candle-lit room
+         * rather than pooling in it. At nothing this is that, exactly, which is
+         * what keeps the shipped picture the original's; wound up, the rows
+         * above fall off with the light's own reach and with which way a surface
+         * faces, which is a real pool at the eye and a picture the original
+         * could not draw. */
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Pool your light instead of filling the room",
+        .help = "The game's candlelight brightens a whole candlelit room "
+                "evenly, however far away the wall is. This gathers it into a "
+                "pool around you instead: bright at your feet, gone by the "
+                "time your light runs out, and dimmer on surfaces facing away."
+    },
+    {
         .key = "player_light_flicker",
         .type = HWR_VT_BOOL,
         .category = HWR_CAT_ENHANCEMENTS,

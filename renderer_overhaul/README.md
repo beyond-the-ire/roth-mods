@@ -254,7 +254,9 @@ not a brightness — it is a distance, the range that room's own light reaches b
 and Modern reads it as exactly that, so a room lights its surfaces until its light runs out. A
 corridor's far end goes dark while the wall in front of you does not; a room whose lights are on
 stays bright down its whole length; the light you carry, a fill, and the map's own torches are
-added to that. Light switches, weapon flashes and everything else the map does to a room still
+added to that. Rooms the map marks candlelit are lit by the light in your hand — that is the
+game's own model, and Modern keeps it there rather than folding it into the room, so turning your
+light down darkens exactly the rooms it is supposed to. Light switches, weapon flashes and everything else the map does to a room still
 work, and read as light rather than as a jump from one shade to the next — a light switch moves the
 room's own reach AND takes it out of the candle model, which is why a room reads properly lit when
 it comes on rather than one step brighter.
@@ -285,6 +287,18 @@ Modern shading brings its own settings with it, all of them dimmed until it is c
   stronger carried light does not brighten that near field, it flattens it. Raise it if you want a
   brighter pool at the cost of some of that. **Flickers**, with its **depth** and **speed**, lets it
   breathe like a flame; it is held well clear of going out, so it never gutters or strobes.
+- **Your light lights candlelit rooms** is the other half of that light, and the half the game
+  itself already had a word for. A room the map marks candlelit is drawn by the game at its own
+  distance law less a fixed number of shade steps, and those steps are the candle rather than the
+  room: the brightness around you in such a room IS the light in your hand. This is how much of it
+  your light supplies. At full it is the game's own candle, so the picture is the one the game
+  draws; turn it down and candlelit rooms go dark around you, leaving only the light the room
+  itself has — and the flicker above breathes through it, so a flame you dial up and down is a
+  flame you can see. **Pool your light instead of filling the room** shapes it: the game's own
+  candle is measured on the screen rather than in the world, so it brightens a whole candlelit room
+  evenly however far away the wall is, and at nothing this is exactly that. Wound up, it gathers
+  into a pool around you instead — bright at your feet, gone by the time your light runs out, and
+  dimmer on surfaces facing away.
 - **Item and figure brightness** is people, creatures and things you can pick up, on a dial of
   their own so they never disappear in a dark room.
 

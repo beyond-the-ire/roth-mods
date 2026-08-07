@@ -256,6 +256,17 @@ struct hwr_settings {
      * of it: at nothing the two rows above are the whole answer, at one the
      * map's word is read whole. */
     float player_light_glow_scale;
+    /* And the half of that light the map itself already had a word for. Rooms
+     * the map marks candle-lit are drawn by the game at their own depth law LESS
+     * a fixed number of shade rows, and those rows are the candle rather than
+     * the room: the game's own near-field brightness in such a room IS the light
+     * the player is holding. This is how much of that the carried light
+     * supplies -- at full it is the game's own candle exactly, and turned down
+     * a candle-lit room is left with only what it states for itself -- and how
+     * much of what it supplies is shaped like a pool at the eye rather than
+     * filling the room evenly the way the game's screen-space one does. */
+    float player_light_candle;
+    float player_light_candle_pool;
     /* The flame in that light: whether it moves at all, how far it may swing
      * either side of its strength, and how quickly its wave runs. It is held
      * well clear of going out, so it reads as a flame rather than a fault. */

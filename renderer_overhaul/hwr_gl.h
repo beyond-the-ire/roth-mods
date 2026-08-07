@@ -356,6 +356,26 @@ struct hwr_gl_light {
     /* How much of the map's own candle word the two above take: zero ignores
      * it and one reads it whole. */
     float lamp_glow_scale;
+    /* The other half of the light a person carries, and the half the map itself
+     * already had a word for.
+     *
+     * A room whose faces the map marks candle-lit is drawn by the original at
+     * its own depth law LESS a constant number of rows, and that constant is the
+     * candle's amplitude rather than anything the room authored. So the room
+     * term says where a room's light starts to go, and this says how much of
+     * that room's candle the light in the hand supplies: at one it is the map's
+     * own number of rows and the sum is the original's picture exactly; at
+     * nothing the room is left with what it states for itself. The light's own
+     * switch puts it out, and the flame and the map's lantern word are spent
+     * into it, so a flicker reaches the near field the original lights this way.
+     *
+     * And how much of what it supplies is shaped like a pool at the eye. The
+     * original's candle is measured in SCREEN space and so fills a candle-lit
+     * room evenly at every distance; at nothing this is that exactly, and wound
+     * up the amount falls off with the light's own reach and with which way a
+     * surface faces. */
+    float candle_amount;
+    float candle_pool;
     /* The flame in that light -- whether it moves, how far it may swing, and
      * how quickly its wave runs. Zero for the first is exactly no flame, which
      * is what leaves the light the rows describe untouched to the bit. */

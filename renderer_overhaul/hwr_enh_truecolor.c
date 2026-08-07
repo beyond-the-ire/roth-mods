@@ -64,6 +64,8 @@
 #define HWR_PLAYER_RANGE_ROW "player_light_range"
 #define HWR_PLAYER_SCOPE_ROW "player_light_scope"
 #define HWR_PLAYER_GLOW_ROW "player_light_glow_scale"
+#define HWR_PLAYER_CANDLE_ROW "player_light_candle"
+#define HWR_PLAYER_CANDLE_POOL_ROW "player_light_candle_pool"
 #define HWR_PLAYER_FLICKER_ROW "player_light_flicker"
 #define HWR_PLAYER_FLICKER_AMOUNT_ROW "player_light_flicker_amount"
 #define HWR_PLAYER_FLICKER_SPEED_ROW "player_light_flicker_speed"
@@ -424,6 +426,17 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
                                HWR_LIGHT_SCOPE_ALL) == HWR_LIGHT_SCOPE_ALL;
     light->lamp_glow_scale = hwr_truecolor_row_float(HWR_PLAYER_GLOW_ROW,
                                                      settings, 0.0f);
+    /* The candle-lit half of the same light, behind the same switch: a room the
+     * map marks candle-lit is one the ORIGINAL lights with the thing in the
+     * player's hand, so putting that light out has to take those rows with it.
+     * The shape dial is not behind the switch for the same reason the reach is
+     * not -- it describes what the light is, not how much of one there is. */
+    light->candle_amount =
+        hwr_truecolor_row_bool(HWR_PLAYER_LIGHT_ROW, settings, 0)
+            ? hwr_truecolor_row_float(HWR_PLAYER_CANDLE_ROW, settings, 1.0f)
+            : 0.0f;
+    light->candle_pool = hwr_truecolor_row_float(HWR_PLAYER_CANDLE_POOL_ROW,
+                                                 settings, 0.0f);
     /* The flame's switch is carried rather than spent into a strength the way
      * the fills above are: what it turns off is a clock, not a term, and the
      * two dials beside it describe the shape of a flame rather than how much of
