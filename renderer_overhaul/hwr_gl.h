@@ -400,6 +400,15 @@ struct hwr_gl_light {
      * surface faces. */
     float candle_amount;
     float candle_pool;
+    /* How softly the candle's cone goes over from light to dark. The engine's
+     * cone edge is where the screen radial has spent the map's own candle word
+     * -- fourteen degrees off the view axis on every map the game ships -- and
+     * the row law crosses it at one pace. This spreads that crossing over a
+     * band about the edge: the radial's slope is eased where the edge lives,
+     * the core inside the band is untouched, and past it the flanks keep a
+     * bounded share of the light they lost. Zero is the engine's own edge,
+     * exactly. */
+    float cone_penumbra;
     /* The flame in that light -- whether it moves, how far it may swing, and
      * how quickly its wave runs. Zero for the first is exactly no flame, which
      * is what leaves the light the rows describe untouched to the bit. */

@@ -134,9 +134,17 @@ shadings, so setting one while the shading is `authentic` leaves the picture unt
   forward is that geometry rather than a departure from it — the light carries further down the
   corridor you are facing and less to either side. What moves is where the pool falls off from; the
   light is still held where you are, so the wall two paces in front of you is lit rather than lit
-  from behind. Zero puts it back on top of you.
+  from behind. Zero — where it ships, since the candle cone itself already aims where you look —
+  puts it on top of you.
+- `player_light_penumbra`: how soft your candlelight's edge is, from 0 through 1. The game switches
+  its cone from light to dark at one pace — a flashlight's rim; this spreads the transition over a
+  wider band about the same edge, a lantern's soft falloff. The middle of the cone and the darkness
+  well beyond it stay where they are. Zero is the game's own edge, exactly.
 - `player_light_flicker`, `player_light_flicker_amount`, `player_light_flicker_speed`: let that
-  light breathe the way a flame does. It is held well clear of going out, so it never gutters.
+  light move the way the game's own flame does. The game flickers its candlelight by moving the
+  pool about where you are looking, not by pulsing its brightness, and that is what these do: the
+  depth is how far the pool wanders — full is the game's own throw — and the speed is the pace.
+  It never strobes and never gutters out.
 - `sprite_light_gain`: how bright people, creatures and things you can pick up are, from 0 through
   4. Raise it if a dark room makes them hard to find.
 
@@ -197,12 +205,14 @@ world gain. A line the file cannot use costs that line and nothing more, and the
 when it reads the file. **Reload From File** on the settings screen reads this file again too.
 
 The file ships with an `authentic`, a `moody` and a `dark` profile and nothing pointed at any of
-them, so the set is there to read and change without pre-judging any map. All three say the same
-three things — how far a room's light carries, the room brightness over it, and where brightness
-levels off — and differ only in the first: `authentic` is the map exactly as it was authored,
-`moody` is a step away from it, and `dark` is two. A row a map answers for is marked on the
-settings screen with what the map says, because moving that setting will not change the picture
-where you are standing.
+them, so the set is there to read and change without pre-judging any map. `authentic` is the
+game's own picture, whole: every dial the modern shading adds, stated at the value that reproduces
+the original exactly — the map read as written, the candle at the game's own strength, no added
+lamp, no flicker, the game's own cone edge — so a map pointed at it is lit as the game lit it
+whatever the settings screen says. `moody` and `dark` are darker steps below the shipped look
+along the one dial that decides what a place feels like, how far a room's light carries. A row a
+map answers for is marked on the settings screen with what the map says, because moving that
+setting will not change the picture where you are standing.
 
 A section written for `room_light_curve = anchored` — one that sets `room_light_dark`,
 `room_light_lit`, or any of the anchor and window keys, without saying which response it means — is
@@ -279,9 +289,13 @@ work, and read as light rather than as a jump from one shade to the next — a l
 room's own reach AND takes it out of the candle model, which is why a room reads properly lit when
 it comes on rather than one step brighter.
 
-At its own defaults — the reach at one, the brightness at one — Modern draws the map exactly as it
-was authored, which is the original's own picture with the thirty-two steps taken out of it and a
-light where you are standing. Every dial is a departure from that rather than from a guess.
+At the reach of one and the candle at full, Modern draws the map exactly as it was authored, which
+is the original's own picture with the thirty-two steps taken out of it. Every dial is a departure
+from that picture rather than from a guess — and what Modern ships at is a departure on purpose: a
+dark, candle-lit look, tuned in play — the room's light carrying to 0.85 of what the map states,
+the candle at just under half the game's own, the flame lit and wandering — that reads as the dark
+the game was written to be. The `authentic` profile in the look file is the map-as-written picture,
+whole, for any map you want it back on.
 
 Modern shading brings its own settings with it, all of them dimmed until it is chosen:
 
@@ -305,23 +319,28 @@ Modern shading brings its own settings with it, all of them dimmed until it is c
   away do not, and it is correct in a mirror without being told anything about one. It is on by
   default under Modern, because a room's own light now runs out with distance and what is left when
   it does should be the light you brought. Its reach follows the map unless you set one, and its
-  strength ships low on purpose: near you the picture is already as bright as it can be drawn, so a
-  stronger carried light does not brighten that near field, it flattens it. Raise it if you want a
-  brighter pool at the cost of some of that. **Flickers**, with its **depth** and **speed**, lets it
-  breathe like a flame; it is held well clear of going out, so it never gutters or strobes.
-  **Carried light aims ahead** puts the pool a little way in front of you instead of on top of you,
-  which is what the game's own candlelight does: it is measured on the screen rather than in the
-  world, which makes it a cone about the direction you are looking. The light carries further down
-  the corridor you are facing and a little less onto the ground at your feet. The light itself is
-  still in your hand, so nothing in front of you is ever lit from behind.
+  strength ships at a whisper on purpose: the candlelight's own cone is the picture's carried
+  light, and near you the picture is already as bright as it can be drawn, so a stronger lamp does
+  not brighten the near field, it flattens it. Raise it if you want a real modern lamp at the cost
+  of some of that. **Flickers**, with its **depth** and **speed**, moves it the way the game's own
+  flame does: the pool of light wanders about where you are looking — the depth is how far, full
+  being the game's own throw, and the speed is the pace. It never strobes and never gutters out.
+  **Carried light aims ahead** puts the lamp's pool a little way in front of you instead of on top
+  of you. It ships at zero: the candle cone already aims the light where you are looking, so the
+  lamp no longer needs an aim of its own to read as directed.
 - **Your light lights candlelit rooms** is the other half of that light, and the half the game
   itself already had a word for. A room the map marks candlelit is drawn by the game at its own
   distance law less a fixed number of shade steps, and those steps are the candle rather than the
   room: the brightness around you in such a room IS the light in your hand. This is how much of it
   your light supplies. At full it is the game's own candle, so the picture is the one the game
-  draws; turn it down and candlelit rooms go dark around you, leaving only the light the room
-  itself has — and the flicker above breathes through it, so a flame you dial up and down is a
-  flame you can see. **Pool your light instead of filling the room** shapes it: the game's own
+  draws; turned down, candlelit rooms go dark around you, leaving only the light the room itself
+  has — and just under half is where it ships, which is the tuned dark look above. The flicker
+  moves the pool of it, so a flame you dial up and down is a flame you can see.
+  **How soft your light's edge is** softens the cone's own rim: the game crosses from light to
+  dark at one pace, and this spreads the crossing over a wider band about the same edge — a
+  lantern's falloff instead of a flashlight's rim, with the middle of the cone and the darkness
+  beyond it left where they are. Zero is the game's own edge.
+  **Pool your light instead of filling the room** shapes it: the game's own
   candle is measured on the screen rather than in the world, so it brightens a whole candlelit room
   evenly however far away the wall is, and at nothing this is exactly that. Wound up, it gathers
   into a pool around you instead — bright at your feet, gone by the time your light runs out, and

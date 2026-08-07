@@ -1368,14 +1368,33 @@ static const char g_geometry_fragment_body[] =
     "uniform int u_shade_fixed_origin;\n"
     "uniform int u_shade_round;\n"
     "uniform int u_shade_per_fragment;\n"
+    /* The flame's wander of the fixed origin, in the origin's own screen
+     * units, zero at rest. The engine's candle is measured from an origin the
+     * flame moves about the view centre; the modern law's fixed centre is the
+     * place that dance is a dance around, and this is the dance given back to
+     * it -- one offset a frame, paced and sized by the flicker dials, staged
+     * beside the origin it moves. The laws that read the engine's own origin
+     * never see it. */
+    "uniform ivec2 u_cone_wander;\n"
+    /* How softly the candle's cone goes over from light to dark. Zero is the
+     * engine's own edge, exactly, and it is the whole dial's identity: the
+     * softened radial below is not evaluated at all. */
+    "uniform float u_cone_penumbra;\n"
+    /* The map's own candle amplitude, declared here because the softened
+     * cone term reads it for the edge it eases about; what it MEANS is said
+     * where its sibling u_candle_state lives, beside the candle rows. */
+    "uniform int u_candle_word;\n"
     /* The candle term the tinted law adds to depth, in the depth word's units.
      *
      * The engine measures it from a light position that lives in screen space
      * and is moved every seventh tick by a random step around the view centre,
-     * and that dance is the flicker. A law whose light no longer dances
-     * measures from the view centre itself -- the place the dance is a dance
-     * around -- which leaves the pool where it always was and stops it moving,
-     * without inventing a light position the map never had.
+     * and that dance is the flicker. A law whose light does not dance measures
+     * from the view centre itself -- the place the dance is a dance around --
+     * which leaves the pool where it always was, without inventing a light
+     * position the map never had. The flicker switch puts the dance back:
+     * u_cone_wander is the flame's own paced wander of that centre, zero at
+     * rest, so a still flame is the fixed centre to the bit and a lit one
+     * moves the pool the way the engine's own candle moves.
      *
      * The engine's distance is the larger of the two axis terms, which makes a
      * pool with straight edges and corners; the length of the pair makes it
@@ -1388,13 +1407,49 @@ static const char g_geometry_fragment_body[] =
      * would have clamped into darkness, and wrapping it lands a bright ring in
      * the dark instead. */
     "float candle_edge_depth(int depth) {\n"
-    "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i : u_shade_origin;\n"
+    "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i+u_cone_wander"
+    " : u_shade_origin;\n"
     "  int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
     "  int px=(abs(wrap16(source_column()-origin.x)) * sx) >> 8;\n"
     "  int py=(abs(wrap16(int(gl_FragCoord.y)-origin.y)) * sy) >> 8;\n"
     "  if (u_shade_round!=0)\n"
     "    return float(depth)+length(vec2(float(px),float(py)));\n"
     "  return float((depth+max(px,py)) & 65535);\n"
+    "}\n"
+    /* The same term with the cone's transition softened, for the modern room
+     * law alone -- the laws that reproduce the engine read the line above and
+     * never this one, which is what keeps their identity out of the dial's
+     * reach.
+     *
+     * The engine's cone edge is where the radial has spent the map's own
+     * candle word: radial = word * unit, fourteen degrees off the view axis
+     * on every map the game ships, and the row law crosses it at one pace --
+     * a pace the eye reads as a flashlight's rim. The penumbra eases
+     * the radial's SLOPE across a band about that edge, half the edge's own
+     * angle to either side, with a bump that returns to slope one at both
+     * ends so the band has no seam: the core inside it is the engine's to
+     * the bit, the slope at the edge itself falls as far as a quarter at the
+     * dial's full, and past the band the flanks keep the bounded rows the
+     * easing left them -- half the word at full, a lantern's spill rather
+     * than a second picture. At a penumbra of nothing the line above is the
+     * whole answer, exactly. */
+    "float cone_edge_depth(int depth, int shr) {\n"
+    "  if (u_cone_penumbra<=0.0) return candle_edge_depth(depth);\n"
+    "  ivec2 origin=u_shade_fixed_origin!=0 ? u_center_i+u_cone_wander"
+    " : u_shade_origin;\n"
+    "  int sx=int(262144.0/u_focal.x), sy=int(262144.0/u_focal.y);\n"
+    "  int px=(abs(wrap16(source_column()-origin.x)) * sx) >> 8;\n"
+    "  int py=(abs(wrap16(int(gl_FragCoord.y)-origin.y)) * sy) >> 8;\n"
+    "  float radial=u_shade_round!=0 ? length(vec2(float(px),float(py)))"
+    " : float(max(px,py));\n"
+    "  float edge=float(u_candle_word)*float(1 << shr);\n"
+    "  if (edge>0.0) {\n"
+    "    float w=0.5*edge;\n"
+    "    float t=clamp((radial-(edge-w))/(2.0*w),0.0,1.0);\n"
+    "    radial-=0.75*u_cone_penumbra*2.0*w*t*t*(2.0-1.3333333*t);\n"
+    "  }\n"
+    "  if (u_shade_round!=0) return float(depth)+radial;\n"
+    "  return float((depth+int(radial)) & 65535);\n"
     "}\n"
     "float shade_amount(int selected_level, bool tinted) {\n"
     "  int level=selected_level; int shr=5+level;\n"
@@ -1486,14 +1541,17 @@ static const char g_geometry_fragment_body[] =
      * view-centre value: brighter than the original everywhere off the axis,
      * by up to half the display range at the screen's edge.
      *
-     * The radial is read through candle_edge_depth() -- the fixed centre and
-     * the round metric this law already declares for its shade rows -- so the
-     * room darkens by the same measure the rows beside it are taken by. The
-     * round metric is at most a sixth of a row wider than the engine's square
-     * one on either screen axis and +5.2 rows at the extreme corner, which is
-     * the documented cost of a pool without square corners. The receding-wall
-     * penalty (v_wall_tint_adjust) applies to wall fragments; the engine's
-     * flat projector has no such term, and a flat's byte is 8 there.
+     * The radial is read through cone_edge_depth() -- candle_edge_depth's own
+     * fixed centre and round metric, the parts this law already declares for
+     * its shade rows, with the penumbra dial's softened transition in front of
+     * them -- so the room darkens by the same measure the rows beside it are
+     * taken by, and at a penumbra of nothing by exactly the term it always
+     * was. The round metric is at most a sixth of a row wider than the
+     * engine's square one on either screen axis and +5.2 rows at the extreme
+     * corner, which is the documented cost of a pool without square corners.
+     * The receding-wall penalty (v_wall_tint_adjust) applies to wall
+     * fragments; the engine's flat projector has no such term, and a flat's
+     * byte is 8 there.
      *
      * The candle-lit class's OWN rows arrive as `candle`, from the light the
      * player carries, rather than being spent here. That constant is the
@@ -1526,7 +1584,7 @@ static const char g_geometry_fragment_body[] =
      * that. */
     "  if (tinted) {\n"
     "    int adj=(v_light_material.y & 8u)!=0u ? 0 : int(v_wall_tint_adjust);\n"
-    "    float r=candle_edge_depth(depth)/float(1 << shr)-float(bias-adj)"
+    "    float r=cone_edge_depth(depth,shr)/float(1 << shr)-float(bias-adj)"
     "-candle;\n"
     "    return r<1.0 ? 1.0 : min(r,float(min(scale,31)));\n"
     "  }\n"
@@ -1701,12 +1759,12 @@ static const char g_geometry_fragment_body[] =
     "uniform float u_candle_pool;\n"
     /* The two halves of the engine's staged word, split where the split
      * can use them: the map's own candle amplitude (poolable, the light in
-     * the hand), and the player-state term -- zero with the player standing
+     * the hand -- u_candle_word, declared up with the cone terms that also
+     * read it), and the player-state term -- zero with the player standing
      * in the candle-lit class, minus thirteen rows times the candle dial
      * when he is not, exactly the step the original draws at a doorway
      * between the classes. The state is a statement about the whole room,
      * so no pool shapes it. */
-    "uniform int u_candle_word;\n"
     "uniform float u_candle_state;\n"
     /* What the light the player carries had to pass through to reach each
      * pixel, written by the pass above and read here; whether this frame has
@@ -3273,14 +3331,19 @@ static int hwr_shade_linear_wanted(enum hwr_gl_shading_mode mode)
  *
  * Two things move the light the player carries that no row can say on its own:
  * the map's own word about how strong its lantern was meant to be, and the
- * flame in it. Both are worked out here, once per rendered frame, as plain
- * multipliers on the strength and the reach the settings layer handed over.
+ * flame in it. Both are worked out here, once per rendered frame -- the word
+ * and the flame's brightness as plain multipliers on the strength and the
+ * reach the settings layer handed over, and the flame's WANDER as the one
+ * screen offset the cone's origin is measured from, which is what the
+ * original's own flicker is: the pool dances about the view centre, it does
+ * not breathe in place.
  *
  * Doing it here rather than in the fragment tail is the whole design. A flame
- * is one number a frame, not a term per pixel; a mirror is lit by the same
- * flame as the view it hangs in without a word being said about reflections;
- * and with nothing asking, both multipliers are exactly one, so the light the
- * rows describe reaches the shader as the bits the rows describe. */
+ * is one number and one offset a frame, not a term per pixel; a mirror is lit
+ * by the same flame as the view it hangs in without a word being said about
+ * reflections; and with nothing asking, the multipliers are exactly one and
+ * the offset exactly nought, so the light the rows describe reaches the
+ * shader as the bits the rows describe. */
 
 /* The step the flame is advanced in. Fixing it is what makes the flame a
  * function of how much of the world's time has passed and of nothing else: the
@@ -3320,6 +3383,28 @@ static int hwr_shade_linear_wanted(enum hwr_gl_shading_mode mode)
  * flame that starts in the same place every run look exactly alike, and only
  * one of them can be measured. */
 #define HWR_LAMP_SEED 0x9e3779b9u
+/* The pool's wander, which is what the flame's flicker IS in the original:
+ * every seventh tick the engine steps a sixteen-bit sequence and moves the
+ * candle's screen origin a random step about the view centre, a sixteenth of
+ * the focal to either side per axis (renderer.c:13411-13426) -- the pool
+ * DANCES, it does not breathe. The modern law's cone measures from the fixed
+ * centre, so the wander is that dance given back to it: the same paced
+ * lottery and the same chase the flame runs, driving a two-axis offset in
+ * units of the engine's own amplitude. The depth dial is how far the pool
+ * wanders -- one is the engine's own sixteenth -- and the speed dial is the
+ * pace, so the two say of the pool exactly what they say of the flame. The
+ * chase is what makes it a wander rather than the original's teleport, which
+ * is the one deliberate departure. The waves are the flame's own idea sized
+ * for a position: two incommensurate rates, low enough that the fastest
+ * shipped pace keeps every wave under the band an eye reads as strobe. Its
+ * sequence is its own, seeded apart from the flame's, so the flame the gates
+ * banked walks the walk it always walked. */
+#define HWR_LAMP_WANDER_A_RATE 1.7f
+#define HWR_LAMP_WANDER_A_SIZE 0.25f
+#define HWR_LAMP_WANDER_B_RATE 2.9f
+#define HWR_LAMP_WANDER_B_SIZE 0.18f
+#define HWR_LAMP_WANDER_B_PHASE 2.1f
+#define HWR_LAMP_WANDER_SEED 0x7f4a7c15u
 
 /* What the map's word does to the strength and to the reach. */
 static float g_lamp_glow_intensity = 1.0f;
@@ -3336,6 +3421,16 @@ static float g_lamp_carry;
  * doing beside it. */
 static uint32_t g_lamp_steps;
 static uint32_t g_lamp_random_state = HWR_LAMP_SEED;
+/* The pool's wander: where the cone's origin stands, where it is reaching
+ * for, the two waves' own phases, and its own sequence. All of it is nought
+ * at rest, which is the identity every still picture stands on. */
+static float g_lamp_wander_x;
+static float g_lamp_wander_y;
+static float g_lamp_wander_target_x;
+static float g_lamp_wander_target_y;
+static float g_lamp_wander_wave_a;
+static float g_lamp_wander_wave_b;
+static uint32_t g_lamp_wander_random_state = HWR_LAMP_WANDER_SEED;
 /* The two clocks the flame is driven by: real time, which is what it runs on,
  * and the world's own, which is what says whether time is passing at all. */
 static uint64_t g_lamp_last_ns;
@@ -3357,6 +3452,17 @@ static float hwr_lamp_random(void)
 {
     g_lamp_random_state = g_lamp_random_state * 1664525u + 1013904223u;
     return (float)((g_lamp_random_state >> 8) & 0xffffffu) / 16777216.0f;
+}
+
+/* And the wander's, apart from it on purpose: the wander draws a different
+ * number of times a step than the flame does, so sharing one sequence would
+ * move every banked flame the moment the wander stood beside it. */
+static float hwr_lamp_wander_random(void)
+{
+    g_lamp_wander_random_state =
+        g_lamp_wander_random_state * 1664525u + 1013904223u;
+    return (float)((g_lamp_wander_random_state >> 8) & 0xffffffu) /
+           16777216.0f;
 }
 
 /* The map's word about its own lantern.
@@ -3435,6 +3541,48 @@ static void hwr_lamp_flicker_step(float amount, float speed)
                                    speed));
 }
 
+/* One step of the pool's wander, beside the flame's and on the same clock.
+ * The lottery picks where the pool reaches for next -- a point in the
+ * engine's own box, depth one being the whole of it -- and the chase walks
+ * there, so the pool wanders where the original's teleports. The desired
+ * point is held inside the engine's box BEFORE it is reached for, exactly as
+ * the flame is held between its bounds, so the origin can never leave the
+ * amplitude the original owns. Depth multiplies every amplitude and speed
+ * every rate, so a depth of nothing is an origin that is exactly still: the
+ * targets and the waves are nought, the chase reaches for nought, and nought
+ * it stands at from reset. */
+static void hwr_lamp_wander_step(float amount, float speed)
+{
+    float chase = 1.0f - expf(-HWR_LAMP_STEP * HWR_LAMP_SMOOTHING * speed);
+    float desired_x;
+    float desired_y;
+
+    g_lamp_wander_wave_a += HWR_LAMP_STEP * speed * HWR_LAMP_WANDER_A_RATE;
+    g_lamp_wander_wave_b += HWR_LAMP_STEP * speed * HWR_LAMP_WANDER_B_RATE;
+    while (g_lamp_wander_wave_a >= HWR_LAMP_TWO_PI)
+        g_lamp_wander_wave_a -= HWR_LAMP_TWO_PI;
+    while (g_lamp_wander_wave_b >= HWR_LAMP_TWO_PI)
+        g_lamp_wander_wave_b -= HWR_LAMP_TWO_PI;
+    if (hwr_lamp_wander_random() <
+        HWR_LAMP_STEP * HWR_LAMP_RETARGET_RATE * speed) {
+        g_lamp_wander_target_x =
+            (hwr_lamp_wander_random() * 2.0f - 1.0f) * amount;
+        g_lamp_wander_target_y =
+            (hwr_lamp_wander_random() * 2.0f - 1.0f) * amount;
+    }
+    desired_x = hwr_lamp_clamp(g_lamp_wander_target_x +
+                                   sinf(g_lamp_wander_wave_a) *
+                                       HWR_LAMP_WANDER_A_SIZE * amount,
+                               -1.0f, 1.0f);
+    desired_y = hwr_lamp_clamp(g_lamp_wander_target_y +
+                                   sinf(g_lamp_wander_wave_b +
+                                        HWR_LAMP_WANDER_B_PHASE) *
+                                       HWR_LAMP_WANDER_B_SIZE * amount,
+                               -1.0f, 1.0f);
+    g_lamp_wander_x += (desired_x - g_lamp_wander_x) * chase;
+    g_lamp_wander_y += (desired_y - g_lamp_wander_y) * chase;
+}
+
 void hwr_gl_lamp_reset(void)
 {
     g_lamp_flicker = 1.0f;
@@ -3444,6 +3592,13 @@ void hwr_gl_lamp_reset(void)
     g_lamp_carry = 0.0f;
     g_lamp_steps = 0;
     g_lamp_random_state = HWR_LAMP_SEED;
+    g_lamp_wander_x = 0.0f;
+    g_lamp_wander_y = 0.0f;
+    g_lamp_wander_target_x = 0.0f;
+    g_lamp_wander_target_y = 0.0f;
+    g_lamp_wander_wave_a = 0.0f;
+    g_lamp_wander_wave_b = 0.0f;
+    g_lamp_wander_random_state = HWR_LAMP_WANDER_SEED;
     g_lamp_last_ns = 0;
     g_lamp_owed_ns = 0;
     g_lamp_last_world_clock = 0;
@@ -3489,6 +3644,8 @@ void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
         g_lamp_carry -= HWR_LAMP_STEP;
         hwr_lamp_flicker_step(light->lamp_flicker_amount,
                               light->lamp_flicker_speed);
+        hwr_lamp_wander_step(light->lamp_flicker_amount,
+                             light->lamp_flicker_speed);
     }
 }
 
@@ -4297,16 +4454,23 @@ static void hwr_bind_light_uniforms(GLuint program,
      * pool keeps its shape. */
     hwr_uniform_1f(program, "u_lamp_forward", light->lamp_forward);
     hwr_uniform_1i(program, "u_lamp_scope_all", light->lamp_scope_all != 0);
-    /* The rows of a candle-lit room's own candle the light supplies, through the
-     * same two factors its strength goes through -- so the flame reaches the
-     * near field the original lights this way, and a map asking for a brighter
-     * lantern gets one there too. With neither asking both are exactly one, so
-     * at full amount the shader subtracts the map's own row count to the bit and
-     * the sum is the original's picture. */
+    /* The rows of a candle-lit room's own candle the light supplies, through
+     * the map's own lantern word -- a map asking for a brighter lantern gets
+     * one here too. The flame is NOT in it: the original's flicker moves the
+     * pool's origin and never the candle's amplitude, and amplitude flicker
+     * here reads as a lamp focusing and unfocusing, not a flame. The
+     * flame reaches this light as the wander of the cone's origin
+     * (u_cone_wander) and as the breath of the additive lamp's own strength
+     * above, which the original never had a term for. With the word not
+     * asking the factor is exactly one, so at full amount the shader
+     * subtracts the map's own row count to the bit and the sum is the
+     * original's picture. */
     hwr_uniform_1f(program, "u_candle_amount",
-                   light->candle_amount * g_lamp_glow_intensity *
-                   g_lamp_flicker);
+                   light->candle_amount * g_lamp_glow_intensity);
     hwr_uniform_1f(program, "u_candle_pool", light->candle_pool);
+    /* How softly the cone goes over from light to dark; nothing is the
+     * engine's own edge and the shader never evaluates the softened arm. */
+    hwr_uniform_1f(program, "u_cone_penumbra", light->cone_penumbra);
     hwr_uniform_2f(program, "u_sprite_light", light->sprite_gain,
                    light->sprite_wrap);
     hwr_uniform_3f(program, "u_key_dir", 0.0f, 0.0f, -1.0f);
@@ -4905,6 +5069,17 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
                    camera->center_x, camera->horizon);
     hwr_uniform_2i(program, "u_shade_origin",
                    camera->shade_origin_x, camera->shade_origin_y);
+    /* The flame's wander of the modern cone's origin, scaled here into the
+     * origin's own screen units: the engine's amplitude is a sixteenth of the
+     * per-axis focal (renderer.c:13411-13426), the wander is kept in that
+     * unit, and the focal is the same one the radial divides by -- so a full
+     * wander is the engine's own step whatever the resolution, and a still
+     * flame is the fixed centre to the bit. */
+    hwr_uniform_2i(program, "u_cone_wander",
+                   (GLint)lrintf(g_lamp_wander_x *
+                                 (float)camera->focal_x / 16.0f),
+                   (GLint)lrintf(g_lamp_wander_y *
+                                 (float)camera->focal_y / 16.0f));
     hwr_uniform_1i(program, "u_flat_edge_bias", camera->flat_edge_bias);
     hwr_uniform_2f(program, "u_viewport", (GLfloat)width, (GLfloat)height);
     hwr_uniform_2i(program, "u_source_viewport",

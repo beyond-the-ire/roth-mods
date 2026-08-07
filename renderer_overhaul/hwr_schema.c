@@ -672,7 +672,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, room_light_reach),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 1.0f },
+        /* The shipped default is the play-tested look: with the candle cone
+         * supplying the near-field darkness, 0.85 is where the corridor's
+         * composed profile sits within a step of the original's while going
+         * genuinely black past the map's own solid-fill distance. One -- the
+         * map exactly as written -- stays the Original, and the authentic
+         * profile in the look file. */
+        .def = { .f = 0.85f },
         .original = { .f = 1.0f },
         /* The floor is a tenth rather than the 0.4 it began at: the dial's
          * whole use is a darker world than the map's, and 0.4 left a person
@@ -1249,20 +1255,16 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_intensity),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        /* What the light above is worth as it ships, and it is deliberately a
-         * long way under what a light can be set to.
-         *
-         * A room read as the distance its own light carries is already drawn at
-         * the brightest the picture HAS wherever that light still reaches --
-         * the world image multiplies the map's own unshaded colour, so there is
-         * no headroom above it anywhere near the player. A carried light strong
-         * enough to be felt there would therefore not brighten the near field,
-         * it would FLATTEN it: two rooms the map states differently, painted
-         * the same white. This is the strongest value that paints nothing alike
-         * that the room's own light separates by an amount an eye reads, and it
-         * is where the light is worth having anyway -- in the dark, where the
-         * room's own has run out. Original holds it at nothing. */
-        .def = { .f = 0.15f },
+        /* What the light above is worth as it ships: a whisper, which is the
+         * play-tested look. With the candle cone restored the candlelight
+         * itself is the picture's carried light -- the cone lights the lane
+         * ahead and darkens the flanks the way the original does -- and an
+         * additive lamp strong enough to be felt would wash the near field
+         * the cone just took back. A hundredth keeps the lamp's machinery
+         * warm (its colour, its flame's breath) without a picture of its
+         * own; a person who wants a real modern lamp turns it up. Original
+         * holds it at nothing. */
+        .def = { .f = 0.01f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
         .max = { .f = 2.0f },
@@ -1329,13 +1331,11 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
          * hand, and treating the aim as a position would light everything past
          * it from behind and leave the wall two paces ahead of him dark.
          *
-         * The default is the furthest aim that still leaves the ground at his
-         * own feet with four fifths of the light a pool at the eye gives it
-         * (0.660 against 0.788) while carrying half again as much onto the
-         * wall he is walking toward (0.562 against 0.360 at five hundred
-         * units). Original holds the same value: the light this shapes does
-         * not exist at the Original at all, and where it does exist the
-         * original's own candle is aimed. */
+         * The default rests at the eye, which is the play-tested look: the
+         * candle cone now supplies the aim the original owns -- the lit lane
+         * sweeps with the view -- so the additive lamp no longer needs an
+         * aim of its own to read as directed. Original holds the same value:
+         * the light this shapes does not exist at the Original at all. */
         .key = "player_light_forward",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -1345,8 +1345,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_forward),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 0.15f },
-        .original = { .f = 0.15f },
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
         .min = { .f = 0.0f },
         .max = { .f = 0.5f },
         .step = { .f = 0.05f },
@@ -1420,7 +1420,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_candle),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        /* Full is the map read exactly as written, and that is where it rests.
+        /* Full is the map read exactly as written, and full stays the
+         * Original: at one this supplies exactly the rows the map states and
+         * the picture is the game's own.
          *
          * The game draws a candle-lit room at its own depth law less a fixed
          * number of shade rows, and those rows are the CANDLE: the amount is
@@ -1430,10 +1432,12 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
          * every candle-lit room paint its own near field at the candle's
          * brightness whether or not there was a candle in it -- the one thing
          * no dial could reach, because the room term had no dial that WAS the
-         * candle. At full this supplies exactly the rows the map states and the
-         * picture is the original's; below it a candle-lit room keeps only what
-         * it states for itself, which is the darkness this dial is for. */
-        .def = { .f = 1.0f },
+         * candle. Below full a candle-lit room keeps only what it states for
+         * itself, which is the darkness this dial is for -- and the shipped
+         * default is the play-tested look, a candle at under half the map's
+         * word, which is what turns the candle-lit halls into the dark the
+         * game reads as horror while the cone keeps the lane ahead legible. */
+        .def = { .f = 0.45f },
         .original = { .f = 1.0f },
         .min = { .f = 0.0f },
         .max = { .f = 2.0f },
@@ -1486,6 +1490,47 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "time your light runs out, and dimmer on surfaces facing away."
     },
     {
+        /* How softly the candle cone's edge goes over from light to dark.
+         *
+         * The game's candlelight is a cone about the view axis, and its edge
+         * is where the screen radial has spent the map's own candle word --
+         * fourteen degrees off centre on every map the game ships. The row
+         * law crosses that edge at one pace, and the eye reads the pace
+         * as a flashlight's rim where a lantern's edge is a band. This eases
+         * the radial's slope across a band about the edge -- half the edge's
+         * own angle to either side -- with the core inside it untouched, the
+         * slope at the edge falling as far as a quarter at full, and the
+         * flanks past it keeping the bounded rows the easing left them (half
+         * the candle word at full: a lantern's spill). Zero evaluates the
+         * engine's own term and nothing else, which is the identity the cone
+         * gates stand on. */
+        .key = "player_light_penumbra",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, player_light_penumbra),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How soft your light's edge is",
+        .help = "Your candlelight is a cone about where you are looking, and "
+                "the game switches it from light to dark at one pace -- a "
+                "flashlight's rim. This spreads that transition over a wider "
+                "band, so the edge reads as a lantern's soft falloff instead. "
+                "The middle of the cone and the darkness beyond it stay where "
+                "they are; zero is the game's own edge."
+    },
+    {
         .key = "player_light_flicker",
         .type = HWR_VT_BOOL,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -1495,14 +1540,17 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_flicker),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .b = 0 },
+        /* On as it ships -- the play-tested look -- and off at the Original:
+         * a still flame is the identity every byte gate stands on. */
+        .def = { .b = 1 },
         .original = { .b = 0 },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Carried light flickers",
-        .help = "Lets the light you carry breathe the way a flame does. It is "
-                "held well clear of going out, so it never gutters or strobes."
+        .help = "Lets your candlelight move the way the game's own does: the "
+                "pool of light wanders about where you are looking, the way a "
+                "flame throws it. It never strobes and never gutters out."
     },
     {
         .key = "player_light_flicker_amount",
@@ -1514,8 +1562,15 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_flicker_amount),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 0.30f },
-        .original = { .f = 0.30f },
+        /* The dial's meaning moved with the mechanism -- it was how far the
+         * light's STRENGTH swung, it is now how far the POOL wanders, one
+         * being the game's own amplitude -- so the default is restated to
+         * reproduce the play-tested feel tuned under the old meaning:
+         * measured at his rig, 0.60 of the wander lands the same display
+         * swing his 0.25 of the swing law gave (0.055-0.072 against
+         * 0.050-0.073 of display across the lane). */
+        .def = { .f = 0.60f },
+        .original = { .f = 0.60f },
         .min = { .f = 0.0f },
         .max = { .f = 1.0f },
         .step = { .f = 0.05f },
@@ -1524,9 +1579,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Flicker depth",
-        .help = "How far the flame swings either side of the strength you "
-                "set. It scales the whole of the flame's motion, and at "
-                "nothing the flame is perfectly still."
+        .help = "How far the pool of light wanders about where you are "
+                "looking. Full is the game's own throw; at nothing the flame "
+                "is perfectly still."
     },
     {
         .key = "player_light_flicker_speed",
@@ -1538,13 +1593,12 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_flicker_speed),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        /* One is the flame's own pace now that the dial commands the whole of
-         * its motion; the 1.8 it shipped at belongs to the older reading,
-         * where the dial ran only the two small waves and the flame's real
-         * movement -- the retargets -- ran at one fixed rate whatever it
-         * said. */
-        .def = { .f = 1.00f },
-        .original = { .f = 1.00f },
+        /* The play-tested pace, tuned once the dial commanded the whole of
+         * the flame's motion; it keeps its meaning under the wander -- speed
+         * scales every rate of the pool's movement as it scaled every rate
+         * of the strength's. */
+        .def = { .f = 1.9f },
+        .original = { .f = 1.9f },
         .min = { .f = 0.1f },
         .max = { .f = 5.0f },
         .step = { .f = 0.1f },
@@ -1553,8 +1607,8 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Flicker speed",
-        .help = "How quickly the whole flame moves: the pace it wanders to "
-                "new strengths, and how briskly it settles on each."
+        .help = "How quickly the flame moves: the pace the pool wanders to "
+                "new places, and how briskly it settles on each."
     },
     {
         .key = "sprite_light_gain",

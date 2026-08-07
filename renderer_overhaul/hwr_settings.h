@@ -280,9 +280,14 @@ struct hwr_settings {
      * filling the room evenly the way the game's screen-space one does. */
     float player_light_candle;
     float player_light_candle_pool;
-    /* The flame in that light: whether it moves at all, how far it may swing
-     * either side of its strength, and how quickly its wave runs. It is held
-     * well clear of going out, so it reads as a flame rather than a fault. */
+    /* How softly that candlelight's cone goes over from light to dark at its
+     * edge. Zero is the game's own transition. */
+    float player_light_penumbra;
+    /* The flame in that light: whether it moves at all, how far the pool of
+     * light wanders about where you are looking, and how quickly it moves.
+     * The wander is the game's own flicker -- the original moves the pool, it
+     * does not pulse the room -- and it is held inside the game's own
+     * amplitude, so it reads as a flame rather than a fault. */
     int player_light_flicker;
     float player_light_flicker_amount;
     float player_light_flicker_speed;

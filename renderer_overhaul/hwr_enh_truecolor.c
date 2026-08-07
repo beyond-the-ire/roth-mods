@@ -68,6 +68,7 @@
 #define HWR_PLAYER_GLOW_ROW "player_light_glow_scale"
 #define HWR_PLAYER_CANDLE_ROW "player_light_candle"
 #define HWR_PLAYER_CANDLE_POOL_ROW "player_light_candle_pool"
+#define HWR_PLAYER_PENUMBRA_ROW "player_light_penumbra"
 #define HWR_PLAYER_FLICKER_ROW "player_light_flicker"
 #define HWR_PLAYER_FLICKER_AMOUNT_ROW "player_light_flicker_amount"
 #define HWR_PLAYER_FLICKER_SPEED_ROW "player_light_flicker_speed"
@@ -430,7 +431,7 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
      * holds a value that arrived some other way: behind the eye is not a place
      * a carried light can be, and past its own reach is not one either. */
     light->lamp_forward = hwr_truecolor_row_float(HWR_PLAYER_FORWARD_ROW,
-                                                  settings, 0.15f);
+                                                  settings, 0.0f);
     if (!(light->lamp_forward > 0.0f))
         light->lamp_forward = 0.0f;
     if (light->lamp_forward > 1.0f)
@@ -452,10 +453,19 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
      * not -- it describes what the light is, not how much of one there is. */
     light->candle_amount =
         hwr_truecolor_row_bool(HWR_PLAYER_LIGHT_ROW, settings, 0)
-            ? hwr_truecolor_row_float(HWR_PLAYER_CANDLE_ROW, settings, 1.0f)
+            ? hwr_truecolor_row_float(HWR_PLAYER_CANDLE_ROW, settings, 0.45f)
             : 0.0f;
     light->candle_pool = hwr_truecolor_row_float(HWR_PLAYER_CANDLE_POOL_ROW,
                                                  settings, 0.0f);
+    /* How softly the cone's edge goes over, like the pool a description of
+     * the light rather than an amount of one, so it is not behind the
+     * switch. It is a share of the band and is held to one. */
+    light->cone_penumbra = hwr_truecolor_row_float(HWR_PLAYER_PENUMBRA_ROW,
+                                                   settings, 0.0f);
+    if (!(light->cone_penumbra > 0.0f))
+        light->cone_penumbra = 0.0f;
+    if (light->cone_penumbra > 1.0f)
+        light->cone_penumbra = 1.0f;
     /* The flame's switch is carried rather than spent into a strength the way
      * the fills above are: what it turns off is a clock, not a term, and the
      * two dials beside it describe the shape of a flame rather than how much of
@@ -464,9 +474,9 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
     light->lamp_flicker =
         hwr_truecolor_row_bool(HWR_PLAYER_FLICKER_ROW, settings, 0);
     light->lamp_flicker_amount =
-        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_AMOUNT_ROW, settings, 0.30f);
+        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_AMOUNT_ROW, settings, 0.60f);
     light->lamp_flicker_speed =
-        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_SPEED_ROW, settings, 1.00f);
+        hwr_truecolor_row_float(HWR_PLAYER_FLICKER_SPEED_ROW, settings, 1.9f);
     light->sprite_gain = hwr_truecolor_row_float(HWR_SPRITE_GAIN_ROW, settings,
                                                  1.0f);
     light->sprite_wrap = hwr_truecolor_row_float(HWR_SPRITE_WRAP_ROW, settings,
