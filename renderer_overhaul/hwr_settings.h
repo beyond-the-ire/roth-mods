@@ -119,6 +119,18 @@ enum hwr_point_color_source {
     HWR_POINT_COLOR_FIXED
 };
 
+/* The quality tier of the sun and moon light's shadow map. Low is the depth
+ * map at its small size with hard edges and geometry-only world casters;
+ * Medium is the full picture -- masked textures cut their own holes in the
+ * shadow -- at the size where window bars resolve; High is the same at twice
+ * that. There is no shadowless beam: the depth map is the beam's only
+ * containment, so the tier below Low is the light's own switch. */
+enum hwr_sun_quality {
+    HWR_SUN_QUALITY_LOW = 0,
+    HWR_SUN_QUALITY_MEDIUM,
+    HWR_SUN_QUALITY_HIGH
+};
+
 /* Whether the world image is dithered where it is finally turned into screen
  * colours. Near-black is where eight bits run out: a ramp too shallow to change
  * a level from one pixel to the next lands as flat plateaus with a visible step
@@ -350,6 +362,29 @@ struct hwr_settings {
     uint32_t point_light_hops;
     float point_light_z_slack;
     float point_light_fade;
+
+    /* The sun and moon: one directional light per map, entering wherever the
+     * map is open to the sky, gated per pixel by a light-space depth shadow
+     * map rendered from the light. Lit only on maps with sky faces -- a
+     * sealed map builds nothing -- and, like the whole lighting family, only
+     * under the Modern shading law. The colour, strength and direction here
+     * are the fallback when no game config names the map; direction tuning
+     * is per-map work by nature, since the maps were authored with no sun. */
+    int sun_light;
+    uint32_t sun_color;
+    float sun_intensity;
+    float sun_elevation_deg;
+    float sun_yaw_deg;
+    /* Objects -- trees, statues, characters -- cast as upright cards faced
+     * to the light, rough silhouettes accepted. The off position is an
+     * escape hatch, not the default. */
+    int sun_object_shadows;
+    enum hwr_sun_quality sun_shadow_quality;
+    /* Edge softness, hard to barely-soft. Zero is the hard edge. */
+    float sun_shadow_softness;
+    /* The moving shadow window's side, in world units: resolution where the
+     * player is, clamped-to-lit beyond it. */
+    float sun_shadow_span;
 };
 
 enum hwr_settings_change {

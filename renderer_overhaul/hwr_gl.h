@@ -471,6 +471,102 @@ struct hwr_gl_point_light {
     float z_hi;
 };
 
+/* One caster vertex of the sun/moon light-space depth map.
+ *
+ * A compact format of its own, in its own array object, drawn by its own small
+ * program: the load-bearing sixteen-attribute main vertex body carries the
+ * whole eye picture and is not touched for casting. World position, the texel
+ * coordinates the masked cut-out needs, and where those texels live in the one
+ * resident texture store -- nothing else, because a depth map has no colour,
+ * no shading and no screen. */
+struct hwr_gl_sun_vertex {
+    float x;
+    float y;
+    float z;
+    /* Texel coordinates in the atlas entry's own space: `u` runs over the
+     * entry's first (row, stride-making) axis and wraps by its height, `v`
+     * over the second and wraps by its width -- the same iy*w+ix addressing
+     * every other sampler of the store uses. Only a masked caster reads them. */
+    float u;
+    float v;
+    uint32_t offset;
+    uint16_t width;
+    uint16_t height;
+    uint8_t flags;
+    uint8_t pad0;
+    uint16_t pad1;
+};
+
+_Static_assert(sizeof(struct hwr_gl_sun_vertex) == 32,
+               "the sun caster vertex must stay 32 bytes");
+
+enum hwr_gl_sun_vertex_flags {
+    /* The surface's texture carries the block-transparency bit: its index-0
+     * texels are holes and the depth pass discards them -- at the tiers that
+     * ask for cut-outs. */
+    HWR_GL_SUN_MASKED = 1u << 0,
+    /* An object card: its outline IS its identity, so its index-0 discard is
+     * not a tier question -- a card without it is a rectangle, not a rough
+     * shadow. Every tier honours this one. */
+    HWR_GL_SUN_CARD = 1u << 1
+};
+
+/* The directional key light and the light-space depth map that gates it,
+ * published whole once per frame by the layer that owns the policy (the
+ * caster set, the moving window, the tiers). This layer only executes it:
+ * with `active` clear -- which is every frame until something publishes one --
+ * the key slot stays at its zero rest and no pass, texture or program below
+ * exists. */
+struct hwr_gl_sun {
+    int active;
+    /* World-space unit direction of travel of the light, sky toward ground
+     * (world z up, so dir[2] < 0). Each view turns its negation into its own
+     * basis as it binds, exactly as the point-light positions are. */
+    float dir[3];
+    float color[3];
+    float intensity;
+    /* world -> [0,1]^3 light space, column-major: xy the depth-map texel
+     * coordinate, z the depth the compare runs against. */
+    float lookup[16];
+    /* world -> light clip (-1..1), column-major: what the caster pass
+     * rasterises through. The two matrices describe ONE window; both are
+     * built where the window is decided so they cannot drift apart. */
+    float clip[16];
+    /* Depth-map side in texels. A change re-takes the storage. */
+    int resolution;
+    /* Whether world-geometry masked casters take the texel discard (the
+     * Medium tier's cut-outs). Object cards discard at every tier. */
+    int cutouts;
+    /* Nonzero selects the LINEAR depth compare -- the free 2x2 PCF, the
+     * barely-soft edge. Zero is the hard edge. */
+    int soft;
+    /* Constant lookup bias in [0,1] depth units, stated by the window owner
+     * in world texels and converted where the window's depth extent is
+     * known. */
+    float bias;
+};
+
+/* Publishes the frame's sun. NULL or active==0 stands the whole machinery
+ * down; the key uniforms then keep the zero rest they have always had. */
+void hwr_gl_set_sun(const struct hwr_gl_sun *sun);
+/* Replaces the static caster slice (the map's own geometry). Uploaded once
+ * and drawn every sun render until replaced; count 0 clears it. Returns 0
+ * when no context exists yet, in which case the caller retries next frame. */
+int hwr_gl_sun_upload_static(const struct hwr_gl_sun_vertex *vertices,
+                             size_t count);
+/* Hands over this frame's dynamic caster slice (object cards, mesh props).
+ * The array must stay valid until the frame's scene render returns; it is
+ * streamed into the pass's own buffer there. */
+void hwr_gl_sun_set_dynamic(const struct hwr_gl_sun_vertex *vertices,
+                            size_t count);
+/* Copies the light-space depth map of the last sun render (row-major floats
+ * in [0,1], resolution*resolution). The offline twin compares its own CPU
+ * projection against exactly these texels. Returns 0 when no map stands. */
+int hwr_gl_sun_read_depth(float *out, int resolution);
+/* Whether the last scene render laid a sun depth map down at all -- the
+ * sealed-map gate reads it: a map with no sky face must never build one. */
+int hwr_gl_sun_map_valid(void);
+
 /* What the settings layer has worked out about the true-colour foundation. */
 struct hwr_gl_truecolor {
     /* The foundation has to exist: a dependent enhancement is asking for it. */

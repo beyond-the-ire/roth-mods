@@ -28,6 +28,8 @@ _Static_assert(sizeof(enum hwr_shading_dither) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_light_scope) == sizeof(int32_t),
                "enum fields must be four bytes wide");
+_Static_assert(sizeof(enum hwr_sun_quality) == sizeof(int32_t),
+               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -85,6 +87,12 @@ static const struct hwr_enum_value HWR_SHADING_DITHER_VALUES[] = {
     { "auto", HWR_SHADING_DITHER_AUTO, "Follow the shading" },
     { "off",  HWR_SHADING_DITHER_OFF,  "Off" },
     { "on",   HWR_SHADING_DITHER_ON,   "On" }
+};
+
+static const struct hwr_enum_value HWR_SUN_QUALITY_VALUES[] = {
+    { "low",    HWR_SUN_QUALITY_LOW,    "Low" },
+    { "medium", HWR_SUN_QUALITY_MEDIUM, "Medium" },
+    { "high",   HWR_SUN_QUALITY_HIGH,   "High" }
 };
 
 /* Retired, and kept only so that a configuration file written for an earlier
@@ -2001,6 +2009,222 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "How long, in seconds, a light takes to come up or go out "
                 "when there is no longer room for it. Nothing appears or "
                 "disappears in a single frame."
+    },
+    /* The sun and moon: one directional light per map, entering wherever the
+     * map is open to the sky and gated per pixel by a real shadow map
+     * rendered from the light. The family sits under the Modern shading law
+     * like every lighting row, every default is the Original preset's own
+     * value, and a map with no sky openings is untouched whatever these say
+     * -- which is what lets the family ship on by default. The starting look
+     * is a moonlit night as a placeholder; the colour, strength and
+     * direction are all here and all per-map overridable, because the maps
+     * were authored with no sun and aiming one is per-map work. */
+    {
+        .key = "sun_light",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_light),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .b = 1 },
+        .original = { .b = 1 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Sun and moon",
+        .help = "An outdoor light that casts in through a map's openings to "
+                "the sky, with real shadows: walls, roofs, window bars and "
+                "outside objects all block it. Maps with no sky openings are "
+                "not affected."
+    },
+    {
+        .key = "sun_color",
+        .type = HWR_VT_COLOR,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_color),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .rgb = 0x00b9c8ffu },
+        .original = { .rgb = 0x00b9c8ffu },
+        .min = { .rgb = 0x00000000u },
+        .max = { .rgb = 0x00ffffffu },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Sun and moon colour",
+        .help = "The colour of the light from the sky. Cool and dim reads as "
+                "moonlight, warm and strong as daylight; a game "
+                "configuration may name a different colour per map."
+    },
+    {
+        .key = "sun_intensity",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_intensity),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.8f },
+        .original = { .f = 0.8f },
+        .min = { .f = 0.0f },
+        .max = { .f = 4.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Sun and moon strength",
+        .help = "How much light the sky light carries. At nothing the light "
+                "is out and no shadows are drawn."
+    },
+    {
+        .key = "sun_elevation_deg",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_elevation_deg),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 45.0f },
+        .original = { .f = 45.0f },
+        .min = { .f = 5.0f },
+        .max = { .f = 85.0f },
+        .step = { .f = 1.0f },
+        .page_step = { .f = 15.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Height above the horizon",
+        .help = "How high the sun or moon stands, in degrees. Low means long "
+                "shadows and light reaching deep through side windows; high "
+                "means short shadows under things."
+    },
+    {
+        .key = "sun_yaw_deg",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_yaw_deg),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.0f },
+        .original = { .f = 0.0f },
+        .min = { .f = 0.0f },
+        .max = { .f = 360.0f },
+        .step = { .f = 5.0f },
+        .page_step = { .f = 45.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Compass direction",
+        .help = "Where the sun or moon stands over the map, as a compass "
+                "bearing: 0 is north (the top of the map as the editor "
+                "shows it), 90 east, 180 south, 270 west. Maps were built "
+                "with no sun, so which windows catch the light is a per-map "
+                "choice; a game configuration may aim it per map."
+    },
+    {
+        .key = "sun_shadow_quality",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_shadow_quality),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .e = HWR_SUN_QUALITY_MEDIUM },
+        .original = { .e = HWR_SUN_QUALITY_MEDIUM },
+        .values = HWR_SUN_QUALITY_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_SUN_QUALITY_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Shadow quality",
+        .help = "How finely the sky light's shadows resolve. Medium is sharp "
+                "enough for window bars to draw their own pattern on the "
+                "floor; Low trades the texture cut-outs and the soft edge "
+                "for speed; High doubles the detail again."
+    },
+    {
+        .key = "sun_object_shadows",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_object_shadows),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .b = 1 },
+        .original = { .b = 1 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Shadows from objects",
+        .help = "Whether trees, statues and characters cast shadows in the "
+                "sky light. Their shadows are flat silhouettes, rough on "
+                "purpose; off leaves only the world itself casting."
+    },
+    {
+        .key = "sun_shadow_softness",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_shadow_softness),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 0.1f },
+        .original = { .f = 0.1f },
+        .min = { .f = 0.0f },
+        .max = { .f = 1.0f },
+        .step = { .f = 0.05f },
+        .page_step = { .f = 0.25f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Shadow edge softness",
+        .help = "How softly a shadow's edge goes over from dark to lit. "
+                "Nothing is a hard edge; the default is barely softened."
+    },
+    {
+        .key = "sun_shadow_span",
+        .type = HWR_VT_F32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_shadow_span),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .f = 4096.0f },
+        .original = { .f = 4096.0f },
+        .min = { .f = 1024.0f },
+        .max = { .f = 16384.0f },
+        .step = { .f = 512.0f },
+        .page_step = { .f = 2048.0f },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Shadow detail window",
+        .help = "How wide an area around the player carries full shadow "
+                "detail, in world units. Beyond it the sky light falls "
+                "unshadowed and the rooms' own darkness carries the far "
+                "field; narrower is finer, wider reaches further."
     },
     /* Reported state. These rows hold no value of their own and no key: each
      * one asks the renderer or the host what is actually happening and answers

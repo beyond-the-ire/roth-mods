@@ -100,7 +100,7 @@ void hwr_frame_perf_finish(struct hwr_frame_perf_sample *sample)
     static uint64_t total_sum;
     static unsigned samples;
     static const char *const phase_name[HWR_FRAME_PERF_PHASE_COUNT] = {
-        "preflight", "engine-walk", "prepare", "render",
+        "preflight", "engine-walk", "prepare", "sun", "render",
         "composite", "submit", "finalize"
     };
     uint64_t total;

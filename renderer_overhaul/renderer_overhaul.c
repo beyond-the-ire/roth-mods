@@ -23,6 +23,7 @@
 #include "hwr_enh_truecolor.h"
 #include "hwr_look.h"
 #include "hwr_ownership.h"
+#include "hwr_sun.h"
 #include "hwr_overlay.h"
 #include "hwr_sysinfo.h"
 
@@ -333,6 +334,8 @@ static void hwr_map_data_clear(int keep_shared, int keep_map)
     hwr_objects_clear(&g_objects);
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     memset(&g_sprite_census, 0, sizeof g_sprite_census);
+    /* The sun's casters and census describe the map being torn down. */
+    hwr_sun_reset();
     hwr_world_clear(&g_world);
     /* A DAS file is closed only when it is not being carried across the
      * transition; keeping it open preserves its decoded payloads -- which the
@@ -1259,6 +1262,13 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
             }
         }
         hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_PREPARE);
+        /* The sun's world-side work -- the caster slices and the moving
+         * window -- as its own measured phase, before the views consume what
+         * it publishes. The GL half of the pass reports beside the frame
+         * perf line's other GPU submits. */
+        if (g_scene.valid)
+            hwr_scene_sun_frame(&g_scene, &g_world, &g_objects, api);
+        hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_SUN);
         pixels = g_scene.valid
                ? hwr_scene_render(&g_scene, &g_world, &g_objects, api,
                                   render_width, render_height,
@@ -2001,7 +2011,8 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
         hwr_settings_register_apply(hwr_data_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_gl_settings_apply, NULL) != 0 ||
         hwr_settings_register_apply(hwr_window_settings_apply, NULL) != 0 ||
-        hwr_enh_truecolor_register() != 0) {
+        hwr_enh_truecolor_register() != 0 ||
+        hwr_sun_register() != 0) {
         fprintf(stderr, "[renderer_overhaul] settings apply-hook registration"
                         " failed; the original renderer keeps the screen\n");
         g_gl_permanently_failed = 1;
@@ -2322,6 +2333,12 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
      * about the map's own footprints, so it is answered once beside the geometry
      * it is read out of rather than sixty times a second. */
     hwr_lights_stage_placed(&g_world);
+    /* And the sun's own per-map fact: the sky-face census that decides
+     * whether the key light exists on this map at all. A sealed map answers
+     * zero and the whole machinery stands down for its duration; the caster
+     * mesh itself is built lazily at the first frame that wants it, so the
+     * census here builds nothing. */
+    hwr_sun_stage_map(&g_world);
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent

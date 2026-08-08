@@ -336,6 +336,14 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
                                  uint32_t width, uint32_t height,
                                  uint32_t source_width,
                                  uint32_t source_height);
+/* The sun/moon key light's whole per-frame world-side work: caster slices,
+ * moving window, publication to the GL layer. Called once per frame BEFORE
+ * hwr_scene_render, as its own measured phase; the render then draws every
+ * view against what was published. Safe with any argument invalid -- the
+ * machinery then stands down for the frame. */
+void hwr_scene_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
+                         const struct hwr_objects *objects,
+                         const struct roth_api_v1 *api);
 void hwr_scene_clear(struct hwr_scene *scene);
 /* Drops the record of what the resident texture store holds, so the next
  * rebuild packs and uploads all of it. Called whenever anything the store was

@@ -8,6 +8,7 @@
 
 #include "hwr_gl.h"
 #include "hwr_lights.h"
+#include "hwr_sun.h"
 
 #include "hwr_util.h"
 #include "hwr_visibility.h"
@@ -5934,6 +5935,25 @@ static int hwr_scene_emit_view(struct hwr_scene *scene,
                               flat_count,
                               translucent_count, translucent_run_count,
                               exception_run_count);
+}
+
+void hwr_scene_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
+                         const struct hwr_objects *objects,
+                         const struct roth_api_v1 *api)
+{
+    struct hwr_gl_camera camera;
+
+    if (scene == NULL || !scene->valid || !scene->uploaded || world == NULL ||
+        !world->valid || api == NULL || api->game_ram == NULL) {
+        hwr_sun_frame(NULL, NULL, NULL, NULL, NULL);
+        return;
+    }
+    hwr_read_camera(&camera, world, api);
+    /* The card sizing law reads the ENGINE's own focals; before the
+     * projection rescale those are exactly what hwr_read_camera staged. */
+    camera.source_focal_x = camera.focal_x;
+    camera.source_focal_y = camera.focal_y;
+    hwr_sun_frame(scene, world, objects, api, &camera);
 }
 
 const uint32_t *hwr_scene_render(struct hwr_scene *scene,

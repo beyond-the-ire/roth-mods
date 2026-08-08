@@ -22,6 +22,9 @@ enum hwr_frame_perf_phase {
     HWR_FRAME_PERF_PREFLIGHT,
     HWR_FRAME_PERF_ENGINE_WALK,
     HWR_FRAME_PERF_PREPARE,
+    /* The sun/moon shadow machinery's world side: the caster slices and the
+     * moving window, prepared before the views consume them. */
+    HWR_FRAME_PERF_SUN,
     HWR_FRAME_PERF_RENDER,
     HWR_FRAME_PERF_COMPOSITE,
     HWR_FRAME_PERF_SUBMIT,

@@ -66,6 +66,27 @@
 #ifndef GL_HALF_FLOAT
 #define GL_HALF_FLOAT 0x140b
 #endif
+#ifndef GL_DEPTH_COMPONENT16
+#define GL_DEPTH_COMPONENT16 0x81a5
+#endif
+#ifndef GL_DEPTH_CLAMP
+#define GL_DEPTH_CLAMP 0x864f
+#endif
+#ifndef GL_TEXTURE_COMPARE_MODE
+#define GL_TEXTURE_COMPARE_MODE 0x884c
+#endif
+#ifndef GL_TEXTURE_COMPARE_FUNC
+#define GL_TEXTURE_COMPARE_FUNC 0x884d
+#endif
+#ifndef GL_COMPARE_REF_TO_TEXTURE
+#define GL_COMPARE_REF_TO_TEXTURE 0x884e
+#endif
+#ifndef GL_CLAMP_TO_BORDER
+#define GL_CLAMP_TO_BORDER 0x812d
+#endif
+#ifndef GL_TEXTURE_BORDER_COLOR
+#define GL_TEXTURE_BORDER_COLOR 0x1004
+#endif
 
 typedef GLenum (APIENTRY *hwr_gl_get_error_fn)(void);
 typedef const GLubyte *(APIENTRY *hwr_gl_get_string_fn)(GLenum);
@@ -108,6 +129,8 @@ typedef void (APIENTRY *hwr_gl_pixel_store_i_fn)(GLenum, GLint);
 typedef void (APIENTRY *hwr_gl_get_tex_image_fn)(GLenum, GLint, GLenum, GLenum,
                                                  GLvoid *);
 typedef void (APIENTRY *hwr_gl_get_integer_v_fn)(GLenum, GLint *);
+typedef void (APIENTRY *hwr_gl_tex_parameter_fv_fn)(GLenum, GLenum,
+                                                    const GLfloat *);
 
 struct hwr_gl_functions {
     hwr_gl_get_error_fn get_error;
@@ -186,6 +209,8 @@ struct hwr_gl_functions {
     PFNGLGETBUFFERSUBDATAPROC get_buffer_sub_data;
     hwr_gl_get_integer_v_fn get_integer_v;
     PFNGLGETUNIFORMIVPROC get_uniform_iv;
+    PFNGLUNIFORMMATRIX4FVPROC uniform_matrix_4fv;
+    hwr_gl_tex_parameter_fv_fn tex_parameter_fv;
 };
 
 static struct hwr_gl_functions g_gl;
@@ -275,6 +300,35 @@ static int g_transmit_blend_pending = 1;
  * the frame rather than with the map. */
 static uint8_t g_blend_bytes[0x10000];
 static int g_blend_bytes_valid;
+/* The sun/moon key light and its light-space depth map: the frame's published
+ * state, the caster geometry it is rendered from, and the GL objects that
+ * exist only while a frame has published one. The dynamic slice is a borrowed
+ * pointer valid for the frame it was handed over in -- it is streamed into the
+ * pass's own buffer at the render and never read after it. */
+static struct hwr_gl_sun g_sun;
+static GLuint g_sun_program;
+static GLuint g_sun_fbo;
+static GLuint g_sun_depth_texture;
+static int g_sun_depth_resolution;
+static GLuint g_sun_static_vao;
+static GLuint g_sun_static_vbo;
+static size_t g_sun_static_count;
+/* The static slice waiting for a context, so a caster set built before the
+ * first frame is not lost: uploaded on the first sun render that finds it. */
+static struct hwr_gl_sun_vertex *g_sun_static_pending;
+static size_t g_sun_static_pending_count;
+static int g_sun_static_pending_valid;
+static GLuint g_sun_dynamic_vao;
+static GLuint g_sun_dynamic_vbo;
+static const struct hwr_gl_sun_vertex *g_sun_dynamic;
+static size_t g_sun_dynamic_count;
+/* Whether a depth map was laid down for the frame being rendered. The lookup
+ * is gated on it, so a frame the pass stood down for reads factor one
+ * everywhere -- and the sealed-map gate reads it from outside. */
+static int g_sun_map_valid;
+/* Set once the sun program has failed to come up, so it is never retried. */
+static int g_sun_failed;
+
 /* Whether the colour plane still describes the same picture the index plane
  * does. The colour target persists exactly as the index target does -- that is
  * what makes the void, the wings and the previous frame a stale-masked wall
@@ -824,6 +878,10 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(get_buffer_sub_data, PFNGLGETBUFFERSUBDATAPROC, "glGetBufferSubData");
     HWR_LOAD_GL(get_integer_v, hwr_gl_get_integer_v_fn, "glGetIntegerv");
     HWR_LOAD_GL(get_uniform_iv, PFNGLGETUNIFORMIVPROC, "glGetUniformiv");
+    HWR_LOAD_GL(uniform_matrix_4fv, PFNGLUNIFORMMATRIX4FVPROC,
+                "glUniformMatrix4fv");
+    HWR_LOAD_GL(tex_parameter_fv, hwr_gl_tex_parameter_fv_fn,
+                "glTexParameterfv");
     return 1;
 }
 
@@ -1804,6 +1862,25 @@ static const char g_geometry_fragment_body[] =
     "uniform vec3 u_key_dir;\n"
     "uniform vec3 u_key_color;\n"
     "uniform float u_key_intensity;\n"
+    /* The light-space depth map that gates the key term, and the constant
+     * world-to-light transform it is read through. The transform is one
+     * matrix for every view of the frame because it is in WORLD space --
+     * which reflected views share, since they draw the same world geometry --
+     * so a mirror needs no rule of its own here either. */
+    "uniform int u_sun_valid;\n"
+    "uniform mat4 u_sun_matrix;\n"
+    "uniform sampler2DShadow u_sun_shadow;\n"
+    "uniform float u_sun_bias;\n"
+    /* How much of the key light reaches this fragment: one depth compare at
+     * the fragment's own world position. Outside the moving window the answer
+     * clamps to LIT -- at the default span that edge is past the engine's own
+     * solid-fill distances, and the room's reach law carries the far field. */
+    "float sun_factor() {\n"
+    "  if (u_sun_valid==0) return 1.0;\n"
+    "  vec3 p=(u_sun_matrix*vec4(v_world,1.0)).xyz;\n"
+    "  if (p.x<0.0 || p.x>1.0 || p.y<0.0 || p.y>1.0) return 1.0;\n"
+    "  return texture(u_sun_shadow,vec3(p.xy,clamp(p.z-u_sun_bias,0.0,1.0)));\n"
+    "}\n"
     /* The lights that are NOT at the eye: a torch on a wall, a candle on a
      * table, a lit window. One array, whatever seeded them, so a class added
      * later is a seeder rather than a second lighting path -- and every one of
@@ -2209,8 +2286,25 @@ static const char g_geometry_fragment_body[] =
     "      total+=light_space(u_lamp_color)*u_lamp_intensity*"
     "max(ndl,0.0)*gain*light_falloff(dist,u_lamp_range)*lamp_transmittance();\n"
     "    }\n"
-    "    total+=light_space(u_key_color)*u_key_intensity*"
-    "max(dot(n,u_key_dir),0.0);\n"
+    /* The directional key -- the sun or the moon -- inside the same normal
+     * branch as every other light, which is the whole of its class rule: the
+     * gate that refuses a ground shadow, a sky cap and a glow face for the
+     * lamp refuses them here too. World-anchored on purpose: turning the head
+     * sweeps the candle cone and must not move a sunbeam. A standing figure
+     * takes the same wrap and the same dial every light gives it. At an
+     * intensity of exactly nothing the branch is never entered and the total
+     * is what it always was, to the bit. */
+    "    if (u_key_intensity>0.0) {\n"
+    "      float kndl=dot(n,u_key_dir);\n"
+    "      float kgain=1.0;\n"
+    "      if (figure) {\n"
+    "        kndl=(kndl+u_sprite_light.y)/(1.0+u_sprite_light.y);\n"
+    "        kgain=u_sprite_light.x;\n"
+    "      }\n"
+    "      if (kndl>0.0)\n"
+    "        total+=light_space(u_key_color)*u_key_intensity*kndl*kgain*"
+    "sun_factor();\n"
+    "    }\n"
     /* And the lights that are not at the eye. They are inside this branch on
      * purpose and it is the whole of their class rule: the one normal every law
      * here reads is zero for the surfaces no light may reach -- a ground shadow
@@ -2846,6 +2940,51 @@ static const char g_probe_fragment_shader[] =
     "  else out_index=texelFetch(u_texels,u_last).r;\n"
     "}\n";
 
+/* The sun caster program: an orthographic depth-only render of the caster
+ * mesh, from the light. No colour, no shading, no screen -- the one thing the
+ * fragment stage does is the masked-texel discard, which is what makes a
+ * grate's holes holes in the shadow map itself and an object card's outline
+ * the outline of its shadow. */
+static const char g_sun_vertex_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) in vec3 a_pos;\n"
+    "layout(location=1) in vec2 a_uv;\n"
+    "layout(location=2) in uint a_offset;\n"
+    "layout(location=3) in uvec2 a_dims;\n"
+    "layout(location=4) in uint a_flags;\n"
+    "uniform mat4 u_matrix;\n"
+    "out vec2 v_uv;\n"
+    "flat out uint v_offset;\n"
+    "flat out uvec2 v_dims;\n"
+    "flat out uint v_flags;\n"
+    "void main() {\n"
+    "  gl_Position=u_matrix*vec4(a_pos,1.0);\n"
+    "  v_uv=a_uv; v_offset=a_offset; v_dims=a_dims; v_flags=a_flags;\n"
+    "}\n";
+
+static const char g_sun_fragment_shader[] =
+    "#version 330 core\n"
+    "uniform usamplerBuffer u_texels;\n"
+    /* Whether world-geometry masked casters take the discard (the cut-out
+     * tiers). An object card takes it whatever this says: a card without its
+     * outline is a rectangle, not a rough shadow. */
+    "uniform int u_cutout;\n"
+    "in vec2 v_uv;\n"
+    "flat in uint v_offset;\n"
+    "flat in uvec2 v_dims;\n"
+    "flat in uint v_flags;\n"
+    "void main() {\n"
+    "  bool masked=(v_flags & 1u)!=0u && (u_cutout!=0 || (v_flags & 2u)!=0u);\n"
+    "  if (masked) {\n"
+    "    int w=int(v_dims.x), h=int(v_dims.y);\n"
+    "    if (w>0 && h>0) {\n"
+    "      int iy=int(floor(v_uv.x)) % h; if (iy<0) iy+=h;\n"
+    "      int ix=int(floor(v_uv.y)) % w; if (ix<0) ix+=w;\n"
+    "      if (texelFetch(u_texels,int(v_offset)+iy*w+ix).r==0u) discard;\n"
+    "    }\n"
+    "  }\n"
+    "}\n";
+
 static GLuint hwr_compile_shader_sources(GLenum type,
                                          const char *const *sources,
                                          GLsizei count)
@@ -2958,6 +3097,8 @@ static void hwr_destroy_programs(void)
         g_gl.delete_program(g_truecolor_resolve_program);
     if (g_index_restore_program != 0)
         g_gl.delete_program(g_index_restore_program);
+    if (g_sun_program != 0)
+        g_gl.delete_program(g_sun_program);
     g_geometry_program = 0;
     g_sky_program = 0;
     g_resolve_program = 0;
@@ -2965,6 +3106,311 @@ static void hwr_destroy_programs(void)
     g_truecolor_program = 0;
     g_truecolor_resolve_program = 0;
     g_index_restore_program = 0;
+    g_sun_program = 0;
+    g_sun_failed = 0;
+}
+
+/* Releases every GL object the sun machinery holds. The published state and
+ * any pending static slice survive: they describe the world, not the context,
+ * and the next frame that can lays everything down again. */
+static void hwr_sun_destroy_objects(void)
+{
+    if (g_sun_static_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_sun_static_vao);
+    if (g_sun_dynamic_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_sun_dynamic_vao);
+    if (g_sun_static_vbo != 0)
+        g_gl.delete_buffers(1, &g_sun_static_vbo);
+    if (g_sun_dynamic_vbo != 0)
+        g_gl.delete_buffers(1, &g_sun_dynamic_vbo);
+    if (g_sun_fbo != 0)
+        g_gl.delete_framebuffers(1, &g_sun_fbo);
+    hwr_delete_texture(&g_sun_depth_texture);
+    g_sun_static_vao = 0;
+    g_sun_dynamic_vao = 0;
+    g_sun_static_vbo = 0;
+    g_sun_dynamic_vbo = 0;
+    g_sun_fbo = 0;
+    g_sun_depth_resolution = 0;
+    g_sun_static_count = 0;
+    g_sun_map_valid = 0;
+}
+
+/* The caster vertex format, bound once per array object against the record
+ * hwr_gl.h declares. Both slices are the one format; each array points into
+ * its own buffer. */
+static void hwr_sun_bind_attributes(void)
+{
+    const GLsizei stride = (GLsizei)sizeof(struct hwr_gl_sun_vertex);
+
+    g_gl.enable_vertex_attrib_array(0);
+    g_gl.vertex_attrib_pointer(0, 3, GL_FLOAT, GL_FALSE, stride,
+                               (const void *)0);
+    g_gl.enable_vertex_attrib_array(1);
+    g_gl.vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, stride,
+                               (const void *)offsetof(struct hwr_gl_sun_vertex,
+                                                      u));
+    g_gl.enable_vertex_attrib_array(2);
+    g_gl.vertex_attrib_i_pointer(2, 1, GL_UNSIGNED_INT, stride,
+                                 (const void *)offsetof(
+                                     struct hwr_gl_sun_vertex, offset));
+    g_gl.enable_vertex_attrib_array(3);
+    g_gl.vertex_attrib_i_pointer(3, 2, GL_UNSIGNED_SHORT, stride,
+                                 (const void *)offsetof(
+                                     struct hwr_gl_sun_vertex, width));
+    g_gl.enable_vertex_attrib_array(4);
+    g_gl.vertex_attrib_i_pointer(4, 1, GL_UNSIGNED_BYTE, stride,
+                                 (const void *)offsetof(
+                                     struct hwr_gl_sun_vertex, flags));
+}
+
+/* Brings the sun pass's own objects up: the program, the two array objects,
+ * and the depth map at the published resolution. A failure marks the pass
+ * failed and stands it down for the context's lifetime rather than retrying
+ * a broken link sixty times a second. Returns 1 when everything stands. */
+static int hwr_sun_ensure_objects(void)
+{
+    int resolution = g_sun.resolution;
+
+    if (g_sun_failed)
+        return 0;
+    if (resolution < 64 || resolution > 8192)
+        return 0;
+    if (g_sun_program == 0) {
+        g_sun_program = hwr_link_program(g_sun_vertex_shader,
+                                         g_sun_fragment_shader);
+        if (g_sun_program == 0) {
+            fprintf(stderr, "[renderer_overhaul] sun caster program: %s\n",
+                    g_error);
+            g_sun_failed = 1;
+            return 0;
+        }
+    }
+    if (g_sun_static_vao == 0) {
+        g_gl.gen_vertex_arrays(1, &g_sun_static_vao);
+        g_gl.gen_buffers(1, &g_sun_static_vbo);
+        g_gl.bind_vertex_array(g_sun_static_vao);
+        g_gl.bind_buffer(GL_ARRAY_BUFFER, g_sun_static_vbo);
+        hwr_sun_bind_attributes();
+    }
+    if (g_sun_dynamic_vao == 0) {
+        g_gl.gen_vertex_arrays(1, &g_sun_dynamic_vao);
+        g_gl.gen_buffers(1, &g_sun_dynamic_vbo);
+        g_gl.bind_vertex_array(g_sun_dynamic_vao);
+        g_gl.bind_buffer(GL_ARRAY_BUFFER, g_sun_dynamic_vbo);
+        hwr_sun_bind_attributes();
+    }
+    if (g_sun_fbo == 0)
+        g_gl.gen_framebuffers(1, &g_sun_fbo);
+    if (g_sun_depth_texture == 0 || g_sun_depth_resolution != resolution) {
+        static const GLfloat lit_border[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        static const GLenum no_buffers[1] = { GL_NONE };
+        GLenum status;
+
+        hwr_delete_texture(&g_sun_depth_texture);
+        g_gl.gen_textures(1, &g_sun_depth_texture);
+        g_gl.active_texture(GL_TEXTURE0 + 11);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_sun_depth_texture);
+        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16,
+                          (GLsizei)resolution, (GLsizei)resolution, 0,
+                          GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, NULL);
+        /* Beyond the window's edge the lookup clamps to LIT: the border holds
+         * the far plane, so the compare passes wherever the window ends. The
+         * shader carries the same rule explicitly; the border is what keeps
+         * the free 2x2 PCF from bleeding the edge texel outward. */
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                             GL_CLAMP_TO_BORDER);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                             GL_CLAMP_TO_BORDER);
+        g_gl.tex_parameter_fv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR,
+                              lit_border);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE,
+                             GL_COMPARE_REF_TO_TEXTURE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC,
+                             GL_LEQUAL);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_sun_fbo);
+        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                    GL_TEXTURE_2D, g_sun_depth_texture, 0);
+        g_gl.draw_buffers(1, no_buffers);
+        g_gl.read_buffer(GL_NONE);
+        status = g_gl.check_framebuffer_status(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            fprintf(stderr, "[renderer_overhaul] sun depth framebuffer "
+                            "incomplete (0x%x)\n", (unsigned)status);
+            hwr_delete_texture(&g_sun_depth_texture);
+            g_sun_depth_resolution = 0;
+            g_sun_failed = 1;
+            g_gl.active_texture(GL_TEXTURE0);
+            return 0;
+        }
+        g_sun_depth_resolution = resolution;
+        g_gl.active_texture(GL_TEXTURE0);
+    }
+    /* The edge softness follows the frame: LINEAR is the free 2x2 PCF the
+     * barely-soft default reads through, NEAREST the hard edge (the Low tier,
+     * and a softness dial at exactly nothing). */
+    g_gl.active_texture(GL_TEXTURE0 + 11);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_sun_depth_texture);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                         g_sun.soft ? GL_LINEAR : GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                         g_sun.soft ? GL_LINEAR : GL_NEAREST);
+    g_gl.active_texture(GL_TEXTURE0);
+    return 1;
+}
+
+void hwr_gl_set_sun(const struct hwr_gl_sun *sun)
+{
+    if (sun == NULL || !sun->active) {
+        memset(&g_sun, 0, sizeof g_sun);
+        return;
+    }
+    g_sun = *sun;
+}
+
+int hwr_gl_sun_upload_static(const struct hwr_gl_sun_vertex *vertices,
+                             size_t count)
+{
+    /* Held first, so a slice built before the context exists is laid down by
+     * the first sun render rather than lost. The holding copy is the caller's
+     * bytes; an empty slice clears it. */
+    if (count != 0 && vertices == NULL)
+        return 0;
+    if (count > (size_t)INT32_MAX / sizeof(struct hwr_gl_sun_vertex))
+        return 0;
+    free(g_sun_static_pending);
+    g_sun_static_pending = NULL;
+    g_sun_static_pending_count = 0;
+    if (count != 0) {
+        g_sun_static_pending = (struct hwr_gl_sun_vertex *)malloc(
+            count * sizeof *vertices);
+        if (g_sun_static_pending == NULL)
+            return 0;
+        memcpy(g_sun_static_pending, vertices, count * sizeof *vertices);
+        g_sun_static_pending_count = count;
+    }
+    g_sun_static_pending_valid = 1;
+    return 1;
+}
+
+void hwr_gl_sun_set_dynamic(const struct hwr_gl_sun_vertex *vertices,
+                            size_t count)
+{
+    g_sun_dynamic = vertices;
+    g_sun_dynamic_count = vertices != NULL ? count : 0;
+}
+
+int hwr_gl_sun_read_depth(float *out, int resolution)
+{
+    if (!g_initialized || out == NULL || !g_sun_map_valid ||
+        g_sun_depth_texture == 0 || resolution != g_sun_depth_resolution ||
+        !hwr_platform_make_current())
+        return 0;
+    g_gl.active_texture(GL_TEXTURE0 + 11);
+    g_gl.bind_texture(GL_TEXTURE_2D, g_sun_depth_texture);
+    g_gl.pixel_store_i(GL_PACK_ALIGNMENT, 1);
+    g_gl.get_tex_image(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, out);
+    g_gl.active_texture(GL_TEXTURE0);
+    return hwr_gl_drain_errors() == 0;
+}
+
+int hwr_gl_sun_map_valid(void)
+{
+    return g_sun_map_valid;
+}
+
+static void hwr_set_sampler(GLuint program, const char *name, GLint unit);
+static void hwr_uniform_1i(GLuint program, const char *name, GLint value);
+
+/* Whether the frame about to be rendered wants the sun machinery at all. The
+ * key term lives inside the modern law alone, so any other law -- and any
+ * frame with the light at zero -- stands the whole pass down. */
+static int hwr_sun_wanted(void)
+{
+    return g_truecolor_active &&
+           g_truecolor_want.shading_mode == HWR_GL_SHADING_MODERN &&
+           g_sun.active && g_sun.intensity > 0.0f;
+}
+
+/* Lays the light-space depth map down for this frame: the static slice as it
+ * stands, the dynamic slice as it was handed over. Leaves no state behind
+ * that the world pass does not set for itself. */
+static void hwr_sun_render_map(void)
+{
+    /* The dynamic slice is a one-frame borrow; it is consumed here whatever
+     * happens next, so a frame the pass stands down for cannot leave a
+     * pointer standing into an array the owner has moved on from. */
+    const struct hwr_gl_sun_vertex *dynamic = g_sun_dynamic;
+    size_t dynamic_count = g_sun_dynamic_count;
+
+    g_sun_dynamic = NULL;
+    g_sun_dynamic_count = 0;
+    g_sun_map_valid = 0;
+    if (!hwr_sun_wanted())
+        return;
+    if (!hwr_sun_ensure_objects())
+        return;
+    if (g_sun_static_pending_valid) {
+        g_gl.bind_buffer(GL_ARRAY_BUFFER, g_sun_static_vbo);
+        g_gl.buffer_data(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(g_sun_static_pending_count *
+                                      sizeof *g_sun_static_pending),
+                         g_sun_static_pending, GL_STATIC_DRAW);
+        g_sun_static_count = g_sun_static_pending_count;
+        free(g_sun_static_pending);
+        g_sun_static_pending = NULL;
+        g_sun_static_pending_count = 0;
+        g_sun_static_pending_valid = 0;
+    }
+    if (g_sun_static_count == 0 && dynamic_count == 0)
+        return;
+    if (dynamic_count != 0) {
+        g_gl.bind_buffer(GL_ARRAY_BUFFER, g_sun_dynamic_vbo);
+        g_gl.buffer_data(GL_ARRAY_BUFFER,
+                         (GLsizeiptr)(dynamic_count * sizeof *dynamic),
+                         dynamic, GL_STREAM_DRAW);
+    }
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_sun_fbo);
+    g_gl.viewport(0, 0, (GLsizei)g_sun_depth_resolution,
+                  (GLsizei)g_sun_depth_resolution);
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.disable(GL_BLEND);
+    g_gl.enable(GL_DEPTH_TEST);
+    g_gl.depth_func(GL_LESS);
+    g_gl.depth_mask(GL_TRUE);
+    g_gl.clear(GL_DEPTH_BUFFER_BIT);
+    g_gl.use_program(g_sun_program);
+    hwr_set_sampler(g_sun_program, "u_texels", 0);
+    {
+        GLint location = g_gl.get_uniform_location(g_sun_program, "u_matrix");
+        if (location >= 0)
+            g_gl.uniform_matrix_4fv(location, 1, GL_FALSE, g_sun.clip);
+    }
+    hwr_uniform_1i(g_sun_program, "u_cutout", g_sun.cutouts != 0);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    g_gl.bind_texture(GL_TEXTURE_BUFFER, g_texture_buffer_texture);
+    /* Slope-scaled offset against acne on zero-thickness walls, and the depth
+     * clamp that pancakes the roof above the window onto the near plane so it
+     * always counts. Both are this pass's own and are taken back off. */
+    g_gl.enable(GL_POLYGON_OFFSET_FILL);
+    g_gl.polygon_offset(2.0f, 4.0f);
+    g_gl.enable(GL_DEPTH_CLAMP);
+    if (g_sun_static_count != 0) {
+        g_gl.bind_vertex_array(g_sun_static_vao);
+        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)g_sun_static_count);
+    }
+    if (dynamic_count != 0) {
+        g_gl.bind_vertex_array(g_sun_dynamic_vao);
+        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)dynamic_count);
+    }
+    g_gl.disable(GL_DEPTH_CLAMP);
+    g_gl.polygon_offset(0.0f, 0.0f);
+    g_gl.disable(GL_POLYGON_OFFSET_FILL);
+    g_gl.bind_vertex_array(0);
+    g_sun_map_valid = 1;
 }
 
 /* Links the four always-present programs on first use (or after a shutdown); a
@@ -5056,6 +5502,40 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         /* And the lights that are not at the eye, in THIS view's space: the
          * rig above is one frame's answer, this is one view's. */
         hwr_bind_point_lights(program, camera);
+        /* The directional key, where one is standing. The rig above staged
+         * the slot's zero rest; a frame with a sun fills it, per view: the
+         * direction is turned into this view's own basis exactly as a normal
+         * is, so a reflected view is lit from the reflected side by
+         * construction, and the shadow lookup stays in world space, which
+         * every view shares. */
+        hwr_set_sampler(program, "u_sun_shadow", 11);
+        hwr_uniform_1i(program, "u_sun_valid", g_sun_map_valid);
+        if (hwr_sun_wanted()) {
+            float s = (float)camera->yaw_sin / 16384.0f;
+            float c = (float)camera->yaw_cos / 16384.0f;
+            float wx = -g_sun.dir[0];
+            float wy = -g_sun.dir[1];
+            float wz = -g_sun.dir[2];
+            float rx = s * wx + c * wy;
+
+            if (camera->x_flip != 0)
+                rx = -rx;
+            hwr_uniform_3f(program, "u_key_dir", rx, s * wy - c * wx, -wz);
+            hwr_uniform_3f(program, "u_key_color", g_sun.color[0],
+                           g_sun.color[1], g_sun.color[2]);
+            hwr_uniform_1f(program, "u_key_intensity", g_sun.intensity);
+        }
+        if (g_sun_map_valid) {
+            GLint location =
+                g_gl.get_uniform_location(program, "u_sun_matrix");
+
+            if (location >= 0)
+                g_gl.uniform_matrix_4fv(location, 1, GL_FALSE, g_sun.lookup);
+            hwr_uniform_1f(program, "u_sun_bias", g_sun.bias);
+            g_gl.active_texture(GL_TEXTURE0 + 11);
+            g_gl.bind_texture(GL_TEXTURE_2D, g_sun_depth_texture);
+            g_gl.active_texture(GL_TEXTURE0);
+        }
     }
     /* The world pass never samples the floor id (it writes it); keep the gate off
      * and clear unit 7 so sampling the attachment being written is impossible. */
@@ -5971,7 +6451,11 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     uint64_t perf_prime = 0;
     uint64_t perf_views = 0;
     uint64_t perf_resolve = 0;
+    /* The sun pass's own submit time, taken back out of the setup phase so
+     * the reported phases still sum to the total. */
+    uint64_t sun_ns = 0;
     static uint64_t perf_setup_sum;
+    static uint64_t perf_sun_sum;
     static uint64_t perf_prime_sum;
     static uint64_t perf_views_sum;
     static uint64_t perf_resolve_sum;
@@ -6046,6 +6530,20 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     }
     compare_active = g_truecolor_active && hwr_truecolor_compare_enabled();
     hwr_truecolor_set_effects(palette);
+
+    /* The sun's light-space depth map, once per frame, before any view: every
+     * view of the frame -- a mirror's included -- reads the one map, exactly
+     * as the point-light array is one frame's answer. A frame that does not
+     * want it lays nothing down and the lookup stands at lit. */
+    {
+        uint64_t sun_t0 = perf_enabled ? hwr_perf_now_ns() : 0;
+
+        hwr_sun_render_map();
+        if (perf_enabled) {
+            sun_ns = hwr_perf_now_ns() - sun_t0;
+            perf_sun_sum += sun_ns;
+        }
+    }
 
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.active_texture(GL_TEXTURE1);
@@ -6169,7 +6667,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         hwr_truecolor_compare_report(views, view_count, width, height);
     if (perf_enabled) {
         uint64_t done = hwr_perf_now_ns();
-        perf_setup_sum += perf_setup - perf_t0;
+        perf_setup_sum += (perf_setup - perf_t0) - sun_ns;
         perf_prime_sum += perf_prime - perf_setup;
         perf_views_sum += perf_views - perf_prime;
         perf_resolve_sum += perf_resolve - perf_views;
@@ -6182,12 +6680,14 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
             double divisor = (double)perf_samples * 1.0e6;
             fprintf(stderr,
                     "[renderer_overhaul] frame perf %ux%u avg/%u:"
-                    " setup=%.2fms truecolor-prime=%.2fms views-submit=%.2fms"
+                    " setup=%.2fms sun=%.2fms truecolor-prime=%.2fms"
+                    " views-submit=%.2fms"
                     " resolve-submit=%.2fms gpu+readback=%.2fms"
                     " total=%.2fms views=%.1f full-copies=%.1f"
                     " truecolor=%s\n",
                     width, height, perf_samples,
                     perf_setup_sum / divisor,
+                    perf_sun_sum / divisor,
                     perf_prime_sum / divisor,
                     perf_views_sum / divisor,
                     perf_resolve_sum / divisor,
@@ -6200,6 +6700,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
                                ? "rgba16f" : "rgba8")
                         : "off");
             perf_setup_sum = 0;
+            perf_sun_sum = 0;
             perf_prime_sum = 0;
             perf_views_sum = 0;
             perf_resolve_sum = 0;
@@ -6345,9 +6846,16 @@ void hwr_gl_shutdown(void)
                 g_truecolor_break ? " (negative self-test)" : "");
     if (g_initialized && hwr_platform_make_current()) {
         hwr_destroy_scene_objects();
+        hwr_sun_destroy_objects();
         hwr_destroy_programs();
         hwr_destroy_framebuffer();
     }
+    free(g_sun_static_pending);
+    g_sun_static_pending = NULL;
+    g_sun_static_pending_count = 0;
+    g_sun_static_pending_valid = 0;
+    g_sun_dynamic = NULL;
+    g_sun_dynamic_count = 0;
     hwr_platform_shutdown();
     free(g_pixels);
     g_pixels = NULL;
