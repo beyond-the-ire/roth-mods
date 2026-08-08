@@ -167,6 +167,11 @@ struct hwr_overlay_layout {
     uint32_t row_h;
     uint32_t title_y;
     uint32_t strip_y;
+    /* The warning band under the section strip, and whether there is one. It
+     * takes a row's height from the rows rather than from the panel, so a
+     * section that carries it shows one setting fewer and nothing else moves. */
+    uint32_t banner_y;
+    int banner;
     uint32_t rows_y0;
     uint32_t rows_y1;
     uint32_t help_y;
@@ -231,6 +236,14 @@ static struct hwr_settings g_draft;
 static struct hwr_settings g_drawn_store;
 static char g_status[160];
 static int g_status_error;
+/* The status line is saying the one thing red is reserved for, rather than an
+ * ordinary message or an error. Kept apart from g_status_error precisely so
+ * that an error can never borrow the warning's colour. */
+static int g_status_warn;
+/* The row the warning has already been said for, so that a dial held down says
+ * it once instead of shouting it -- and so that the System section's message
+ * list, which keeps every status line, is not filled with one sentence. */
+static const struct hwr_setting_desc *g_warned_row;
 static struct hwr_overlay_row g_rows[HWR_OVERLAY_MAX_ROWS];
 static int g_row_count;
 static int g_hover_kind;
@@ -400,11 +413,21 @@ static void hwr_overlay_status(const char *text, int error)
 {
     snprintf(g_status, sizeof g_status, "%s", text != NULL ? text : "");
     g_status_error = error;
+    g_status_warn = 0;
     /* The System section keeps the last message, so one that has been replaced
      * on the status line is still somewhere to be read. */
     if (g_status[0] != 0)
         hwr_sysinfo_note_message(g_status);
     g_redraw = 1;
+}
+
+/* The warning, which is a status line of its own kind: not an error -- nothing
+ * has gone wrong and nothing was refused -- but the one message this screen
+ * draws in red. */
+static void hwr_overlay_status_warn(const char *text)
+{
+    hwr_overlay_status(text, 0);
+    g_status_warn = 1;
 }
 
 /* Esc is the panel's own while an editor is open, while the panel has asked a
@@ -625,6 +648,48 @@ static int hwr_overlay_map_text(const struct hwr_setting_desc *desc, char *out,
     return out[0] != 0;
 }
 
+/* Whether the section on screen holds a row the map being played answers for.
+ * One walk of the rows this section built -- the layer knows which rows a map
+ * answers for and the panel knows which of them are here, so neither has to
+ * keep a count for the other.
+ *
+ * It asks exactly what the row marks ask, so the banner and the marks can never
+ * disagree: a banner saying "the settings marked below" over a section with
+ * nothing marked would be worse than no banner at all. */
+static int hwr_overlay_section_overridden(void)
+{
+    int i;
+
+    if (hwr_look_current_map() == NULL)
+        return 0;
+    for (i = 0; i < g_row_count; i++) {
+        const struct hwr_setting_desc *desc = hwr_overlay_row_desc(i);
+
+        if (desc != NULL && g_rows[i].widget != HWR_W_INFO &&
+            hwr_look_overrides(desc))
+            return 1;
+    }
+    return 0;
+}
+
+/* The banner's own sentence. The map is NAMED: a warning about a place the
+ * player cannot identify reads as a fault in the mod rather than as a fact
+ * about where they are standing. */
+static int hwr_overlay_banner_text(char *out, size_t out_size)
+{
+    const char *map = hwr_look_current_map();
+
+    if (out == NULL || out_size == 0)
+        return 0;
+    out[0] = 0;
+    if (map == NULL || !hwr_overlay_section_overridden())
+        return 0;
+    snprintf(out, out_size,
+             "%s sets its own lighting. The settings marked below do not apply "
+             "while you are here.", map);
+    return out[0] != 0;
+}
+
 /* A row the player has moved away from what the store holds. */
 static int hwr_overlay_row_changed(int row)
 {
@@ -665,6 +730,24 @@ static int hwr_overlay_commit(const struct hwr_settings *trial)
     return 1;
 }
 
+/* The moment the whole warning exists for: the dial moved and the picture did
+ * not, because the map being played answers for this setting itself. The reason
+ * is said at the instant it happens rather than left to be noticed on the row.
+ *
+ * Once per row: a step held down moves the value many times, and a sentence
+ * repeated on every one of them would be noise on the status line and a page of
+ * one message in the System section's list. Moving a DIFFERENT row the map also
+ * answers for says it again, which is the case where a person is still finding
+ * out. */
+static void hwr_overlay_note_map_answers(const struct hwr_setting_desc *desc)
+{
+    if (desc == NULL || desc == g_warned_row || !hwr_look_overrides(desc))
+        return;
+    g_warned_row = desc;
+    hwr_overlay_status_warn("The map you are in sets this itself; your change "
+                            "takes effect elsewhere.");
+}
+
 static int hwr_overlay_set_value(const struct hwr_setting_desc *desc,
                                  union hwr_value value)
 {
@@ -677,7 +760,10 @@ static int hwr_overlay_set_value(const struct hwr_setting_desc *desc,
         return 0;
     }
     hwr_schema_set(&trial, desc, value);
-    return hwr_overlay_commit(&trial);
+    if (!hwr_overlay_commit(&trial))
+        return 0;
+    hwr_overlay_note_map_answers(desc);
+    return 1;
 }
 
 static int hwr_overlay_set_pair(const struct hwr_setting_desc *width_desc,
@@ -1061,6 +1147,10 @@ static void hwr_overlay_edit_key(uint8_t make)
 static void hwr_overlay_reset_draft(void)
 {
     g_draft = *hwr_settings_get();
+    /* A fresh draft is a fresh start: the panel opening, or a draft thrown
+     * away, re-arms the warning so the next person to move an overridden dial
+     * is told why rather than left with a sentence somebody else already had. */
+    g_warned_row = NULL;
     g_redraw = 1;
 }
 
@@ -1352,6 +1442,14 @@ static void hwr_overlay_layout(const struct roth_api_v1 *api,
     if (body < (8u + (uint32_t)layout->action_lines) * layout->row_h) {
         layout->help_y = layout->status_y;
         layout->rows_y1 = layout->status_y;
+        /* And the warning band goes with it, on that same test: in a panel with
+         * no room to spare the rows are what a person came for, and the red on
+         * the rows the map answers for says the same thing without a line of
+         * its own. */
+    } else if (hwr_overlay_section_overridden()) {
+        layout->banner = 1;
+        layout->banner_y = layout->rows_y0;
+        layout->rows_y0 += layout->row_h;
     }
     if (layout->rows_y1 <= layout->rows_y0 + layout->row_h) {
         layout->visible = 0;
@@ -1477,9 +1575,14 @@ static void hwr_overlay_draw_row(const struct roth_api_v1 *api,
                      active);
         used = strlen(value);
         if (g_rows[row].widget != HWR_W_INFO && used + 12u < sizeof value &&
-            hwr_overlay_map_text(desc, active, sizeof active))
+            hwr_overlay_map_text(desc, active, sizeof active)) {
             snprintf(value + used, sizeof value - used, "  (this map: %s)",
                      active);
+            /* And in the warning colour, so the eye finds the rows the map
+             * answers for without reading every line of the section. Exactly
+             * the rows that carry the text carry the colour. */
+            value_color = colors->warn;
+        }
     }
     if (hwr_overlay_widget_steps(g_rows[row].widget) && g_rows[row].selectable) {
         uint32_t marker_w = 8u;
@@ -1581,6 +1684,23 @@ static void hwr_overlay_render(const struct roth_api_v1 *api,
         }
     }
 
+    /* The warning band, where the map being played answers for something on
+     * this section. It explains the red the rows below it are marked in, which
+     * a mark on its own cannot do: which map, and that the settings still
+     * hold everywhere else. */
+    if (layout->banner) {
+        char banner[192];
+
+        hwr_overlay_draw_fill(&canvas, layout->cx0, layout->banner_y,
+                              layout->cx1, layout->banner_y + layout->row_h,
+                              colors->panel);
+        if (hwr_overlay_banner_text(banner, sizeof banner))
+            hwr_overlay_draw_text(api, &canvas, layout->cx0 + 3u,
+                                  layout->banner_y + layout->scale,
+                                  layout->cx1 - layout->cx0 - 6u, colors->warn,
+                                  banner);
+    }
+
     /* Rows. */
     drawn = 0;
     y = layout->rows_y0;
@@ -1648,12 +1768,21 @@ static void hwr_overlay_render(const struct roth_api_v1 *api,
     } else {
         snprintf(text, sizeof text, "%s", g_status);
     }
-    hwr_overlay_draw_text(api, &canvas, layout->cx0 + 3u,
-                          layout->status_y + layout->scale,
-                          layout->cx1 - layout->cx0 - 6u,
-                          g_status_error || g_confirm_pending ? colors->gold_hi
-                                                              : colors->text,
-                          text);
+    {
+        /* Three kinds of line, three colours, and the order matters: the
+         * question a display change is waiting on outranks everything, an error
+         * is gold as it has always been, and red is the warning's alone. */
+        uint8_t status_color = colors->text;
+
+        if (g_confirm_pending || g_status_error)
+            status_color = colors->gold_hi;
+        else if (g_status_warn)
+            status_color = colors->warn;
+        hwr_overlay_draw_text(api, &canvas, layout->cx0 + 3u,
+                              layout->status_y + layout->scale,
+                              layout->cx1 - layout->cx0 - 6u, status_color,
+                              text);
+    }
 
     /* Actions. */
     for (i = 0; i < HWR_ACTION_COUNT; i++) {
@@ -2409,6 +2538,9 @@ void hwr_overlay_init(void)
     g_edit_row = -1;
     g_hover_index = -1;
     g_status[0] = 0;
+    g_status_error = 0;
+    g_status_warn = 0;
+    g_warned_row = NULL;
     g_toggle_key = hwr_settings_get()->overlay_key;
     g_available = hwr_overlay_draw_init() == 0;
     if (!g_available)

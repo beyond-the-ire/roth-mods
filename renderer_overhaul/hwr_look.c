@@ -1389,6 +1389,29 @@ int hwr_look_overrides(const struct hwr_setting_desc *desc)
     return index >= 0 && hwr_row_set_has(&g_effective.present, index);
 }
 
+/* Both of the two below are read off the state the layer already keeps -- what
+ * is in force and which place it is in force for -- so that the settings screen
+ * can say a map answers for itself without the layer keeping a second copy of
+ * the answer for it to read. */
+
+int hwr_look_override_count(void)
+{
+    size_t count = hwr_schema_count();
+    size_t i;
+    int total = 0;
+
+    for (i = 0; i < count; i++) {
+        if (hwr_row_set_has(&g_effective.present, (int)i))
+            total++;
+    }
+    return total;
+}
+
+const char *hwr_look_current_map(void)
+{
+    return g_look_map[0] != 0 ? g_look_map : NULL;
+}
+
 int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out)
 {
     size_t i;

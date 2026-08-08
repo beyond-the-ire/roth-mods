@@ -46,6 +46,18 @@
 #define HWR_COLOR_GOLD_MID_DEF 0x75u
 #define HWR_COLOR_GOLD_LO_DEF 0x9eu
 #define HWR_COLOR_PANEL_DEF   0x01u
+/* The warning colour's own literal: the head of this game's red ramp, which is
+ * also what the sampling below finds in its palette. The two agreeing is worth
+ * having -- the warning never changes colour under somebody's eye as the art
+ * comes up -- but the sampling is what makes it a red the GAME holds rather
+ * than a number picked here, which is what a palette nobody has seen needs. */
+#define HWR_COLOR_WARN_DEF    0x67u
+
+/* A palette entry is six bits per channel, so a red at full strength alone is
+ * worth 63 * 54 by the luminance weights below. Half of that is the floor: a
+ * red darker than that reads as a shadow rather than as a warning, and would
+ * be worse than the literal it replaced. */
+#define HWR_WARN_LUMINANCE_FLOOR (32u * 54u)
 
 /* Working room for one sampled tile. */
 #define HWR_SCRATCH_W 128u
@@ -72,7 +84,7 @@ static int32_t g_cursor_y;
 
 static struct hwr_overlay_colors g_colors = {
     HWR_COLOR_GOLD_HI_DEF, HWR_COLOR_GOLD_MID_DEF, HWR_COLOR_GOLD_LO_DEF,
-    HWR_COLOR_TEXT_DEF, HWR_COLOR_PANEL_DEF
+    HWR_COLOR_TEXT_DEF, HWR_COLOR_PANEL_DEF, HWR_COLOR_WARN_DEF
 };
 static uint32_t g_colors_base;
 
@@ -275,6 +287,43 @@ void hwr_overlay_draw_finish(const struct hwr_overlay_canvas *canvas,
 
 /* --------------------------------- colours -------------------------------- */
 
+/* The warning red, off the palette rather than off a tile: the index whose red
+ * most exceeds BOTH of its other channels, above a luminance floor. The frame
+ * art has no red in it -- it is gold from edge to edge -- so the tile the golds
+ * are drawn from cannot answer this, and the palette can: every game whose art
+ * has a fire in it carries a saturated red somewhere in its ramp, and this
+ * finds that one rather than trusting a number written here. */
+static void hwr_overlay_sample_warn(const uint8_t *palette)
+{
+    uint32_t strongest = 0;
+    uint8_t warn = 0;
+    uint32_t i;
+
+    for (i = 1; i < 256u; i++) {
+        uint32_t red = palette[i * 3u];
+        uint32_t green = palette[i * 3u + 1u];
+        uint32_t blue = palette[i * 3u + 2u];
+        uint32_t other = green > blue ? green : blue;
+        uint32_t luminance;
+        uint32_t excess;
+
+        if (red <= other)
+            continue;
+        excess = red - other;
+        luminance = red * 54u + green * 183u + blue * 19u;
+        if (luminance < HWR_WARN_LUMINANCE_FLOOR)
+            continue;
+        if (excess > strongest) {
+            strongest = excess;
+            warn = (uint8_t)i;
+        }
+    }
+    /* A palette with no red in it at all keeps the literal: a warning drawn in
+     * whatever came nearest to red would be a warning nobody reads as one. */
+    if (warn != 0)
+        g_colors.warn = warn;
+}
+
 /* The frame art's own golds: the brightest, the most common, and the darkest of
  * the warm indices the top-run tile is drawn from. */
 static void hwr_overlay_sample_colors(const struct roth_api_v1 *api)
@@ -298,10 +347,17 @@ static void hwr_overlay_sample_colors(const struct roth_api_v1 *api)
     base = api->game_ram->u32(VA_G_RELOC_BASE);
     if (base == 0 || base == g_colors_base)
         return;
-    descriptor = api->engine->resolve_reloc_ptr(HWR_SLOT_TOP_RUN);
     palette = (const uint8_t *)(uintptr_t)api->game_ram->u32(
         VA_G_PALETTE_RGB_PTR);
-    if (descriptor == 0 || palette == NULL)
+    if (palette == NULL)
+        return;
+    /* The warning red is the palette's own business and is taken first: it is
+     * wanted as soon as there is a palette, and it must not wait on the frame
+     * art the golds need -- which is a separate thing that may not be loaded
+     * yet, and which this deliberately does not stand or fall with. */
+    hwr_overlay_sample_warn(palette);
+    descriptor = api->engine->resolve_reloc_ptr(HWR_SLOT_TOP_RUN);
+    if (descriptor == 0)
         return;
     width = *(const uint16_t *)(uintptr_t)(descriptor + 4u);
     height = *(const uint16_t *)(uintptr_t)(descriptor + 6u);

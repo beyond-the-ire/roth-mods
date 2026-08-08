@@ -115,6 +115,14 @@ union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
 /* Whether the current map overrides this row, for anything that wants to say
  * so. */
 int hwr_look_overrides(const struct hwr_setting_desc *desc);
+/* How many rows the map in force answers for. Zero where it answers for none,
+ * which is also the answer where no game config is in force at all. */
+int hwr_look_override_count(void);
+/* The map whose answers are in force, by the name it is matched on, or NULL
+ * where no map has been chosen. The settings screen names it rather than
+ * saying "this map": a warning about a place nobody can identify reads as a
+ * fault in the mod. */
+const char *hwr_look_current_map(void);
 
 /* What the game config says about one object graphic's own light.
  *

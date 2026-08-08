@@ -54,6 +54,13 @@ which is the place to look when a setting and the picture disagree. A row whose 
 be honoured shows both, as `(in use: ...)`, and a row the map being played answers for itself shows
 what the map says, as `(this map: ...)`.
 
+Where the map you are in answers for a setting itself, the settings screen says so in red, and red
+on that screen means nothing else. The value of every such row is drawn in it; a line under the
+section names the map whenever that section holds one of those rows; and moving one of them says,
+once, that the map you are in sets it itself and your change takes effect elsewhere. Every setting
+still applies everywhere the map does not answer for it, so a change made there is not lost — it is
+waiting outside.
+
 The settings file is written whole, through a temporary file and an atomic replace, so a write
 that fails leaves the previous file exactly as it was and reports why on the settings screen.
 
@@ -261,8 +268,9 @@ here.
 exactly the same rules, so every bound and every message comes from the settings screen itself and
 the two can never disagree. A key belongs there when it says how a *place* is lit rather than what
 a *screen* wants: the shading and the whole light rig may be written in one, and the brightness and
-contrast of the picture may not. A row a map answers for is marked on the settings screen with what
-the map says, because moving that setting will not change the picture where you are standing.
+contrast of the picture may not. A row a map answers for is marked in red on the settings screen
+with what the map says, because moving that setting will not change the picture where you are
+standing.
 
 `lights` says what particular **things** give off, under `graphics`, keyed by the graphic the map
 draws them with — for where one value for a whole map is not enough, such as a brazier that should

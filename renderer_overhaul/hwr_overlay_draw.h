@@ -33,6 +33,11 @@ struct hwr_overlay_colors {
     uint8_t gold_lo;   /* dark frame gold: fills and disabled text */
     uint8_t text;      /* body text */
     uint8_t panel;     /* the frame's own background */
+    /* The one warning this screen gives: the map being played answers for a
+     * setting itself, so moving it here changes nothing where you are standing.
+     * Red is reserved for saying that and for nothing else -- an ordinary error
+     * stays gold -- so red on this screen always means the same thing. */
+    uint8_t warn;
 };
 
 int hwr_overlay_draw_init(void);
