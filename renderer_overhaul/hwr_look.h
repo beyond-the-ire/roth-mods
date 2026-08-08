@@ -4,43 +4,57 @@
 #include "hwr_schema.h"
 #include "hwr_settings.h"
 
-/* The look configuration: one global look plus per-map overrides, in a plain
- * text file beside the settings file.
+/* The game config: what a particular game's places are lit like, described in
+ * a JSON file inside the mod's own `game_configs` folder.
  *
- *   [look]              the global look; every key defaults to what the
- *                       settings registry already holds, so an absent file
- *                       means "no overrides" rather than "defaults"
- *   [profile.<name>]    a reusable named block a map can select
- *   [map.<map name>]    one map's own keys, matched on the name of the map's
- *                       own file -- STUDY1, STUDY2 -- case-insensitively, with
- *                       any directory and any extension stripped from both
- *                       sides. Maps sharing a texture archive are still
- *                       different maps here, which is what makes a look a
- *                       map's own.
+ *   {
+ *     "format": 1,
+ *     "for": "Realms of the Haunting",
+ *     "notes": "How this game's places are lit.",
+ *     "everywhere": { ...one place... },
+ *     "maps": { "STUDY1": { ...one place... } }
+ *   }
  *
- * Precedence, lowest to highest: the registry value, the global look, the
- * profile a map selects, the map's own keys. A map nobody listed gets the
- * global look, silently, so community and custom maps are covered by
- * construction.
+ * `everywhere` and each entry under `maps` have the SAME shape, and that is
+ * the whole of the composition rule: a map's answer is laid over the game's
+ * answer, field by field. A map nobody listed gets `everywhere` alone,
+ * silently, so community and custom maps are covered by construction. An
+ * absent file means "no overrides" rather than "defaults" -- every dial falls
+ * to the settings screen on every map.
  *
- * A key is accepted when the settings table has a row of that name carrying
- * HWR_SF_MAP_OVERRIDE, and its value is parsed by that row. There is no key
- * table here: adding a look key is adding one flag to one row, and the two can
- * never drift apart. A line this file cannot use costs that line and a note,
- * never the file -- it is written by hand, unlike the settings file.
+ * A map is matched on the name of the map's own file -- STUDY1, STUDY2 --
+ * case-insensitively, with any directory and any extension stripped from both
+ * sides. Maps sharing a texture archive are still different maps here, which
+ * is what makes a description a map's own.
  *
- * And one section of a different kind, because it is keyed by something that is
- * not a settings row:
+ * One place says two kinds of thing:
  *
- *   [lights]            what particular THINGS give off, keyed by the graphic
- *   [profile.X.lights]  the map draws them with. A settings row is one value
- *   [map.X.lights]      for a whole map; this says a brazier is brighter than
- *                       a candle, and that one fullbright decal is not a light
- *                       at all. It follows exactly the same three-section
- *                       precedence chain, field by field.
+ *   "settings"  the dials, spelled exactly as the settings file spells them. A
+ *               key is accepted when the settings table has a row of that name
+ *               that says a map may override it, and its value is read by that
+ *               row. There is no key table here: adding one is adding one flag
+ *               to one row, and the two can never drift apart.
+ *
+ *   "lights"    what particular THINGS give off, under "graphics", keyed by
+ *               the graphic the map draws them with. A settings row is one
+ *               value for a whole map; this says a brazier is brighter than a
+ *               candle, and that one fullbright decal is not a light at all.
+ *               Each field is separately present or absent, so a map may raise
+ *               a strength without restating a colour.
+ *
+ * A member named exactly `notes`, at any level, is documentation -- a piece of
+ * text or a list of them -- and is never read as data.
+ *
+ * What a bad file costs, in two answers, because they differ: a file that is
+ * not JSON at all costs the WHOLE file, reported once, with whatever was in
+ * force left standing -- one missing brace moves every following line into a
+ * different place, so half a file read would look like an answer. Anything
+ * else -- an unknown key, a value out of range, a colour that is not six
+ * hexadecimal digits -- costs its own key and a note, and the rest of the file
+ * is read.
  */
 
-/* Reads the file beside the settings file, if there is one. */
+/* Reads the game config, if there is one. */
 void hwr_look_load(const char *plugin_dir);
 /* Asks for the file to be read again at the next safe point. */
 void hwr_look_request_reload(void);
@@ -50,8 +64,8 @@ void hwr_look_poll(void);
  * never land inside a render. */
 void hwr_look_drain_request(void);
 /* Chooses the map whose overrides are in force. NULL or an unknown name leaves
- * the global look standing. Raises the change bits of every row whose effective
- * value moved, so the next pump applies them. */
+ * the game-wide answer standing. Raises the change bits of every row whose
+ * effective value moved, so the next pump applies them. */
 void hwr_look_select_map(const char *map_name);
 /* The value a row is worth right now: its override where the current map has
  * one, and the store's own value everywhere else. */
@@ -61,15 +75,15 @@ union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
  * so. */
 int hwr_look_overrides(const struct hwr_setting_desc *desc);
 
-/* What the look file says about one object graphic's own light.
+/* What the game config says about one object graphic's own light.
  *
- * Every field is separately present or absent, because the file writes a
- * dash for one it is saying nothing about and because the three sections
- * compose FIELD BY FIELD: a map may make its torches brighter without
- * restating the colour the global section already gave them. `off` is the
- * whole entry rather than a field: a thing the map marks unshaded that is
- * plainly not a light -- a glowing decal, a bright pickup -- is refused
- * outright, and nothing else in the entry matters. */
+ * Every field is separately present or absent, because a field the file says
+ * nothing about is simply left out and because the two scopes compose FIELD BY
+ * FIELD: a map may make its torches brighter without restating the colour the
+ * game-wide answer already gave them. `off` is the whole entry rather than a
+ * field: a thing the map marks unshaded that is plainly not a light -- a
+ * glowing decal, a bright pickup -- is refused outright, and nothing else in
+ * the entry is read. */
 struct hwr_look_light {
     int off;
     int has_intensity;
