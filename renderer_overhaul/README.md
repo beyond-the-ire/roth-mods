@@ -240,6 +240,9 @@ putting the file back puts the selection back.
         "0x0412": { "strength": 1.6, "reach": 520, "colour": "#ffb46e" },
         "0x0455": { "strength": 0.6, "reach": 260 },
         "0x0301": { "off": true }
+      },
+      "surfaces": {
+        "0x0a31": { "colour": "#ff5a20", "strength": 1.2, "reach": 640 }
       }
     }
   },
@@ -308,6 +311,30 @@ what stands there is drawn with something else the entry is still applied and th
 which is how a list written for one version of a map tells you it has gone stale. An entry standing
 at a position nothing occupies says so too, once, naming the map — so a mistyped number is visible
 rather than silently doing nothing.
+
+`surfaces`, under the same `lights`, says what a **painted surface** gives off — lava, a glowing
+rune, a lit sigil on a wall. It is keyed by the texture number the map's own geometry carries for a
+face, and it may be written in `everywhere` as well as under a map: a texture is the same texture
+wherever it is painted, so a game whose lava glows usually wants it to glow everywhere. The fields
+are the same three, composing field by field, and `off` is the whole entry here too.
+
+Two things about `surfaces` are worth knowing before you write one:
+
+- **The colour is required.** A thing that gives light is drawn as a cut-out sprite, so the game can
+  tell the flame from the bracket it hangs on and read the light's colour off it. A wall texture is
+  not cut out of anything — every texel is the surface — so the same reading over lava returns the
+  colour of the rock around it. Rather than give every glowing surface in the game one fixed colour
+  and say nothing about it, a grant without a `colour` lights nothing and the game says so. Write it
+  once in `everywhere` and a map may raise the strength without restating it.
+- **A grant lights the room; it does not repaint the surface.** Whether a face is drawn fullbright
+  stays what the map itself says and what the game's own colours do with it. This adds a light beside
+  the lava, not a new way of drawing lava.
+
+One light is placed **per room per texture**, in the middle of that room's granted faces and just
+clear of them, however many faces there are: a lake of lava is one light over the lake rather than
+three hundred lights fighting for the handful of slots the picture carries. Which faces those are is
+worked out once, when the map loads. **Light from glowing surfaces** on the settings screen turns
+the whole class off; grants are still read and still reported either way.
 
 Colours are written `"#rrggbb"`. JSON has no comment character for a hash to collide with, so a
 colour here is written the way a person writes one; the bare six digits are accepted too.

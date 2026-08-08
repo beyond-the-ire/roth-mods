@@ -314,6 +314,11 @@ struct hwr_settings {
      * to either. */
     int point_light;
     int point_light_objects;
+    /* The second source: the FACES a game config grants a light -- lava, a
+     * glowing rune, a lit sigil painted onto a wall. Nothing is granted until
+     * somebody writes one down, so this switch costs an untuned game nothing;
+     * what it buys a tuned one is a lake of lava lighting its own cavern. */
+    int point_light_glow_faces;
     /* How many the world pass carries at once. It is a quality dial rather
      * than a limit somebody should have to think about: what is dropped is
      * always the light contributing least where the eye is. */

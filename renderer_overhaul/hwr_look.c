@@ -23,8 +23,12 @@
  * tables are grown to fit the file rather than declared to fit the cap. */
 #define HWR_LOOK_MAX_MAPS 64u
 #define HWR_LOOK_NAME 64u
-/* How many graphics one scope may say something about. A place has a handful
- * of things that give light; this is room for one that is nothing but. */
+/* How many entries one keyed grant table may hold in one scope -- the graphics
+ * a place says something about, and the surfaces it says something about, which
+ * are two tables of the same shape keyed by two different sixteen-bit numbers.
+ * A place has a handful of things that give light; this is room for one that is
+ * nothing but, and a game has a lava, a rune and a sigil or two rather than
+ * sixty of them. */
 #define HWR_LOOK_MAX_LIGHTS 64u
 /* And how many PLACED things one map may name. A hand-tuned map picks out the
  * few lights that carry a room -- the hearth, the brazier at the top of the
@@ -74,10 +78,17 @@ struct hwr_look_values {
     union hwr_value value[HWR_LOOK_MAX_ROWS];
 };
 
-/* What one graphic gives off, kept with each field's own presence so that
- * composing two scopes is per field rather than per entry. */
+/* What one KEYED thing gives off, kept with each field's own presence so that
+ * composing two scopes is per field rather than per entry.
+ *
+ * The key is a sixteen-bit number and the table says nothing about which one:
+ * the graphics table is keyed by the graphic a thing is drawn with and the
+ * surfaces table by the texture a face is painted with, and what makes them two
+ * tables is where they are read from and what consults them, never their shape.
+ * One shape is one merge rule, and a rule written once cannot compose one table
+ * differently from the other. */
 struct hwr_look_light_entry {
-    uint16_t graphic_id;
+    uint16_t id;
     struct hwr_look_light light;
 };
 
@@ -118,6 +129,7 @@ struct hwr_look_objects {
 struct hwr_look_scope {
     struct hwr_look_values values;
     struct hwr_look_lights lights;
+    struct hwr_look_lights surfaces;
     struct hwr_look_objects objects;
 };
 
@@ -140,7 +152,13 @@ static struct hwr_look_file g_look;
 static int g_look_present;
 static struct hwr_look_values g_effective;
 static struct hwr_look_lights g_effective_lights;
+static struct hwr_look_lights g_effective_surfaces;
 static struct hwr_look_objects g_effective_objects;
+/* A number that moves when the granted surfaces do and at no other time. What
+ * reads it works a map out ONCE and then wants to know, in one comparison per
+ * frame, whether that answer is still the answer. It starts at one so that
+ * nought is free to mean nothing has been worked out yet. */
+static uint32_t g_surface_generation = 1u;
 /* What has been SAID about each entry on the map in force, and whether the
  * map's own objects have been offered yet. Kept beside the entries rather than
  * in them, because what an entry is and what has been said about it are two
@@ -604,28 +622,31 @@ static void hwr_look_merge(struct hwr_look_values *into,
     }
 }
 
-/* The entry for one graphic in one scope, created where there is not one.
- * NULL means the scope is already carrying as many graphics as it may. */
+/* The entry for one key in one scope's table, created where there is not one.
+ * NULL means the scope is already carrying as many as it may. */
 static struct hwr_look_light_entry *hwr_look_light_entry(
-    struct hwr_look_lights *lights, uint16_t graphic_id)
+    struct hwr_look_lights *lights, uint16_t id)
 {
     size_t i;
 
     for (i = 0; i < lights->count; i++) {
-        if (lights->items[i].graphic_id == graphic_id)
+        if (lights->items[i].id == id)
             return &lights->items[i];
     }
     if (lights->count >= HWR_LOOK_MAX_LIGHTS)
         return NULL;
     memset(&lights->items[lights->count], 0, sizeof lights->items[0]);
-    lights->items[lights->count].graphic_id = graphic_id;
+    lights->items[lights->count].id = id;
     return &lights->items[lights->count++];
 }
 
 /* One scope's entries over another's, FIELD by field. A map raising the
  * strength of a graphic the game-wide answer already coloured keeps that
  * colour, which is the same rule the settings rows compose by and the reason a
- * field a scope says nothing about is left out rather than written down. */
+ * field a scope says nothing about is left out rather than written down.
+ *
+ * Written once for both keyed tables, so a surface composes exactly as a
+ * graphic does and neither can quietly grow a rule of its own. */
 static void hwr_look_lights_merge(struct hwr_look_lights *into,
                                   const struct hwr_look_lights *from)
 {
@@ -634,7 +655,7 @@ static void hwr_look_lights_merge(struct hwr_look_lights *into,
     for (i = 0; i < from->count; i++) {
         const struct hwr_look_light_entry *source = &from->items[i];
         struct hwr_look_light_entry *target =
-            hwr_look_light_entry(into, source->graphic_id);
+            hwr_look_light_entry(into, source->id);
 
         if (target == NULL)
             continue;
@@ -863,9 +884,9 @@ static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
     return 0;
 }
 
-/* A graphic number, however it is spelled: a string in any base, which is what
- * a table keyed by one uses, or a bare number where one is written beside a
- * position. Answers 0 for anything that is not one. */
+/* A sixteen-bit number, however it is spelled: a string in any base, which is
+ * what a table keyed by one uses, or a bare number where one is written beside
+ * a position. Answers 0 for anything that is not one. */
 static int hwr_look_graphic_number(const char *text, uint16_t *out)
 {
     unsigned long graphic;
@@ -880,10 +901,16 @@ static int hwr_look_graphic_number(const char *text, uint16_t *out)
     return 1;
 }
 
-/* What one graphic gives off. */
+/* What one keyed thing gives off: one graphic, or one surface.
+ *
+ * `noun` and `key_word` are what the complaints call the thing and its key --
+ * a light keyed by a graphic, a surface keyed by a texture. The reading is
+ * otherwise the same for both, and deliberately so: two readers would be two
+ * places for the three fields to be spelled and one place for them to drift. */
 static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
                                 struct hwr_look_lights *into,
-                                const char *where, int report)
+                                const char *where, int report,
+                                const char *noun, const char *key_word)
 {
     const char *key = hwr_json_name(doc, node);
     struct hwr_look_light_entry *entry;
@@ -894,19 +921,19 @@ static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
     if (key == NULL)
         return;
     if (!hwr_look_graphic_number(key, &graphic)) {
-        hwr_look_note(report, where, "'%s' is not a graphic number", key);
+        hwr_look_note(report, where, "'%s' is not a %s number", key, key_word);
         return;
     }
     hwr_look_where(inside, where, key);
     if (hwr_json_type(doc, node) != HWR_JSON_OBJECT) {
-        hwr_look_note(report, inside, "a light is a block of what it gives "
-                                      "off");
+        hwr_look_note(report, inside, "a %s is a block of what it gives off",
+                      noun);
         return;
     }
     entry = hwr_look_light_entry(into, graphic);
     if (entry == NULL) {
-        hwr_look_note(report, inside, "that is more lights than one place may "
-                                      "describe");
+        hwr_look_note(report, inside, "that is more %ss than one place may "
+                                      "describe", noun);
         return;
     }
     if (hwr_look_grant_off(doc, node, inside, report)) {
@@ -1100,7 +1127,30 @@ static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
                  light = hwr_json_next(doc, light)) {
                 if (hwr_look_is_notes(hwr_json_name(doc, light)))
                     continue;
-                hwr_look_read_light(doc, light, &into->lights, inside, report);
+                hwr_look_read_light(doc, light, &into->lights, inside, report,
+                                    "light", "graphic");
+            }
+        } else if (strcmp(name, "surfaces") == 0) {
+            int surface;
+
+            /* Keyed by the texture a FACE is painted with rather than by the
+             * graphic a THING is drawn with -- lava, a rune, a lit sigil. It
+             * is read in every scope, unlike the placed things below: a
+             * texture is the same texture wherever it is painted, and a game
+             * whose lava glows wants it to glow everywhere. */
+            hwr_look_where(inside, where, "surfaces");
+            if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
+                hwr_look_note(report, inside, "the surfaces are a block keyed "
+                                              "by the texture a face is "
+                                              "painted with");
+                continue;
+            }
+            for (surface = hwr_json_first(doc, child); surface >= 0;
+                 surface = hwr_json_next(doc, surface)) {
+                if (hwr_look_is_notes(hwr_json_name(doc, surface)))
+                    continue;
+                hwr_look_read_light(doc, surface, &into->surfaces, inside,
+                                    report, "surface", "texture");
             }
         } else if (strcmp(name, "objects") == 0) {
             hwr_look_where(inside, where, "objects");
@@ -1382,21 +1432,25 @@ static void hwr_look_compose(const struct hwr_look_file *file,
                              const char *map_name,
                              struct hwr_look_values *out,
                              struct hwr_look_lights *out_lights,
+                             struct hwr_look_lights *out_surfaces,
                              struct hwr_look_objects *out_objects)
 {
     const struct hwr_look_map *map;
 
     memset(out, 0, sizeof *out);
     memset(out_lights, 0, sizeof *out_lights);
+    memset(out_surfaces, 0, sizeof *out_surfaces);
     memset(out_objects, 0, sizeof *out_objects);
     if (!g_look_present)
         return;
     hwr_look_merge(out, &file->everywhere.values);
     hwr_look_lights_merge(out_lights, &file->everywhere.lights);
+    hwr_look_lights_merge(out_surfaces, &file->everywhere.surfaces);
     map = hwr_look_find_map(file, map_name);
     if (map != NULL) {
         hwr_look_merge(out, &map->scope.values);
         hwr_look_lights_merge(out_lights, &map->scope.lights);
+        hwr_look_lights_merge(out_surfaces, &map->scope.surfaces);
         /* And the placed things, which are the last word and come from ONE
          * scope: there is no game-wide table of them to compose with, because
          * a position outside the map it belongs to names nothing. */
@@ -1408,25 +1462,39 @@ static void hwr_look_compose(const struct hwr_look_file *file,
  * that changed value are applied and nothing else is disturbed. */
 static void hwr_look_publish(const struct hwr_look_values *next,
                              const struct hwr_look_lights *next_lights,
+                             const struct hwr_look_lights *next_surfaces,
                              const struct hwr_look_objects *next_objects)
 {
     uint32_t changed = 0;
     size_t count = hwr_schema_count();
     size_t i;
+    int surfaces_moved;
 
     /* The lights table is not a row and raises no row's bit of its own, so it
      * raises the rig's: what it changes is what the lights that are not at the
      * eye are worth, which is the same thing every row of that family changes.
      * The placed things are the same table said more precisely, so they raise
-     * the same bit. */
+     * the same bit, and so do the surfaces. */
+    surfaces_moved =
+        next_surfaces->count != g_effective_surfaces.count ||
+        memcmp(next_surfaces->items, g_effective_surfaces.items,
+               next_surfaces->count * sizeof next_surfaces->items[0]) != 0;
     if (next_lights->count != g_effective_lights.count ||
         memcmp(next_lights->items, g_effective_lights.items,
                next_lights->count * sizeof next_lights->items[0]) != 0 ||
+        surfaces_moved ||
         next_objects->count != g_effective_objects.count ||
         memcmp(next_objects->items, g_effective_objects.items,
                next_objects->count * sizeof next_objects->items[0]) != 0)
         changed |= HWR_CHANGE_TRUECOLOR;
     g_effective_lights = *next_lights;
+    /* And the one thing a seeding that works a whole map out ONCE has to be
+     * told about: the granted surfaces moving under it. Raised only where they
+     * actually moved, because what reads this is deciding whether to walk a
+     * map again. */
+    if (surfaces_moved && ++g_surface_generation == 0u)
+        g_surface_generation = 1u;      /* never nought: nought means unstaged */
+    g_effective_surfaces = *next_surfaces;
     g_effective_objects = *next_objects;
     /* A new set of placed things is a new conversation about them: what has
      * been said is about the map in force, and the map in force has just been
@@ -1464,12 +1532,14 @@ static void hwr_look_publish_nothing(void)
 {
     struct hwr_look_values empty;
     struct hwr_look_lights no_lights;
+    struct hwr_look_lights no_surfaces;
     struct hwr_look_objects no_objects;
 
     memset(&empty, 0, sizeof empty);
     memset(&no_lights, 0, sizeof no_lights);
+    memset(&no_surfaces, 0, sizeof no_surfaces);
     memset(&no_objects, 0, sizeof no_objects);
-    hwr_look_publish(&empty, &no_lights, &no_objects);
+    hwr_look_publish(&empty, &no_lights, &no_surfaces, &no_objects);
 }
 
 static void hwr_look_say_what_was_read(const struct hwr_look_file *file)
@@ -1652,11 +1722,13 @@ void hwr_look_select_map(const char *map_name)
 {
     struct hwr_look_values next;
     struct hwr_look_lights next_lights;
+    struct hwr_look_lights next_surfaces;
     struct hwr_look_objects next_objects;
 
     hwr_look_map_name(g_look_map, HWR_LOOK_NAME, map_name);
-    hwr_look_compose(&g_look, g_look_map, &next, &next_lights, &next_objects);
-    hwr_look_publish(&next, &next_lights, &next_objects);
+    hwr_look_compose(&g_look, g_look_map, &next, &next_lights, &next_surfaces,
+                     &next_objects);
+    hwr_look_publish(&next, &next_lights, &next_surfaces, &next_objects);
 }
 
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
@@ -1707,12 +1779,49 @@ int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out)
         return 0;
     memset(out, 0, sizeof *out);
     for (i = 0; i < g_effective_lights.count; i++) {
-        if (g_effective_lights.items[i].graphic_id != graphic_id)
+        if (g_effective_lights.items[i].id != graphic_id)
             continue;
         *out = g_effective_lights.items[i].light;
         return 1;
     }
     return 0;
+}
+
+int hwr_look_light_for_surface(uint16_t texture_id, struct hwr_look_light *out)
+{
+    size_t i;
+
+    if (out == NULL)
+        return 0;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < g_effective_surfaces.count; i++) {
+        if (g_effective_surfaces.items[i].id != texture_id)
+            continue;
+        *out = g_effective_surfaces.items[i].light;
+        return 1;
+    }
+    return 0;
+}
+
+size_t hwr_look_surface_count(void)
+{
+    return g_effective_surfaces.count;
+}
+
+int hwr_look_surface_at(size_t index, uint16_t *texture_id,
+                        struct hwr_look_light *out)
+{
+    if (index >= g_effective_surfaces.count || texture_id == NULL ||
+        out == NULL)
+        return 0;
+    *texture_id = g_effective_surfaces.items[index].id;
+    *out = g_effective_surfaces.items[index].light;
+    return 1;
+}
+
+uint32_t hwr_look_surface_generation(void)
+{
+    return g_surface_generation;
 }
 
 int hwr_look_light_at(int16_t world_x, int16_t world_y, int16_t world_z,
@@ -1802,6 +1911,10 @@ void hwr_look_clear(void)
     memset(&g_look, 0, sizeof g_look);
     memset(&g_effective, 0, sizeof g_effective);
     memset(&g_effective_lights, 0, sizeof g_effective_lights);
+    if (g_effective_surfaces.count != 0u &&
+        ++g_surface_generation == 0u)
+        g_surface_generation = 1u;
+    memset(&g_effective_surfaces, 0, sizeof g_effective_surfaces);
     memset(&g_effective_objects, 0, sizeof g_effective_objects);
     memset(g_object_matched, 0, sizeof g_object_matched);
     memset(g_object_told, 0, sizeof g_object_told);

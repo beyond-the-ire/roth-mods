@@ -2307,6 +2307,16 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
      * forgotten rather than carried, so nothing here fades out of a room that
      * no longer exists. */
     hwr_lights_reset();
+    /* And the granted surfaces of the map now staged, taken ONCE, HERE.
+     *
+     * Which faces carry a texture the game config grants a light, and where the
+     * centroid of each room's worth of them lies, is a fact about the MAP. It
+     * is taken beside the geometry it is read out of, so a frame's whole share
+     * of the work is the containment test over the small set it leaves behind
+     * -- and a map nothing is granted on costs no walk at all. What it does not
+     * follow is a texture a script swaps mid-map: the answer is the map as it
+     * was staged, which is what "once per map" means. */
+    hwr_lights_stage_glow_faces(&g_world);
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent

@@ -58,6 +58,12 @@
  *               map, and the same three numbers elsewhere are a different
  *               corner of a different building.
  *
+ *               And under "surfaces", what a PAINTED SURFACE gives off, keyed
+ *               by the texture the map's own geometry carries: lava, a glowing
+ *               rune, a lit sigil painted onto a wall. A grant there seeds a
+ *               light; it never changes how the surface itself is drawn, which
+ *               stays the map's own word and the engine's own colours.
+ *
  * A member named exactly `notes`, at any level, is documentation -- a piece of
  * text or a list of them -- and is never read as data.
  *
@@ -172,6 +178,33 @@ int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out);
  * once against the map's own objects rather than once per frame per light. */
 int hwr_look_light_at(int16_t world_x, int16_t world_y, int16_t world_z,
                       struct hwr_look_light *out);
+
+/* And the same for one SURFACE, keyed by the sixteen-bit logical texture id the
+ * map's own geometry carries for a face -- the id in a sector's ceiling and
+ * floor, in a wall's three bands and in a slab's two.
+ *
+ * A texture nobody named leaves `out` cleared. What a grant here does is SEED A
+ * LIGHT and nothing else: whether the face itself is drawn fullbright stays the
+ * map's own glow flag and the engine's own glow colours, so a grant adds a
+ * light to a room and never a second way of painting the thing that gives it. */
+int hwr_look_light_for_surface(uint16_t texture_id, struct hwr_look_light *out);
+
+/* The granted surfaces as a list, for the one caller that wants all of them
+ * rather than one: the seeding walks a whole map once looking for the faces
+ * that carry them, and asking that walk to name every texture in the game would
+ * be the wrong way round. */
+size_t hwr_look_surface_count(void);
+int hwr_look_surface_at(size_t index, uint16_t *texture_id,
+                        struct hwr_look_light *out);
+/* A number that moves when the granted surfaces do and at no other time.
+ *
+ * Which faces of a map carry a granted texture is a fact about the MAP, worked
+ * out once when it is staged rather than once a frame. This is what lets the
+ * one thing that could invalidate that answer without a map load -- somebody
+ * editing the file and asking for it to be read again -- be noticed with one
+ * integer compare instead of a walk. It is never zero, so zero is free to mean
+ * "nothing has been worked out yet". */
+uint32_t hwr_look_surface_generation(void);
 
 /* Whether the map's own objects are still to be offered to the table above.
  * Answers 0 once they have been -- and 0 on every map that has no entries to

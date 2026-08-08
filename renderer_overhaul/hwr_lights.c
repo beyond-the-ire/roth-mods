@@ -7,6 +7,7 @@
 #include "hwr_world.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -334,8 +335,16 @@ static const uint8_t *hwr_lights_hop_map(const struct hwr_world *world,
 
 struct hwr_light_retained {
     /* What names this light across frames. A torch does not move, so its own
-     * identity is where it is and what it is drawn with. */
-    uint16_t graphic_id;
+     * identity is where it is and what it is drawn with.
+     *
+     * WHICH CLASS SEEDED IT is part of that name and not decoration. A glow
+     * face has no graphic at all, and the number beside it is a texture rather
+     * than a graphic; without the class to tell the two apart, a torch and a
+     * granted patch of floor that happened to share a room, a number and a
+     * position would be one light to the fade and would trade a level between
+     * them. */
+    uint8_t source;             /* an enum hwr_light_class */
+    uint16_t source_id;         /* its graphic, or the texture it is painted with */
     uint16_t sector_index;
     int16_t world_x;
     int16_t world_y;
@@ -350,6 +359,64 @@ static struct hwr_light_retained g_retained[HWR_LIGHT_RETAIN_MAX];
 static size_t g_retained_count;
 static uint64_t g_last_ns;
 
+/* ------------------------------------------------------- the granted faces
+ *
+ * What a game config's `surfaces` table amounts to on one map: for each room
+ * and each granted texture painted anywhere in it, ONE light, at the centroid
+ * of that room's granted faces, pushed off each of them along the way it faces.
+ *
+ * It is worked out ONCE, when the map is staged. Which faces carry a granted
+ * texture is a fact about the map; a frame only has to ask which of the handful
+ * that leaves behind is in a room being drawn.
+ *
+ * The merge is stated rather than discovered. A lava lake is hundreds of faces
+ * sharing one texture, and one light per face would fill a sixteen-slot array
+ * with sixteen near-identical lights a foot apart and starve every torch in the
+ * room -- while looking, from the middle of the lake, exactly like one light. */
+
+/* How many surfaces one map may have granted at once. The look layer's own
+ * table is this size, so this is the whole of what it can hand over. */
+#define HWR_GLOW_GRANT_MAX 64u
+/* How many distinct granted textures ONE room may be found to carry. A room
+ * with more than this many different glowing surfaces in it is not a room. */
+#define HWR_GLOW_SECTOR_TEXTURES 16u
+/* And how many (room, texture) lights one map may leave behind. A cavern
+ * network whose every chamber holds lava reaches a few hundred, so this is
+ * generous rather than tight; past it the map says so once and keeps the rooms
+ * it found first, in the map's own order, which is stable. */
+#define HWR_GLOW_FACE_MAX 512u
+/* How far off its own surface a light is placed, in world units.
+ *
+ * Small on purpose: it exists so that a light is never inside the wall or under
+ * the floor it came from, not to move the light into the room. A candle-lit
+ * room spends one shade row every thirty-two world units, so this is half a row
+ * -- clear of the surface, and too little to carry a light through anything
+ * thicker than a pane. */
+#define HWR_GLOW_FACE_OFFSET 16
+
+struct hwr_glow_grant {
+    uint16_t texture_id;
+    struct hwr_look_light light;
+};
+
+struct hwr_glow_face {
+    uint16_t sector_index;
+    int16_t world_x;
+    int16_t world_y;
+    int16_t world_z;
+    uint8_t grant;              /* into g_glow_grants */
+};
+
+static struct hwr_glow_grant g_glow_grants[HWR_GLOW_GRANT_MAX];
+static size_t g_glow_grant_count;
+static struct hwr_glow_face g_glow_faces[HWR_GLOW_FACE_MAX];
+static size_t g_glow_face_count;
+/* Which set of granted surfaces the staged answer was worked out from. Nought
+ * means nothing has been worked out; the look layer's own generation is never
+ * nought, so the two can never be confused. */
+static uint32_t g_glow_face_generation;
+static unsigned long g_glow_face_walks;
+
 void hwr_lights_reset(void)
 {
     memset(g_retained, 0, sizeof g_retained);
@@ -358,13 +425,342 @@ void hwr_lights_reset(void)
     memset(g_color_cache, 0, sizeof g_color_cache);
     g_color_cache_count = 0;
     memset(&g_stats, 0, sizeof g_stats);
+    /* And the granted faces of the map that was loaded. A new map's sector 12
+     * is not the old map's sector 12, so an answer worked out over one map is
+     * not an answer about the other. The WALK COUNT is not forgotten: it is a
+     * count of something that happened, and a reset does not unhappen it. */
+    memset(g_glow_grants, 0, sizeof g_glow_grants);
+    g_glow_grant_count = 0;
+    memset(g_glow_faces, 0, sizeof g_glow_faces);
+    g_glow_face_count = 0;
+    g_glow_face_generation = 0;
+}
+
+unsigned long hwr_lights_glow_face_walks(void)
+{
+    return g_glow_face_walks;
+}
+
+/* Sixteen bits, the way the map is authored in them: a coordinate that runs off
+ * one end comes back on the other, so a difference across the wrap is a short
+ * one rather than a map-wide one. */
+static int16_t hwr_glow_wrap16(int32_t value)
+{
+    int32_t wrapped = value & 0xffff;
+
+    return (int16_t)(wrapped >= 0x8000 ? wrapped - 0x10000 : wrapped);
+}
+
+/* A height, held to the sixteen bits a light's position is kept in. Heights are
+ * NOT modular the way the map's own x and y are -- a ceiling near the top of the
+ * range pushed past it is at the top of the range, not at the bottom -- so this
+ * is a clamp and the one above is a wrap, and the difference is deliberate. */
+static int16_t hwr_glow_clamp16(int32_t value)
+{
+    if (value < -32768)
+        return -32768;
+    if (value > 32767)
+        return 32767;
+    return (int16_t)value;
+}
+
+/* Which grant a face's texture id is under, or -1 for none.
+ *
+ * The id is first held to the same rule the world's own texture census applies:
+ * a negative flat id is the engine's solid-colour sentinel rather than a
+ * picture, an id past the archives addresses nothing, and the world span colour
+ * key is the marker a portal's empty middle band carries. None of the three is
+ * a surface somebody can have painted lava onto. */
+static int hwr_glow_grant_of(const struct hwr_world *world,
+                             const struct hwr_glow_grant *grants,
+                             size_t grant_count, int32_t id)
+{
+    uint16_t texture_id;
+    size_t i;
+
+    if (id < 0 || id >= 0x1600)
+        return -1;
+    texture_id = (uint16_t)id;
+    if (texture_id == world->world_span_colorkey)
+        return -1;
+    for (i = 0; i < grant_count; i++) {
+        if (grants[i].texture_id == texture_id)
+            return (int)i;
+    }
+    return -1;
+}
+
+/* One room's running answer for one granted texture. The positions are summed
+ * RELATIVE TO THE FIRST ONE, in the sixteen bits the map is authored in, so a
+ * room that straddles the wrap has its centroid inside itself rather than on
+ * the far side of the world. */
+struct hwr_glow_accum {
+    int grant;
+    int16_t anchor_x;
+    int16_t anchor_y;
+    int32_t sum_x;
+    int32_t sum_y;
+    int32_t sum_z;
+    uint32_t count;
+};
+
+static void hwr_glow_accumulate(struct hwr_glow_accum *accum, size_t *used,
+                                int grant, int16_t x, int16_t y, int16_t z)
+{
+    struct hwr_glow_accum *slot;
+    size_t i;
+
+    for (i = 0; i < *used; i++) {
+        if (accum[i].grant != grant)
+            continue;
+        slot = &accum[i];
+        slot->sum_x += hwr_glow_wrap16((int32_t)x - slot->anchor_x);
+        slot->sum_y += hwr_glow_wrap16((int32_t)y - slot->anchor_y);
+        slot->sum_z += z;
+        slot->count++;
+        return;
+    }
+    if (*used >= HWR_GLOW_SECTOR_TEXTURES)
+        return;
+    slot = &accum[(*used)++];
+    slot->grant = grant;
+    slot->anchor_x = x;
+    slot->anchor_y = y;
+    slot->sum_x = 0;
+    slot->sum_y = 0;
+    slot->sum_z = z;
+    slot->count = 1;
+}
+
+/* The middle of a room's own footprint: the mean of the corners its wall loop
+ * runs through. It is what a flat's light stands over, because a floor has no
+ * one point that is more its centre than any other. */
+static int hwr_glow_sector_centroid(const struct hwr_world *world,
+                                    const struct hwr_sector *sector,
+                                    int16_t *out_x, int16_t *out_y)
+{
+    int16_t anchor_x = 0;
+    int16_t anchor_y = 0;
+    int32_t sum_x = 0;
+    int32_t sum_y = 0;
+    uint32_t counted = 0;
+    size_t w;
+
+    for (w = 0; w < sector->wall_count; w++) {
+        size_t wall_index = sector->first_wall + w;
+        const struct hwr_vertex *vertex;
+
+        if (wall_index >= world->wall_count)
+            break;
+        if (world->walls[wall_index].vertex_a_index >= world->vertex_count)
+            continue;
+        vertex = &world->vertices[world->walls[wall_index].vertex_a_index];
+        if (counted == 0u) {
+            anchor_x = vertex->world_x;
+            anchor_y = vertex->world_y;
+        }
+        sum_x += hwr_glow_wrap16((int32_t)vertex->world_x - anchor_x);
+        sum_y += hwr_glow_wrap16((int32_t)vertex->world_y - anchor_y);
+        counted++;
+    }
+    if (counted == 0u)
+        return 0;
+    *out_x = hwr_glow_wrap16(anchor_x + sum_x / (int32_t)counted);
+    *out_y = hwr_glow_wrap16(anchor_y + sum_y / (int32_t)counted);
+    return 1;
+}
+
+void hwr_lights_stage_glow_faces(const struct hwr_world *world)
+{
+    size_t surfaces = hwr_look_surface_count();
+    int said_full = 0;
+    size_t i;
+    size_t s;
+
+    g_glow_grant_count = 0;
+    g_glow_face_count = 0;
+    g_glow_face_generation = hwr_look_surface_generation();
+    if (world == NULL || !world->valid || surfaces == 0u)
+        return;
+    for (i = 0; i < surfaces && g_glow_grant_count < HWR_GLOW_GRANT_MAX; i++) {
+        uint16_t texture_id = 0;
+        struct hwr_look_light light;
+
+        if (!hwr_look_surface_at(i, &texture_id, &light))
+            continue;
+        /* Refused outright, exactly as a graphic is: whatever the map paints
+         * with it, this is not a light. */
+        if (light.off)
+            continue;
+        /* THE ONE FIELD A SURFACE CANNOT ANSWER FOR ITSELF, and the reason it
+         * is required rather than defaulted.
+         *
+         * A thing that gives light is drawn with a sprite, and a sprite is cut
+         * from its background: the mask says which texels are the thing, so the
+         * flame can be separated from the bracket it hangs on and its colour
+         * read off. A world texture has no mask -- every texel is the surface
+         * -- so the same average over lava returns the colour of the rock
+         * around it, and no weighting recovers the difference on a picture that
+         * is bright all over. Rather than give every granted surface in the
+         * game the one torch colour and say nothing, the file is asked for the
+         * colour and told when it did not give one. */
+        if (!light.has_color) {
+            fprintf(stderr, "[renderer_overhaul] the surface %#06x is granted "
+                            "a light with no colour; a surface has no colour "
+                            "of its own to read one from, so nothing is lit "
+                            "from it\n",
+                    (unsigned)texture_id);
+            continue;
+        }
+        g_glow_grants[g_glow_grant_count].texture_id = texture_id;
+        g_glow_grants[g_glow_grant_count].light = light;
+        g_glow_grant_count++;
+    }
+    if (g_glow_grant_count == 0u)
+        return;
+    /* Past this line a map is actually walked, and that is the whole of what
+     * this counter is for. */
+    g_glow_face_walks++;
+    for (s = 0; s < world->sector_count && s <= 0xffffu; s++) {
+        const struct hwr_sector *sector = &world->sectors[s];
+        struct hwr_glow_accum accum[HWR_GLOW_SECTOR_TEXTURES];
+        size_t used = 0;
+        int16_t centre_x = 0;
+        int16_t centre_y = 0;
+        int16_t mid_z;
+        int grant;
+        size_t w;
+
+        if (!hwr_glow_sector_centroid(world, sector, &centre_x, &centre_y))
+            continue;
+        mid_z = (int16_t)(((int32_t)sector->floor_z +
+                           (int32_t)sector->ceiling_z) / 2);
+        /* THE FLATS. A ceiling faces down into its room and a floor faces up
+         * into it, so each is pushed off along the only direction it has. */
+        grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
+                                  (int32_t)sector->ceiling_flat_id);
+        if (grant >= 0)
+            hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
+                                hwr_glow_clamp16((int32_t)sector->ceiling_z -
+                                                 HWR_GLOW_FACE_OFFSET));
+        grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
+                                  (int32_t)sector->floor_flat_id);
+        if (grant >= 0)
+            hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
+                                hwr_glow_clamp16((int32_t)sector->floor_z +
+                                                 HWR_GLOW_FACE_OFFSET));
+        /* AND THE SLAB, which is a block sharing the room's own footprint: its
+         * underside faces down and its top faces up, like the two above. */
+        if (sector->slab_index < world->slab_count) {
+            const struct hwr_slab *slab = &world->slabs[sector->slab_index];
+
+            grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
+                                      (int32_t)(int16_t)slab->lower_surface_id);
+            if (grant >= 0)
+                hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
+                                    hwr_glow_clamp16((int32_t)slab->lower_z -
+                                                     HWR_GLOW_FACE_OFFSET));
+            grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
+                                      (int32_t)(int16_t)slab->upper_surface_id);
+            if (grant >= 0)
+                hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
+                                    hwr_glow_clamp16((int32_t)slab->upper_z +
+                                                     HWR_GLOW_FACE_OFFSET));
+        }
+        /* THE WALLS, all three of a wall's bands, at the middle of its two
+         * corners and at the height between its room's floor and ceiling. */
+        for (w = 0; w < sector->wall_count; w++) {
+            size_t wall_index = sector->first_wall + w;
+            const struct hwr_wall *wall;
+            const struct hwr_vertex *a;
+            const struct hwr_vertex *b;
+            int32_t ids[3];
+            int32_t dx;
+            int32_t dy;
+            double length;
+            int16_t push_x;
+            int16_t push_y;
+            size_t k;
+            int any = 0;
+
+            if (wall_index >= world->wall_count)
+                break;
+            wall = &world->walls[wall_index];
+            ids[0] = (int32_t)(int16_t)wall->middle_id;
+            ids[1] = (int32_t)(int16_t)wall->upper_id;
+            ids[2] = (int32_t)(int16_t)wall->lower_id;
+            for (k = 0; k < 3u; k++)
+                any |= hwr_glow_grant_of(world, g_glow_grants,
+                                         g_glow_grant_count, ids[k]) >= 0;
+            if (!any)
+                continue;
+            if (wall->vertex_a_index >= world->vertex_count ||
+                wall->vertex_b_index >= world->vertex_count)
+                continue;
+            a = &world->vertices[wall->vertex_a_index];
+            b = &world->vertices[wall->vertex_b_index];
+            dx = hwr_glow_wrap16((int32_t)b->world_x - a->world_x);
+            dy = hwr_glow_wrap16((int32_t)b->world_y - a->world_y);
+            length = sqrt((double)dx * dx + (double)dy * dy);
+            if (!(length > 0.0))
+                continue;
+            /* OFF THE FACE, along the way it faces. Which of a segment's two
+             * perpendiculars that is comes from the ENGINE'S OWN visibility
+             * rule rather than from where anybody is standing: (dy, -dx)
+             * points at every eye allowed to see the face, which is the
+             * interior of the room that owns it. Taking the other one would
+             * put every wall light inside the wall. */
+            push_x = hwr_glow_wrap16(
+                (int32_t)a->world_x + dx / 2 +
+                (int32_t)lround((double)dy / length * HWR_GLOW_FACE_OFFSET));
+            push_y = hwr_glow_wrap16(
+                (int32_t)a->world_y + dy / 2 +
+                (int32_t)lround((double)-dx / length * HWR_GLOW_FACE_OFFSET));
+            for (k = 0; k < 3u; k++) {
+                grant = hwr_glow_grant_of(world, g_glow_grants,
+                                          g_glow_grant_count, ids[k]);
+                if (grant >= 0)
+                    hwr_glow_accumulate(accum, &used, grant, push_x, push_y,
+                                        mid_z);
+            }
+        }
+        /* ONE LIGHT PER (ROOM, TEXTURE), at the mean of what was found. */
+        for (i = 0; i < used; i++) {
+            struct hwr_glow_face *face;
+
+            if (g_glow_face_count >= HWR_GLOW_FACE_MAX) {
+                if (!said_full) {
+                    said_full = 1;
+                    fprintf(stderr, "[renderer_overhaul] this map has more "
+                                    "rooms with a granted surface in them than "
+                                    "%u; the rest are not lit from\n",
+                            (unsigned)HWR_GLOW_FACE_MAX);
+                }
+                break;
+            }
+            face = &g_glow_faces[g_glow_face_count++];
+            face->sector_index = (uint16_t)s;
+            face->world_x = hwr_glow_wrap16(
+                accum[i].anchor_x + accum[i].sum_x / (int32_t)accum[i].count);
+            face->world_y = hwr_glow_wrap16(
+                accum[i].anchor_y + accum[i].sum_y / (int32_t)accum[i].count);
+            face->world_z = (int16_t)(accum[i].sum_z / (int32_t)accum[i].count);
+            face->grant = (uint8_t)accum[i].grant;
+        }
+        /* Full is full: the rooms found first are kept, in the map's own order,
+         * and the rest of the map is not walked for rooms there is no room
+         * for. */
+        if (said_full)
+            break;
+    }
 }
 
 /* ------------------------------------------------------------ the candidates */
 
 struct hwr_light_candidate {
     struct hwr_gl_point_light light;
-    uint16_t graphic_id;
+    uint8_t source;
+    uint16_t source_id;
     uint16_t sector_index;
     int16_t world_x;
     int16_t world_y;
@@ -442,7 +838,8 @@ static struct hwr_light_retained *hwr_light_find_retained(
     for (i = 0; i < g_retained_count; i++) {
         struct hwr_light_retained *held = &g_retained[i];
 
-        if (held->used && held->graphic_id == candidate->graphic_id &&
+        if (held->used && held->source == candidate->source &&
+            held->source_id == candidate->source_id &&
             held->sector_index == candidate->sector_index &&
             held->world_x == candidate->world_x &&
             held->world_y == candidate->world_y &&
@@ -518,7 +915,8 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
         return 0;
     }
     memset(out, 0, sizeof *out);
-    out->graphic_id = object->graphic_id;
+    out->source = (uint8_t)HWR_LIGHT_CLASS_OBJECT;
+    out->source_id = object->graphic_id;
     out->sector_index = object->sector_index;
     out->world_x = object->world_x;
     out->world_y = object->world_y;
@@ -602,6 +1000,52 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
 
 /* ------------------------------------------------------------- the enumerator */
 
+/* CONTAINMENT: the hop cap, worked out once for the frame rather than per
+ * candidate -- AND ONLY WHERE THERE IS NO DRAWN SET TO CONTAIN BY.
+ *
+ * Which room a light is in is a fact about the map. Which room the eye is in
+ * is a fact about where somebody is standing, and it changes every time they
+ * take a step. So the two are not the same kind of rule: the drawn set says
+ * whether a light's room is ON THE SCREEN, and a light whose room is on the
+ * screen has to be lighting it. Counting doorways from the eye instead
+ * DELETES that light -- while its room is still in view -- and what that
+ * looks like is a pool on a wall going out as you walk away from it. A light
+ * that follows the player is not a containment; it is a different bug.
+ *
+ * The doorway count is therefore the containment of LAST RESORT. Where the
+ * engine's own walk gave an answer, that answer is the containment and this
+ * one stands down. Where it did not -- the visibility pass switched off, or
+ * a draw list that could not be read -- every room is a room that might be
+ * on the screen, and then the eye's own room is the only thing left to count
+ * from. A camera whose room the engine has not named leaves even that
+ * unenforced: refusing every light because one word was not read would be a
+ * blackout, not a containment.
+ *
+ * Rooting the walk at the light rather than at the eye is NOT the fix and is
+ * worth saying so once: the portal graph is walked both ways, so the count
+ * between two rooms is the same number whichever end it starts from. What
+ * had to change is what that number is allowed to decide.
+ *
+ * A cull set that does not answer for every room of the map is not a drawn
+ * set either: the per-candidate gate lets a room past the end of it through, so
+ * standing the last resort down on one would leave those rooms with no
+ * containment at all. Named here rather than assumed.
+ *
+ * Written once for every class, because a containment that meant one thing for
+ * a torch and another for a lit floor would not be a containment. */
+static const uint8_t *hwr_lights_hop_containment(
+    const struct hwr_lights_frame *frame)
+{
+    const uint8_t *hop = NULL;
+
+    if (frame->camera_sector >= 0 &&
+        !(frame->pvs_valid && frame->visible != NULL &&
+          frame->visible_count >= frame->world->sector_count))
+        hop = hwr_lights_hop_map(frame->world, frame->camera_sector,
+                                 g_settings.hops);
+    return hop;
+}
+
 static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
                                       struct hwr_light_candidate *candidates,
                                       size_t max)
@@ -634,46 +1078,127 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
         }
         hwr_look_objects_settled();
     }
-    /* CONTAINMENT: the hop cap, worked out once for the frame rather than per
-     * candidate -- AND ONLY WHERE THERE IS NO DRAWN SET TO CONTAIN BY.
-     *
-     * Which room a light is in is a fact about the map. Which room the eye is in
-     * is a fact about where somebody is standing, and it changes every time they
-     * take a step. So the two are not the same kind of rule: the drawn set says
-     * whether a light's room is ON THE SCREEN, and a light whose room is on the
-     * screen has to be lighting it. Counting doorways from the eye instead
-     * DELETES that light -- while its room is still in view -- and what that
-     * looks like is a pool on a wall going out as you walk away from it. A light
-     * that follows the player is not a containment; it is a different bug.
-     *
-     * The doorway count is therefore the containment of LAST RESORT. Where the
-     * engine's own walk gave an answer, that answer is the containment and this
-     * one stands down. Where it did not -- the visibility pass switched off, or
-     * a draw list that could not be read -- every room is a room that might be
-     * on the screen, and then the eye's own room is the only thing left to count
-     * from. A camera whose room the engine has not named leaves even that
-     * unenforced: refusing every light because one word was not read would be a
-     * blackout, not a containment.
-     *
-     * Rooting the walk at the light rather than at the eye is NOT the fix and is
-     * worth saying so once: the portal graph is walked both ways, so the count
-     * between two rooms is the same number whichever end it starts from. What
-     * had to change is what that number is allowed to decide.
-     *
-     * A cull set that does not answer for every room of the map is not a drawn
-     * set either: the gate above lets a room past the end of it through, so
-     * standing the last resort down on one would leave those rooms with no
-     * containment at all. Named here rather than assumed. */
-    if (frame->camera_sector >= 0 &&
-        !(frame->pvs_valid && frame->visible != NULL &&
-          frame->visible_count >= frame->world->sector_count))
-        hop = hwr_lights_hop_map(frame->world, frame->camera_sector,
-                                 g_settings.hops);
+    hop = hwr_lights_hop_containment(frame);
     for (i = 0; i < frame->objects->count && count < max; i++) {
         const struct hwr_object *object = &frame->objects->items[i];
         struct hwr_light_candidate candidate;
 
         if (!hwr_light_from_object(frame, object, &candidate))
+            continue;
+        if (hop != NULL && hop[candidate.sector_index] == 0xffu) {
+            g_stats.too_far++;
+            continue;
+        }
+        candidates[count++] = candidate;
+    }
+    return count;
+}
+
+/* One granted face-set into one light. Everything the map, the rows and the
+ * game config have to say about it is already spent: what is left is where it
+ * stands, what it is worth, and the containments.
+ *
+ * WHAT THIS DOES NOT DO, and the ruling behind it: nothing here changes how the
+ * granted surface is DRAWN. Whether a face renders fullbright stays the map's
+ * own glow flag and the engine's own glow colours, exactly as it was before
+ * anybody wrote a grant. A grant adds a light to a room; it is not a second way
+ * of painting the thing that gives it, and inventing one would put the
+ * authentic picture at risk for nothing. */
+static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
+                                    const struct hwr_glow_face *face,
+                                    struct hwr_light_candidate *out)
+{
+    const struct hwr_world *world = frame->world;
+    const struct hwr_glow_grant *grant;
+    const struct hwr_sector *sector;
+    float glow_intensity = 1.0f;
+    float glow_range = 1.0f;
+
+    if (face->sector_index >= world->sector_count ||
+        face->grant >= g_glow_grant_count)
+        return 0;
+    grant = &g_glow_grants[face->grant];
+    sector = &world->sectors[face->sector_index];
+    /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
+     * is a light in a room that cannot be seen from here. */
+    if (frame->pvs_valid && frame->visible != NULL &&
+        face->sector_index < frame->visible_count &&
+        !frame->visible[face->sector_index]) {
+        g_stats.unseen++;
+        return 0;
+    }
+    memset(out, 0, sizeof *out);
+    out->source = (uint8_t)HWR_LIGHT_CLASS_GLOW_FACE;
+    out->source_id = grant->texture_id;
+    out->sector_index = face->sector_index;
+    out->world_x = face->world_x;
+    out->world_y = face->world_y;
+    out->world_z = face->world_z;
+    out->light.world_x = (float)face->world_x;
+    out->light.world_y = (float)face->world_y;
+    out->light.world_z = (float)face->world_z;
+    /* The map's own candle word, through exactly the recipe every other light
+     * takes it through -- named rather than copied, so the two cannot drift. */
+    hwr_gl_glow_factors(frame->candle_glow, g_settings.glow_scale,
+                        &glow_intensity, &glow_range);
+    out->light.intensity = g_settings.intensity * glow_intensity;
+    out->light.range = g_settings.range * glow_range;
+    /* The colour is the file's, always: a grant without one is refused where
+     * the map is staged, so by here there is one. */
+    out->light.color[0] = (float)((grant->light.color >> 16) & 0xffu) / 255.0f;
+    out->light.color[1] = (float)((grant->light.color >> 8) & 0xffu) / 255.0f;
+    out->light.color[2] = (float)(grant->light.color & 0xffu) / 255.0f;
+    if (grant->light.has_intensity)
+        out->light.intensity = grant->light.intensity;
+    if (grant->light.has_range)
+        out->light.range = grant->light.range;
+    /* CONTAINMENT: the world-Z window, its own room's floor and ceiling with
+     * slack either side. Ordered here so a map with a ceiling under its floor
+     * cannot invert it. */
+    {
+        float low = (float)sector->floor_z;
+        float high = (float)sector->ceiling_z;
+
+        if (low > high) {
+            float swap = low;
+
+            low = high;
+            high = swap;
+        }
+        out->light.z_lo = low - g_settings.z_slack;
+        out->light.z_hi = high + g_settings.z_slack;
+    }
+    /* CONTAINMENT: the reach. */
+    if (!(out->light.range > 0.0f))
+        return 0;
+    if (!(out->light.intensity > 0.0f))
+        return 0;
+    return 1;
+}
+
+static size_t hwr_lights_seed_glow_faces(const struct hwr_lights_frame *frame,
+                                         struct hwr_light_candidate *candidates,
+                                         size_t max)
+{
+    const uint8_t *hop;
+    size_t count = 0;
+    size_t i;
+
+    /* WHERE THE GRANTED FACES ARE IS NOT ASKED HERE. It was worked out when the
+     * map was staged, and this is the one comparison that says so: the only
+     * thing that can move the answer without a map load is somebody editing the
+     * game config and asking for it to be read again, and that moves the look
+     * layer's own generation. A frame in which nothing has changed does not
+     * walk a wall. */
+    if (g_glow_face_generation != hwr_look_surface_generation())
+        hwr_lights_stage_glow_faces(frame->world);
+    if (g_glow_face_count == 0u)
+        return 0;
+    hop = hwr_lights_hop_containment(frame);
+    for (i = 0; i < g_glow_face_count && count < max; i++) {
+        struct hwr_light_candidate candidate;
+
+        if (!hwr_light_from_glow_face(frame, &g_glow_faces[i], &candidate))
             continue;
         if (hop != NULL && hop[candidate.sector_index] == 0xffu) {
             g_stats.too_far++;
@@ -730,7 +1255,12 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
                 HWR_LIGHT_CANDIDATE_MAX - candidate_count);
             break;
         case HWR_LIGHT_CLASS_GLOW_FACE:
-            /* Seeded from the emissive faces of a sector, at their centroid. */
+            /* Seeded from the faces a game config grants a light, one per room
+             * per texture, at the centroid of that room's own granted faces --
+             * a set worked out when the map was staged rather than now. */
+            candidate_count += hwr_lights_seed_glow_faces(
+                frame, candidates + candidate_count,
+                HWR_LIGHT_CANDIDATE_MAX - candidate_count);
             break;
         case HWR_LIGHT_CLASS_MUZZLE:
             /* One frame at the player, when the weapon fires. */
@@ -823,7 +1353,8 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
             continue;                       /* out, and no longer held */
         memset(held, 0, sizeof *held);
         held->used = 1;
-        held->graphic_id = candidate->graphic_id;
+        held->source = candidate->source;
+        held->source_id = candidate->source_id;
         held->sector_index = candidate->sector_index;
         held->world_x = candidate->world_x;
         held->world_y = candidate->world_y;

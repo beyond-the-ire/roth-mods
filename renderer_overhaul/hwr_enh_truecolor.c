@@ -81,6 +81,7 @@
  * effective value is known, map override and live preview included. */
 #define HWR_POINT_ROW "point_light"
 #define HWR_POINT_OBJECTS_ROW "point_light_objects"
+#define HWR_POINT_GLOW_FACES_ROW "point_light_glow_faces"
 #define HWR_POINT_MAX_ROW "point_light_max"
 #define HWR_POINT_INTENSITY_ROW "point_light_intensity"
 #define HWR_POINT_RANGE_ROW "point_light_range"
@@ -512,6 +513,15 @@ static void hwr_truecolor_points(const struct hwr_settings *settings,
         hwr_truecolor_row_bool(HWR_POINT_ROW, settings, 1) &&
         hwr_truecolor_row_bool(HWR_POINT_OBJECTS_ROW, settings, 1))
         points.classes |= 1u << HWR_LIGHT_CLASS_OBJECT;
+    /* The second source, asked the same way and behind the same family switch:
+     * the faces a game config grants a light. The candidate set behind it is a
+     * fact about the map and is worked out when the map is staged, so a class
+     * nobody asked for costs the frame one comparison here and nothing at
+     * all in the seeding. */
+    if (mode == HWR_GL_SHADING_MODERN &&
+        hwr_truecolor_row_bool(HWR_POINT_ROW, settings, 1) &&
+        hwr_truecolor_row_bool(HWR_POINT_GLOW_FACES_ROW, settings, 1))
+        points.classes |= 1u << HWR_LIGHT_CLASS_GLOW_FACE;
     points.max = hwr_truecolor_row_u32(HWR_POINT_MAX_ROW, settings, 8u);
     points.intensity = hwr_truecolor_row_float(HWR_POINT_INTENSITY_ROW,
                                                settings, 1.0f);

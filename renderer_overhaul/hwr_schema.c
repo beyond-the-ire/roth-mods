@@ -1768,6 +1768,27 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "setting above on with nothing seeding it."
     },
     {
+        .key = "point_light_glow_faces",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_glow_faces),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .b = 1 },
+        .original = { .b = 1 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Light from glowing surfaces",
+        .help = "The other place those lights come from: the surfaces a game "
+                "config says give light, such as lava. Nothing glows until a "
+                "game config names it, so on an undescribed game this costs "
+                "nothing either way."
+    },
+    {
         .key = "point_light_max",
         .type = HWR_VT_U32,
         .category = HWR_CAT_ENHANCEMENTS,

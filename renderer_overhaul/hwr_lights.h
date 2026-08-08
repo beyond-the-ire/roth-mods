@@ -115,10 +115,38 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
                         struct hwr_gl_point_light *out, size_t max);
 
 /* Forgets what stood last frame: the retained set that the fade and the
- * hysteresis are kept in, and the colours read off sprites. Called where a map
- * is staged -- a new map's sector 12 is not the old map's sector 12, and its
- * archives are not the old map's archives either. */
+ * hysteresis are kept in, the colours read off sprites, and the granted faces
+ * of the map that was loaded. Called where a map is staged -- a new map's
+ * sector 12 is not the old map's sector 12, and its archives are not the old
+ * map's archives either. */
 void hwr_lights_reset(void);
+
+/* Works out, for the map now staged, where the faces a game config grants a
+ * light actually are.
+ *
+ * THIS IS A FACT ABOUT THE MAP, and it is taken ONCE, here, rather than on
+ * every frame: which faces carry a granted texture and where the centroid of
+ * each room's worth of them lies does not change because somebody took a step.
+ * Walking every wall, flat and slab of a map sixty times a second to find out
+ * again would be the whole cost of the feature, and there would be nothing to
+ * show for it. What a frame does instead is the containment test over the small
+ * set this leaves behind.
+ *
+ * ONE LIGHT PER ROOM PER TEXTURE, at the centroid of that room's granted faces
+ * and pushed off each face along its own normal. A lava lake is hundreds of
+ * faces sharing one texture; one light each would fill a sixteen-slot array
+ * with near-identical lights and starve every torch in the room.
+ *
+ * Called with the world a map load has just snapshotted. A map with nothing
+ * granted -- which is every map until somebody describes one -- costs no walk
+ * at all. */
+void hwr_lights_stage_glow_faces(const struct hwr_world *world);
+
+/* How many times that walk has been taken.
+ *
+ * A claim that a frame does not walk a map looking for granted faces is a claim
+ * about something that did NOT happen, and only a counter can state one. */
+unsigned long hwr_lights_glow_face_walks(void);
 
 /* The colour one decoded sprite frame throws, through a map's own palette:
  * the average of its texels weighted by the square of the engine's own
