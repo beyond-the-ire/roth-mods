@@ -42,33 +42,42 @@
  *               row. There is no key table here: adding one is adding one flag
  *               to one row, and the two can never drift apart.
  *
- *   "lights"    what particular THINGS give off, under "graphics", keyed by
- *               the graphic the map draws them with. A settings row is one
- *               value for a whole map; this says a brazier is brighter than a
- *               candle, and that one fullbright decal is not a light at all.
- *               Each field is separately present or absent, so a map may raise
- *               a strength without restating a colour.
+ *   "lights"    five tables, and every number in every one of them is DECIMAL
+ *               and is the number the community ROTH Editor prints for the
+ *               same thing:
  *
- *               And under "objects", ONE PLACED OBJECT of the map rather than a
- *               kind of them -- or a group of them -- addressed the way the
- *               community ROTH Editor addresses it: by the object number it
- *               shows as "Object: N", or by the tag it shows as "ID:". That is
- *               the most specific statement anybody can make about a light, so
- *               it is the last word: the hearth in one room burns hotter than
- *               every other brazier of its kind. Objects are described under a
- *               map and never under "everywhere" -- an object's number is a
- *               number in ONE map's own list.
+ *               "sprites"  a BLANKET over every object drawn with one sprite,
+ *                          keyed by the texture and source pair the editor's
+ *                          object panel shows -- "34/0" is that panel's
+ *                          Texture Index 34, Texture Source 0.
  *
- *               And under "placed", a light tied to NO object: three numbers
- *               somebody chose, because the map has nothing standing there to
- *               tune. It states its own colour, because there is nothing to
- *               read one off. Under a map only, for the same reason as above.
+ *               "textures" a BLANKET over every wall band and every floor and
+ *                          ceiling painted with one texture, keyed by that
+ *                          texture's own number: lava, a glowing rune, a lit
+ *                          sigil. Written game-wide as readily as under a map,
+ *                          because a texture is the same texture wherever it
+ *                          is painted.
  *
- *               And under "surfaces", what a PAINTED SURFACE gives off, keyed
- *               by the texture the map's own geometry carries: lava, a glowing
- *               rune, a lit sigil painted onto a wall. A grant there seeds a
- *               light; it never changes how the surface itself is drawn, which
- *               stays the map's own word and the engine's own colours.
+ *               "objects"  ONE object of one map, or one tagged GROUP of them,
+ *                          by the `Object: N` number or the `ID:` tag.
+ *
+ *               "faces"    ONE face of one map, or one tagged group of them,
+ *                          by the `Face: N` number or the `Face ID` tag.
+ *
+ *               "placed"   a light tied to NO object at all: three numbers
+ *                          somebody chose, in the GAME'S own coordinates --
+ *                          the ones HWR_OBJ_DUMP prints.
+ *
+ *               The last three are written under a map and never under
+ *               `everywhere`: a number in one map's own list, and three
+ *               numbers inside one building, name nothing anywhere else.
+ *
+ *               A GRANT CREATES A LIGHT. A thing the map itself marks unshaded
+ *               is a light already and a grant tunes it; a thing the map does
+ *               NOT mark is made one by a grant that also gives a `colour`,
+ *               because an unlit sprite has no honest colour to read a light's
+ *               off. A grant with no colour over an unmarked thing says so and
+ *               lights nothing.
  *
  * A member named exactly `notes`, at any level, is documentation -- a piece of
  * text or a list of them -- and is never read as data.
@@ -115,7 +124,12 @@ void hwr_look_load(const char *plugin_dir);
 /* Notices the picker moving in the settings pump, which is where the layer
  * asks for the newly chosen file. Deliberately not an apply hook: the look's
  * overrides are in force before the hooks that consume them run, and
- * publishing from inside one would invert that order. */
+ * publishing from inside one would invert that order.
+ *
+ * THE FILE IS READ FROM DISK EVERY TIME the selection moves, including a move
+ * away from a file and straight back to it. The model in memory is what was
+ * read last time, and a person who has just edited a file and reached for the
+ * picker is asking for what is on disk now. */
 void hwr_look_follow_selection(void);
 /* Asks for the folder to be listed again and the chosen file read again at the
  * next safe point. */
@@ -145,15 +159,14 @@ int hwr_look_override_count(void);
  * fault in the mod. */
 const char *hwr_look_current_map(void);
 
-/* What the game config says about one object graphic's own light.
+/* What the game config says about one light.
  *
  * Every field is separately present or absent, because a field the file says
  * nothing about is simply left out and because the two scopes compose FIELD BY
  * FIELD: a map may make its torches brighter without restating the colour the
  * game-wide answer already gave them. `off` is the whole entry rather than a
- * field: a thing the map marks unshaded that is plainly not a light -- a
- * glowing decal, a bright pickup -- is refused outright, and nothing else in
- * the entry is read. */
+ * field: a thing that is plainly not a light -- a glowing decal, a bright
+ * pickup -- is refused outright, and nothing else in the entry is read. */
 struct hwr_look_light {
     int off;
     int has_intensity;
@@ -164,47 +177,109 @@ struct hwr_look_light {
     uint32_t color;
 };
 
-/* Fills `out` from the entry in force for this graphic and returns nonzero
- * when there is one. A graphic nobody named leaves `out` cleared, which is
- * every field absent -- the settings rows answer for it whole. */
-int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out);
+/* One grant laid over another, FIELD by field, with `off` left to the caller
+ * because `off` belongs to the most specific table naming a thing rather than
+ * to the composition. Written once so that no two families can grow a
+ * composition rule of their own. */
+void hwr_look_light_over(struct hwr_look_light *into,
+                         const struct hwr_look_light *from);
 
-/* The same for ONE PLACED OBJECT of the map, addressed the way the community
- * ROTH Editor addresses it -- because a person tuning a map has that editor open
- * beside the file, and a file written against numbers nobody can look up is a
- * file nobody can write.
+/* THE SPRITE BLANKET: what every object drawn with one sprite gives off,
+ * keyed here by the sixteen-bit graphic the map's own record carries, which is
+ * the editor's texture index in its low byte and its texture source in its
+ * high byte. The file writes the pair; this takes the number the record does.
  *
- * Two spellings, in the order they rank:
+ * A sprite nobody named leaves `out` cleared, which is every field absent --
+ * the settings rows answer for it whole. */
+int hwr_look_light_for_sprite(uint16_t graphic_id, struct hwr_look_light *out);
+
+/* EVERYTHING THE FILE SAYS ABOUT ONE OBJECT OF THE MAP, the three tables that
+ * can name it composed least specific first:
  *
- *   ITS OBJECT NUMBER -- the map-wide index over the per-sector object lists
- *   flattened in sector order, which the editor shows as `Object: N`. It names
- *   exactly one thing, so it is the most specific statement anybody can make and
- *   it is the last word.
+ *   its SPRITE -- every object of that kind, everywhere;
+ *   its ID TAG -- the group a creator gathered by hand, which the editor shows
+ *   as `ID:` and which is deliberately shared;
+ *   its OBJECT NUMBER -- the `Object: N` of the editor, which names exactly one
+ *   thing and is therefore the last word.
  *
- *   ITS ID TAG -- the record's own +0x0e word, which the editor shows as `ID:`.
- *   A creator types it to gather objects into a group for the command system, so
- *   it is deliberately SHARED: an entry keyed by it answers for EVERY object
- *   carrying it, which is what lets the torches of one corridor be tuned in one
- *   line. Nought is not an address -- it is the untagged default -- and is
- *   refused where the file is read.
+ * Composed FIELD by field, so a hearth may be made stronger than the group it
+ * is tagged with without restating the colour its kind already carries; `off`
+ * is taken whole from the MOST SPECIFIC table naming it, so one object of a
+ * refused kind may be made a light again.
  *
- * A number nobody named leaves `out` cleared. Whether the entry AGREES with what
- * is there is not asked here: the graphic written beside a number is a check on
- * the entry rather than part of its key, and the checking is done once against
- * the map's own objects rather than once per frame per light. */
-int hwr_look_light_for_object(uint32_t map_index, struct hwr_look_light *out);
-int hwr_look_light_for_object_id(uint16_t object_id,
-                                 struct hwr_look_light *out);
+ * Returns 0 where nothing names it at all, leaving `out` cleared. */
+int hwr_look_object_grant(uint32_t map_index, uint16_t object_id,
+                          uint16_t graphic_id, struct hwr_look_light *out);
+
+/* THE TEXTURE BLANKET, keyed by the sixteen-bit texture number the map's own
+ * geometry carries -- in a sector's ceiling and floor, in a wall's three bands
+ * and in a slab's two. Every face and every flat painted with it emits.
+ *
+ * What a grant here does is SEED A LIGHT and nothing else: whether the surface
+ * itself is drawn fullbright stays the map's own glow flag and the engine's own
+ * glow colours, so a grant adds a light to a room and never a second way of
+ * painting the thing that gives it. */
+int hwr_look_light_for_texture(uint16_t texture_id, struct hwr_look_light *out);
+
+/* The granted textures as a list, for the one caller that wants all of them
+ * rather than one: the seeding walks a whole map once looking for the faces and
+ * flats that carry them, and asking that walk to name every texture in the game
+ * would be the wrong way round.
+ *
+ * `map_scoped` is whether the MAP's own section said any of this, which is what
+ * decides whether a texture no face on this map carries is worth a word: a
+ * game-wide entry is written once for every map in the game and is silent on
+ * the ones that do not use it, and an entry written under a map names a texture
+ * its author believed was there. */
+size_t hwr_look_texture_count(void);
+int hwr_look_texture_at(size_t index, uint16_t *texture_id, int *map_scoped,
+                        struct hwr_look_light *out);
+
+/* THE NAMED FACES of one map: the editor's `Face: N`, which is the position of
+ * the face record in the map's own flat face array, and the editor's read-only
+ * `Face ID`, which is the tag a mapping record carries and which several faces
+ * may share -- exactly the pair the objects table offers, for exactly the same
+ * reasons.
+ *
+ * Composed the same way and in the same order: whatever the texture blanket
+ * says about the texture that face is painted with, then the tag, then the
+ * number. `off` comes whole from the most specific of the two named here, and
+ * the caller lays the blanket under what this returns.
+ *
+ * Returns 0 where neither names it, leaving `out` cleared. */
+size_t hwr_look_face_count(void);
+int hwr_look_face_at(size_t index, int *by_id, uint32_t *key,
+                     struct hwr_look_light *out);
+int hwr_look_face_grant(uint32_t face_index, uint16_t face_tag,
+                        struct hwr_look_light *out);
+
+/* A number that moves when anything a map's own geometry is lit FROM does --
+ * the granted textures, the named faces -- and at no other time.
+ *
+ * Which faces of a map carry a granted texture, and which of them somebody
+ * named, are facts about the MAP, worked out once when it is staged rather than
+ * once a frame. This is what lets the one thing that could invalidate that
+ * answer without a map load -- somebody editing the file and asking for it to
+ * be read again -- be noticed with one integer compare instead of a walk. It is
+ * never zero, so zero is free to mean "nothing has been worked out yet". */
+uint32_t hwr_look_glow_generation(void);
 
 /* And the FREE-STANDING lights: the ones tied to no object at all, hung at three
  * numbers somebody chose because the map has nothing standing there to tune.
  *
  * A list rather than a lookup, because nothing in the world asks for one -- the
- * seeding walks them exactly as it walks the granted surfaces, and for the same
+ * seeding walks them exactly as it walks the granted textures, and for the same
  * reason: which room each hangs in is a fact about the map, worked out once when
  * it is staged.
  *
- * The colour is REQUIRED, for the same reason a granted surface's is: there is
+ * The three numbers are THE GAME'S OWN, X included: the same space the map file
+ * is written in and the same space HWR_OBJ_DUMP prints, with nothing flipped or
+ * reinterpreted on the way in. The community editor DISPLAYS X with the
+ * opposite sign, so a number copied off its position box has to be flipped
+ * before it is written -- but which of the two a number came from is not
+ * something this layer can know, so it is not something it guesses at.
+ *
+ * The colour is REQUIRED, for the same reason a granted texture's is: there is
  * nothing to derive one from. A torch has a sprite a colour can be read off; a
  * light hanging in the air has no sprite, no object and no map mark, so a
  * default here would be the mod choosing a colour and calling it the author's.
@@ -217,53 +292,31 @@ int hwr_look_placed_at(size_t index, int16_t *world_x, int16_t *world_y,
  * nought, so nought is free to mean nothing has been worked out yet. */
 uint32_t hwr_look_placed_generation(void);
 
-/* And the same for one SURFACE, keyed by the sixteen-bit logical texture id the
- * map's own geometry carries for a face -- the id in a sector's ceiling and
- * floor, in a wall's three bands and in a slab's two.
- *
- * A texture nobody named leaves `out` cleared. What a grant here does is SEED A
- * LIGHT and nothing else: whether the face itself is drawn fullbright stays the
- * map's own glow flag and the engine's own glow colours, so a grant adds a
- * light to a room and never a second way of painting the thing that gives it. */
-int hwr_look_light_for_surface(uint16_t texture_id, struct hwr_look_light *out);
-
-/* The granted surfaces as a list, for the one caller that wants all of them
- * rather than one: the seeding walks a whole map once looking for the faces
- * that carry them, and asking that walk to name every texture in the game would
- * be the wrong way round. */
-size_t hwr_look_surface_count(void);
-int hwr_look_surface_at(size_t index, uint16_t *texture_id,
-                        struct hwr_look_light *out);
-/* A number that moves when the granted surfaces do and at no other time.
- *
- * Which faces of a map carry a granted texture is a fact about the MAP, worked
- * out once when it is staged rather than once a frame. This is what lets the
- * one thing that could invalidate that answer without a map load -- somebody
- * editing the file and asking for it to be read again -- be noticed with one
- * integer compare instead of a walk. It is never zero, so zero is free to mean
- * "nothing has been worked out yet". */
-uint32_t hwr_look_surface_generation(void);
-
 /* Whether the map's own objects are still to be offered to the object table.
- * Answers 0 once they have been -- and 0 on every map that has no entries to
- * check, which is what keeps this off the frame's own cost. */
+ * Answers 0 once they have been -- and 0 on every map that has nothing to check,
+ * which is what keeps this off the frame's own cost. */
 int hwr_look_objects_pending(void);
-/* One of the map's own objects, by its number, its id tag and the graphic it is
- * drawn with. EVERY object is offered, not only the ones that become lights: an
- * object refused as not a light is still an object standing there, and an entry
- * addressing one must not be reported as addressing nothing.
+/* One of the map's own objects: its number, its id tag, the sprite it is drawn
+ * with, and whether the MAP ITSELF marks it as giving light. EVERY object is
+ * offered, not only the ones that become lights: an object refused as not a
+ * light is still an object standing there, and an entry addressing one must not
+ * be reported as addressing nothing.
  *
- * This is where an entry keyed by an object NUMBER is checked against the
- * graphic written beside it, and says so where the two disagree -- the entry
- * being applied anyway. An entry keyed by an id TAG is checked when the walk
- * settles instead, because the question for a group is whether ANY of its
- * members is drawn with that graphic, and no single object answers that. */
+ * `marked` is what turns silence into a sentence. An entry naming a thing the
+ * map does not mark can still make it a light -- but only with a colour, since
+ * an unlit sprite has none to read -- so an entry naming one and giving no
+ * colour is an entry that will never do anything, and it says so here. */
 void hwr_look_object_seen(uint32_t map_index, uint16_t object_id,
-                          uint16_t graphic_id);
-/* The map holds nothing else. Every entry nothing answered to says so, once per
- * entry per map, so a mistyped number is visible rather than silent -- and every
- * id tag whose whole group is drawn with something else says so too. */
-void hwr_look_objects_settled(void);
+                          uint16_t graphic_id, int marked);
+/* One of the map's own records that is numbered and never drawn. Offered
+ * separately because "this map has no object 70" and "object 70 is hidden" are
+ * different sentences and a person who typed 70 needs the true one. */
+void hwr_look_object_hidden(uint32_t map_index);
+/* The map holds nothing else, and it numbers `numbered` records in all. Every
+ * entry nothing answered to says so, once per entry per map, so a mistyped
+ * number is visible rather than silent -- and a number past the end of the
+ * map's own list is told that it is past the end rather than merely missed. */
+void hwr_look_objects_settled(uint32_t numbered);
 
 void hwr_look_clear(void);
 

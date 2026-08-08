@@ -385,6 +385,9 @@ static uint64_t g_last_ns;
  * generous rather than tight; past it the map says so once and keeps the rooms
  * it found first, in the map's own order, which is stable. */
 #define HWR_GLOW_FACE_MAX 512u
+/* And how many faces one map may NAME. The look layer's own table is this size,
+ * so this is the whole of what it can hand over. */
+#define HWR_GLOW_NAMED_MAX 64u
 /* How far off its own surface a light is placed, in world units.
  *
  * Small on purpose: it exists so that a light is never inside the wall or under
@@ -396,15 +399,36 @@ static uint64_t g_last_ns;
 
 struct hwr_glow_grant {
     uint16_t texture_id;
+    /* Whether the MAP's own section said any of this, and whether any face or
+     * flat of the map turned out to carry the texture. The pair is what decides
+     * whether a grant nothing carries is worth a word: a game-wide entry is
+     * written once for a whole game and is expected to name nothing on most of
+     * its maps, and an entry written under a map names a texture its author
+     * believed was in that map. */
+    uint8_t map_scoped;
+    uint8_t found;
     struct hwr_look_light light;
 };
 
+/* ONE LIGHT the map's own geometry gives off, wherever it came from: the middle
+ * of a room's faces painted with one granted texture, or one face somebody named
+ * on its own. Both are the same thing to everything downstream -- a position, a
+ * room and a colour -- so they are one array and one class, and the seeding
+ * below is the only place that has to know which is which.
+ *
+ * The composed grant is carried HERE rather than referenced through the grant
+ * table, because a named face's answer is its own: whatever the texture blanket
+ * said, then its tag, then its number. */
 struct hwr_glow_face {
     uint16_t sector_index;
+    /* What names this light across frames for the fade and the hysteresis: the
+     * texture for one the blanket found, the face number for one somebody
+     * named. */
+    uint16_t source_id;
     int16_t world_x;
     int16_t world_y;
     int16_t world_z;
-    uint8_t grant;              /* into g_glow_grants */
+    struct hwr_look_light light;
 };
 
 static struct hwr_glow_grant g_glow_grants[HWR_GLOW_GRANT_MAX];
@@ -613,29 +637,88 @@ static int hwr_glow_sector_centroid(const struct hwr_world *world,
     return 1;
 }
 
+/* WHERE ONE FACE'S OWN LIGHT STANDS: the middle of its two corners, pushed
+ * clear along the way the face looks, at the height between its room's floor
+ * and ceiling.
+ *
+ * Which of a segment's two perpendiculars that is comes from the ENGINE'S OWN
+ * visibility rule rather than from where anybody is standing: (dy, -dx) points
+ * at every eye allowed to see the face, which is the interior of the room that
+ * owns it. Taking the other one would put every wall light inside the wall.
+ *
+ * Written once and used twice -- by the texture blanket, which accumulates
+ * these into one light per room, and by a face somebody named, which keeps its
+ * own -- so the two cannot place a light by different laws. Returns 0 where the
+ * face has no geometry to stand on. */
+static int hwr_glow_face_point(const struct hwr_world *world,
+                               const struct hwr_sector *sector,
+                               const struct hwr_wall *wall, int16_t *out_x,
+                               int16_t *out_y, int16_t *out_z)
+{
+    const struct hwr_vertex *a;
+    const struct hwr_vertex *b;
+    int32_t dx;
+    int32_t dy;
+    double length;
+
+    if (wall->vertex_a_index >= world->vertex_count ||
+        wall->vertex_b_index >= world->vertex_count)
+        return 0;
+    a = &world->vertices[wall->vertex_a_index];
+    b = &world->vertices[wall->vertex_b_index];
+    dx = hwr_glow_wrap16((int32_t)b->world_x - a->world_x);
+    dy = hwr_glow_wrap16((int32_t)b->world_y - a->world_y);
+    length = sqrt((double)dx * dx + (double)dy * dy);
+    if (!(length > 0.0))
+        return 0;
+    *out_x = hwr_glow_wrap16(
+        (int32_t)a->world_x + dx / 2 +
+        (int32_t)lround((double)dy / length * HWR_GLOW_FACE_OFFSET));
+    *out_y = hwr_glow_wrap16(
+        (int32_t)a->world_y + dy / 2 +
+        (int32_t)lround((double)-dx / length * HWR_GLOW_FACE_OFFSET));
+    *out_z = (int16_t)(((int32_t)sector->floor_z +
+                        (int32_t)sector->ceiling_z) / 2);
+    return 1;
+}
+
 void hwr_lights_stage_glow_faces(const struct hwr_world *world)
 {
-    size_t surfaces = hwr_look_surface_count();
+    size_t textures = hwr_look_texture_count();
+    size_t named = hwr_look_face_count();
+    /* The two things a named face needs remembered across the walk: what it
+     * addresses, and whether anything on this map answered to it. */
+    int named_by_id[HWR_GLOW_NAMED_MAX];
+    uint32_t named_key[HWR_GLOW_NAMED_MAX];
+    unsigned char named_matched[HWR_GLOW_NAMED_MAX];
+    unsigned char named_told[HWR_GLOW_NAMED_MAX];
     int said_full = 0;
     size_t i;
     size_t s;
 
     g_glow_grant_count = 0;
     g_glow_face_count = 0;
-    g_glow_face_generation = hwr_look_surface_generation();
-    if (world == NULL || !world->valid || surfaces == 0u)
+    g_glow_face_generation = hwr_look_glow_generation();
+    if (named > HWR_GLOW_NAMED_MAX)
+        named = HWR_GLOW_NAMED_MAX;
+    memset(named_by_id, 0, sizeof named_by_id);
+    memset(named_key, 0, sizeof named_key);
+    memset(named_matched, 0, sizeof named_matched);
+    memset(named_told, 0, sizeof named_told);
+    if (world == NULL || !world->valid || (textures == 0u && named == 0u))
         return;
-    for (i = 0; i < surfaces && g_glow_grant_count < HWR_GLOW_GRANT_MAX; i++) {
+    for (i = 0; i < textures && g_glow_grant_count < HWR_GLOW_GRANT_MAX; i++) {
         uint16_t texture_id = 0;
+        int map_scoped = 0;
         struct hwr_look_light light;
 
-        if (!hwr_look_surface_at(i, &texture_id, &light))
+        if (!hwr_look_texture_at(i, &texture_id, &map_scoped, &light))
             continue;
-        /* Refused outright, exactly as a graphic is: whatever the map paints
+        /* Refused outright, exactly as a sprite is: whatever the map paints
          * with it, this is not a light. */
         if (light.off)
             continue;
-        /* THE ONE FIELD A SURFACE CANNOT ANSWER FOR ITSELF, and the reason it
+        /* THE ONE FIELD A TEXTURE CANNOT ANSWER FOR ITSELF, and the reason it
          * is required rather than defaulted.
          *
          * A thing that gives light is drawn with a sprite, and a sprite is cut
@@ -644,22 +727,30 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
          * read off. A world texture has no mask -- every texel is the surface
          * -- so the same average over lava returns the colour of the rock
          * around it, and no weighting recovers the difference on a picture that
-         * is bright all over. Rather than give every granted surface in the
+         * is bright all over. Rather than give every granted texture in the
          * game the one torch colour and say nothing, the file is asked for the
          * colour and told when it did not give one. */
         if (!light.has_color) {
-            fprintf(stderr, "[renderer_overhaul] the surface %#06x is granted "
-                            "a light with no colour; a surface has no colour "
-                            "of its own to read one from, so nothing is lit "
-                            "from it\n",
+            fprintf(stderr, "[renderer_overhaul] the texture %u is granted a "
+                            "light with no colour; a texture has no colour of "
+                            "its own to read one from, so nothing is lit from "
+                            "it\n",
                     (unsigned)texture_id);
             continue;
         }
         g_glow_grants[g_glow_grant_count].texture_id = texture_id;
+        g_glow_grants[g_glow_grant_count].map_scoped = (uint8_t)(map_scoped != 0);
+        g_glow_grants[g_glow_grant_count].found = 0;
         g_glow_grants[g_glow_grant_count].light = light;
         g_glow_grant_count++;
     }
-    if (g_glow_grant_count == 0u)
+    for (i = 0; i < named; i++) {
+        struct hwr_look_light light;
+
+        if (!hwr_look_face_at(i, &named_by_id[i], &named_key[i], &light))
+            named_key[i] = 0xffffffffu;         /* addresses nothing */
+    }
+    if (g_glow_grant_count == 0u && named == 0u)
         return;
     /* Past this line a map is actually walked, and that is the whole of what
      * this counter is for. */
@@ -670,28 +761,32 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
         size_t used = 0;
         int16_t centre_x = 0;
         int16_t centre_y = 0;
-        int16_t mid_z;
         int grant;
         size_t w;
 
         if (!hwr_glow_sector_centroid(world, sector, &centre_x, &centre_y))
             continue;
-        mid_z = (int16_t)(((int32_t)sector->floor_z +
-                           (int32_t)sector->ceiling_z) / 2);
         /* THE FLATS. A ceiling faces down into its room and a floor faces up
-         * into it, so each is pushed off along the only direction it has. */
+         * into it, so each is pushed off along the only direction it has. They
+         * are not faces and carry no number of their own, so only the texture
+         * blanket ever reaches them -- which is exactly what makes a blanket a
+         * blanket. */
         grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
                                   (int32_t)sector->ceiling_flat_id);
-        if (grant >= 0)
+        if (grant >= 0) {
+            g_glow_grants[grant].found = 1u;
             hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                 hwr_glow_clamp16((int32_t)sector->ceiling_z -
                                                  HWR_GLOW_FACE_OFFSET));
+        }
         grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
                                   (int32_t)sector->floor_flat_id);
-        if (grant >= 0)
+        if (grant >= 0) {
+            g_glow_grants[grant].found = 1u;
             hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                 hwr_glow_clamp16((int32_t)sector->floor_z +
                                                  HWR_GLOW_FACE_OFFSET));
+        }
         /* AND THE SLAB, which is a block sharing the room's own footprint: its
          * underside faces down and its top faces up, like the two above. */
         if (sector->slab_index < world->slab_count) {
@@ -699,32 +794,35 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
 
             grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
                                       (int32_t)(int16_t)slab->lower_surface_id);
-            if (grant >= 0)
+            if (grant >= 0) {
+                g_glow_grants[grant].found = 1u;
                 hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                     hwr_glow_clamp16((int32_t)slab->lower_z -
                                                      HWR_GLOW_FACE_OFFSET));
+            }
             grant = hwr_glow_grant_of(world, g_glow_grants, g_glow_grant_count,
                                       (int32_t)(int16_t)slab->upper_surface_id);
-            if (grant >= 0)
+            if (grant >= 0) {
+                g_glow_grants[grant].found = 1u;
                 hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                     hwr_glow_clamp16((int32_t)slab->upper_z +
                                                      HWR_GLOW_FACE_OFFSET));
+            }
         }
-        /* THE WALLS, all three of a wall's bands, at the middle of its two
-         * corners and at the height between its room's floor and ceiling. */
+        /* THE WALLS, which are the faces: all three of a wall's bands for the
+         * blanket, and the whole face for anybody who named it. */
         for (w = 0; w < sector->wall_count; w++) {
             size_t wall_index = sector->first_wall + w;
             const struct hwr_wall *wall;
-            const struct hwr_vertex *a;
-            const struct hwr_vertex *b;
+            struct hwr_look_light face_light;
             int32_t ids[3];
-            int32_t dx;
-            int32_t dy;
-            double length;
-            int16_t push_x;
-            int16_t push_y;
+            int16_t push_x = 0;
+            int16_t push_y = 0;
+            int16_t push_z = 0;
+            int blanket = -1;
+            int is_named;
             size_t k;
-            int any = 0;
+            size_t e;
 
             if (wall_index >= world->wall_count)
                 break;
@@ -732,39 +830,105 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
             ids[0] = (int32_t)(int16_t)wall->middle_id;
             ids[1] = (int32_t)(int16_t)wall->upper_id;
             ids[2] = (int32_t)(int16_t)wall->lower_id;
-            for (k = 0; k < 3u; k++)
-                any |= hwr_glow_grant_of(world, g_glow_grants,
-                                         g_glow_grant_count, ids[k]) >= 0;
-            if (!any)
-                continue;
-            if (wall->vertex_a_index >= world->vertex_count ||
-                wall->vertex_b_index >= world->vertex_count)
-                continue;
-            a = &world->vertices[wall->vertex_a_index];
-            b = &world->vertices[wall->vertex_b_index];
-            dx = hwr_glow_wrap16((int32_t)b->world_x - a->world_x);
-            dy = hwr_glow_wrap16((int32_t)b->world_y - a->world_y);
-            length = sqrt((double)dx * dx + (double)dy * dy);
-            if (!(length > 0.0))
-                continue;
-            /* OFF THE FACE, along the way it faces. Which of a segment's two
-             * perpendiculars that is comes from the ENGINE'S OWN visibility
-             * rule rather than from where anybody is standing: (dy, -dx)
-             * points at every eye allowed to see the face, which is the
-             * interior of the room that owns it. Taking the other one would
-             * put every wall light inside the wall. */
-            push_x = hwr_glow_wrap16(
-                (int32_t)a->world_x + dx / 2 +
-                (int32_t)lround((double)dy / length * HWR_GLOW_FACE_OFFSET));
-            push_y = hwr_glow_wrap16(
-                (int32_t)a->world_y + dy / 2 +
-                (int32_t)lround((double)-dx / length * HWR_GLOW_FACE_OFFSET));
             for (k = 0; k < 3u; k++) {
                 grant = hwr_glow_grant_of(world, g_glow_grants,
                                           g_glow_grant_count, ids[k]);
-                if (grant >= 0)
-                    hwr_glow_accumulate(accum, &used, grant, push_x, push_y,
-                                        mid_z);
+                if (grant < 0)
+                    continue;
+                g_glow_grants[grant].found = 1u;
+                if (blanket < 0)
+                    blanket = grant;
+            }
+            /* WHAT THE MAP CALLS THIS FACE, and whether anybody named it.
+             * `world->walls[i]` IS the editor's `Face: i` -- the flat face
+             * array of the file is the sector-ordered walk on every map the
+             * game and the editor produce -- so no re-keying is needed here,
+             * only the statement that they are the same number. */
+            for (e = 0; e < named; e++) {
+                if (named_by_id[e]
+                    ? (wall->face_tag != 0u &&
+                       named_key[e] == (uint32_t)wall->face_tag)
+                    : named_key[e] == (uint32_t)wall_index)
+                    named_matched[e] = 1u;
+            }
+            is_named = hwr_look_face_grant((uint32_t)wall_index,
+                                           wall->face_tag, &face_light);
+            if (!is_named) {
+                if (blanket < 0)
+                    continue;
+                if (!hwr_glow_face_point(world, sector, wall, &push_x, &push_y,
+                                         &push_z))
+                    continue;
+                for (k = 0; k < 3u; k++) {
+                    grant = hwr_glow_grant_of(world, g_glow_grants,
+                                              g_glow_grant_count, ids[k]);
+                    if (grant >= 0)
+                        hwr_glow_accumulate(accum, &used, grant, push_x,
+                                            push_y, push_z);
+                }
+                continue;
+            }
+            /* NAMED, so it keeps its own light and is taken OUT of the room's
+             * accumulation: the most specific statement anybody made about a
+             * face is the one in force, and a face somebody picked out is not a
+             * face to be averaged into the middle of the room with the rest.
+             * `off` takes it out and leaves nothing behind. */
+            if (face_light.off)
+                continue;
+            {
+                struct hwr_look_light light;
+
+                memset(&light, 0, sizeof light);
+                if (blanket >= 0)
+                    hwr_look_light_over(&light, &g_glow_grants[blanket].light);
+                hwr_look_light_over(&light, &face_light);
+                if (!light.has_color) {
+                    /* Said once per entry rather than once per face: a tag may
+                     * name thirty faces, and thirty copies of one sentence is
+                     * not thirty pieces of news. */
+                    for (e = 0; e < named; e++) {
+                        if (!named_matched[e] || named_told[e])
+                            continue;
+                        named_told[e] = 1u;
+                        if (named_by_id[e])
+                            fprintf(stderr, "[renderer_overhaul] the faces "
+                                            "tagged %lu are granted a light "
+                                            "with no colour; a face has no "
+                                            "colour of its own to read one "
+                                            "from, so nothing is lit from "
+                                            "them\n",
+                                    (unsigned long)named_key[e]);
+                        else
+                            fprintf(stderr, "[renderer_overhaul] the face %lu "
+                                            "is granted a light with no "
+                                            "colour; a face has no colour of "
+                                            "its own to read one from, so "
+                                            "nothing is lit from it\n",
+                                    (unsigned long)named_key[e]);
+                    }
+                    continue;
+                }
+                if (!hwr_glow_face_point(world, sector, wall, &push_x, &push_y,
+                                         &push_z))
+                    continue;
+                if (g_glow_face_count >= HWR_GLOW_FACE_MAX) {
+                    if (!said_full) {
+                        said_full = 1;
+                        fprintf(stderr, "[renderer_overhaul] this map has more "
+                                        "lit faces and rooms than %u; the rest "
+                                        "are not lit from\n",
+                                (unsigned)HWR_GLOW_FACE_MAX);
+                    }
+                    break;
+                }
+                g_glow_faces[g_glow_face_count].sector_index = (uint16_t)s;
+                g_glow_faces[g_glow_face_count].source_id =
+                    (uint16_t)wall_index;
+                g_glow_faces[g_glow_face_count].world_x = push_x;
+                g_glow_faces[g_glow_face_count].world_y = push_y;
+                g_glow_faces[g_glow_face_count].world_z = push_z;
+                g_glow_faces[g_glow_face_count].light = light;
+                g_glow_face_count++;
             }
         }
         /* ONE LIGHT PER (ROOM, TEXTURE), at the mean of what was found. */
@@ -775,26 +939,56 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
                 if (!said_full) {
                     said_full = 1;
                     fprintf(stderr, "[renderer_overhaul] this map has more "
-                                    "rooms with a granted surface in them than "
-                                    "%u; the rest are not lit from\n",
+                                    "lit faces and rooms than %u; the rest are "
+                                    "not lit from\n",
                             (unsigned)HWR_GLOW_FACE_MAX);
                 }
                 break;
             }
             face = &g_glow_faces[g_glow_face_count++];
             face->sector_index = (uint16_t)s;
+            face->source_id = g_glow_grants[accum[i].grant].texture_id;
             face->world_x = hwr_glow_wrap16(
                 accum[i].anchor_x + accum[i].sum_x / (int32_t)accum[i].count);
             face->world_y = hwr_glow_wrap16(
                 accum[i].anchor_y + accum[i].sum_y / (int32_t)accum[i].count);
             face->world_z = (int16_t)(accum[i].sum_z / (int32_t)accum[i].count);
-            face->grant = (uint8_t)accum[i].grant;
+            face->light = g_glow_grants[accum[i].grant].light;
         }
         /* Full is full: the rooms found first are kept, in the map's own order,
          * and the rest of the map is not walked for rooms there is no room
          * for. */
         if (said_full)
             break;
+    }
+    /* AND WHAT THE MAP TURNED OUT NOT TO HOLD, said once, here, because only a
+     * finished walk can say it.
+     *
+     * A texture written under a MAP is a texture its author believed was in
+     * that map, so a map that carries it nowhere is worth a sentence. One
+     * written game-wide is written once for a whole game and is expected to
+     * name nothing on most of its maps, so it stays quiet -- otherwise a line
+     * about lava would be printed on every corridor in the game. */
+    for (i = 0; i < g_glow_grant_count; i++) {
+        if (g_glow_grants[i].found || !g_glow_grants[i].map_scoped)
+            continue;
+        fprintf(stderr, "[renderer_overhaul] no face or flat of this map is "
+                        "painted with the texture %u, so the light granted to "
+                        "it lights nothing here\n",
+                (unsigned)g_glow_grants[i].texture_id);
+    }
+    for (i = 0; i < named; i++) {
+        if (named_matched[i] || named_key[i] == 0xffffffffu)
+            continue;
+        if (named_by_id[i])
+            fprintf(stderr, "[renderer_overhaul] no face of this map is tagged "
+                            "%lu\n", (unsigned long)named_key[i]);
+        else
+            fprintf(stderr, "[renderer_overhaul] this map has no face %lu; its "
+                            "faces are numbered 0 to %lu\n",
+                    (unsigned long)named_key[i],
+                    (unsigned long)(world->wall_count != 0u
+                                    ? world->wall_count - 1u : 0u));
     }
 }
 
@@ -1035,6 +1229,25 @@ static struct hwr_light_retained *hwr_light_find_retained(
     return NULL;
 }
 
+/* WHETHER THE MAP ITSELF MARKS ONE OBJECT AS GIVING LIGHT: its shade byte
+ * composed against its room's brightness by the engine's own rule, and nought.
+ *
+ * ONE place in the seeder asks it, because two would be two places for a copy
+ * of the arithmetic to grow. The rule itself is named rather than transcribed:
+ * a mark read from a transcription can drift away from the mark the emitter
+ * draws by without either side noticing. */
+static int hwr_light_object_marked(const struct hwr_world *world,
+                                   const struct hwr_object *object)
+{
+    uint8_t sector_light = 0;
+
+    if (world != NULL &&
+        object->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+        object->sector_index < world->sector_count)
+        sector_light = world->sectors[object->sector_index].light;
+    return hwr_object_composed_light(object->seed, sector_light) == 0;
+}
+
 /* One object into one light, with everything the rows and the map and the look
  * file have to say about it already spent. Returns 0 when the object is not a
  * light at all. */
@@ -1045,10 +1258,8 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     const struct hwr_world *world = frame->world;
     const struct hwr_sector *sector;
     struct hwr_look_light named;
-    struct hwr_look_light tagged;
-    struct hwr_look_light numbered;
-    int by_tag;
-    int by_number;
+    int granted;
+    int marked;
     float glow_intensity = 1.0f;
     float glow_range = 1.0f;
 
@@ -1067,40 +1278,47 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
         return 0;
     }
     sector = &world->sectors[object->sector_index];
-    /* THE MARK, and the whole of the seeding rule: an object whose composed
-     * shade byte is zero is the one the map's own author declared never to be
-     * darkened, which is the torches, the candles and the lit sigils. It is
-     * composed by the shared rule rather than by a copy of it here, because a
-     * mark read from a transcription can drift away from the mark the emitter
-     * draws by without either side noticing. */
-    if (hwr_object_composed_light(object->seed, sector->light) != 0)
-        return 0;
-    g_stats.marked++;
-    /* And the game config's word, which is the one place a person overrules the
-     * map: a fullbright decal that is plainly not a light is refused here.
+    /* THE GAME CONFIG'S WORD, ASKED FIRST -- and that order is the ruling.
      *
-     * It is asked in the THREE spellings it has, and in the order it ranks them,
-     * least specific first:
+     * The three tables that can name one object are composed by the look layer
+     * in the order they rank, least specific first: what a KIND of thing gives
+     * off, keyed by the sprite; what a GROUP of them does, keyed by the id tag
+     * a creator typed to gather them; and what THIS ONE does, keyed by its own
+     * object number, which names exactly one thing and is therefore the last
+     * word. `off` comes whole from the most specific of the three naming it.
      *
-     *   what a KIND of thing gives off, keyed by the graphic;
-     *   what a GROUP of them does, keyed by the id tag a creator typed to gather
-     *   them -- more specific than a kind, because a kind is every torch in the
-     *   game and a tag is the ones somebody grouped by hand;
-     *   and what THIS ONE does, keyed by its own object number, which names
-     *   exactly one thing and is therefore the last word.
-     *
-     * `off` is the whole entry rather than a field, so the MOST SPECIFIC TABLE
-     * NAMING A THING AT ALL is the one that answers for whether it is a light.
-     * That is what lets one brazier of a kind be turned off with every other
-     * brazier of that kind left alight, one tagged group be refused whole, and
-     * one hearth be called a light in a map whose decals of that graphic are
-     * not. */
-    (void)hwr_look_light_for(object->graphic_id, &named);
-    by_tag = hwr_look_light_for_object_id(object->object_id, &tagged);
-    by_number = hwr_look_light_for_object(object->map_index, &numbered);
-    if (by_number ? numbered.off : (by_tag ? tagged.off : named.off)) {
-        g_stats.refused++;
-        return 0;
+     * It is asked BEFORE the map's own mark rather than after, because A GRANT
+     * CREATES A LIGHT. Asked after, a file could only ever dim, recolour or
+     * refuse what the map had already marked -- so an entry naming the one
+     * candelabra a map forgot to mark did nothing, and said nothing about
+     * doing nothing. */
+    granted = hwr_look_object_grant(object->map_index, object->object_id,
+                                    object->graphic_id, &named);
+    /* THE MAP'S OWN MARK: an object whose composed shade byte is zero is the
+     * one the map's own author declared never to be darkened, which is the
+     * torches, the candles and the lit sigils. It is composed by the shared
+     * rule rather than by a copy of it here, because a mark read from a
+     * transcription can drift away from the mark the emitter draws by without
+     * either side noticing. */
+    marked = hwr_light_object_marked(world, object);
+    if (!marked) {
+        /* PROMOTION, and the one field it cannot do without. A thing the map
+         * never lit is drawn as an ordinary sprite, so there is no honest
+         * colour to read a light off it -- the average of an unlit candelabra
+         * is the colour of brass. A grant that names one and gives a colour
+         * makes it a light; a grant that names one and gives none lights
+         * nothing, and the look layer says so once, naming the entry. */
+        if (!granted || named.off || !named.has_color)
+            return 0;
+        g_stats.promoted++;
+    } else {
+        g_stats.marked++;
+        /* And the one place a person overrules the map the other way: a
+         * fullbright decal that is plainly not a light is refused here. */
+        if (granted && named.off) {
+            g_stats.refused++;
+            return 0;
+        }
     }
     /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
      * is a light in a room that cannot be seen from here. */
@@ -1130,7 +1348,13 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->light.color[0] = g_settings.color[0];
     out->light.color[1] = g_settings.color[1];
     out->light.color[2] = g_settings.color[2];
-    if (g_settings.color_from_sprite) {
+    /* THE COLOUR OFF THE SPRITE, and only where the map itself marked the thing.
+     * A marked sprite is drawn as a cut-out with a flame in it, so an average
+     * over what is not cut away is the flame's own colour. A thing the map never
+     * lit is drawn no differently from a chair, so the same reading returns the
+     * colour of the chair -- which is why a promotion carries its own colour and
+     * why nothing is read off the sprite for one. */
+    if (g_settings.color_from_sprite && marked) {
         float sprite_color[3];
 
         /* A sprite that has no colour to give -- one cut entirely away, or one
@@ -1142,40 +1366,9 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
             out->light.color[2] = sprite_color[2];
         }
     }
-    /* What the game config says about this particular graphic, over all of it --
-     * then what it says about the GROUP this one is tagged into over that, then
-     * what it says about THIS ONE by number over that. FIELD by field at every
-     * step, so a hearth may be made stronger than every other brazier of its
-     * kind without restating the colour its kind was already given, and a tagged
-     * corridor may be given one colour without restating the strengths. */
-    if (by_tag) {
-        if (tagged.has_intensity) {
-            named.has_intensity = 1;
-            named.intensity = tagged.intensity;
-        }
-        if (tagged.has_range) {
-            named.has_range = 1;
-            named.range = tagged.range;
-        }
-        if (tagged.has_color) {
-            named.has_color = 1;
-            named.color = tagged.color;
-        }
-    }
-    if (by_number) {
-        if (numbered.has_intensity) {
-            named.has_intensity = 1;
-            named.intensity = numbered.intensity;
-        }
-        if (numbered.has_range) {
-            named.has_range = 1;
-            named.range = numbered.range;
-        }
-        if (numbered.has_color) {
-            named.has_color = 1;
-            named.color = numbered.color;
-        }
-    }
+    /* And what the game config says, over all of it -- already composed in the
+     * order the three tables rank, so this is the one place the answer is
+     * spent rather than a fourth place it could be composed differently. */
     if (named.has_intensity)
         out->light.intensity = named.intensity;
     if (named.has_range)
@@ -1268,7 +1461,7 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
 
     if (frame->objects == NULL || !frame->objects->valid)
         return 0;
-    /* THE GAME CONFIG'S OWN PLACED THINGS, offered every object the map holds
+    /* THE GAME CONFIG'S OWN NAMED THINGS, offered every object the map holds
      * before any of them is judged.
      *
      * EVERY object, not only the ones that become lights: an object refused as
@@ -1279,6 +1472,15 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
      * whether a thing lights the room, and this question is about whether it
      * exists.
      *
+     * The map's own MARK is offered with each one, because the question a person
+     * needs answered is not only "is it there" but "can this entry ever do
+     * anything to it": an entry naming a thing the map does not mark, and giving
+     * no colour, is an entry that will never light anything.
+     *
+     * And the records the map numbers and never draws are offered too, so that
+     * "there is no object 70" is never said about an object 70 that is there and
+     * hidden.
+     *
      * Taken ONCE PER MAP rather than once per frame, and not taken at all on a
      * map with nothing to check, which is every map until somebody tunes one. */
     if (hwr_look_objects_pending()) {
@@ -1286,9 +1488,12 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
             const struct hwr_object *object = &frame->objects->items[i];
 
             hwr_look_object_seen(object->map_index, object->object_id,
-                                 object->graphic_id);
+                                 object->graphic_id,
+                                 hwr_light_object_marked(frame->world, object));
         }
-        hwr_look_objects_settled();
+        for (i = 0; i < frame->objects->hidden_count; i++)
+            hwr_look_object_hidden(frame->objects->hidden[i]);
+        hwr_look_objects_settled(frame->objects->numbered);
     }
     hop = hwr_lights_hop_containment(frame);
     for (i = 0; i < frame->objects->count && count < max; i++) {
@@ -1321,15 +1526,12 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
                                     struct hwr_light_candidate *out)
 {
     const struct hwr_world *world = frame->world;
-    const struct hwr_glow_grant *grant;
     const struct hwr_sector *sector;
     float glow_intensity = 1.0f;
     float glow_range = 1.0f;
 
-    if (face->sector_index >= world->sector_count ||
-        face->grant >= g_glow_grant_count)
+    if (face->sector_index >= world->sector_count)
         return 0;
-    grant = &g_glow_grants[face->grant];
     sector = &world->sectors[face->sector_index];
     /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
      * is a light in a room that cannot be seen from here. */
@@ -1341,7 +1543,7 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     }
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)HWR_LIGHT_CLASS_GLOW_FACE;
-    out->source_id = grant->texture_id;
+    out->source_id = face->source_id;
     out->sector_index = face->sector_index;
     out->world_x = face->world_x;
     out->world_y = face->world_y;
@@ -1357,13 +1559,13 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     out->light.range = g_settings.range * glow_range;
     /* The colour is the file's, always: a grant without one is refused where
      * the map is staged, so by here there is one. */
-    out->light.color[0] = (float)((grant->light.color >> 16) & 0xffu) / 255.0f;
-    out->light.color[1] = (float)((grant->light.color >> 8) & 0xffu) / 255.0f;
-    out->light.color[2] = (float)(grant->light.color & 0xffu) / 255.0f;
-    if (grant->light.has_intensity)
-        out->light.intensity = grant->light.intensity;
-    if (grant->light.has_range)
-        out->light.range = grant->light.range;
+    out->light.color[0] = (float)((face->light.color >> 16) & 0xffu) / 255.0f;
+    out->light.color[1] = (float)((face->light.color >> 8) & 0xffu) / 255.0f;
+    out->light.color[2] = (float)(face->light.color & 0xffu) / 255.0f;
+    if (face->light.has_intensity)
+        out->light.intensity = face->light.intensity;
+    if (face->light.has_range)
+        out->light.range = face->light.range;
     /* CONTAINMENT: the world-Z window, its own room's floor and ceiling with
      * slack either side. Ordered here so a map with a ceiling under its floor
      * cannot invert it. */
@@ -1402,7 +1604,7 @@ static size_t hwr_lights_seed_glow_faces(const struct hwr_lights_frame *frame,
      * game config and asking for it to be read again, and that moves the look
      * layer's own generation. A frame in which nothing has changed does not
      * walk a wall. */
-    if (g_glow_face_generation != hwr_look_surface_generation())
+    if (g_glow_face_generation != hwr_look_glow_generation())
         hwr_lights_stage_glow_faces(frame->world);
     if (g_glow_face_count == 0u)
         return 0;

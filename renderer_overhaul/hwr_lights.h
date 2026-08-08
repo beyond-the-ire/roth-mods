@@ -208,6 +208,11 @@ struct hwr_lights_stats {
     unsigned long too_far;     /* past the hop cap */
     unsigned long capped;      /* more candidates than slots */
     unsigned long fading;      /* still going out from an earlier frame */
+    /* A thing the map does NOT mark that a game config named, with a colour,
+     * and thereby made a light. Counted apart from the marked ones because the
+     * two answer different questions: one is what the map itself says, the
+     * other is what somebody wrote over it. */
+    unsigned long promoted;
 };
 const struct hwr_lights_stats *hwr_lights_last_stats(void);
 

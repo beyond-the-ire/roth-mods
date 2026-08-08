@@ -1790,11 +1790,11 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Light from glowing surfaces",
-        .help = "The other place those lights come from: the surfaces a game "
-                "config says give light, such as lava. Nothing glows until a "
-                "game config names it, so on an undescribed game this costs "
-                "nothing either way."
+        .label = "Light from glowing textures",
+        .help = "The other place those lights come from: the textures and "
+                "faces a game config says give light, such as lava. Nothing "
+                "glows until a game config names it, so on an undescribed "
+                "game this costs nothing either way."
     },
     {
         .key = "point_light_max",
@@ -2086,10 +2086,15 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "is out and no shadows are drawn."
     },
     {
+        /* THE TWO DIALS THAT AIM THE LIGHT, on the screen rather than in the
+         * file alone. The maps were authored with no sun at all, so how long
+         * the shadows are and which windows catch the light are taste rather
+         * than truth -- and taste is settled by turning a dial and looking at
+         * the room, which cannot be done from a text file. */
         .key = "sun_elevation_deg",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_ADVANCED,
+        .exposure = HWR_EXP_CONSUMER,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, sun_elevation_deg),
@@ -2104,7 +2109,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Height above the horizon",
+        .label = "Sun height above horizon",
         .help = "How high the sun or moon stands, in degrees. Low means long "
                 "shadows and light reaching deep through side windows; high "
                 "means short shadows under things."
@@ -2113,7 +2118,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .key = "sun_yaw_deg",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_ADVANCED,
+        .exposure = HWR_EXP_CONSUMER,
         .apply_kind = HWR_APPLY_HOOK,
         .change_bit = HWR_CHANGE_TRUECOLOR,
         .offset = offsetof(struct hwr_settings, sun_yaw_deg),
@@ -2128,7 +2133,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Compass direction",
+        .label = "Sun compass direction",
         .help = "Where the sun or moon stands over the map, as a compass "
                 "bearing: 0 is north (the top of the map as the editor "
                 "shows it), 90 east, 180 south, 270 west. Maps were built "

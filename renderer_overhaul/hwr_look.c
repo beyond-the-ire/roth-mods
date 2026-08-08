@@ -23,20 +23,24 @@
  * tables are grown to fit the file rather than declared to fit the cap. */
 #define HWR_LOOK_MAX_MAPS 64u
 #define HWR_LOOK_NAME 64u
-/* How many entries one keyed grant table may hold in one scope -- the graphics
- * a place says something about, and the surfaces it says something about, which
+/* How many entries one keyed grant table may hold in one scope -- the sprites
+ * a place says something about, and the textures it says something about, which
  * are two tables of the same shape keyed by two different sixteen-bit numbers.
  * A place has a handful of things that give light; this is room for one that is
  * nothing but, and a game has a lava, a rune and a sigil or two rather than
  * sixty of them. */
 #define HWR_LOOK_MAX_LIGHTS 64u
-/* And how many PLACED things one map may name. A hand-tuned map picks out the
- * few lights that carry a room -- the hearth, the brazier at the top of the
- * stairs -- so this is far past what tuning takes, and it is the same number as
- * the graphics above so that neither is the one somebody has to remember. Every
+/* And how many OBJECTS one map may name. A hand-tuned map picks out the few
+ * lights that carry a room -- the hearth, the brazier at the top of the stairs
+ * -- so this is far past what tuning takes, and it is the same number as the
+ * sprites above so that neither is the one somebody has to remember. Every
  * place carries a table of this size whether it fills one or not, which is what
- * it costs; it is the same bargain the graphics table already makes. */
+ * it costs; it is the same bargain the sprites table already makes. */
 #define HWR_LOOK_MAX_OBJECTS 64u
+/* And how many FACES one map may name, which is the same table for the map's
+ * own geometry that the one above is for the things standing on it. Same size
+ * for the same reason. */
+#define HWR_LOOK_MAX_FACES 64u
 /* And how many FREE-STANDING lights one map may hang in the air. These are not
  * a tuning of something the map already carries -- each is a light somebody put
  * where the map has none -- so a map that wants many is a map being re-lit
@@ -87,13 +91,21 @@ struct hwr_look_values {
  * composing two scopes is per field rather than per entry.
  *
  * The key is a sixteen-bit number and the table says nothing about which one:
- * the graphics table is keyed by the graphic a thing is drawn with and the
- * surfaces table by the texture a face is painted with, and what makes them two
+ * the sprites table is keyed by the sprite a thing is drawn with and the
+ * textures table by the texture a face is painted with, and what makes them two
  * tables is where they are read from and what consults them, never their shape.
  * One shape is one merge rule, and a rule written once cannot compose one table
- * differently from the other. */
+ * differently from the other.
+ *
+ * `from_map` is the one thing about an entry that is not what it says: whether
+ * the MAP's own section contributed to it. A game-wide entry is written once
+ * for a whole game and is expected to name nothing on most of its maps; an
+ * entry written under a map names something its author believed was in that
+ * map. Only the second is worth a word when the map turns out not to carry
+ * it. */
 struct hwr_look_light_entry {
     uint16_t id;
+    uint8_t from_map;
     struct hwr_look_light light;
 };
 
@@ -123,10 +135,13 @@ struct hwr_look_lights {
  *   untagged default and the command system's own word for "the source object",
  *   so it addresses everything and nothing.
  *
- * An entry carries one or the other and never both. The graphic beside it is a
- * CHECK rather than part of the key, in either spelling: an entry whose graphic
- * is not what the map draws is still applied and says so, which is what catches
- * a file gone stale after a map has been re-authored. */
+ * An entry carries one or the other and never both.
+ *
+ * AN ENTRY MAKES A LIGHT. Where the map itself marks a thing unshaded it is a
+ * light already and the entry tunes it; where the map does not, the entry makes
+ * it one -- but only with a `colour`, because a thing the map never lit has no
+ * honest colour for a light to be read off. That rule lives where the light is
+ * seeded; what lives here is only what the file said. */
 struct hwr_look_object_entry {
     /* Which spelling: 0 an object number, 1 an id tag. */
     int by_id;
@@ -134,8 +149,6 @@ struct hwr_look_object_entry {
      * a sixteen-bit word; one field holds either, because what tells them apart
      * is `by_id` rather than their range. */
     uint32_t key;
-    int has_graphic;
-    uint16_t graphic_id;
     struct hwr_look_light light;
 };
 
@@ -144,15 +157,45 @@ struct hwr_look_objects {
     size_t count;
 };
 
+/* And exactly the same pair for one FACE of the map, because the editor offers
+ * exactly the same pair for one:
+ *
+ *   THE FACE NUMBER -- `index` -- the position of the face record in the map's
+ *   own flat face array, which the editor shows as `Face: N`. It names one
+ *   wall.
+ *
+ *   THE FACE TAG -- `id` -- the word at the end of an extended texture-mapping
+ *   record, which the editor shows as the read-only `Face ID` and which the map
+ *   command system addresses a face by. One mapping record may be shared by
+ *   many faces, so a tag names a GROUP; nought is the untagged default and is
+ *   refused, exactly as an object's is.
+ *
+ * A named face emits by itself. There is no map mark for a face the way there
+ * is for a thing, so a face grant states its own colour or lights nothing. */
+struct hwr_look_face_entry {
+    int by_id;
+    uint32_t key;
+    struct hwr_look_light light;
+};
+
+struct hwr_look_faces {
+    struct hwr_look_face_entry items[HWR_LOOK_MAX_FACES];
+    size_t count;
+};
+
 /* A FREE-STANDING light: one that belongs to no object at all, hung at three
  * numbers somebody chose.
  *
  * This is what `at` addresses now, and it is a different thing from tuning a
  * light the map already has. Nothing is being described here -- there is no
- * object to read a graphic off, no sprite to take a colour from and no map
+ * object to read a sprite off, no sprite to take a colour from and no map
  * mark saying this is a light -- so the colour is REQUIRED, exactly as it is
- * for a granted surface and for the same reason: there is nothing to derive it
+ * for a granted texture and for the same reason: there is nothing to derive it
  * from. An entry with no colour lights nothing and says so.
+ *
+ * The three numbers held here are the GAME'S OWN, straight out of the file that
+ * wrote them: the same space the map is measured in and the same space
+ * HWR_OBJ_DUMP prints.
  *
  * There is no `off`. An entry here exists only because somebody wrote it, so
  * the way to be rid of one is to delete it; a switch for turning off a thing
@@ -178,9 +221,10 @@ struct hwr_look_placed {
  * with a note. */
 struct hwr_look_scope {
     struct hwr_look_values values;
-    struct hwr_look_lights lights;
-    struct hwr_look_lights surfaces;
+    struct hwr_look_lights sprites;
+    struct hwr_look_lights textures;
     struct hwr_look_objects objects;
+    struct hwr_look_faces faces;
     struct hwr_look_placed placed;
 };
 
@@ -202,15 +246,17 @@ static char g_look_path[2600];
 static struct hwr_look_file g_look;
 static int g_look_present;
 static struct hwr_look_values g_effective;
-static struct hwr_look_lights g_effective_lights;
-static struct hwr_look_lights g_effective_surfaces;
+static struct hwr_look_lights g_effective_sprites;
+static struct hwr_look_lights g_effective_textures;
 static struct hwr_look_objects g_effective_objects;
+static struct hwr_look_faces g_effective_faces;
 static struct hwr_look_placed g_effective_placed;
-/* A number that moves when the granted surfaces do and at no other time. What
- * reads it works a map out ONCE and then wants to know, in one comparison per
- * frame, whether that answer is still the answer. It starts at one so that
- * nought is free to mean nothing has been worked out yet. */
-static uint32_t g_surface_generation = 1u;
+/* A number that moves when anything the map's own geometry is lit FROM does --
+ * the granted textures, the named faces -- and at no other time. What reads it
+ * works a map out ONCE and then wants to know, in one comparison per frame,
+ * whether that answer is still the answer. It starts at one so that nought is
+ * free to mean nothing has been worked out yet. */
+static uint32_t g_glow_generation = 1u;
 /* And the same for the free-standing lights, which are worked out against the
  * map's own rooms once when it is staged for exactly the same reason. */
 static uint32_t g_placed_generation = 1u;
@@ -220,15 +266,21 @@ static uint32_t g_placed_generation = 1u;
  * different things: one is the file's answer and moves when the file does, the
  * other is a conversation that starts again on every map.
  *
- * `matched` is whether anything on the map answered to the entry's key at all,
- * and `drawn` whether anything that answered was drawn with the graphic written
- * beside it. The two are separate because an id names a GROUP: the question for
- * an object number is whether THAT object is drawn with it, and the question for
- * a tag is whether ANY of the objects carrying it is -- so the second can only
- * be answered once the whole map has been offered. */
+ * `matched` is whether anything DRAWN on the map answered to the entry's key,
+ * `hidden` whether the only thing that answered was a record the map numbers
+ * and never draws, and `told` whether the one thing worth saying about this
+ * entry has been said. Three flags rather than one because "no such object",
+ * "there is one and it is hidden" and "there is one and this entry cannot make
+ * it a light" are three different sentences, and a person who has typed a
+ * number needs whichever of them is true. */
 static unsigned char g_object_matched[HWR_LOOK_MAX_OBJECTS];
-static unsigned char g_object_drawn[HWR_LOOK_MAX_OBJECTS];
+static unsigned char g_object_hidden[HWR_LOOK_MAX_OBJECTS];
 static unsigned char g_object_told[HWR_LOOK_MAX_OBJECTS];
+/* And the same for the sprite blanket, which is the third table that can name
+ * an object: an entry there with no colour cannot make an unmarked thing a
+ * light either, and a blanket that quietly does nothing is exactly as hard to
+ * find as a number that quietly does nothing. */
+static unsigned char g_sprite_told[HWR_LOOK_MAX_LIGHTS];
 static int g_objects_settled;
 static char g_look_map[HWR_LOOK_NAME];
 static uint64_t g_look_hash;
@@ -703,15 +755,40 @@ static struct hwr_look_light_entry *hwr_look_light_entry(
     return &lights->items[lights->count++];
 }
 
-/* One scope's entries over another's, FIELD by field. A map raising the
- * strength of a graphic the game-wide answer already coloured keeps that
- * colour, which is the same rule the settings rows compose by and the reason a
- * field a scope says nothing about is left out rather than written down.
+/* One grant laid over another, FIELD by field and `off` left alone. A map
+ * raising the strength of a sprite the game-wide answer already coloured keeps
+ * that colour, which is the same rule the settings rows compose by and the
+ * reason a field a scope says nothing about is left out rather than written
+ * down.
  *
- * Written once for both keyed tables, so a surface composes exactly as a
- * graphic does and neither can quietly grow a rule of its own. */
+ * Written ONCE and exported, so that the two scopes, the three tables that can
+ * name an object and the three that can name a face all compose by one rule and
+ * none of them can quietly grow one of its own. */
+void hwr_look_light_over(struct hwr_look_light *into,
+                         const struct hwr_look_light *from)
+{
+    if (into == NULL || from == NULL)
+        return;
+    if (from->has_intensity) {
+        into->has_intensity = 1;
+        into->intensity = from->intensity;
+    }
+    if (from->has_range) {
+        into->has_range = 1;
+        into->range = from->range;
+    }
+    if (from->has_color) {
+        into->has_color = 1;
+        into->color = from->color;
+    }
+}
+
+/* One scope's keyed entries over another's. `from_map` says whether this is the
+ * map's own section rather than the answer every place gets, which is the one
+ * thing an entry remembers about where it came from. */
 static void hwr_look_lights_merge(struct hwr_look_lights *into,
-                                  const struct hwr_look_lights *from)
+                                  const struct hwr_look_lights *from,
+                                  int from_map)
 {
     size_t i;
 
@@ -722,20 +799,11 @@ static void hwr_look_lights_merge(struct hwr_look_lights *into,
 
         if (target == NULL)
             continue;
+        if (from_map)
+            target->from_map = 1u;
         if (source->light.off)
             target->light.off = 1;
-        if (source->light.has_intensity) {
-            target->light.has_intensity = 1;
-            target->light.intensity = source->light.intensity;
-        }
-        if (source->light.has_range) {
-            target->light.has_range = 1;
-            target->light.range = source->light.range;
-        }
-        if (source->light.has_color) {
-            target->light.has_color = 1;
-            target->light.color = source->light.color;
-        }
+        hwr_look_light_over(&target->light, &source->light);
     }
 }
 
@@ -760,6 +828,26 @@ static struct hwr_look_object_entry *hwr_look_object_entry(
     objects->items[objects->count].by_id = by_id;
     objects->items[objects->count].key = key;
     return &objects->items[objects->count++];
+}
+
+/* And the same for one FACE of the map, by the same rule and for the same
+ * reasons: a face number and a face tag that happen to be the same number are
+ * two different addresses. */
+static struct hwr_look_face_entry *hwr_look_face_entry(
+    struct hwr_look_faces *faces, int by_id, uint32_t key)
+{
+    size_t i;
+
+    for (i = 0; i < faces->count; i++) {
+        if (faces->items[i].by_id == by_id && faces->items[i].key == key)
+            return &faces->items[i];
+    }
+    if (faces->count >= HWR_LOOK_MAX_FACES)
+        return NULL;
+    memset(&faces->items[faces->count], 0, sizeof faces->items[0]);
+    faces->items[faces->count].by_id = by_id;
+    faces->items[faces->count].key = key;
+    return &faces->items[faces->count++];
 }
 
 /* And one free-standing light, which IS keyed by where it hangs, because that
@@ -969,33 +1057,63 @@ static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
     return 0;
 }
 
-/* A sixteen-bit number, however it is spelled: a string in any base, which is
- * what a table keyed by one uses, or a bare number where one is written beside
- * a position. Answers 0 for anything that is not one. */
-static int hwr_look_graphic_number(const char *text, uint16_t *out)
+/* A TEXTURE NUMBER: the whole number the map's own geometry carries for a face
+ * or a flat, which the editor prints in decimal and which is written here in
+ * decimal. Any base is read, because a file written by hand in hexadecimal is a
+ * file that meant a number rather than a file with a mistake in it -- but
+ * decimal is what everything this mod prints and ships uses, so decimal is what
+ * a person ever has to know. Answers 0 for anything that is not a number. */
+static int hwr_look_texture_number(const char *text, uint16_t *out)
 {
-    unsigned long graphic;
+    unsigned long texture;
     char *end = NULL;
 
     if (text == NULL || text[0] == 0)
         return 0;
-    graphic = strtoul(text, &end, 0);
-    if (end == text || *end != 0 || graphic > 0xffffuL)
+    texture = strtoul(text, &end, 0);
+    if (end == text || *end != 0 || texture > 0xffffuL)
         return 0;
-    *out = (uint16_t)graphic;
+    *out = (uint16_t)texture;
     return 1;
 }
 
-/* What one keyed thing gives off: one graphic, or one surface.
+/* A SPRITE, written the way the editor's own object panel shows one: its
+ * Texture Index, an oblique, its Texture Source. "34/0" is the panel read
+ * straight across.
  *
- * `noun` and `key_word` are what the complaints call the thing and its key --
- * a light keyed by a graphic, a surface keyed by a texture. The reading is
- * otherwise the same for both, and deliberately so: two readers would be two
- * places for the three fields to be spelled and one place for them to drift. */
+ * The map record carries the pair as one sixteen-bit word -- the index in its
+ * low byte, the source in its high byte -- and that word is what everything
+ * downstream of here uses, so the pair is folded into it once, here, and the
+ * two spellings can never disagree. */
+static int hwr_look_sprite_number(const char *text, uint16_t *out)
+{
+    unsigned long index;
+    unsigned long source;
+    char *end = NULL;
+
+    if (text == NULL || text[0] == 0)
+        return 0;
+    index = strtoul(text, &end, 0);
+    if (end == text || *end != '/' || index > 0xffuL)
+        return 0;
+    text = end + 1;
+    source = strtoul(text, &end, 0);
+    if (end == text || *end != 0 || source > 0xffuL)
+        return 0;
+    *out = (uint16_t)(index | (source << 8));
+    return 1;
+}
+
+/* What one keyed thing gives off: one sprite, or one texture.
+ *
+ * `noun` is what the complaints call the thing, and `by_pair` which of the two
+ * key spellings this table takes. The reading is otherwise the same for both,
+ * and deliberately so: two readers would be two places for the three fields to
+ * be spelled and one place for them to drift. */
 static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
                                 struct hwr_look_lights *into,
                                 const char *where, int report,
-                                const char *noun, const char *key_word)
+                                const char *noun, int by_pair)
 {
     const char *key = hwr_json_name(doc, node);
     struct hwr_look_light_entry *entry;
@@ -1005,8 +1123,15 @@ static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
 
     if (key == NULL)
         return;
-    if (!hwr_look_graphic_number(key, &graphic)) {
-        hwr_look_note(report, where, "'%s' is not a %s number", key, key_word);
+    if (by_pair ? !hwr_look_sprite_number(key, &graphic)
+                : !hwr_look_texture_number(key, &graphic)) {
+        if (by_pair)
+            hwr_look_note(report, where, "'%s' is not a sprite; a sprite is "
+                                         "the texture and source numbers the "
+                                         "editor shows for an object, written "
+                                         "\"34/0\"", key);
+        else
+            hwr_look_note(report, where, "'%s' is not a texture number", key);
         return;
     }
     hwr_look_where(inside, where, key);
@@ -1042,7 +1167,15 @@ static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
  * integers because that is the space the map itself is authored in: a position
  * that will not fit in one is a position inside no building, and saying so turns
  * a mistyped number into a complaint rather than into a light nobody ever
- * sees. */
+ * sees.
+ *
+ * THE THREE NUMBERS ARE THE GAME'S OWN, exactly as the map file carries them
+ * and exactly as HWR_OBJ_DUMP prints them: what is written here is what the
+ * world is measured in, and nothing is flipped, scaled or reinterpreted on the
+ * way in. The community editor happens to DISPLAY X with the opposite sign, so
+ * an X copied off its position box has to be flipped before it is written here
+ * -- but that is a fact about the editor's screen, and this layer is not the
+ * place to guess which of the two a number came from. */
 static int hwr_look_read_at(const struct hwr_json_doc *doc, int node,
                             int16_t out[3], const char *where, int report)
 {
@@ -1100,8 +1233,7 @@ static int hwr_look_read_whole(const struct hwr_json_doc *doc, int node,
     return 1;
 }
 
-/* One placed object of the map: which one, optionally which graphic it should
- * be, and what it gives off.
+/* One object of the map: which one, and what it gives off.
  *
  * THE ADDRESS IS THE EDITOR'S. `index` is the object number the community ROTH
  * Editor shows as `Object: N`; `id` is the tag it shows as `ID:` and names every
@@ -1111,10 +1243,9 @@ static int hwr_look_read_whole(const struct hwr_json_doc *doc, int node,
  *
  * The address is read BEFORE `off` is asked about, which is the one place the
  * "nothing else in the entry is read" rule has an edge worth stating: which
- * object it is and which graphic it should be are what ADDRESS the entry rather
- * than what it gives off, so an entry that turns one thing off is still checked
- * against what is actually there. An entry nobody can check is an entry that
- * goes stale in silence. */
+ * object it is is what ADDRESSES the entry rather than what it gives off, so an
+ * entry that turns one thing off is still held against what is actually there.
+ * An entry nobody can check is an entry that goes stale in silence. */
 static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
                                  struct hwr_look_objects *into, size_t index,
                                  const char *where, int report)
@@ -1175,27 +1306,9 @@ static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
     }
     entry = hwr_look_object_entry(into, by_tag, key);
     if (entry == NULL) {
-        hwr_look_note(report, inside, "that is more placed objects than one map "
-                                      "may describe");
+        hwr_look_note(report, inside, "that is more objects than one map may "
+                                      "describe");
         return;
-    }
-    child = hwr_json_member(doc, node, "graphic");
-    if (child >= 0) {
-        const char *text = hwr_json_as_text(doc, child);
-        char written[64];
-        uint16_t graphic = 0;
-
-        if (text == NULL) {
-            hwr_json_render(doc, child, written, sizeof written);
-            text = written;
-        }
-        if (!hwr_look_graphic_number(text, &graphic))
-            hwr_look_note(report, inside, "the graphic is a number, such as "
-                                          "\"0x0412\"");
-        else {
-            entry->has_graphic = 1;
-            entry->graphic_id = graphic;
-        }
     }
     if (hwr_look_grant_off(doc, node, inside, report)) {
         entry->light.off = 1;
@@ -1207,7 +1320,7 @@ static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
 
         if (field == NULL || hwr_look_is_notes(field) ||
             strcmp(field, "index") == 0 || strcmp(field, "id") == 0 ||
-            strcmp(field, "graphic") == 0 || strcmp(field, "off") == 0)
+            strcmp(field, "off") == 0)
             continue;
         if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
@@ -1215,8 +1328,8 @@ static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
     }
 }
 
-/* The placed objects one map picks out. A LIST rather than a block, because one
- * entry may name a whole group of objects and because a number is not a name. */
+/* The objects one map picks out. A LIST rather than a block, because one entry
+ * may name a whole group of objects and because a number is not a name. */
 static void hwr_look_read_objects(const struct hwr_json_doc *doc, int array,
                                   struct hwr_look_objects *into,
                                   const char *where, int report)
@@ -1225,14 +1338,113 @@ static void hwr_look_read_objects(const struct hwr_json_doc *doc, int array,
     int child;
 
     if (hwr_json_type(doc, array) != HWR_JSON_ARRAY) {
-        hwr_look_note(report, where, "the placed objects are a list, because "
-                                     "each names an object by a number rather "
-                                     "than by a name");
+        hwr_look_note(report, where, "the objects are a list, because each "
+                                     "names an object by a number rather than "
+                                     "by a name");
         return;
     }
     for (child = hwr_json_first(doc, array); child >= 0;
          child = hwr_json_next(doc, child))
         hwr_look_read_object(doc, child, into, index++, where, report);
+}
+
+/* One face of the map: which one, and what it gives off. The same two spellings
+ * the objects list takes, read by the same rules and refusing the same things,
+ * because the editor offers the same pair for a face and a person reading them
+ * off one panel must not have to learn two grammars. */
+static void hwr_look_read_face(const struct hwr_json_doc *doc, int node,
+                               struct hwr_look_faces *into, size_t index,
+                               const char *where, int report)
+{
+    struct hwr_look_face_entry *entry;
+    char inside[HWR_LOOK_WHERE];
+    char label[24];
+    uint32_t key = 0;
+    int by_index;
+    int by_id;
+    int by_tag = 0;
+    int child;
+
+    snprintf(label, sizeof label, "%u", (unsigned)index);
+    hwr_look_where(inside, where, label);
+    if (hwr_json_type(doc, node) != HWR_JSON_OBJECT) {
+        hwr_look_note(report, inside, "one face is a block of which face it is "
+                                      "and what it gives off");
+        return;
+    }
+    by_index = hwr_json_member(doc, node, "index");
+    by_id = hwr_json_member(doc, node, "id");
+    if (by_index >= 0 && by_id >= 0) {
+        hwr_look_note(report, inside, "an entry names one face by its number "
+                                      "or a group of them by their id tag, not "
+                                      "both");
+        return;
+    }
+    if (by_index < 0 && by_id < 0) {
+        hwr_look_note(report, inside, "a face is addressed by its number, "
+                                      "written \"index\": 2430, or by its id "
+                                      "tag, written \"id\": 11 -- both are the "
+                                      "numbers the map editor shows for it");
+        return;
+    }
+    if (by_index >= 0) {
+        if (!hwr_look_read_whole(doc, by_index, 0xffffffu, &key,
+                                 "face number", inside, report))
+            return;
+    } else {
+        if (!hwr_look_read_whole(doc, by_id, 0xffffu, &key, "id tag", inside,
+                                 report))
+            return;
+        /* NOUGHT IS NOT AN ADDRESS here either: it is what every face whose
+         * mapping record carries no tag reads as, which is most of a map. */
+        if (key == 0u) {
+            hwr_look_note(report, inside, "an id tag of 0 is what a face with "
+                                          "no tag carries, so it addresses "
+                                          "nothing here");
+            return;
+        }
+        by_tag = 1;
+    }
+    entry = hwr_look_face_entry(into, by_tag, key);
+    if (entry == NULL) {
+        hwr_look_note(report, inside, "that is more faces than one map may "
+                                      "describe");
+        return;
+    }
+    if (hwr_look_grant_off(doc, node, inside, report)) {
+        entry->light.off = 1;
+        return;
+    }
+    for (child = hwr_json_first(doc, node); child >= 0;
+         child = hwr_json_next(doc, child)) {
+        const char *field = hwr_json_name(doc, child);
+
+        if (field == NULL || hwr_look_is_notes(field) ||
+            strcmp(field, "index") == 0 || strcmp(field, "id") == 0 ||
+            strcmp(field, "off") == 0)
+            continue;
+        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
+            hwr_look_note(report, inside, "'%s' is not something a light gives "
+                                          "off", field);
+    }
+}
+
+static void hwr_look_read_faces(const struct hwr_json_doc *doc, int array,
+                                struct hwr_look_faces *into,
+                                const char *where, int report)
+{
+    size_t index = 0;
+    int child;
+
+    if (hwr_json_type(doc, array) != HWR_JSON_ARRAY) {
+        hwr_look_note(report, where, "the faces are a list, because each names "
+                                     "a face by a number rather than by a "
+                                     "name");
+        return;
+    }
+    for (child = hwr_json_first(doc, array); child >= 0;
+         child = hwr_json_next(doc, child))
+        hwr_look_read_face(doc, child, into, index++, where, report);
 }
 
 /* One free-standing light: where it hangs and what it gives off.
@@ -1334,55 +1546,69 @@ static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
 
         if (name == NULL || hwr_look_is_notes(name))
             continue;
-        if (strcmp(name, "graphics") == 0) {
+        if (strcmp(name, "sprites") == 0) {
             int light;
 
-            hwr_look_where(inside, where, "graphics");
+            /* A BLANKET over every object drawn with one sprite, keyed by the
+             * texture and source pair the editor's object panel shows. Read in
+             * every scope: a sprite is the same sprite wherever it is drawn. */
+            hwr_look_where(inside, where, "sprites");
             if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
-                hwr_look_note(report, inside, "the graphics are a block keyed "
-                                              "by the graphic a thing is drawn "
-                                              "with");
+                hwr_look_note(report, inside, "the sprites are a block keyed "
+                                              "by the texture and source "
+                                              "numbers the editor shows for an "
+                                              "object, written \"34/0\"");
                 continue;
             }
             for (light = hwr_json_first(doc, child); light >= 0;
                  light = hwr_json_next(doc, light)) {
                 if (hwr_look_is_notes(hwr_json_name(doc, light)))
                     continue;
-                hwr_look_read_light(doc, light, &into->lights, inside, report,
-                                    "light", "graphic");
+                hwr_look_read_light(doc, light, &into->sprites, inside, report,
+                                    "sprite", 1);
             }
-        } else if (strcmp(name, "surfaces") == 0) {
-            int surface;
+        } else if (strcmp(name, "textures") == 0) {
+            int texture;
 
-            /* Keyed by the texture a FACE is painted with rather than by the
-             * graphic a THING is drawn with -- lava, a rune, a lit sigil. It
-             * is read in every scope, unlike the placed things below: a
-             * texture is the same texture wherever it is painted, and a game
-             * whose lava glows wants it to glow everywhere. */
-            hwr_look_where(inside, where, "surfaces");
+            /* And a BLANKET over the map's own geometry: every wall band and
+             * every floor and ceiling painted with one texture -- lava, a rune,
+             * a lit sigil. Read in every scope for the same reason: a texture
+             * is the same texture wherever it is painted, and a game whose lava
+             * glows wants it to glow everywhere. */
+            hwr_look_where(inside, where, "textures");
             if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
-                hwr_look_note(report, inside, "the surfaces are a block keyed "
-                                              "by the texture a face is "
-                                              "painted with");
+                hwr_look_note(report, inside, "the textures are a block keyed "
+                                              "by the number of a texture the "
+                                              "map paints with");
                 continue;
             }
-            for (surface = hwr_json_first(doc, child); surface >= 0;
-                 surface = hwr_json_next(doc, surface)) {
-                if (hwr_look_is_notes(hwr_json_name(doc, surface)))
+            for (texture = hwr_json_first(doc, child); texture >= 0;
+                 texture = hwr_json_next(doc, texture)) {
+                if (hwr_look_is_notes(hwr_json_name(doc, texture)))
                     continue;
-                hwr_look_read_light(doc, surface, &into->surfaces, inside,
-                                    report, "surface", "texture");
+                hwr_look_read_light(doc, texture, &into->textures, inside,
+                                    report, "texture", 0);
             }
         } else if (strcmp(name, "objects") == 0) {
             hwr_look_where(inside, where, "objects");
             if (!placed) {
                 hwr_look_note(report, inside, "an object's number and its id "
-                                              "tag belong to ONE map, so a "
-                                              "placed object is described under "
-                                              "a map rather than everywhere");
+                                              "tag belong to ONE map, so an "
+                                              "object is described under a map "
+                                              "rather than everywhere");
                 continue;
             }
             hwr_look_read_objects(doc, child, &into->objects, inside, report);
+        } else if (strcmp(name, "faces") == 0) {
+            hwr_look_where(inside, where, "faces");
+            if (!placed) {
+                hwr_look_note(report, inside, "a face's number and its id tag "
+                                              "belong to ONE map, so a face is "
+                                              "described under a map rather "
+                                              "than everywhere");
+                continue;
+            }
+            hwr_look_read_faces(doc, child, &into->faces, inside, report);
         } else if (strcmp(name, "placed") == 0) {
             /* The lights that belong to no object at all. Under a map only, for
              * the same reason: three numbers elsewhere are a different corner of
@@ -1666,34 +1892,37 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
 static void hwr_look_compose(const struct hwr_look_file *file,
                              const char *map_name,
                              struct hwr_look_values *out,
-                             struct hwr_look_lights *out_lights,
-                             struct hwr_look_lights *out_surfaces,
+                             struct hwr_look_lights *out_sprites,
+                             struct hwr_look_lights *out_textures,
                              struct hwr_look_objects *out_objects,
+                             struct hwr_look_faces *out_faces,
                              struct hwr_look_placed *out_placed)
 {
     const struct hwr_look_map *map;
 
     memset(out, 0, sizeof *out);
-    memset(out_lights, 0, sizeof *out_lights);
-    memset(out_surfaces, 0, sizeof *out_surfaces);
+    memset(out_sprites, 0, sizeof *out_sprites);
+    memset(out_textures, 0, sizeof *out_textures);
     memset(out_objects, 0, sizeof *out_objects);
+    memset(out_faces, 0, sizeof *out_faces);
     memset(out_placed, 0, sizeof *out_placed);
     if (!g_look_present)
         return;
     hwr_look_merge(out, &file->everywhere.values);
-    hwr_look_lights_merge(out_lights, &file->everywhere.lights);
-    hwr_look_lights_merge(out_surfaces, &file->everywhere.surfaces);
+    hwr_look_lights_merge(out_sprites, &file->everywhere.sprites, 0);
+    hwr_look_lights_merge(out_textures, &file->everywhere.textures, 0);
     map = hwr_look_find_map(file, map_name);
     if (map != NULL) {
         hwr_look_merge(out, &map->scope.values);
-        hwr_look_lights_merge(out_lights, &map->scope.lights);
-        hwr_look_lights_merge(out_surfaces, &map->scope.surfaces);
-        /* And the two tables that come from ONE scope: the map's own placed
-         * objects, which are the last word, and its free-standing lights.
-         * There is no game-wide table of either to compose with, because an
-         * object number and a position outside the map they belong to name
-         * nothing. */
+        hwr_look_lights_merge(out_sprites, &map->scope.sprites, 1);
+        hwr_look_lights_merge(out_textures, &map->scope.textures, 1);
+        /* And the three tables that come from ONE scope: the map's own objects
+         * and faces, which are the last word, and its free-standing lights.
+         * There is no game-wide table of any of them to compose with, because a
+         * number in one map's list and a position inside one building name
+         * nothing anywhere else. */
         *out_objects = map->scope.objects;
+        *out_faces = map->scope.faces;
         *out_placed = map->scope.placed;
     }
 }
@@ -1701,46 +1930,51 @@ static void hwr_look_compose(const struct hwr_look_file *file,
 /* Publishes a freshly composed override set and reports what moved, so the rows
  * that changed value are applied and nothing else is disturbed. */
 static void hwr_look_publish(const struct hwr_look_values *next,
-                             const struct hwr_look_lights *next_lights,
-                             const struct hwr_look_lights *next_surfaces,
+                             const struct hwr_look_lights *next_sprites,
+                             const struct hwr_look_lights *next_textures,
                              const struct hwr_look_objects *next_objects,
+                             const struct hwr_look_faces *next_faces,
                              const struct hwr_look_placed *next_placed)
 {
     uint32_t changed = 0;
     size_t count = hwr_schema_count();
     size_t i;
-    int surfaces_moved;
+    int glow_moved;
     int placed_moved;
 
-    /* The lights table is not a row and raises no row's bit of its own, so it
+    /* The sprites table is not a row and raises no row's bit of its own, so it
      * raises the rig's: what it changes is what the lights that are not at the
      * eye are worth, which is the same thing every row of that family changes.
-     * The placed things are the same table said more precisely, so they raise
-     * the same bit, and so do the surfaces. */
-    surfaces_moved =
-        next_surfaces->count != g_effective_surfaces.count ||
-        memcmp(next_surfaces->items, g_effective_surfaces.items,
-               next_surfaces->count * sizeof next_surfaces->items[0]) != 0;
+     * The objects, the faces, the textures and the placed lights are the same
+     * table said more precisely, so they raise the same bit. */
+    glow_moved =
+        next_textures->count != g_effective_textures.count ||
+        memcmp(next_textures->items, g_effective_textures.items,
+               next_textures->count * sizeof next_textures->items[0]) != 0 ||
+        next_faces->count != g_effective_faces.count ||
+        memcmp(next_faces->items, g_effective_faces.items,
+               next_faces->count * sizeof next_faces->items[0]) != 0;
     placed_moved =
         next_placed->count != g_effective_placed.count ||
         memcmp(next_placed->items, g_effective_placed.items,
                next_placed->count * sizeof next_placed->items[0]) != 0;
-    if (next_lights->count != g_effective_lights.count ||
-        memcmp(next_lights->items, g_effective_lights.items,
-               next_lights->count * sizeof next_lights->items[0]) != 0 ||
-        surfaces_moved || placed_moved ||
+    if (next_sprites->count != g_effective_sprites.count ||
+        memcmp(next_sprites->items, g_effective_sprites.items,
+               next_sprites->count * sizeof next_sprites->items[0]) != 0 ||
+        glow_moved || placed_moved ||
         next_objects->count != g_effective_objects.count ||
         memcmp(next_objects->items, g_effective_objects.items,
                next_objects->count * sizeof next_objects->items[0]) != 0)
         changed |= HWR_CHANGE_TRUECOLOR;
-    g_effective_lights = *next_lights;
+    g_effective_sprites = *next_sprites;
     /* And the one thing a seeding that works a whole map out ONCE has to be
-     * told about: the granted surfaces moving under it. Raised only where they
-     * actually moved, because what reads this is deciding whether to walk a
-     * map again. */
-    if (surfaces_moved && ++g_surface_generation == 0u)
-        g_surface_generation = 1u;      /* never nought: nought means unstaged */
-    g_effective_surfaces = *next_surfaces;
+     * told about: what the map's own geometry is lit from moving under it.
+     * Raised only where it actually moved, because what reads this is deciding
+     * whether to walk a map again. */
+    if (glow_moved && ++g_glow_generation == 0u)
+        g_glow_generation = 1u;         /* never nought: nought means unstaged */
+    g_effective_textures = *next_textures;
+    g_effective_faces = *next_faces;
     /* The free-standing lights carry a generation for the same reason: which
      * room each one hangs in is a fact about the map, worked out once when it is
      * staged, and this is what says that answer is stale. */
@@ -1748,12 +1982,12 @@ static void hwr_look_publish(const struct hwr_look_values *next,
         g_placed_generation = 1u;
     g_effective_placed = *next_placed;
     g_effective_objects = *next_objects;
-    /* A new set of placed objects is a new conversation about them: what has
-     * been said is about the map in force, and the map in force has just been
-     * decided. */
+    /* A new set of objects is a new conversation about them: what has been said
+     * is about the map in force, and the map in force has just been decided. */
     memset(g_object_matched, 0, sizeof g_object_matched);
-    memset(g_object_drawn, 0, sizeof g_object_drawn);
+    memset(g_object_hidden, 0, sizeof g_object_hidden);
     memset(g_object_told, 0, sizeof g_object_told);
+    memset(g_sprite_told, 0, sizeof g_sprite_told);
     g_objects_settled = 0;
     for (i = 0; i < count; i++) {
         int had = hwr_row_set_has(&g_effective.present, (int)i);
@@ -1784,17 +2018,19 @@ static void hwr_look_publish(const struct hwr_look_values *next,
 static void hwr_look_publish_nothing(void)
 {
     struct hwr_look_values empty;
-    struct hwr_look_lights no_lights;
-    struct hwr_look_lights no_surfaces;
+    struct hwr_look_lights no_sprites;
+    struct hwr_look_lights no_textures;
     struct hwr_look_objects no_objects;
+    struct hwr_look_faces no_faces;
     struct hwr_look_placed no_placed;
 
     memset(&empty, 0, sizeof empty);
-    memset(&no_lights, 0, sizeof no_lights);
-    memset(&no_surfaces, 0, sizeof no_surfaces);
+    memset(&no_sprites, 0, sizeof no_sprites);
+    memset(&no_textures, 0, sizeof no_textures);
     memset(&no_objects, 0, sizeof no_objects);
+    memset(&no_faces, 0, sizeof no_faces);
     memset(&no_placed, 0, sizeof no_placed);
-    hwr_look_publish(&empty, &no_lights, &no_surfaces, &no_objects,
+    hwr_look_publish(&empty, &no_sprites, &no_textures, &no_objects, &no_faces,
                      &no_placed);
 }
 
@@ -1977,16 +2213,17 @@ void hwr_look_drain_request(void)
 void hwr_look_select_map(const char *map_name)
 {
     struct hwr_look_values next;
-    struct hwr_look_lights next_lights;
-    struct hwr_look_lights next_surfaces;
+    struct hwr_look_lights next_sprites;
+    struct hwr_look_lights next_textures;
     struct hwr_look_objects next_objects;
+    struct hwr_look_faces next_faces;
     struct hwr_look_placed next_placed;
 
     hwr_look_map_name(g_look_map, HWR_LOOK_NAME, map_name);
-    hwr_look_compose(&g_look, g_look_map, &next, &next_lights, &next_surfaces,
-                     &next_objects, &next_placed);
-    hwr_look_publish(&next, &next_lights, &next_surfaces, &next_objects,
-                     &next_placed);
+    hwr_look_compose(&g_look, g_look_map, &next, &next_sprites, &next_textures,
+                     &next_objects, &next_faces, &next_placed);
+    hwr_look_publish(&next, &next_sprites, &next_textures, &next_objects,
+                     &next_faces, &next_placed);
 }
 
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
@@ -2029,102 +2266,178 @@ const char *hwr_look_current_map(void)
     return g_look_map[0] != 0 ? g_look_map : NULL;
 }
 
-int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out)
+int hwr_look_light_for_sprite(uint16_t graphic_id, struct hwr_look_light *out)
 {
     size_t i;
 
     if (out == NULL)
         return 0;
     memset(out, 0, sizeof *out);
-    for (i = 0; i < g_effective_lights.count; i++) {
-        if (g_effective_lights.items[i].id != graphic_id)
+    for (i = 0; i < g_effective_sprites.count; i++) {
+        if (g_effective_sprites.items[i].id != graphic_id)
             continue;
-        *out = g_effective_lights.items[i].light;
+        *out = g_effective_sprites.items[i].light;
         return 1;
     }
     return 0;
 }
 
-int hwr_look_light_for_surface(uint16_t texture_id, struct hwr_look_light *out)
+/* Which slot of each of the three tables names one object, or -1. Written once
+ * and used twice -- by the composition below and by the report that has to say
+ * WHICH entry did nothing -- so a note can never blame a table other than the
+ * one that answered. */
+static int hwr_look_object_slots(uint32_t map_index, uint16_t object_id,
+                                 uint16_t graphic_id, int *sprite_slot,
+                                 int *tag_slot, int *number_slot)
 {
     size_t i;
+
+    *sprite_slot = -1;
+    *tag_slot = -1;
+    *number_slot = -1;
+    for (i = 0; i < g_effective_sprites.count; i++) {
+        if (g_effective_sprites.items[i].id == graphic_id) {
+            *sprite_slot = (int)i;
+            break;
+        }
+    }
+    for (i = 0; i < g_effective_objects.count; i++) {
+        const struct hwr_look_object_entry *entry =
+            &g_effective_objects.items[i];
+
+        /* Nought is refused where the file is read, so nothing here can be
+         * keyed by it -- but an object carrying no tag must not match one
+         * either. */
+        if (entry->by_id) {
+            if (object_id != 0u && entry->key == (uint32_t)object_id)
+                *tag_slot = (int)i;
+        } else if (entry->key == map_index) {
+            *number_slot = (int)i;
+        }
+    }
+    return *sprite_slot >= 0 || *tag_slot >= 0 || *number_slot >= 0;
+}
+
+int hwr_look_object_grant(uint32_t map_index, uint16_t object_id,
+                          uint16_t graphic_id, struct hwr_look_light *out)
+{
+    int sprite_slot;
+    int tag_slot;
+    int number_slot;
 
     if (out == NULL)
         return 0;
     memset(out, 0, sizeof *out);
-    for (i = 0; i < g_effective_surfaces.count; i++) {
-        if (g_effective_surfaces.items[i].id != texture_id)
-            continue;
-        *out = g_effective_surfaces.items[i].light;
-        return 1;
-    }
-    return 0;
-}
-
-size_t hwr_look_surface_count(void)
-{
-    return g_effective_surfaces.count;
-}
-
-int hwr_look_surface_at(size_t index, uint16_t *texture_id,
-                        struct hwr_look_light *out)
-{
-    if (index >= g_effective_surfaces.count || texture_id == NULL ||
-        out == NULL)
+    if (!hwr_look_object_slots(map_index, object_id, graphic_id, &sprite_slot,
+                               &tag_slot, &number_slot))
         return 0;
-    *texture_id = g_effective_surfaces.items[index].id;
-    *out = g_effective_surfaces.items[index].light;
+    /* LEAST SPECIFIC FIRST, field by field: a kind is every object of that
+     * sprite in the game, a tag is the ones somebody grouped by hand, and a
+     * number is exactly one thing. */
+    if (sprite_slot >= 0)
+        hwr_look_light_over(out,
+                            &g_effective_sprites.items[sprite_slot].light);
+    if (tag_slot >= 0)
+        hwr_look_light_over(out, &g_effective_objects.items[tag_slot].light);
+    if (number_slot >= 0)
+        hwr_look_light_over(out, &g_effective_objects.items[number_slot].light);
+    /* AND `off` WHOLE, FROM THE MOST SPECIFIC TABLE NAMING IT. It is the entry
+     * rather than a field, so one object of a refused kind may be called a
+     * light again, and one member of a group may be refused. */
+    if (number_slot >= 0)
+        out->off = g_effective_objects.items[number_slot].light.off;
+    else if (tag_slot >= 0)
+        out->off = g_effective_objects.items[tag_slot].light.off;
+    else
+        out->off = g_effective_sprites.items[sprite_slot].light.off;
     return 1;
 }
 
-uint32_t hwr_look_surface_generation(void)
-{
-    return g_surface_generation;
-}
-
-int hwr_look_light_for_object(uint32_t map_index, struct hwr_look_light *out)
+int hwr_look_light_for_texture(uint16_t texture_id, struct hwr_look_light *out)
 {
     size_t i;
 
     if (out == NULL)
         return 0;
     memset(out, 0, sizeof *out);
-    for (i = 0; i < g_effective_objects.count; i++) {
-        const struct hwr_look_object_entry *entry =
-            &g_effective_objects.items[i];
-
-        if (entry->by_id || entry->key != map_index)
+    for (i = 0; i < g_effective_textures.count; i++) {
+        if (g_effective_textures.items[i].id != texture_id)
             continue;
-        *out = entry->light;
+        *out = g_effective_textures.items[i].light;
         return 1;
     }
     return 0;
 }
 
-int hwr_look_light_for_object_id(uint16_t object_id, struct hwr_look_light *out)
+size_t hwr_look_texture_count(void)
 {
+    return g_effective_textures.count;
+}
+
+int hwr_look_texture_at(size_t index, uint16_t *texture_id, int *map_scoped,
+                        struct hwr_look_light *out)
+{
+    if (index >= g_effective_textures.count || texture_id == NULL ||
+        map_scoped == NULL || out == NULL)
+        return 0;
+    *texture_id = g_effective_textures.items[index].id;
+    *map_scoped = g_effective_textures.items[index].from_map != 0u;
+    *out = g_effective_textures.items[index].light;
+    return 1;
+}
+
+uint32_t hwr_look_glow_generation(void)
+{
+    return g_glow_generation;
+}
+
+size_t hwr_look_face_count(void)
+{
+    return g_effective_faces.count;
+}
+
+int hwr_look_face_at(size_t index, int *by_id, uint32_t *key,
+                     struct hwr_look_light *out)
+{
+    if (index >= g_effective_faces.count || by_id == NULL || key == NULL ||
+        out == NULL)
+        return 0;
+    *by_id = g_effective_faces.items[index].by_id;
+    *key = g_effective_faces.items[index].key;
+    *out = g_effective_faces.items[index].light;
+    return 1;
+}
+
+int hwr_look_face_grant(uint32_t face_index, uint16_t face_tag,
+                        struct hwr_look_light *out)
+{
+    int tag_slot = -1;
+    int number_slot = -1;
     size_t i;
 
     if (out == NULL)
         return 0;
-    /* Nought is refused where the file is read, so nothing here can be keyed by
-     * it -- but an object carrying no tag must not go looking either, because a
-     * table that never holds nought would answer nothing very slowly. */
-    if (object_id == 0u) {
-        memset(out, 0, sizeof *out);
-        return 0;
-    }
     memset(out, 0, sizeof *out);
-    for (i = 0; i < g_effective_objects.count; i++) {
-        const struct hwr_look_object_entry *entry =
-            &g_effective_objects.items[i];
+    for (i = 0; i < g_effective_faces.count; i++) {
+        const struct hwr_look_face_entry *entry = &g_effective_faces.items[i];
 
-        if (!entry->by_id || entry->key != (uint32_t)object_id)
-            continue;
-        *out = entry->light;
-        return 1;
+        if (entry->by_id) {
+            if (face_tag != 0u && entry->key == (uint32_t)face_tag)
+                tag_slot = (int)i;
+        } else if (entry->key == face_index) {
+            number_slot = (int)i;
+        }
     }
-    return 0;
+    if (tag_slot < 0 && number_slot < 0)
+        return 0;
+    if (tag_slot >= 0)
+        hwr_look_light_over(out, &g_effective_faces.items[tag_slot].light);
+    if (number_slot >= 0)
+        hwr_look_light_over(out, &g_effective_faces.items[number_slot].light);
+    out->off = number_slot >= 0
+             ? g_effective_faces.items[number_slot].light.off
+             : g_effective_faces.items[tag_slot].light.off;
+    return 1;
 }
 
 size_t hwr_look_placed_count(void)
@@ -2152,12 +2465,18 @@ uint32_t hwr_look_placed_generation(void)
 
 int hwr_look_objects_pending(void)
 {
-    return !g_objects_settled && g_effective_objects.count != 0u;
+    return !g_objects_settled &&
+           (g_effective_objects.count != 0u ||
+            g_effective_sprites.count != 0u);
 }
 
 void hwr_look_object_seen(uint32_t map_index, uint16_t object_id,
-                          uint16_t graphic_id)
+                          uint16_t graphic_id, int marked)
 {
+    struct hwr_look_light grant;
+    int sprite_slot;
+    int tag_slot;
+    int number_slot;
     size_t i;
 
     if (g_objects_settled)
@@ -2173,32 +2492,72 @@ void hwr_look_object_seen(uint32_t map_index, uint16_t object_id,
             continue;
         }
         g_object_matched[i] = 1u;
-        if (entry->has_graphic && entry->graphic_id == graphic_id)
-            g_object_drawn[i] = 1u;
-        /* THE GRAPHIC IS A CHECK RATHER THAN PART OF THE KEY, so an entry that
-         * names the wrong one is applied and says so. That is what catches an
-         * entry gone stale after a map has been re-authored -- the one place
-         * addressing an object by its number is weak, because deleting an
-         * object in the editor renumbers every object after it.
-         *
-         * The remark is made HERE only for an object NUMBER, which names one
-         * thing and can therefore be judged on the spot. An id tag names a
-         * GROUP, and the question for a group is whether ANY of its members is
-         * drawn with the graphic -- which nothing can answer until the whole map
-         * has been offered, so that one is made when it settles. */
-        if (!entry->by_id && entry->has_graphic &&
-            entry->graphic_id != graphic_id && !g_object_told[i]) {
-            g_object_told[i] = 1u;
-            fprintf(stderr, "[renderer_overhaul] %s: object %lu on %s is drawn "
-                            "with %#06x, not the %#06x written beside it; the "
-                            "entry is applied anyway\n",
-                    g_look_path, (unsigned long)entry->key, g_look_map,
-                    (unsigned)graphic_id, (unsigned)entry->graphic_id);
-        }
+    }
+    /* AND THE ONE THING THAT USED TO BE SILENT. A grant makes a thing a light
+     * even where the map itself does not mark it -- but only with a colour,
+     * because a thing the map never lit has no honest colour for a light to be
+     * read off it. An entry naming such a thing and giving no colour is an entry
+     * that will never do anything, and it looks from the outside exactly like a
+     * value that had no effect.
+     *
+     * Said once per entry per map, and blamed on the MOST SPECIFIC table naming
+     * the object -- which is the entry whose author expected something. */
+    if (marked || !hwr_look_object_slots(map_index, object_id, graphic_id,
+                                         &sprite_slot, &tag_slot, &number_slot))
+        return;
+    if (!hwr_look_object_grant(map_index, object_id, graphic_id, &grant))
+        return;
+    if (grant.off || grant.has_color)
+        return;
+    if (number_slot >= 0) {
+        if (g_object_told[number_slot])
+            return;
+        g_object_told[number_slot] = 1u;
+        fprintf(stderr, "[renderer_overhaul] %s: object %lu on %s is not one of "
+                        "the lights the map marks; give the entry a colour to "
+                        "make it one, or it lights nothing\n",
+                g_look_path, (unsigned long)map_index, g_look_map);
+    } else if (tag_slot >= 0) {
+        if (g_object_told[tag_slot])
+            return;
+        g_object_told[tag_slot] = 1u;
+        fprintf(stderr, "[renderer_overhaul] %s: an object tagged %lu on %s is "
+                        "not one of the lights the map marks; give the entry a "
+                        "colour to make it one, or it lights nothing\n",
+                g_look_path,
+                (unsigned long)g_effective_objects.items[tag_slot].key,
+                g_look_map);
+    } else {
+        if (g_sprite_told[sprite_slot])
+            return;
+        g_sprite_told[sprite_slot] = 1u;
+        fprintf(stderr, "[renderer_overhaul] %s: an object drawn with the "
+                        "sprite %u/%u on %s is not one of the lights the map "
+                        "marks; give the entry a colour to make it one, or it "
+                        "lights nothing\n",
+                g_look_path, (unsigned)(graphic_id & 0xffu),
+                (unsigned)(graphic_id >> 8), g_look_map);
     }
 }
 
-void hwr_look_objects_settled(void)
+void hwr_look_object_hidden(uint32_t map_index)
+{
+    size_t i;
+
+    if (g_objects_settled)
+        return;
+    for (i = 0; i < g_effective_objects.count; i++) {
+        const struct hwr_look_object_entry *entry =
+            &g_effective_objects.items[i];
+
+        /* Only a NUMBER can name one: a hidden record is never read, so its tag
+         * is not a thing this layer has ever seen. */
+        if (!entry->by_id && entry->key == map_index)
+            g_object_hidden[i] = 1u;
+    }
+}
+
+void hwr_look_objects_settled(uint32_t numbered)
 {
     size_t i;
 
@@ -2209,32 +2568,29 @@ void hwr_look_objects_settled(void)
         const struct hwr_look_object_entry *entry =
             &g_effective_objects.items[i];
 
-        if (!g_object_matched[i]) {
-            /* A number nothing answers to is a typed number that will never do
-             * anything, and one that says nothing is one nobody finds. */
-            if (entry->by_id)
-                fprintf(stderr, "[renderer_overhaul] %s: no object tagged %lu "
-                                "on %s\n",
-                        g_look_path, (unsigned long)entry->key, g_look_map);
-            else
-                fprintf(stderr, "[renderer_overhaul] %s: no object %lu on %s\n",
-                        g_look_path, (unsigned long)entry->key, g_look_map);
+        if (g_object_matched[i] || g_object_told[i])
             continue;
-        }
-        /* And the group's own version of the graphic check, which only the
-         * finished walk can answer: an id naming objects of which NOT ONE is
-         * drawn with the graphic written beside it is an entry whose author was
-         * describing something else. It is applied anyway, exactly as the
-         * single object's is. */
-        if (entry->by_id && entry->has_graphic && !g_object_drawn[i] &&
-            !g_object_told[i]) {
-            g_object_told[i] = 1u;
-            fprintf(stderr, "[renderer_overhaul] %s: no object tagged %lu on %s "
-                            "is drawn with the %#06x written beside it; the "
-                            "entry is applied anyway\n",
-                    g_look_path, (unsigned long)entry->key, g_look_map,
-                    (unsigned)entry->graphic_id);
-        }
+        /* A number nothing answers to is a typed number that will never do
+         * anything, and one that says nothing is one nobody finds. Which
+         * sentence is true matters: "there is no object 70" sends a person
+         * looking for a renumbering that never happened, when the truth was
+         * that object 70 is there and hidden. */
+        if (!entry->by_id && g_object_hidden[i])
+            fprintf(stderr, "[renderer_overhaul] %s: object %lu on %s is hidden "
+                            "and never drawn; it cannot be a light\n",
+                    g_look_path, (unsigned long)entry->key, g_look_map);
+        else if (entry->by_id)
+            fprintf(stderr, "[renderer_overhaul] %s: no object tagged %lu on "
+                            "%s\n",
+                    g_look_path, (unsigned long)entry->key, g_look_map);
+        else if (numbered != 0u && entry->key >= numbered)
+            fprintf(stderr, "[renderer_overhaul] %s: %s numbers no object %lu; "
+                            "its objects are numbered 0 to %lu\n",
+                    g_look_path, g_look_map, (unsigned long)entry->key,
+                    (unsigned long)(numbered - 1u));
+        else
+            fprintf(stderr, "[renderer_overhaul] %s: no object %lu on %s\n",
+                    g_look_path, (unsigned long)entry->key, g_look_map);
     }
 }
 
@@ -2242,18 +2598,20 @@ void hwr_look_clear(void)
 {
     memset(&g_look, 0, sizeof g_look);
     memset(&g_effective, 0, sizeof g_effective);
-    memset(&g_effective_lights, 0, sizeof g_effective_lights);
-    if (g_effective_surfaces.count != 0u &&
-        ++g_surface_generation == 0u)
-        g_surface_generation = 1u;
-    memset(&g_effective_surfaces, 0, sizeof g_effective_surfaces);
+    memset(&g_effective_sprites, 0, sizeof g_effective_sprites);
+    if ((g_effective_textures.count != 0u || g_effective_faces.count != 0u) &&
+        ++g_glow_generation == 0u)
+        g_glow_generation = 1u;
+    memset(&g_effective_textures, 0, sizeof g_effective_textures);
+    memset(&g_effective_faces, 0, sizeof g_effective_faces);
     if (g_effective_placed.count != 0u && ++g_placed_generation == 0u)
         g_placed_generation = 1u;
     memset(&g_effective_placed, 0, sizeof g_effective_placed);
     memset(&g_effective_objects, 0, sizeof g_effective_objects);
     memset(g_object_matched, 0, sizeof g_object_matched);
-    memset(g_object_drawn, 0, sizeof g_object_drawn);
+    memset(g_object_hidden, 0, sizeof g_object_hidden);
     memset(g_object_told, 0, sizeof g_object_told);
+    memset(g_sprite_told, 0, sizeof g_sprite_told);
     g_objects_settled = 0;
     g_look_present = 0;
     g_look_path[0] = 0;

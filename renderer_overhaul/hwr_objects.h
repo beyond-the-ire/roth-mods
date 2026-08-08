@@ -127,6 +127,18 @@ struct hwr_objects {
     size_t count;
     size_t capacity;
     size_t source_counts[HWR_OBJECT_SOURCE_COUNT];
+    /* HOW MANY RECORDS THE MAP ITSELF NUMBERS, hidden ones included -- one past
+     * the largest number any entry of a game config could ever address. It is a
+     * fact about the map rather than about this walk, and it is what separates
+     * a number nobody can reach from a number naming a record that is simply
+     * never drawn. */
+    uint32_t numbered;
+    /* And the numbers of exactly those: the records the map holds and this walk
+     * declines to draw. Kept because "this map has no object 70" and "object 70
+     * is hidden" are different sentences and only one of them is ever true. */
+    uint32_t *hidden;
+    size_t hidden_count;
+    size_t hidden_capacity;
     int enabled;
     int valid;
     char error[192];

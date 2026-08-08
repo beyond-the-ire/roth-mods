@@ -82,6 +82,11 @@ void hwr_objects_clear(struct hwr_objects *objects)
     objects->items = NULL;
     objects->count = 0;
     objects->capacity = 0;
+    free(objects->hidden);
+    objects->hidden = NULL;
+    objects->hidden_count = 0;
+    objects->hidden_capacity = 0;
+    objects->numbered = 0;
     memset(objects->source_counts, 0, sizeof objects->source_counts);
     objects->valid = 0;
     objects->error[0] = 0;
@@ -106,6 +111,26 @@ static int hwr_objects_push(struct hwr_objects *objects, const struct hwr_object
     }
     objects->items[objects->count++] = *item;
     objects->source_counts[item->source]++;
+    return 0;
+}
+
+/* One more number the map holds and this walk will not draw. The list is grown
+ * rather than sized from a count, because the count is only known once the walk
+ * that finds them is over. */
+static int hwr_objects_push_hidden(struct hwr_objects *objects, uint32_t number)
+{
+    if (objects->hidden_count == objects->hidden_capacity) {
+        size_t next = objects->hidden_capacity != 0
+                    ? objects->hidden_capacity * 2u : 32u;
+        uint32_t *grown = (uint32_t *)realloc(objects->hidden,
+                                              next * sizeof *grown);
+
+        if (grown == NULL)
+            return -1;
+        objects->hidden = grown;
+        objects->hidden_capacity = next;
+    }
+    objects->hidden[objects->hidden_count++] = number;
     return 0;
 }
 
@@ -177,8 +202,14 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
             const uint8_t *record = section + record_offset;
             struct hwr_object item;
             uint32_t mine = number++;
-            if (record[HWR_OBJ_OFF_FLAGS7] & 0x80u)
+            if (record[HWR_OBJ_OFF_FLAGS7] & 0x80u) {
+                /* Numbered, never drawn -- and remembered, so that an entry of
+                 * a game config naming one is told what it named rather than
+                 * told the map has no such object. */
+                if (hwr_objects_push_hidden(objects, mine) != 0)
+                    return hwr_objects_fail(objects, "out of memory enumerating objects");
                 continue;                                    /* hidden */
+            }
             memset(&item, 0, sizeof item);
             item.map_index = mine;
             item.source = HWR_OBJECT_MAP;
@@ -202,6 +233,7 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
                 return hwr_objects_fail(objects, "out of memory enumerating objects");
         }
     }
+    objects->numbered = number;
     return 0;
 }
 
@@ -344,6 +376,8 @@ int hwr_objects_rebuild(struct hwr_objects *objects, const struct hwr_world *wor
     if (objects == NULL || world == NULL || api == NULL || api->game_ram == NULL)
         return -1;
     objects->count = 0;
+    objects->hidden_count = 0;
+    objects->numbered = 0;
     memset(objects->source_counts, 0, sizeof objects->source_counts);
     objects->valid = 0;
     objects->error[0] = 0;
@@ -398,11 +432,13 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
         return;
     yaw = api->game_ram->u16(0x909f8u);   /* g_sprite_view_angle */
     fprintf(file,
-            "objects total=%zu map=%zu particle=%zu pickup-fly=%zu player-reflection=%zu\n",
+            "objects total=%zu map=%zu particle=%zu pickup-fly=%zu player-reflection=%zu"
+            " numbered=%lu hidden=%zu\n",
             objects->count, objects->source_counts[HWR_OBJECT_MAP],
             objects->source_counts[HWR_OBJECT_PARTICLE],
             objects->source_counts[HWR_OBJECT_PICKUP_FLY],
-            objects->source_counts[HWR_OBJECT_PLAYER_REFLECTION]);
+            objects->source_counts[HWR_OBJECT_PLAYER_REFLECTION],
+            (unsigned long)objects->numbered, objects->hidden_count);
     for (i = 0; i < objects->count; i++) {
         const struct hwr_object *o = &objects->items[i];
         struct hwr_sprite_lookup lookup;
@@ -424,10 +460,26 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
             snprintf(number, sizeof number, "-");
         else
             snprintf(number, sizeof number, "%lu", (unsigned long)o->map_index);
+        /* THE IDENTIFIERS ARE THE ONES THE EDITOR SHOWS, in the spelling it
+         * shows them in. The sprite is the texture and source PAIR of the
+         * object panel, in that order, which is also how a game config keys the
+         * table that answers for a kind of thing; the tag is the panel's `ID:`;
+         * and both are decimal, because that is what the panel prints and this
+         * file exists to be read beside it.
+         *
+         * THE POSITION IS THE GAME'S OWN, straight out of the record. It is the
+         * space the world is measured in and the space a game config's `placed`
+         * entry is written in, so what is printed here can be pasted into one
+         * unchanged. The community editor DISPLAYS X with the opposite sign,
+         * which is a fact about its screen rather than about the world -- so a
+         * number taken off that screen is the one that needs flipping, not this
+         * one. */
         fprintf(file,
-                "%-5s %-10s x=%d y=%d z=%d facing=%u id=%#06x light=%u object-id=%u flags=%#x f7=%#04x f9=%#04x",
+                "%-5s %-10s x=%d y=%d z=%d facing=%u sprite=%u/%u light=%u id=%u flags=%#x f7=%#04x f9=%#04x",
                 number, hwr_objects_source_name(o->source), o->world_x,
-                o->world_y, o->world_z, o->facing, o->graphic_id, o->seed,
+                o->world_y, o->world_z, o->facing,
+                (unsigned)(o->graphic_id & 0xffu),
+                (unsigned)(o->graphic_id >> 8), o->seed,
                 o->object_id,
                 o->flags, o->flags7, o->flags9);
         if (have_frame)
@@ -437,6 +489,13 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
         else
             fprintf(file, " frame=unresolved\n");
     }
+    /* And the records the map numbers and never draws. They are not objects
+     * this layer knows anything else about -- it declined to read them -- but
+     * their NUMBERS are what a person needs, because the editor shows them and
+     * a config entry naming one can never do anything. */
+    for (i = 0; i < objects->hidden_count; i++)
+        fprintf(file, "%-5lu hidden     never drawn\n",
+                (unsigned long)objects->hidden[i]);
     fclose(file);
     rename(temp_path, path);
 }
