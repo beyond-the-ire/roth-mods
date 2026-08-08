@@ -3,6 +3,7 @@
 #include "hwr_json.h"
 #include "hwr_util.h"
 
+#include <dirent.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,13 +30,37 @@
  * says so, which is what lets an older build be honest about a newer file
  * rather than guess at it. */
 #define HWR_LOOK_FORMAT 1
-/* Where the descriptions live, and the one that is read. The folder is listed
- * and picked from on the settings screen; until then it is this name. */
+/* Where the descriptions live: a folder of them inside the mod's own folder,
+ * listed on the settings screen and chosen from there. The base game's ships
+ * as game_configs/roth.json, and that name is also the one a fresh install
+ * with no settings file of its own starts on. */
 #define HWR_LOOK_FOLDER "game_configs"
-#define HWR_LOOK_FILE "roth.json"
+#define HWR_LOOK_EXTENSION ".json"
+#define HWR_LOOK_SHIPPED "roth"
+/* The file the layer read before the folder did, kept only to say that it is
+ * no longer read. */
+#define HWR_LOOK_RETIRED "renderer_look.cfg"
 /* How long a place in the file may be named. Deep enough for every chain the
  * shape has and short enough to say in one line. */
 #define HWR_LOOK_WHERE 256u
+/* How many files the folder is listed down to. A game has one description and
+ * a machine with map packs on it has a handful; this is far past either, and
+ * it bounds the work a folder somebody emptied a download into can cost. */
+#define HWR_LOOK_MAX_CONFIGS 64u
+/* Those, plus none at the front of the list, plus the one place kept for a
+ * file the settings file names and the folder does not hold. */
+#define HWR_LOOK_MAX_SLOTS (HWR_LOOK_MAX_CONFIGS + 2u)
+/* How long the name shown on the settings screen may be. Wide enough for the
+ * longest name a file may carry plus what is added to one the folder does not
+ * hold, so that a kept name is shown whole rather than cut off at the point it
+ * stops being recognisable. */
+#define HWR_LOOK_LABEL 144u
+/* How long a game config's own name may be. Longer than any file anybody will
+ * write, and deliberately at least as long as the settings file's own value
+ * can carry: a name kept for a file the folder does not hold has to be kept
+ * WHOLE, or the settings file would name one thing and the list hold another,
+ * and one file somebody moved would cost every setting in it. */
+#define HWR_LOOK_TOKEN 128u
 
 struct hwr_look_values {
     struct hwr_row_set present;
@@ -74,6 +99,7 @@ struct hwr_look_file {
     size_t map_count;
 };
 
+static char g_look_dir[2048];
 static char g_look_path[2600];
 static struct hwr_look_file g_look;
 static int g_look_present;
@@ -85,6 +111,28 @@ static uint64_t g_look_candidate_hash;
 static uint32_t g_look_candidate_polls;
 static uint32_t g_look_frames_until_poll;
 static int g_look_reload_pending;
+
+/* The picker's own members: what the folder was found to hold, in the shape
+ * the settings table takes an enumeration in. The token is the file's name
+ * without its extension and is what the settings file carries; the label is
+ * what the settings screen shows, which is the file's own `for` string where
+ * it has one. Slot nought is none and is always there.
+ *
+ * The two arrays behind them hold the text, because the table keeps pointers
+ * and a folder listing is not made of string literals. */
+static struct hwr_enum_value g_slots[HWR_LOOK_MAX_SLOTS];
+static char g_slot_token[HWR_LOOK_MAX_SLOTS][HWR_LOOK_TOKEN];
+static char g_slot_label[HWR_LOOK_MAX_SLOTS][HWR_LOOK_LABEL];
+/* Which slots are a name the settings file carries and the folder does not
+ * answer for. The place is kept so that the settings file still parses whole
+ * -- one missing description must never cost every other setting -- and so
+ * that putting the file back restores the selection rather than having
+ * silently forgotten it. */
+static unsigned char g_slot_missing[HWR_LOOK_MAX_SLOTS];
+static size_t g_slot_count;
+/* The selection the layer has already acted on, so that the settings pump can
+ * tell a picker that has moved from one that has not with one comparison. */
+static int32_t g_look_followed;
 
 /* ------------------------------------------------------- what is said ---- */
 
@@ -130,6 +178,329 @@ static void hwr_look_where(char out[HWR_LOOK_WHERE], const char *where,
             out[used++] = name[i];
     }
     out[used] = 0;
+}
+
+/* ----------------------------------------------- the folder and the picker */
+
+/* Whether a name can be written down in the settings file. That file is
+ * key=value, '#' starts a comment in it and whitespace around a value is
+ * trimmed, so a file name carrying either is a selection nobody could record
+ * -- and a selection that cannot be recorded is worse than a file left out of
+ * the list, because it would be lost on the next save without a word. */
+static int hwr_look_plain_name(const char *name)
+{
+    size_t i;
+
+    if (name == NULL || name[0] == 0)
+        return 0;
+    for (i = 0; name[i] != 0; i++) {
+        char letter = name[i];
+
+        if ((letter >= 'a' && letter <= 'z') ||
+            (letter >= 'A' && letter <= 'Z') ||
+            (letter >= '0' && letter <= '9') ||
+            letter == '-' || letter == '_' || letter == '.')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* The name a file is listed under: what it is called with its extension taken
+ * off. Answers 0 for anything in the folder that is not one of ours, and for a
+ * name too long to record. */
+static int hwr_look_file_token(const char *file_name, char *out,
+                               size_t out_size)
+{
+    size_t length = file_name != NULL ? strlen(file_name) : 0;
+    size_t suffix = strlen(HWR_LOOK_EXTENSION);
+
+    if (length <= suffix || length - suffix >= out_size)
+        return 0;
+    if (!hwr_ascii_equal_ci(file_name + length - suffix, HWR_LOOK_EXTENSION))
+        return 0;
+    memcpy(out, file_name, length - suffix);
+    out[length - suffix] = 0;
+    return 1;
+}
+
+/* How big a file is, or -1 where that cannot be told. Asked before a file is
+ * read rather than after, so that one too large to be one of ours is left out
+ * of the list for that reason instead of being reported as unreadable. */
+static long hwr_look_file_size(const char *path)
+{
+    FILE *stream = fopen(path, "rb");
+    long size = -1;
+
+    if (stream == NULL)
+        return -1;
+    if (fseek(stream, 0, SEEK_END) == 0)
+        size = ftell(stream);
+    fclose(stream);
+    return size;
+}
+
+/* What one file calls the game it describes, which is the name the settings
+ * screen shows for it. A file that is not JSON at all is still listed and
+ * simply has nothing to say here -- a broken file in the folder must never
+ * cost the folder -- and what is wrong with it is reported if and when it is
+ * the one chosen. */
+static void hwr_look_read_title(const char *path, char *out, size_t out_size)
+{
+    struct hwr_json_doc doc;
+    const char *title;
+
+    out[0] = 0;
+    memset(&doc, 0, sizeof doc);
+    if (!hwr_json_parse_file(&doc, path)) {
+        hwr_json_free(&doc);
+        return;
+    }
+    title = hwr_json_as_text(&doc,
+                             hwr_json_member(&doc, hwr_json_root(&doc), "for"));
+    if (title != NULL)
+        snprintf(out, out_size, "%s", title);
+    hwr_json_free(&doc);
+}
+
+static void hwr_look_publish_slots(void)
+{
+    hwr_schema_set_enum_values("game_config", g_slots, g_slot_count);
+}
+
+/* The list back to none alone, which is what it holds where nothing has looked
+ * in a folder at all. */
+static void hwr_look_slots_reset(void)
+{
+    memset(g_slots, 0, sizeof g_slots);
+    memset(g_slot_token, 0, sizeof g_slot_token);
+    memset(g_slot_label, 0, sizeof g_slot_label);
+    memset(g_slot_missing, 0, sizeof g_slot_missing);
+    snprintf(g_slot_label[0], HWR_LOOK_LABEL, "None");
+    g_slots[0].token = g_slot_token[0];
+    g_slots[0].value = 0;
+    g_slots[0].label = g_slot_label[0];
+    g_slot_count = 1;
+    hwr_look_publish_slots();
+}
+
+static int hwr_look_add_slot(const char *token, const char *label, int missing)
+{
+    size_t at = g_slot_count;
+
+    if (at >= HWR_LOOK_MAX_SLOTS)
+        return -1;
+    snprintf(g_slot_token[at], HWR_LOOK_TOKEN, "%s", token);
+    snprintf(g_slot_label[at], HWR_LOOK_LABEL, "%s", label);
+    g_slots[at].token = g_slot_token[at];
+    g_slots[at].value = (int32_t)at;
+    g_slots[at].label = g_slot_label[at];
+    g_slot_missing[at] = missing != 0 ? 1u : 0u;
+    g_slot_count++;
+    return (int)at;
+}
+
+static int hwr_look_slot_of(const char *token)
+{
+    size_t i;
+
+    if (token == NULL)
+        return -1;
+    for (i = 0; i < g_slot_count; i++) {
+        if (hwr_ascii_equal_ci(g_slot_token[i], token))
+            return (int)i;
+    }
+    return -1;
+}
+
+/* Which file is chosen, by name. Nothing chosen and a place the list does not
+ * hold are the same answer here: the empty name, which is none. */
+static const char *hwr_look_selected_token(void)
+{
+    int32_t slot = hwr_settings_get()->game_config;
+
+    if (slot < 0 || (size_t)slot >= g_slot_count)
+        return "";
+    return g_slot_token[slot];
+}
+
+static int hwr_look_selected_is_missing(void)
+{
+    int32_t slot = hwr_settings_get()->game_config;
+
+    if (slot < 0 || (size_t)slot >= g_slot_count)
+        return 0;
+    return g_slot_missing[slot] != 0;
+}
+
+/* One line for the file this layer used to read, said once and only where one
+ * is actually still sitting beside the plugin. */
+static void hwr_look_note_retired_file(void)
+{
+    static int said;
+    char path[2600];
+    FILE *stream;
+
+    if (said || g_look_dir[0] == 0)
+        return;
+    snprintf(path, sizeof path, "%s/%s", g_look_dir, HWR_LOOK_RETIRED);
+    stream = fopen(path, "rb");
+    if (stream == NULL)
+        return;
+    fclose(stream);
+    said = 1;
+    fprintf(stderr, "[renderer_overhaul] %s is no longer read; per-map looks "
+                    "now live in the %s folder\n",
+            HWR_LOOK_RETIRED, HWR_LOOK_FOLDER);
+}
+
+void hwr_look_scan(const char *plugin_dir, const char *keep)
+{
+    char names[HWR_LOOK_MAX_CONFIGS][HWR_LOOK_TOKEN];
+    char keep_token[HWR_LOOK_TOKEN];
+    char folder[2100];
+    size_t count = 0;
+    size_t left_out = 0;
+    DIR *listing;
+    size_t i;
+    int slot;
+
+    /* What is kept across a listing is the file's NAME, never the place it sat
+     * in: a file added to the folder moves every place after it, and a
+     * selection that followed a place would quietly become a different file. */
+    if (keep != NULL)
+        snprintf(keep_token, sizeof keep_token, "%s", keep);
+    else
+        snprintf(keep_token, sizeof keep_token, "%s",
+                 hwr_look_selected_token());
+    /* The folder is never written down from itself. A re-listing hands back
+     * the one already known -- which is the same bytes this would be copying
+     * onto -- and a copy of a thing onto itself is not a copy. */
+    if (plugin_dir != NULL && plugin_dir != g_look_dir)
+        snprintf(g_look_dir, sizeof g_look_dir, "%s", plugin_dir);
+    hwr_look_slots_reset();
+    snprintf(folder, sizeof folder, "%s/%s", g_look_dir, HWR_LOOK_FOLDER);
+    listing = opendir(folder);
+    if (listing != NULL) {
+        const struct dirent *entry;
+
+        while ((entry = readdir(listing)) != NULL) {
+            char token[HWR_LOOK_TOKEN];
+            char path[2600];
+            long size;
+
+            if (!hwr_look_file_token(entry->d_name, token, sizeof token))
+                continue;
+            if (!hwr_look_plain_name(token)) {
+                fprintf(stderr, "[renderer_overhaul] %s/%s: a game config's "
+                                "name may hold only letters, digits, '-', '_' "
+                                "and '.', because it is what the settings file "
+                                "records it as; left out\n",
+                        folder, entry->d_name);
+                continue;
+            }
+            snprintf(path, sizeof path, "%s/%s", folder, entry->d_name);
+            size = hwr_look_file_size(path);
+            if (size < 0 || (unsigned long)size > (unsigned long)
+                                                     HWR_JSON_MAX_BYTES) {
+                fprintf(stderr, "[renderer_overhaul] %s: a game config is a "
+                                "few kilobytes; this one is not one of ours "
+                                "and is left out\n", path);
+                continue;
+            }
+            if (count >= HWR_LOOK_MAX_CONFIGS) {
+                left_out++;
+                continue;
+            }
+            snprintf(names[count], HWR_LOOK_TOKEN, "%s", token);
+            count++;
+        }
+        closedir(listing);
+    }
+    if (left_out != 0)
+        fprintf(stderr, "[renderer_overhaul] %s holds more than %u game "
+                        "configs; %u of them are left out of the list\n",
+                folder, (unsigned)HWR_LOOK_MAX_CONFIGS, (unsigned)left_out);
+    /* Sorted by name, and the same way on every machine: a folder listing
+     * arrives in whatever order the filesystem feels like, and a picker whose
+     * order changes between runs is one nobody can find their file in. */
+    for (i = 1; i < count; i++) {
+        char moving[HWR_LOOK_TOKEN];
+        size_t at = i;
+
+        memcpy(moving, names[i], HWR_LOOK_TOKEN);
+        while (at > 0 && hwr_ascii_before_ci(moving, names[at - 1u])) {
+            memcpy(names[at], names[at - 1u], HWR_LOOK_TOKEN);
+            at--;
+        }
+        memcpy(names[at], moving, HWR_LOOK_TOKEN);
+    }
+    for (i = 0; i < count; i++) {
+        char path[2600];
+        char label[HWR_LOOK_LABEL];
+
+        snprintf(path, sizeof path, "%s/%.*s%s", folder,
+                 (int)(HWR_LOOK_TOKEN - 1u), names[i], HWR_LOOK_EXTENSION);
+        hwr_look_read_title(path, label, sizeof label);
+        hwr_look_add_slot(names[i], label[0] != 0 ? label : names[i], 0);
+    }
+    /* A name the settings file carries that the folder does not answer for
+     * keeps its place in the list. Refusing it outright would mark the whole
+     * settings file invalid and take every other setting down with it, over
+     * one file somebody moved; and forgetting it would mean putting the file
+     * back does not put the selection back. */
+    if (keep_token[0] != 0 && hwr_look_slot_of(keep_token) < 0) {
+        char label[HWR_LOOK_LABEL];
+
+        snprintf(label, sizeof label, "%s (missing)", keep_token);
+        hwr_look_add_slot(keep_token, label, 1);
+    }
+    hwr_look_publish_slots();
+    slot = hwr_look_slot_of(keep_token);
+    hwr_settings_set_game_config(slot > 0 ? (int32_t)slot : 0);
+    hwr_look_note_retired_file();
+}
+
+size_t hwr_look_config_count(void)
+{
+    return g_slot_count;
+}
+
+const char *hwr_look_config_token(size_t slot)
+{
+    return slot < g_slot_count ? g_slot_token[slot] : NULL;
+}
+
+const char *hwr_look_config_label(size_t slot)
+{
+    return slot < g_slot_count ? g_slot_label[slot] : NULL;
+}
+
+int hwr_look_config_is_missing(size_t slot)
+{
+    return slot < g_slot_count && g_slot_missing[slot] != 0;
+}
+
+int hwr_look_select_config(const char *token)
+{
+    int slot = hwr_look_slot_of(token);
+
+    if (slot < 0)
+        return 0;
+    hwr_settings_set_game_config((int32_t)slot);
+    return hwr_settings_get()->game_config == slot;
+}
+
+void hwr_look_select_shipped(void)
+{
+    int slot = hwr_look_slot_of(HWR_LOOK_SHIPPED);
+
+    if (slot <= 0 || g_slot_missing[slot])
+        return;
+    if (!hwr_look_select_config(HWR_LOOK_SHIPPED))
+        return;
+    fprintf(stderr, "[renderer_overhaul] no settings file yet; the game config "
+                    "%s describes this game's maps\n", g_slot_label[slot]);
 }
 
 /* ------------------------------------------------------------ the model -- */
@@ -827,20 +1198,64 @@ static void hwr_look_say_what_was_read(const struct hwr_look_file *file)
                 g_look_path, (unsigned)file->map_count);
 }
 
-void hwr_look_load(const char *plugin_dir)
+/* Nothing is in force, and why. This is not an error in any of its three
+ * spellings: a person who has chosen none has chosen it, a file the folder does
+ * not hold keeps its place in the list so that putting it back puts the
+ * selection back, and a file that has just been deleted is answered for the
+ * same way. In all three every dial falls to the settings screen on every map,
+ * and the settings file is NEVER rewritten over any of it. */
+static void hwr_look_stand_down(int report)
 {
+    const char *token = hwr_look_selected_token();
+
+    memset(&g_look, 0, sizeof g_look);
+    g_look_present = 0;
+    g_look_hash = 0;
+    g_look_candidate_hash = 0;
+    g_look_candidate_polls = 0;
+    hwr_look_publish_nothing();
+    if (!report)
+        return;
+    if (token[0] == 0)
+        fprintf(stderr, "[renderer_overhaul] no game config is in force; the "
+                        "settings in force describe every map\n");
+    else if (hwr_look_selected_is_missing())
+        fprintf(stderr, "[renderer_overhaul] the game config %s is not in the "
+                        "%s folder; the settings in force describe every map\n",
+                token, HWR_LOOK_FOLDER);
+    else
+        fprintf(stderr, "[renderer_overhaul] no game config at %s; the "
+                        "settings in force describe every map\n", g_look_path);
+}
+
+/* Whatever the picker names, read into the live model. The selection is a NAME
+ * and the file it names is read wherever the list says it stands, so a file
+ * that was there when the folder was listed and is not there now, and one that
+ * was never there, are one answer rather than two.
+ *
+ * A file that is there and cannot be read costs the FILE and nothing else:
+ * whatever was in force stays in force, which is what a person editing one
+ * wants and what one missing brace must never be allowed to undo. */
+static void hwr_look_take_selection(int report)
+{
+    const char *token = hwr_look_selected_token();
     struct hwr_look_file *next;
     uint64_t hash = 0;
     int read;
 
-    if (plugin_dir == NULL)
-        plugin_dir = "";
-    snprintf(g_look_path, sizeof g_look_path, "%s/%s/%s", plugin_dir,
-             HWR_LOOK_FOLDER, HWR_LOOK_FILE);
+    g_look_followed = hwr_settings_get()->game_config;
+    if (token[0] == 0) {
+        g_look_path[0] = 0;
+        hwr_look_stand_down(report);
+        return;
+    }
+    snprintf(g_look_path, sizeof g_look_path, "%s/%s/%.*s%s", g_look_dir,
+             HWR_LOOK_FOLDER, (int)(HWR_LOOK_TOKEN - 1u), token,
+             HWR_LOOK_EXTENSION);
     next = (struct hwr_look_file *)malloc(sizeof *next);
     if (next == NULL)
         return;
-    read = hwr_look_read(next, &hash, 1);
+    read = hwr_look_read(next, &hash, report);
     if (read < 0) {
         /* The file said so itself while it was being read. Whatever was in
          * force is what a person had before they broke it, and it stands. */
@@ -849,12 +1264,7 @@ void hwr_look_load(const char *plugin_dir)
     }
     if (read == 0) {
         free(next);
-        memset(&g_look, 0, sizeof g_look);
-        g_look_present = 0;
-        g_look_map[0] = 0;
-        hwr_look_publish_nothing();
-        fprintf(stderr, "[renderer_overhaul] no game config at %s; the "
-                        "settings in force describe every map\n", g_look_path);
+        hwr_look_stand_down(report);
         return;
     }
     g_look = *next;
@@ -862,13 +1272,34 @@ void hwr_look_load(const char *plugin_dir)
     g_look_present = 1;
     g_look_hash = hash;
     g_look_candidate_polls = 0;
-    hwr_look_say_what_was_read(&g_look);
-    hwr_look_select_map(NULL);
+    if (report)
+        hwr_look_say_what_was_read(&g_look);
+    hwr_look_select_map(g_look_map[0] != 0 ? g_look_map : NULL);
+}
+
+void hwr_look_load(const char *plugin_dir)
+{
+    if (plugin_dir != NULL)
+        snprintf(g_look_dir, sizeof g_look_dir, "%s", plugin_dir);
+    hwr_look_note_retired_file();
+    g_look_map[0] = 0;
+    hwr_look_take_selection(1);
+}
+
+void hwr_look_follow_selection(void)
+{
+    if (hwr_settings_get()->game_config == g_look_followed)
+        return;
+    /* One comparison per pump, and deliberately not an apply hook: the look's
+     * overrides have to be in force BEFORE the hooks that consume them run,
+     * and publishing from inside one would invert that order. */
+    g_look_followed = hwr_settings_get()->game_config;
+    g_look_reload_pending = 1;
 }
 
 void hwr_look_request_reload(void)
 {
-    if (g_look_path[0] == 0)
+    if (g_look_dir[0] == 0)
         return;
     g_look_reload_pending = 1;
 }
@@ -919,42 +1350,16 @@ void hwr_look_poll(void)
 
 void hwr_look_drain_request(void)
 {
-    struct hwr_look_file *next;
-    uint64_t hash = 0;
-    int read;
-
     if (!g_look_reload_pending)
         return;
     g_look_reload_pending = 0;
-    next = (struct hwr_look_file *)malloc(sizeof *next);
-    if (next == NULL)
-        return;
-    read = hwr_look_read(next, &hash, 1);
-    if (read < 0) {
-        free(next);
-        return;
-    }
-    if (read == 0) {
-        free(next);
-        if (g_look_present) {
-            /* The file was there and is not any more: the game-wide answer goes
-             * with it rather than standing over a file nobody has. */
-            memset(&g_look, 0, sizeof g_look);
-            g_look_present = 0;
-            hwr_look_publish_nothing();
-            fprintf(stderr, "[renderer_overhaul] the game config %s is gone; "
-                            "the settings in force describe every map\n",
-                    g_look_path);
-        }
-        return;
-    }
-    g_look = *next;
-    free(next);
-    g_look_present = 1;
-    g_look_hash = hash;
-    g_look_candidate_polls = 0;
-    fprintf(stderr, "[renderer_overhaul] game config reloaded\n");
-    hwr_look_select_map(g_look_map[0] != 0 ? g_look_map : NULL);
+    /* Whatever the picker names, read again. The folder itself is listed by the
+     * settings file's own reload, which runs first in the pump and is what
+     * Reload From File asks for beside this -- so by the time this runs, a file
+     * put in the folder while the game was running is already in the picker. A
+     * request that came from the file watcher instead is about the CONTENT of
+     * the chosen file, and the folder has not moved for it. */
+    hwr_look_take_selection(1);
 }
 
 void hwr_look_select_map(const char *map_name)
@@ -1007,9 +1412,17 @@ void hwr_look_clear(void)
     memset(&g_effective_lights, 0, sizeof g_effective_lights);
     g_look_present = 0;
     g_look_path[0] = 0;
+    g_look_dir[0] = 0;
     g_look_map[0] = 0;
     g_look_hash = 0;
     g_look_candidate_hash = 0;
     g_look_candidate_polls = 0;
     g_look_reload_pending = 0;
+    /* The list back to none alone, and the selection with it. The row's value
+     * is a place in that list, so a selection left standing over a list that
+     * no longer holds it would be a value the row itself refuses -- which is a
+     * settings file that cannot be saved. */
+    hwr_look_slots_reset();
+    hwr_settings_set_game_config(0);
+    g_look_followed = 0;
 }

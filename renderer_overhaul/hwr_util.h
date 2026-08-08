@@ -4,6 +4,12 @@
 #include <stdint.h>
 
 int hwr_ascii_equal_ci(const char *a, const char *b);
+/* Whether a sorts before b, ignoring case, with the case-sensitive comparison
+ * as the tie-break so that two names differing only in case still have one
+ * settled order. It exists so that a folder listing -- which arrives in
+ * whatever order a filesystem feels like -- is shown in the same order on
+ * every machine and on every run. */
+int hwr_ascii_before_ci(const char *a, const char *b);
 
 /* A set of settings rows, held by table position.
  *

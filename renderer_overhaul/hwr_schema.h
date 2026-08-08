@@ -55,7 +55,10 @@ enum hwr_widget {
 enum {
     HWR_SF_NEEDS_CONFIRM = 1u << 0, /* a change wants confirm/revert */
     HWR_SF_ZERO_IS_AUTO  = 1u << 1, /* zero is legal and means "follow" */
-    HWR_SF_MAP_OVERRIDE  = 1u << 2, /* a per-map profile may override it */
+    /* A game config's entry for the map being played may override it. Which
+     * rows those are is this flag and nothing else, so adding a look key is
+     * adding one flag to one row and no second list can drift from it. */
+    HWR_SF_MAP_OVERRIDE  = 1u << 2,
     HWR_SF_RESTART_FREE  = 1u << 3, /* takes effect without a restart */
     HWR_SF_EXCLUSIVE_MIN = 1u << 4, /* the minimum itself is not accepted */
     /* The row is live at one particular value of the row it hangs off, which
@@ -120,6 +123,20 @@ struct hwr_setting_desc {
     union hwr_value (*from_field)(const struct hwr_settings *);
     int (*read_info)(const struct roth_api_v1 *, char *, size_t);
 };
+
+/* The members of one enumeration row, where they are not known until something
+ * outside the table has looked: the game config picker's are the files in the
+ * game configs folder, and there is no such thing as a compile-time list of
+ * those. The array belongs to the caller and has to outlive the row, which is
+ * why the one caller keeps it in a module of its own. The row must be an
+ * enumeration and the list must hold at least one member; anything else is
+ * refused and the row keeps what it had.
+ *
+ * Nothing else in the table is written after it is built, and every reader
+ * outside this file is handed a const view of it. */
+void hwr_schema_set_enum_values(const char *key,
+                                const struct hwr_enum_value *values,
+                                size_t count);
 
 size_t hwr_schema_count(void);
 const struct hwr_setting_desc *hwr_schema_at(size_t index);

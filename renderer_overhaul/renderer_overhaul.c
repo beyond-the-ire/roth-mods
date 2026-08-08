@@ -558,9 +558,14 @@ static void hwr_apply_window_requests(const struct roth_api_v1 *api)
 static void hwr_settings_pump(const struct roth_api_v1 *api)
 {
     hwr_config_drain_request();
-    /* The look file is the second writer into the same store, so it is read at
-     * the same safe point and its overrides are in force before the hooks that
-     * consume them run. */
+    /* The picker having moved is one comparison, and it is taken here rather
+     * than in an apply hook: the look's overrides have to be in force before
+     * the hooks that consume them run, and a hook publishing them would invert
+     * exactly that order. */
+    hwr_look_follow_selection();
+    /* The game config is the second writer into the same store, so it is read
+     * at the same safe point and its overrides are in force before the hooks
+     * that consume them run. */
     hwr_look_drain_request();
     hwr_settings_apply_pending();
     /* A response that fits a scale to the map's own authored brightness may
@@ -2001,7 +2006,11 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
                         " failed; the original renderer keeps the screen\n");
         g_gl_permanently_failed = 1;
     }
-    hwr_config_load(g_plugin_dir);
+    /* The game configs folder is listed BEFORE the settings file is parsed, so
+     * that the file's own choice of one is a value the picker row holds -- even
+     * where the file it names has been moved away. The chosen file itself is
+     * read straight afterwards. */
+    hwr_config_open(g_plugin_dir);
     hwr_look_load(g_plugin_dir);
     hwr_overlay_init();
 }

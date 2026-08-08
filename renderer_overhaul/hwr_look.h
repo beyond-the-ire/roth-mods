@@ -7,6 +7,13 @@
 /* The game config: what a particular game's places are lit like, described in
  * a JSON file inside the mod's own `game_configs` folder.
  *
+ * The folder holds as many of them as anybody likes -- one per game, or two
+ * for one game and a choice between them -- and which is in force is a row on
+ * the settings screen whose members are the files themselves. What the settings
+ * file records is the file's NAME, so files may be added or taken away without
+ * renumbering anybody's selection, and the empty name is a real value meaning
+ * none.
+ *
  *   {
  *     "format": 1,
  *     "for": "Realms of the Haunting",
@@ -54,9 +61,43 @@
  * is read.
  */
 
-/* Reads the game config, if there is one. */
+/* Lists the game configs folder and fills the settings table's `game_config`
+ * row from what is in it: none first, then one entry per file, sorted by name
+ * so the list reads the same on every machine and every run.
+ *
+ * `keep` is the name the settings file carries, peeked out of it BEFORE it is
+ * parsed -- which is the whole reason this runs first. A name the folder does
+ * not answer for keeps a place of its own in the list, so that the settings
+ * file still parses whole (one file somebody moved must never cost every other
+ * setting) and so that putting the file back puts the selection back. NULL
+ * keeps whatever is chosen now, which is what a re-listing wants.
+ *
+ * A name is kept across a listing, never a place: files may be added or taken
+ * away without renumbering anybody's selection. */
+void hwr_look_scan(const char *plugin_dir, const char *keep);
+/* The list as it stands, for anything that has to say what is in it. */
+size_t hwr_look_config_count(void);
+const char *hwr_look_config_token(size_t slot);
+const char *hwr_look_config_label(size_t slot);
+int hwr_look_config_is_missing(size_t slot);
+/* Chooses one by name, case-insensitively. Answers 0 where the list holds no
+ * such name and leaves the selection alone. */
+int hwr_look_select_config(const char *token);
+/* Chooses the base game's own config, for the one case that calls for it: a
+ * fresh install with no settings file at all. It is not the row's default --
+ * a default naming a file somebody deleted would be a value with no place in
+ * the list, which would read back as its own opposite. */
+void hwr_look_select_shipped(void);
+
+/* Reads whatever the picker names, if it names anything. */
 void hwr_look_load(const char *plugin_dir);
-/* Asks for the file to be read again at the next safe point. */
+/* Notices the picker moving in the settings pump, which is where the layer
+ * asks for the newly chosen file. Deliberately not an apply hook: the look's
+ * overrides are in force before the hooks that consume them run, and
+ * publishing from inside one would invert that order. */
+void hwr_look_follow_selection(void);
+/* Asks for the folder to be listed again and the chosen file read again at the
+ * next safe point. */
 void hwr_look_request_reload(void);
 /* The optional development watcher, on the same switch the settings file uses. */
 void hwr_look_poll(void);

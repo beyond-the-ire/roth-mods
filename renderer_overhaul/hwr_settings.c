@@ -218,6 +218,18 @@ void hwr_settings_set_pitch_mode(enum hwr_pitch_mode mode)
     hwr_settings_commit_key("pitch_mode", value);
 }
 
+/* The look layer's own writer into the store. It is a place in the list the
+ * folder scan built, so it is committed through the row like every other value
+ * and a place the list does not hold is refused rather than stored. */
+void hwr_settings_set_game_config(int32_t slot)
+{
+    union hwr_value value;
+
+    memset(&value, 0, sizeof value);
+    value.e = slot;
+    hwr_settings_commit_key("game_config", value);
+}
+
 /* The settings overlay reads its key straight from the store when it handles a
  * scancode, so the row carries no change bit and no hook reacts to it. */
 void hwr_settings_set_overlay_key(uint32_t scancode)

@@ -150,7 +150,24 @@ static union hwr_value hwr_fps_cap_from_field(
 
 #define HWR_COUNT_OF(table) (sizeof (table) / sizeof (table)[0])
 
-static const struct hwr_setting_desc HWR_SCHEMA[] = {
+/* The game config picker's members before a folder has been listed, and the
+ * ones it falls back to if none ever is. Slot nought is none, and its token is
+ * the EMPTY STRING -- so "no game config" is a real value of a real row,
+ * written into the settings file as `game_config=`, read back from an empty or
+ * an absent value, and shippable as a default, rather than a special case
+ * standing beside the table. It lives here rather than in the folder scan so
+ * that the row can always be written and always be validated, even where
+ * nothing has looked in a folder at all. */
+static const struct hwr_enum_value HWR_GAME_CONFIG_NONE[] = {
+    { "", 0, "None" }
+};
+
+/* Not const, and for one reason: the game config picker's members are the
+ * files in a folder, which nothing can know until the folder is listed.
+ * hwr_schema_set_enum_values is the only writer, it touches that row's member
+ * list and nothing else, and every reader outside this file is handed a const
+ * view of the table. */
+static struct hwr_setting_desc HWR_SCHEMA[] = {
     {
         .key = "enabled",
         .type = HWR_VT_BOOL,
@@ -468,6 +485,42 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                 "shading, which is what keeps its darkest levels smooth."
     },
     {
+        /* Which of the files in the game configs folder describes this game's
+         * maps. It sits at the top of the lighting family so that the first
+         * question this section asks is WHICH map descriptions are in force and
+         * everything below it is what you want everywhere.
+         *
+         * It is an enumeration whose members are not known until the folder is
+         * listed, which is exactly what a selection that is a NAME needs: the
+         * table already keeps a token and a label apart, the settings file
+         * round-trips the token rather than a place in the list, and files may
+         * therefore be added or taken away without renumbering anybody's
+         * selection.
+         *
+         * It hangs off nothing on purpose: which description is in force has to
+         * be visible and changeable whatever the shading is set to. And it
+         * carries no per-map override, because a game config must not be able
+         * to choose a different game config. */
+        .key = "game_config",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_LIVE,
+        .change_bit = HWR_CHANGE_GAME_CONFIG,
+        .offset = offsetof(struct hwr_settings, game_config),
+        .flags = HWR_SF_RESTART_FREE,
+        .def = { .e = 0 },
+        .original = { .e = 0 },
+        .values = HWR_GAME_CONFIG_NONE,
+        .value_count = HWR_COUNT_OF(HWR_GAME_CONFIG_NONE),
+        .depends_on = -1,
+        .label = "Game config",
+        .help = "The game config override in force: which of the files in the "
+                "game configs folder describes this game's maps. Each one says "
+                "how particular places are lit; put one in that folder for a "
+                "map pack."
+    },
+    {
         /* The shading law. Original is the picture the game has always drawn,
          * to the byte; anything else asks for the colour world image and, being
          * an enumeration rather than a switch, clears the neutral early-out --
@@ -674,10 +727,10 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                  HWR_SF_DEPENDS_ON_VALUE,
         /* The shipped default is the play-tested look: with the candle cone
          * supplying the near-field darkness, 0.85 is where the corridor's
-         * composed profile sits within a step of the original's while going
+         * composed falloff sits within a step of the original's while going
          * genuinely black past the map's own solid-fill distance. One -- the
-         * map exactly as written -- stays the Original, and the authentic
-         * profile in the look file. */
+         * map exactly as written -- stays the Original, and is what a game
+         * config puts back on a map that wants it. */
         .def = { .f = 0.85f },
         .original = { .f = 1.0f },
         /* The floor is a tenth rather than the 0.4 it began at: the dial's
@@ -2109,6 +2162,26 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
 _Static_assert(HWR_COUNT_OF(HWR_SCHEMA) <= HWR_ROW_SET_MAX,
                "the settings table has outgrown the row set that indexes it");
 
+void hwr_schema_set_enum_values(const char *key,
+                                const struct hwr_enum_value *values,
+                                size_t count)
+{
+    size_t i;
+
+    if (key == NULL || values == NULL || count == 0)
+        return;
+    for (i = 0; i < HWR_COUNT_OF(HWR_SCHEMA); i++) {
+        if (HWR_SCHEMA[i].key == NULL ||
+            !hwr_ascii_equal_ci(key, HWR_SCHEMA[i].key))
+            continue;
+        if (HWR_SCHEMA[i].type != HWR_VT_ENUM)
+            return;
+        HWR_SCHEMA[i].values = values;
+        HWR_SCHEMA[i].value_count = count;
+        return;
+    }
+}
+
 size_t hwr_schema_count(void)
 {
     return HWR_COUNT_OF(HWR_SCHEMA);
@@ -2478,6 +2551,12 @@ int hwr_schema_format(const struct hwr_setting_desc *desc,
 {
     size_t i;
     int written = -1;
+    /* Whether a value was written at all, kept apart from how many bytes it
+     * took. An enumeration's token may legitimately be the empty string -- the
+     * game config picker's none is exactly that -- and inferring failure from a
+     * length of nought would make that one row unwritable, which fails a whole
+     * settings save. */
+    int found = 0;
 
     if (desc == NULL || out == NULL || out_size == 0)
         return 0;
@@ -2506,12 +2585,14 @@ int hwr_schema_format(const struct hwr_setting_desc *desc,
         for (i = 0; i < desc->value_count; i++) {
             if (desc->values[i].value == value.e) {
                 written = snprintf(out, out_size, "%s", desc->values[i].token);
+                found = 1;   /* an empty token is a legal token */
                 break;
             }
         }
         break;
     }
-    if (written <= 0 || (size_t)written >= out_size) {
+    if (written < 0 || (size_t)written >= out_size ||
+        (written == 0 && !found)) {
         out[0] = 0;
         return 0;
     }

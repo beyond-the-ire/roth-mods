@@ -6,7 +6,35 @@
 
 struct hwr_settings;
 
+/* The one start-up order the game config picker needs, in one place so that
+ * nothing that stands in for the renderer can drift from it:
+ *
+ *   1  the name of the chosen game config is PEEKED out of the settings file,
+ *      before anything parses it;
+ *   2  the game configs folder is listed, with that name kept a place in the
+ *      list even where the folder does not hold it -- otherwise one file
+ *      somebody moved would mark the whole settings file invalid and take every
+ *      other setting down with it;
+ *   3  the settings file is read, and the selection parses because its name is
+ *      in the list;
+ *   4  and only where there was no settings file AT ALL -- a fresh install --
+ *      the base game's own config is chosen, with one line saying so.
+ *
+ * The chosen file itself is read afterwards, by hwr_look_load. */
+void hwr_config_open(const char *plugin_dir);
+
 void hwr_config_load(const char *plugin_dir);
+/* Whether the last hwr_config_load found no settings file at all, which is a
+ * different thing from finding one with errors in it: the first is a fresh
+ * install and the second is a file somebody has edited. Reloads do not answer
+ * it -- by the time one happens the question has already been settled. */
+int hwr_config_first_run(void);
+/* One key's value read straight out of the file, without parsing the rest of
+ * it -- the same trick the writer already uses to see which keys the file it is
+ * replacing carried. Answers 1 where the key is in the file, INCLUDING where
+ * its value is empty, which is a value in its own right. */
+int hwr_config_peek(const char *plugin_dir, const char *key, char *out,
+                    size_t out_size);
 /* Watches the file for a direct edit. The settings overlay's Reload From File
  * is what a person uses, so this is off unless it is asked for. */
 void hwr_config_poll(void);

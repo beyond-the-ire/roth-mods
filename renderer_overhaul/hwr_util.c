@@ -16,6 +16,29 @@ int hwr_ascii_equal_ci(const char *a, const char *b)
     return *a == 0 && *b == 0;
 }
 
+int hwr_ascii_before_ci(const char *a, const char *b)
+{
+    const char *left = a;
+    const char *right = b;
+
+    if (a == NULL || b == NULL)
+        return 0;
+    while (*left != 0 && *right != 0) {
+        int one = tolower((unsigned char)*left);
+        int two = tolower((unsigned char)*right);
+
+        if (one != two)
+            return one < two;
+        left++;
+        right++;
+    }
+    if (*left != *right)
+        return *left == 0;
+    /* The same name but for its case: settled by the bytes themselves, so the
+     * order two such files are shown in is the same everywhere. */
+    return strcmp(a, b) < 0;
+}
+
 void hwr_row_set_clear(struct hwr_row_set *set)
 {
     if (set != NULL)

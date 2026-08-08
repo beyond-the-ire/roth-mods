@@ -158,6 +158,13 @@ struct hwr_settings {
      * authentic one. */
     int truecolor_force;
     enum hwr_truecolor_format truecolor_format;
+    /* Which of the files in the game configs folder describes this game's
+     * maps, as a place in the list the folder scan builds. Nought is the first
+     * of them and always means none, whatever the folder holds. The place is a
+     * within-a-session number and never leaves the store: the settings file
+     * carries the file's NAME, so files may be added to or taken out of the
+     * folder without renumbering anybody's selection. */
+    int32_t game_config;
     /* The shading law, and the first enhancement that changes what the world
      * image is rather than how bright it is. Authentic asks for nothing and is
      * the original picture; every other value is a dependent of the foundation
@@ -350,7 +357,13 @@ enum hwr_settings_change {
     HWR_CHANGE_PITCH_MODE       = 1u << 7,
     HWR_CHANGE_DEBUG            = 1u << 9,
     HWR_CHANGE_SHADE_SCALE      = 1u << 10,
-    HWR_CHANGE_TRUECOLOR        = 1u << 11
+    HWR_CHANGE_TRUECOLOR        = 1u << 11,
+    /* No hook reacts to the game config picker: the look layer notices it
+     * moving in the settings pump instead, so that a newly chosen file's
+     * overrides are in force BEFORE the hooks that consume them run. The row
+     * carries a bit of its own anyway, because the table's rule is that every
+     * row does and the mask keeps its meaning that way. */
+    HWR_CHANGE_GAME_CONFIG      = 1u << 12
 };
 
 typedef void (*hwr_settings_apply_fn)(uint32_t mask,
@@ -378,5 +391,11 @@ void hwr_settings_set_min_present_interval_us(uint32_t interval_us);
 void hwr_settings_set_fov_deg(float fov_deg);
 void hwr_settings_set_pitch_mode(enum hwr_pitch_mode mode);
 void hwr_settings_set_overlay_key(uint32_t scancode);
+/* Which game config is chosen, by its place in the list the folder scan built.
+ * The look layer writes it when the folder is listed again and the file that
+ * was chosen has moved place, so a selection survives a file being added to or
+ * taken out of the folder. A place the list does not hold is refused by the
+ * row, exactly as any other value out of range is. */
+void hwr_settings_set_game_config(int32_t slot);
 
 #endif

@@ -1241,12 +1241,15 @@ static void hwr_overlay_run_action(int action)
         return;
     case HWR_ACTION_RELOAD:
         /* The one road from the file into the settings, asked for by hand
-         * instead of by a save. The look file is read again with it: they are
-         * two halves of what is on disk. */
+         * instead of by a save. The game configs folder is listed again with it
+         * and the chosen file read again: they are the halves of what is on
+         * disk, and a file put in that folder while the game was running has to
+         * turn up in the picker without a restart. */
         hwr_config_request_reload();
         hwr_look_request_reload();
         g_await_reload = 1;
-        hwr_overlay_status("Reading the settings file.", 0);
+        hwr_overlay_status("Reading the settings and the game configs folder.",
+                           0);
         return;
     default:
         return;

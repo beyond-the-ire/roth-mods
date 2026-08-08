@@ -4,6 +4,7 @@
 
 #include "hwr_config.h"
 
+#include "hwr_look.h"
 #include "hwr_schema.h"
 #include "hwr_settings.h"
 #include "hwr_util.h"
@@ -59,6 +60,9 @@ struct hwr_config_state {
     uint64_t reload_hash;
     /* One note per retired key per session, by table position. */
     struct hwr_row_set retired_noted;
+    /* Whether the last load found no file at all, which is not the same answer
+     * as a file with errors in it. */
+    int first_run;
 };
 
 static struct hwr_config_state g_config;
@@ -280,6 +284,7 @@ void hwr_config_load(const char *plugin_dir)
     if (result == 0) {
         /* Not a failure: the built-in defaults are a complete configuration,
          * and the file can be written from the settings themselves. */
+        g_config.first_run = 1;
         fprintf(stderr,
                 "[renderer_overhaul] no configuration file at %s; using defaults\n",
                 g_config.path);
@@ -297,6 +302,84 @@ void hwr_config_load(const char *plugin_dir)
     }
     hwr_settings_replace(&settings);
     hwr_config_note(0, "Settings loaded.");
+}
+
+int hwr_config_first_run(void)
+{
+    return g_config.first_run;
+}
+
+static int hwr_config_peek_path(const char *path, const char *key, char *out,
+                                size_t out_size)
+{
+    char line[512];
+    FILE *file;
+    int found = 0;
+
+    if (out == NULL || out_size == 0 || key == NULL || path == NULL)
+        return 0;
+    out[0] = 0;
+    file = fopen(path, "r");
+    if (file == NULL)
+        return 0;
+    while (fgets(line, sizeof line, file) != NULL) {
+        char *equals;
+
+        hwr_strip_comment(line);
+        equals = strchr(line, '=');
+        if (equals == NULL)
+            continue;
+        *equals = 0;
+        if (!hwr_ascii_equal_ci(hwr_trim(line), key))
+            continue;
+        /* A later line wins over an earlier one, exactly as it does when the
+         * file is parsed whole. */
+        snprintf(out, out_size, "%s", hwr_trim(equals + 1));
+        found = 1;
+    }
+    fclose(file);
+    return found;
+}
+
+int hwr_config_peek(const char *plugin_dir, const char *key, char *out,
+                    size_t out_size)
+{
+    char path[2600];
+
+    snprintf(path, sizeof path, "%s/renderer_overhaul.cfg",
+             plugin_dir != NULL ? plugin_dir : "");
+    return hwr_config_peek_path(path, key, out, out_size);
+}
+
+/* The game configs folder listed with the name the settings file carries, which
+ * has to happen BEFORE that file is parsed. The rule is about what is in the
+ * file rather than about which time it is being read, so it holds at start-up
+ * and at every reload alike: `path` is the settings file to peek at, and NULL
+ * for the folder means the one already known. */
+static void hwr_config_list_game_configs(const char *plugin_dir,
+                                         const char *path)
+{
+    char chosen[128];
+    int named = hwr_config_peek_path(path, "game_config", chosen,
+                                     sizeof chosen);
+
+    hwr_look_scan(plugin_dir, named ? chosen : NULL);
+}
+
+void hwr_config_open(const char *plugin_dir)
+{
+    char path[2600];
+
+    snprintf(path, sizeof path, "%s/renderer_overhaul.cfg",
+             plugin_dir != NULL ? plugin_dir : "");
+    hwr_config_list_game_configs(plugin_dir, path);
+    hwr_config_load(plugin_dir);
+    /* A fresh install, and only a fresh install: a settings file that says
+     * nothing about the game config has been written by a build that had no
+     * such row, and choosing one behind its owner's back would be this layer
+     * deciding what their maps look like. */
+    if (hwr_config_first_run())
+        hwr_look_select_shipped();
 }
 
 /* The file is read once at startup and whenever it is asked for. Watching it
@@ -374,6 +457,11 @@ void hwr_config_drain_request(void)
     expected = g_config.reload_hash;
     g_config.reload_expects_hash = 0;
 
+    /* The folder first, exactly as at start-up: a file put in it while the game
+     * was running turns up in the picker, one taken out keeps its place, and a
+     * name the file carries is a name the picker row holds by the time the file
+     * is parsed. This is also what Reload From File promises about the folder. */
+    hwr_config_list_game_configs(NULL, g_config.path);
     /* Read the file once more, this time reporting what is wrong with it. */
     result = hwr_config_read(&settings, &hash, 1);
     if (result == 0) {

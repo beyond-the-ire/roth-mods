@@ -9,9 +9,12 @@ backdrops, and engine-composited HUD and menus.
 
 ## Installation
 
-Copy the `renderer_overhaul` folder into `<game>/mods/`. Keep `plugin.so` for Linux or
-`plugin.dll` for Windows in that folder alongside `renderer_overhaul.cfg` and, if you want to light
-individual maps differently, `renderer_look.cfg`.
+Copy the `renderer_overhaul` folder into `<game>/mods/`. Keep in that folder:
+
+- `plugin.so` for Linux, or `plugin.dll` for Windows;
+- `renderer_overhaul.cfg`, the settings file;
+- `game_configs/`, which holds the descriptions of how individual maps are lit. The base game's
+  own, `game_configs/roth.json`, ships in it and is selected out of the box.
 
 The moddable ROTH.C executable loads the plugin automatically. Starting with `--no-mods`, or
 removing this folder, restores the original renderer exactly.
@@ -38,7 +41,8 @@ Changes are collected as a draft and nothing takes effect until **Apply**, which
 settings file and puts the whole file into force in one step. **Cancel** returns the draft to the
 settings in force, **Defaults** loads the built-in settings, **Original** restores the original
 look (640x480, original field of view, every enhancement off), and **Reload From File** reads the
-file again after it has been edited by hand.
+settings file again after it has been edited by hand — and, with it, lists the game configs folder
+again, so a file dropped in there while the game is running turns up without a restart.
 
 A change to the render size or the window mode is asked about after it is applied: keep it within
 fifteen seconds, or the settings it replaced come back on their own. That is what makes a display
@@ -75,6 +79,9 @@ line. Applying the settings rewrites the file with its own comments and ordering
 - `fov_deg`: horizontal FOV at the original 4:3 aspect, from 30 through 170 degrees. Zero preserves
   the original projection. Wider output aspects automatically gain horizontal view area.
 - `overlay_key`: which key opens the settings screen, by name, such as `f12` or `f9`.
+- `game_config`: which file in `game_configs/` describes this game's maps, by its name without the
+  `.json` — `roth` for the one that ships. An empty value, and no line at all, both mean none: every
+  map falls back to the settings alone. See *The game configs folder* below.
 - `shading_mode`: `authentic`, `smooth`, or `modern`. `authentic` is the original picture; `smooth`
   follows the same authored shading continuously instead of in thirty-two steps; `modern` lights
   the world with the rig below instead of shading it by distance.
@@ -187,59 +194,119 @@ how far away you are only stands it further down the queue for one of the slots.
 
 A resolution change can cause a one-frame hitch while the render targets are resized.
 
-## Per-map look file
+## The game configs folder
 
-`renderer_look.cfg`, beside the settings file, says how individual places are lit. The settings
-file says what you want everywhere; this one says what a particular map wants, and where it gives
-an answer that answer is the one in force. It is optional, the game never writes it, and it takes
-the same `key=value` lines with `#` starting a comment — so a colour in it is six bare hexadecimal
-digits with no hash in front.
+The settings screen says what you want everywhere. A **game config** says what a particular place
+wants, and where it gives an answer, that answer is the one in force there.
 
-It has three kinds of section, and a later one wins over an earlier one: `[look]` for every map,
-`[profile.NAME]` for a named set applied wherever a map asks for it, and `[map.NAME]` for one map,
-named by its own file without the folder and without the extension. A map picks up a profile with
-a `profile = NAME` line and may add keys of its own, which win over the profile's.
+Those descriptions live in `game_configs/`, inside the mod folder, one file per game or map pack,
+each a `.json` file. The base game's own ships as `game_configs/roth.json`. Which one is in force
+is the **Game config** row at the top of the Enhancements section on the settings screen: it lists
+every file the folder holds, plus **None**, and choosing None — or taking the file out of the
+folder — leaves every map falling back to the settings screen alone.
 
-Only the settings that describe how a place looks may appear: the shading, the light rig, and the
-world gain. A line the file cannot use costs that line and nothing more, and the game reports it
-when it reads the file. **Reload From File** on the settings screen reads this file again too.
+A file is shown in that list by its own `for` line rather than by its file name, so
+`roth.json` reads as *Realms of the Haunting*. A file with no `for` line is shown by its name. Name
+a file with letters, digits, `-`, `_` and `.` only: the name is what the settings file records the
+selection as, and one carrying a space or a `#` cannot be written down, so it is left out of the
+list and the game says why.
 
-The file ships with an `authentic`, a `moody` and a `dark` profile and nothing pointed at any of
-them, so the set is there to read and change without pre-judging any map. `authentic` is the
-game's own picture, whole: every dial the modern shading adds, stated at the value that reproduces
-the original exactly — the map read as written, the candle at the game's own strength, no added
-lamp, no flicker, the game's own cone edge — so a map pointed at it is lit as the game lit it
-whatever the settings screen says. `moody` and `dark` are darker steps below the shipped look
-along the one dial that decides what a place feels like, how far a room's light carries. A row a
-map answers for is marked on the settings screen with what the map says, because moving that
-setting will not change the picture where you are standing.
+**Reload From File** on the settings screen reads the settings again, lists the folder again, and
+reads the chosen description again — so a file dropped into that folder while the game is running
+turns up in the list without a restart. If the settings file names a description that is no longer
+in the folder, nothing else is disturbed: the rest of your settings load exactly as they were, the
+list keeps the name with `(missing)` beside it, every map falls back to the settings alone, and
+putting the file back puts the selection back.
 
-A section written for `room_light_curve = anchored` — one that sets `room_light_dark`,
-`room_light_lit`, or any of the anchor and window keys, without saying which response it means — is
-read with that response, so it goes on looking as it did, and the game says so once when it reads
-the file. Naming `room_light_curve` in that section is what takes the note away and reads the rest
-of it with the response you named.
+### What is in one
 
-It also has one section of a different kind. `[lights]` says what particular THINGS give off, keyed
-by the graphic the map draws them with, where a single setting for the whole map is not enough — a
-brazier brighter than a candle, or a glowing decal that is plainly not a light at all. It follows
-the same three-section chain, and `[profile.NAME.lights]` and `[map.NAME.lights]` are its profile
-and per-map forms:
+```json
+{
+  "format": 1,
+  "for": "Realms of the Haunting",
+  "notes": "How this game's places are lit.",
 
+  "everywhere": {
+    "settings": { "shading_mode": "modern", "room_light_reach": 0.85 },
+    "lights": {
+      "graphics": {
+        "0x0412": { "strength": 1.6, "reach": 520, "colour": "#ffb46e" },
+        "0x0455": { "strength": 0.6, "reach": 260 },
+        "0x0301": { "off": true }
+      }
+    }
+  },
+
+  "maps": {
+    "STUDY1": {
+      "notes": "Lamplit and enclosed; its own candles carry it.",
+      "settings": { "room_light_reach": 0.72 },
+      "lights": { "graphics": { "0x0412": { "strength": 2.0 } } }
+    }
+  }
+}
 ```
-[lights]
-; graphic = strength, reach, colour     a dash keeps whatever was set before it
-0x0412 = 1.6, 520, ffb46e               ; a wall torch
-0x0455 = 0.6, 260, -                    ; a table candle, its colour left alone
-0x0301 = off                            ; not a light, whatever the map marks it
 
-[map.STUDY1.lights]
-0x0412 = 2.0, -, -                      ; this map's torches read brighter
+`everywhere` and each entry under `maps` have the **same shape**, and that is the whole of the
+composition rule: a map's answer is laid over the game's answer, field by field. A map nobody
+listed gets `everywhere` alone, silently, so a map pack is covered whether or not anyone has
+described it.
+
+A map is keyed by the name of its **own file**, without the folder and without the extension —
+`STUDY1`, `CRYPT1` — matched whatever its case and with or without an extension either side, so
+`study1` and `STUDY1.RAW` name one map. Maps that share a texture archive are still different maps
+here.
+
+`settings` holds settings-screen keys, spelled exactly as the settings file spells them and read by
+exactly the same rules, so every bound and every message comes from the settings screen itself and
+the two can never disagree. A key belongs there when it says how a *place* is lit rather than what
+a *screen* wants: the shading and the whole light rig may be written in one, and the brightness and
+contrast of the picture may not. A row a map answers for is marked on the settings screen with what
+the map says, because moving that setting will not change the picture where you are standing.
+
+`lights` says what particular **things** give off, under `graphics`, keyed by the graphic the map
+draws them with — for where one value for a whole map is not enough, such as a brazier that should
+read brighter than a table candle. Nothing has to be listed for a map's torches to work: the game
+already marks them, custom maps included. Each field stands on its own, so a map may raise a
+strength without restating a colour. `off` is the whole entry rather than a field: a thing the map
+marks unshaded that is plainly not a light — a glowing decal, a bright pickup — is refused outright.
+Running the game with `HWR_OBJ_DUMP` set to a file name writes out every object a map holds along
+with the graphic it is drawn with, which is where those numbers come from.
+
+Colours are written `"#rrggbb"`. JSON has no comment character for a hash to collide with, so a
+colour here is written the way a person writes one; the bare six digits are accepted too.
+
+### Documentation inside one: `notes`
+
+JSON has no comments. A member named exactly **`notes`**, at any level, is documentation — a piece
+of text or a list of them — and is never read as data:
+
+```json
+"STUDY1": {
+  "notes": [
+    "The study is lamplit and enclosed.",
+    "Its own candles carry it, so the room reach comes down."
+  ],
+  "settings": { "room_light_reach": 0.72 }
+}
 ```
 
-Each field is composed on its own, so a map may raise a strength without restating the colour the
-global section gave it. Colours here are six bare hexadecimal digits like every other colour in
-this file.
+`notes` is a reserved name: no part of a game config will ever use it for anything else. The shipped
+`roth.json` is written almost entirely in `notes`, as a worked example to read and fill in — as it
+ships it states no value and names no map, so it changes nothing until you write something into it.
+
+### What a mistake costs
+
+Two answers, and the difference is worth knowing:
+
+- **A file that is not JSON costs the whole file.** One missing brace moves every following line
+  into a different place, so half a file read would look like an answer. Nothing is loaded, whatever
+  was in force stays in force, and the game reports where the file stopped making sense.
+- **Anything else costs its own key.** An unknown key, a value out of range, a map name nothing
+  matches, a colour that is not six hexadecimal digits: the game names that key, ignores it, and
+  reads the rest of the file.
+
+Both are reported on the error stream, the same place the settings file's own notes go.
 
 ## Requirements
 
@@ -294,8 +361,8 @@ is the original's own picture with the thirty-two steps taken out of it. Every d
 from that picture rather than from a guess — and what Modern ships at is a departure on purpose: a
 dark, candle-lit look, tuned in play — the room's light carrying to 0.85 of what the map states,
 the candle at just under half the game's own, the flame lit and wandering — that reads as the dark
-the game was written to be. The `authentic` profile in the look file is the map-as-written picture,
-whole, for any map you want it back on.
+the game was written to be. **Original** puts the game's own picture back whole, and a game config
+can put the map-as-written reach back on any map you want it on.
 
 Modern shading brings its own settings with it, all of them dimmed until it is chosen:
 
@@ -362,4 +429,4 @@ keeps it. A setting the map being played answers for itself keeps the map's answ
 it, and the row says so.
 
 The picture settings are one choice for the whole game and are not per-map; the shading and the
-light rig may be set per map through the look file.
+light rig may be set per map through a game config.
