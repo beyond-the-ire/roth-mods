@@ -1503,7 +1503,9 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
          * flanks past it keeping the bounded rows the easing left them (half
          * the candle word at full: a lantern's spill). Zero evaluates the
          * engine's own term and nothing else, which is the identity the cone
-         * gates stand on. */
+         * gates stand on. It ships at the half the play-tested look settled
+         * on -- the lantern's edge -- and its Original stays the engine's
+         * own exact edge, so the Original preset keeps the identity. */
         .key = "player_light_penumbra",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -1513,7 +1515,7 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_penumbra),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 0.0f },
+        .def = { .f = 0.5f },
         .original = { .f = 0.0f },
         .min = { .f = 0.0f },
         .max = { .f = 1.0f },
@@ -1564,13 +1566,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
                  HWR_SF_DEPENDS_ON_VALUE,
         /* The dial's meaning moved with the mechanism -- it was how far the
          * light's STRENGTH swung, it is now how far the POOL wanders, one
-         * being the game's own amplitude -- so the default is restated to
-         * reproduce the play-tested feel tuned under the old meaning:
-         * measured at his rig, 0.60 of the wander lands the same display
-         * swing his 0.25 of the swing law gave (0.055-0.072 against
-         * 0.050-0.073 of display across the lane). */
-        .def = { .f = 0.60f },
-        .original = { .f = 0.60f },
+         * being the game's own amplitude. The shipped number is the
+         * play-tested pick made under the new meaning: a fifth of the
+         * engine's own throw, a gentler dance than the restated carry-over
+         * of the old feel. The Original follows the default, because the
+         * dial is inert under the Original's still flame. */
+        .def = { .f = 0.2f },
+        .original = { .f = 0.2f },
         .min = { .f = 0.0f },
         .max = { .f = 1.0f },
         .step = { .f = 0.05f },
@@ -1593,12 +1595,13 @@ static const struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, player_light_flicker_speed),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        /* The play-tested pace, tuned once the dial commanded the whole of
-         * the flame's motion; it keeps its meaning under the wander -- speed
-         * scales every rate of the pool's movement as it scaled every rate
-         * of the strength's. */
-        .def = { .f = 1.9f },
-        .original = { .f = 1.9f },
+        /* The play-tested pace, re-tuned once the dial paced the pool's
+         * wander rather than the strength's swing; it keeps its meaning --
+         * speed scales every rate of the pool's movement as it scaled every
+         * rate of the strength's. The Original follows the default, because
+         * the dial is inert under the Original's still flame. */
+        .def = { .f = 3.0f },
+        .original = { .f = 3.0f },
         .min = { .f = 0.1f },
         .max = { .f = 5.0f },
         .step = { .f = 0.1f },
