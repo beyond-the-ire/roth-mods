@@ -2317,6 +2317,11 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
      * follow is a texture a script swaps mid-map: the answer is the map as it
      * was staged, which is what "once per map" means. */
     hwr_lights_stage_glow_faces(&g_world);
+    /* And the free-standing lights the game config hangs in this map, for the
+     * same reason and in the same place: which ROOM each one is in is a fact
+     * about the map's own footprints, so it is answered once beside the geometry
+     * it is read out of rather than sixty times a second. */
+    hwr_lights_stage_placed(&g_world);
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent

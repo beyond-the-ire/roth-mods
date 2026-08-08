@@ -126,12 +126,24 @@ static int hwr_objects_section_fits(uint32_t offset, uint32_t size)
 
 /* Enumerates every sector's object list. The list is iterated for every sector,
  * never gated on the sector's has-objects bit, so a stale-flag sector cannot hide
- * its objects. Hidden records (flag +7 bit0x80) are skipped. */
+ * its objects. Hidden records (flag +7 bit0x80) are skipped.
+ *
+ * THE ORDER OF THIS WALK IS A PUBLISHED FACT, not an implementation detail: the
+ * running counter below is the map-wide object NUMBER, and it is the number the
+ * community map editor shows as `Object: N` -- the per-sector object lists
+ * flattened with the sectors in ascending order. A game config addresses one
+ * placed object by it, so the walk may not be reordered without moving what
+ * every such entry addresses.
+ *
+ * The counter advances for EVERY record the map holds, including the hidden ones
+ * skipped just below and the ones a malformed section costs: what numbers an
+ * object is the map's own list, not this walk's willingness to draw it. */
 static int hwr_objects_walk_map(struct hwr_objects *objects,
                                 const struct hwr_world *world,
                                 const struct roth_api_v1 *api)
 {
     const uint8_t *section = hwr_objects_section(api);
+    uint32_t number = 0;
     size_t sector;
     if (section == NULL)
         return hwr_objects_fail(objects, "object section is not staged");
@@ -144,22 +156,31 @@ static int hwr_objects_walk_map(struct hwr_objects *objects,
         if (!hwr_objects_section_fits(dir_offset, 2u))
             continue;
         list_offset = hwr_obj_u16(section + dir_offset);
-        /* A sector with no list has no directory target to follow. */
+        /* A sector with no list has no directory target to follow -- and holds
+         * no objects, so it numbers none either. */
         if (list_offset < 2u || !hwr_objects_section_fits(list_offset, 1u))
             continue;
         count = section[list_offset];
         if (count == 0)
             continue;
         if (!hwr_objects_section_fits(list_offset + 2u,
-                                      (uint32_t)count * HWR_OBJ_RECORD_STRIDE))
+                                      (uint32_t)count * HWR_OBJ_RECORD_STRIDE)) {
+            /* The count was readable and the records are not. The map still
+             * says this sector holds that many, so they still take their
+             * numbers; skipping them silently would shift every object after
+             * them. */
+            number += count;
             continue;                               /* records begin at +2, not +1 */
+        }
         record_offset = list_offset + 2u;
         for (j = 0; j < count; j++, record_offset += HWR_OBJ_RECORD_STRIDE) {
             const uint8_t *record = section + record_offset;
             struct hwr_object item;
+            uint32_t mine = number++;
             if (record[HWR_OBJ_OFF_FLAGS7] & 0x80u)
                 continue;                                    /* hidden */
             memset(&item, 0, sizeof item);
+            item.map_index = mine;
             item.source = HWR_OBJECT_MAP;
             item.world_x = hwr_obj_i16(record + HWR_OBJ_OFF_X);
             item.world_y = hwr_obj_i16(record + HWR_OBJ_OFF_Y);
@@ -219,6 +240,7 @@ static int hwr_objects_walk_particles(struct hwr_objects *objects,
             struct hwr_object item;
             memset(&item, 0, sizeof item);
             item.source = HWR_OBJECT_PARTICLE;
+            item.map_index = HWR_OBJECT_NO_INDEX;  /* no map numbers this */
             item.sector_index = (uint16_t)HWR_OBJECT_NO_SECTOR;
             item.world_x = (int16_t)api->game_ram->u16(off + HWR_PARTICLE_OFF_X);
             item.world_y = (int16_t)api->game_ram->u16(off + HWR_PARTICLE_OFF_Y);
@@ -249,6 +271,7 @@ static int hwr_objects_walk_pickup(struct hwr_objects *objects,
         return 0;                                            /* not visible */
     memset(&item, 0, sizeof item);
     item.source = HWR_OBJECT_PICKUP_FLY;
+    item.map_index = HWR_OBJECT_NO_INDEX;   /* no map numbers this */
     item.sector_index = (uint16_t)HWR_OBJECT_NO_SECTOR;
     item.world_x = (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_X);
     item.world_y = (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_Y);
@@ -287,6 +310,7 @@ static int hwr_objects_walk_reflected_player(
         return 0;
     memset(&item, 0, sizeof item);
     item.source = HWR_OBJECT_PLAYER_REFLECTION;
+    item.map_index = HWR_OBJECT_NO_INDEX;   /* no map numbers this */
     item.world_x =
         (int16_t)api->game_ram->u16(appearance + HWR_OBJ_OFF_X);
     item.world_y =
@@ -383,16 +407,28 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
         const struct hwr_object *o = &objects->items[i];
         struct hwr_sprite_lookup lookup;
         struct hwr_sprite_frame frame;
+        char number[16];
         int have_frame = 0;
         memset(&frame, 0, sizeof frame);
         if (hwr_sprites_resolve(api, map_archive, shared_archive, o->graphic_id,
                                 o->facing, yaw, 0, o->backref, &lookup) == 0 &&
             hwr_sprites_frame(&lookup, &frame) == 0)
             have_frame = 1;
+        /* THE OBJECT NUMBER FIRST, because it is what a game config addresses a
+         * placed object by and it is the same number the community map editor
+         * shows for the same thing. The dump, the config and the editor naming
+         * one object by one number is the whole of what makes this file an
+         * authoring aid rather than a listing. A dash where no map numbers the
+         * thing at all. */
+        if (o->map_index == HWR_OBJECT_NO_INDEX)
+            snprintf(number, sizeof number, "-");
+        else
+            snprintf(number, sizeof number, "%lu", (unsigned long)o->map_index);
         fprintf(file,
-                "%-10s x=%d y=%d z=%d facing=%u id=%#06x light=%u object-id=%u flags=%#x f7=%#04x f9=%#04x",
-                hwr_objects_source_name(o->source), o->world_x, o->world_y,
-                o->world_z, o->facing, o->graphic_id, o->seed, o->object_id,
+                "%-5s %-10s x=%d y=%d z=%d facing=%u id=%#06x light=%u object-id=%u flags=%#x f7=%#04x f9=%#04x",
+                number, hwr_objects_source_name(o->source), o->world_x,
+                o->world_y, o->world_z, o->facing, o->graphic_id, o->seed,
+                o->object_id,
                 o->flags, o->flags7, o->flags9);
         if (have_frame)
             fprintf(file, " frame=%u %ux%u fflags=%#x flip=%d\n",

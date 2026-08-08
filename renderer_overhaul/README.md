@@ -254,10 +254,17 @@ putting the file back puts the selection back.
       "lights": {
         "graphics": { "0x0412": { "strength": 2.0 } },
         "objects": [
-          { "notes": "the hearth", "at": [1284, -2210, 96],
+          { "notes": "the hearth", "index": 12,
             "strength": 2.6, "reach": 700, "colour": "#ff9040" },
+          { "notes": "every torch the author tagged alike", "id": 36,
+            "reach": 800 },
           { "notes": "a bright decal, not a light",
-            "at": [980, -2044, 72], "off": true }
+            "index": 40, "off": true }
+        ],
+        "placed": [
+          { "notes": "a lamp over the stairwell the map never had",
+            "at": [1284, -2210, 96], "colour": "#ffb46e",
+            "strength": 1.2, "reach": 420 }
         ]
       }
     }
@@ -292,25 +299,54 @@ marks unshaded that is plainly not a light — a glowing decal, a bright pickup 
 Running the game with `HWR_OBJ_DUMP` set to a file name writes out every object a map holds along
 with the graphic it is drawn with, which is where those numbers come from.
 
-`objects`, under the same `lights`, says the same thing about **one particular thing** rather than
-about a kind of them: the hearth in one room, not every brazier in the game. It is a **list**, and
-each entry is addressed by **where the thing stands** — `"at": [x, y, z]`, the three numbers the map
-itself carries for it, which the same `HWR_OBJ_DUMP` file lists beside every object's graphic. A
-position is not a name, which is why this is a list and not a block, and it belongs to one map: an
-`objects` list is written **under a map** and never under `everywhere`, because the same three
-numbers in another map are a different corner of a different building.
+`objects`, under the same `lights`, says the same thing about **one particular object of the map**
+rather than about a kind of them: the hearth in one room, not every brazier in the game. It is a
+**list**, and each entry names its object the way the **ROTH Editor** names it — so the numbers you
+write here are the numbers you are reading off your screen while you write them.
 
-What one entry says wins over whatever `graphics` said about its kind — the most specific statement
-anybody made is the one in force — and it composes field by field with it, so one hearth may be made
-stronger without restating the colour every brazier already has. `off` is the whole entry here too:
-turning one thing off leaves every other thing of its kind alight, and naming one thing in a map
-whose whole kind is `off` makes that one a light again.
+Two ways to name one, and an entry uses exactly one of them:
 
-You may write a `graphic` beside a position as well. It is a **check**, not part of the address: if
-what stands there is drawn with something else the entry is still applied and the game says so,
-which is how a list written for one version of a map tells you it has gone stale. An entry standing
-at a position nothing occupies says so too, once, naming the map — so a mistyped number is visible
-rather than silently doing nothing.
+- **`"index": N`** — the object's own number, which the editor shows as **`Object: N`** when you
+  select it. It names exactly one thing.
+- **`"id": N`** — the tag the editor shows as **`ID:`**, which the map's creator typed to gather
+  objects into a group for the command system. It is *meant* to be shared, so an entry keyed by it
+  applies to **every object carrying that tag** — which is how the six torches of one corridor get
+  tuned in a single line. `"id": 0` is refused and says so: 0 is the untagged default that most
+  objects carry.
+
+An entry that writes both, or neither, is refused with a note and the rest of the file is read.
+
+`HWR_OBJ_DUMP` set to a file name writes out every object a map holds with **its number in the first
+column**, followed by the graphic it is drawn with and its `object-id` — so the dump, the config and
+the editor all name the same thing by the same number.
+
+**Numbers move when a map is edited.** The object number is a position in the map's own list, so
+deleting an object in the editor shifts the number of every object after it. For a map that is
+finished, `index` is exact and stable. For a map still being built, the **ID tag is the stable
+handle**: it travels with the object it was typed on. Either way, write a `graphic` beside the entry
+and the game will tell you when the file has drifted (below).
+
+What one entry says wins over whatever `graphics` said about its kind, and an `index` entry wins over
+an `id` entry — the most specific statement anybody made is the one in force. All three compose
+**field by field**, so one hearth may be made stronger than the group it is tagged with without
+restating the colour every brazier of its kind already has. `off` is the whole entry rather than a
+field, and the most specific table naming a thing at all is the one that answers for whether it is a
+light: turning one object off leaves every other object of its kind and its group alight, and naming
+one object in a map whose whole kind is `off` makes that one a light again.
+
+You may write a `graphic` beside either spelling. It is a **check**, not part of the address:
+
+- beside an `index`, if the object with that number is drawn with something else the entry is still
+  applied and the game says so;
+- beside an `id`, if **no** object carrying that tag is drawn with it, the entry is still applied and
+  the game says so.
+
+An entry naming a number nothing answers to says so too, once, naming the map — `no object 900 on
+STUDY1`, `no object tagged 999 on STUDY1` — so a mistyped number is visible rather than silently
+doing nothing.
+
+An `objects` list is written **under a map** and never under `everywhere`, because an object's number
+and its id tag belong to one map's own list.
 
 `surfaces`, under the same `lights`, says what a **painted surface** gives off — lava, a glowing
 rune, a lit sigil on a wall. It is keyed by the texture number the map's own geometry carries for a
@@ -338,6 +374,42 @@ the whole class off; grants are still read and still reported either way.
 
 Colours are written `"#rrggbb"`. JSON has no comment character for a hash to collide with, so a
 colour here is written the way a person writes one; the bare six digits are accepted too.
+
+### Lights the map never had: `placed`
+
+`placed`, under the same `lights`, is for the other case entirely: a light that belongs to **no
+object at all**, hung at three numbers you choose because there is nothing standing there to tune.
+
+```json
+"placed": [
+  { "notes": "a lamp over the stairwell",
+    "at": [1284, -2210, 96], "colour": "#ffb46e",
+    "strength": 1.2, "reach": 420 }
+]
+```
+
+- **`at` is required** and is where the light hangs, in the map's own coordinates — the same three
+  numbers `HWR_OBJ_DUMP` prints for the objects around it, which is the easiest way to find a
+  sensible one. **Take them from the dump, not from the editor's position boxes:** the ROTH Editor
+  displays X with the opposite sign to the one the map file carries, so an X copied off its screen
+  puts the light on the wrong side of the world. Y and Z agree.
+- **`colour` is required**, for exactly the reason a granted surface's is: there is nothing to read
+  one off. A torch is drawn as a cut-out sprite the game can take a colour from; a light hanging in
+  the air has no sprite, no object and no map mark. An entry without a colour lights nothing and says
+  so.
+- `strength` and `reach` are optional and fall to the settings screen's own values, so you can hang a
+  light and tune the whole rig afterwards.
+- There is **no `off`**. An entry here exists only because you wrote it, so the way to be rid of one
+  is to delete the line.
+
+Each light is placed in whichever of the map's rooms contains the point — the same question the
+editor asks when you drop an object into a room — and is then held by exactly the containments every
+other light is held by. A light hung outside every room lights nothing and says so.
+
+A `placed` list is written **under a map** and never under `everywhere`: the same three numbers in
+another map are a different corner of a different building. `point_light_objects` and **Light from
+glowing surfaces** do not reach these — a light you wrote down is not a kind of thing the game has,
+so there is no separate switch for it — but `point_light` turns them off with everything else.
 
 ### Documentation inside one: `notes`
 

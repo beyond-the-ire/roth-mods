@@ -49,14 +49,20 @@
  *               Each field is separately present or absent, so a map may raise
  *               a strength without restating a colour.
  *
- *               And under "objects", ONE placed thing rather than a kind of
- *               them, addressed by where it stands. That is the most specific
- *               statement anybody can make about a light, so it is the last
- *               word: the hearth in one room burns hotter than every other
- *               brazier of its kind. Objects are described under a map and
- *               never under "everywhere" -- a position is a position in ONE
- *               map, and the same three numbers elsewhere are a different
- *               corner of a different building.
+ *               And under "objects", ONE PLACED OBJECT of the map rather than a
+ *               kind of them -- or a group of them -- addressed the way the
+ *               community ROTH Editor addresses it: by the object number it
+ *               shows as "Object: N", or by the tag it shows as "ID:". That is
+ *               the most specific statement anybody can make about a light, so
+ *               it is the last word: the hearth in one room burns hotter than
+ *               every other brazier of its kind. Objects are described under a
+ *               map and never under "everywhere" -- an object's number is a
+ *               number in ONE map's own list.
+ *
+ *               And under "placed", a light tied to NO object: three numbers
+ *               somebody chose, because the map has nothing standing there to
+ *               tune. It states its own colour, because there is nothing to
+ *               read one off. Under a map only, for the same reason as above.
  *
  *               And under "surfaces", what a PAINTED SURFACE gives off, keyed
  *               by the texture the map's own geometry carries: lava, a glowing
@@ -163,21 +169,53 @@ struct hwr_look_light {
  * every field absent -- the settings rows answer for it whole. */
 int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out);
 
-/* The same for ONE placed thing, addressed by where it stands: the three exact
- * numbers the map's own object section carries for it.
+/* The same for ONE PLACED OBJECT of the map, addressed the way the community
+ * ROTH Editor addresses it -- because a person tuning a map has that editor open
+ * beside the file, and a file written against numbers nobody can look up is a
+ * file nobody can write.
  *
- * The position is the identity because it is authored map data, streamed
- * whole out of the map file and written back into a save byte for byte -- a
- * brazier is at the same three numbers on the twentieth visit as on the first.
- * It is also the identity the light rig already names a light by across frames,
- * so the file and the rig agree by construction rather than by coincidence.
+ * Two spellings, in the order they rank:
  *
- * A position nobody named leaves `out` cleared. Whether the entry AGREES with
- * what stands there is not asked here: the graphic written beside a position is
- * a check on the entry rather than part of its key, and the checking is done
- * once against the map's own objects rather than once per frame per light. */
-int hwr_look_light_at(int16_t world_x, int16_t world_y, int16_t world_z,
-                      struct hwr_look_light *out);
+ *   ITS OBJECT NUMBER -- the map-wide index over the per-sector object lists
+ *   flattened in sector order, which the editor shows as `Object: N`. It names
+ *   exactly one thing, so it is the most specific statement anybody can make and
+ *   it is the last word.
+ *
+ *   ITS ID TAG -- the record's own +0x0e word, which the editor shows as `ID:`.
+ *   A creator types it to gather objects into a group for the command system, so
+ *   it is deliberately SHARED: an entry keyed by it answers for EVERY object
+ *   carrying it, which is what lets the torches of one corridor be tuned in one
+ *   line. Nought is not an address -- it is the untagged default -- and is
+ *   refused where the file is read.
+ *
+ * A number nobody named leaves `out` cleared. Whether the entry AGREES with what
+ * is there is not asked here: the graphic written beside a number is a check on
+ * the entry rather than part of its key, and the checking is done once against
+ * the map's own objects rather than once per frame per light. */
+int hwr_look_light_for_object(uint32_t map_index, struct hwr_look_light *out);
+int hwr_look_light_for_object_id(uint16_t object_id,
+                                 struct hwr_look_light *out);
+
+/* And the FREE-STANDING lights: the ones tied to no object at all, hung at three
+ * numbers somebody chose because the map has nothing standing there to tune.
+ *
+ * A list rather than a lookup, because nothing in the world asks for one -- the
+ * seeding walks them exactly as it walks the granted surfaces, and for the same
+ * reason: which room each hangs in is a fact about the map, worked out once when
+ * it is staged.
+ *
+ * The colour is REQUIRED, for the same reason a granted surface's is: there is
+ * nothing to derive one from. A torch has a sprite a colour can be read off; a
+ * light hanging in the air has no sprite, no object and no map mark, so a
+ * default here would be the mod choosing a colour and calling it the author's.
+ * An entry with none lights nothing and says so. */
+size_t hwr_look_placed_count(void);
+int hwr_look_placed_at(size_t index, int16_t *world_x, int16_t *world_y,
+                       int16_t *world_z, struct hwr_look_light *out);
+/* Moves when the free-standing lights do and at no other time, so which room
+ * each hangs in is worked out once per map rather than once a frame. Never
+ * nought, so nought is free to mean nothing has been worked out yet. */
+uint32_t hwr_look_placed_generation(void);
 
 /* And the same for one SURFACE, keyed by the sixteen-bit logical texture id the
  * map's own geometry carries for a face -- the id in a sector's ceiling and
@@ -206,22 +244,25 @@ int hwr_look_surface_at(size_t index, uint16_t *texture_id,
  * "nothing has been worked out yet". */
 uint32_t hwr_look_surface_generation(void);
 
-/* Whether the map's own objects are still to be offered to the table above.
+/* Whether the map's own objects are still to be offered to the object table.
  * Answers 0 once they have been -- and 0 on every map that has no entries to
  * check, which is what keeps this off the frame's own cost. */
 int hwr_look_objects_pending(void);
-/* One of the map's own objects. EVERY object is offered, not only the ones
- * that become lights: an object refused as not a light is still an object
- * standing there, and an entry addressing one must not be reported as
- * addressing nothing.
+/* One of the map's own objects, by its number, its id tag and the graphic it is
+ * drawn with. EVERY object is offered, not only the ones that become lights: an
+ * object refused as not a light is still an object standing there, and an entry
+ * addressing one must not be reported as addressing nothing.
  *
- * This is where the two remarks about an entry are made -- an entry whose
- * graphic is not the one the map draws that thing with says so, and the entry
- * is applied anyway. */
-void hwr_look_object_seen(int16_t world_x, int16_t world_y, int16_t world_z,
+ * This is where an entry keyed by an object NUMBER is checked against the
+ * graphic written beside it, and says so where the two disagree -- the entry
+ * being applied anyway. An entry keyed by an id TAG is checked when the walk
+ * settles instead, because the question for a group is whether ANY of its
+ * members is drawn with that graphic, and no single object answers that. */
+void hwr_look_object_seen(uint32_t map_index, uint16_t object_id,
                           uint16_t graphic_id);
-/* The map holds nothing else. Every entry nothing stood at says so, once per
- * entry per map, so a mistyped position is visible rather than silent. */
+/* The map holds nothing else. Every entry nothing answered to says so, once per
+ * entry per map, so a mistyped number is visible rather than silent -- and every
+ * id tag whose whole group is drawn with something else says so too. */
 void hwr_look_objects_settled(void);
 
 void hwr_look_clear(void);

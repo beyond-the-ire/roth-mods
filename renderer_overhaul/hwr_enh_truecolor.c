@@ -522,6 +522,16 @@ static void hwr_truecolor_points(const struct hwr_settings *settings,
         hwr_truecolor_row_bool(HWR_POINT_ROW, settings, 1) &&
         hwr_truecolor_row_bool(HWR_POINT_GLOW_FACES_ROW, settings, 1))
         points.classes |= 1u << HWR_LIGHT_CLASS_GLOW_FACE;
+    /* And the third: the lights a game config hangs where the map has none.
+     * There is no row of its own for this one, and that is stated rather than
+     * missing. Every other class answers a question about the WORLD -- do this
+     * map's torches light it, does its lava -- and somebody may reasonably want
+     * one and not the other. A free-standing light is not in the world until
+     * somebody writes it down, so the honest switch for it is the whole rig's,
+     * and the way to be rid of one is to delete the line. */
+    if (mode == HWR_GL_SHADING_MODERN &&
+        hwr_truecolor_row_bool(HWR_POINT_ROW, settings, 1))
+        points.classes |= 1u << HWR_LIGHT_CLASS_PLACED;
     points.max = hwr_truecolor_row_u32(HWR_POINT_MAX_ROW, settings, 8u);
     points.intensity = hwr_truecolor_row_float(HWR_POINT_INTENSITY_ROW,
                                                settings, 1.0f);

@@ -51,8 +51,33 @@ struct hwr_object {
     int16_t world_z;
     uint16_t graphic_id;
     uint8_t facing;
-    /* Record +0xe: command-target id used by object-related map commands. */
+    /* Record +0xe: the creator-typed COMMAND-GROUP tag used by object-related
+     * map commands. One command acts on every record carrying the same value,
+     * so it is deliberately SHARED rather than unique, and 0 is both the
+     * untagged default and the command system's own word for "the source
+     * object". The community map editor shows it as `ID:`.
+     *
+     * A game config may address a placed object by it, and means every object
+     * carrying it. */
     uint16_t object_id;
+    /* THE OBJECT NUMBER: the map-wide index over the per-sector object lists,
+     * flattened with the sectors in ascending order and each sector's own list
+     * in list order. That is exactly the number the community map editor shows
+     * as `Object: N`, which is what makes it a fact about the MAP rather than
+     * about this walk, and it is what a game config addresses one placed object
+     * by.
+     *
+     * It counts EVERY record, including the ones this walk goes on to skip. A
+     * hidden object is an object the editor still numbers, so a number that
+     * moved because the mod declined to draw something would agree with the
+     * editor on maps with no hidden objects and lie quietly on every other one
+     * -- silent wrong-object addressing, which is the worst failure this key
+     * can have.
+     *
+     * HWR_OBJECT_NO_INDEX where the source is not the map's own object section:
+     * a particle and the flying pickup are drawn in the world without being
+     * authored into it, so no map numbers them. */
+    uint32_t map_index;
     /* Record +8: the shade seed the type-1 billboard path composes with the
      * owner sector's light (renderer.c:6180-6182). */
     uint8_t seed;
@@ -81,6 +106,8 @@ struct hwr_object {
 
 /* Sentinel owner-sector value for objects with no owning sector. */
 #define HWR_OBJECT_NO_SECTOR 0xffffu
+/* Sentinel object number for a thing no map numbers. */
+#define HWR_OBJECT_NO_INDEX 0xffffffffu
 
 /* An object's effective shade byte, composed the way the engine's own type-1
  * billboard path composes it (renderer.c:6180-6182): the record's seed biased

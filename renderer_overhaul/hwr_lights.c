@@ -417,6 +417,39 @@ static size_t g_glow_face_count;
 static uint32_t g_glow_face_generation;
 static unsigned long g_glow_face_walks;
 
+/* ------------------------------------------------- the free-standing lights
+ *
+ * What a game config's `placed` list amounts to on one map: for each entry, ONE
+ * light where it was hung, in whichever of the map's rooms contains that point.
+ *
+ * The room is worked out ONCE, when the map is staged, for the same reason the
+ * granted faces are: which room a point is in is a fact about the map, and
+ * asking it again sixty times a second would be the whole cost of the feature.
+ *
+ * Nothing else about these is worked out at all. They are not found, they are
+ * not derived and they are not composed with anything -- each is exactly what
+ * somebody wrote down, which is why the colour is required and why there is no
+ * `off`. */
+
+/* How many free-standing lights one map may hang. The look layer's own table is
+ * this size, so this is the whole of what it can hand over. */
+#define HWR_PLACED_MAX 64u
+
+struct hwr_placed_light {
+    uint16_t sector_index;
+    int16_t world_x;
+    int16_t world_y;
+    int16_t world_z;
+    struct hwr_look_light light;
+};
+
+static struct hwr_placed_light g_placed[HWR_PLACED_MAX];
+static size_t g_placed_count;
+/* Which set of free-standing lights the staged answer was worked out from.
+ * Nought means nothing has been worked out. */
+static uint32_t g_placed_generation;
+static unsigned long g_placed_walks;
+
 void hwr_lights_reset(void)
 {
     memset(g_retained, 0, sizeof g_retained);
@@ -434,11 +467,21 @@ void hwr_lights_reset(void)
     memset(g_glow_faces, 0, sizeof g_glow_faces);
     g_glow_face_count = 0;
     g_glow_face_generation = 0;
+    /* And the rooms the free-standing lights were found to hang in, which are
+     * rooms of the map that was loaded and of no other. */
+    memset(g_placed, 0, sizeof g_placed);
+    g_placed_count = 0;
+    g_placed_generation = 0;
 }
 
 unsigned long hwr_lights_glow_face_walks(void)
 {
     return g_glow_face_walks;
+}
+
+unsigned long hwr_lights_placed_walks(void)
+{
+    return g_placed_walks;
 }
 
 /* Sixteen bits, the way the map is authored in them: a coordinate that runs off
@@ -755,6 +798,149 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
     }
 }
 
+/* Whether a point is inside one room's own footprint.
+ *
+ * The crossing count over the room's wall loop, which is the same question the
+ * community map editor asks when somebody drops an object into a room -- so a
+ * light hung in the editor's sector 12 belongs to sector 12 here, rather than to
+ * whichever room some other rule happened to pick.
+ *
+ * Worked in the sixteen bits the map is authored in, without wrapping: a room
+ * that straddles the wrap is not a room anybody builds, and pretending to handle
+ * one would be arithmetic nobody could check. The crossing test is written
+ * without a division, so a wall lying flat along the ray cannot divide by
+ * nothing -- it is skipped by the half-open comparison above it, which is also
+ * what makes a point on a shared edge belong to exactly one of the two rooms. */
+static int hwr_placed_inside(const struct hwr_world *world,
+                             const struct hwr_sector *sector,
+                             int16_t at_x, int16_t at_y)
+{
+    int32_t px = at_x;
+    int32_t py = at_y;
+    int inside = 0;
+    size_t w;
+
+    for (w = 0; w < sector->wall_count; w++) {
+        size_t wall_index = sector->first_wall + w;
+        const struct hwr_wall *wall;
+        const struct hwr_vertex *a;
+        const struct hwr_vertex *b;
+        int32_t ax;
+        int32_t ay;
+        int32_t bx;
+        int32_t by;
+        int64_t across;
+        int64_t along;
+
+        if (wall_index >= world->wall_count)
+            break;
+        wall = &world->walls[wall_index];
+        if (wall->vertex_a_index >= world->vertex_count ||
+            wall->vertex_b_index >= world->vertex_count)
+            continue;
+        a = &world->vertices[wall->vertex_a_index];
+        b = &world->vertices[wall->vertex_b_index];
+        ax = a->world_x;
+        ay = a->world_y;
+        bx = b->world_x;
+        by = b->world_y;
+        if ((ay > py) == (by > py))
+            continue;                   /* the ray does not cross this edge */
+        across = (int64_t)(bx - ax) * (int64_t)(py - ay);
+        along = (int64_t)(by - ay) * (int64_t)(px - ax);
+        if (by > ay ? along < across : along > across)
+            inside = !inside;
+    }
+    return inside;
+}
+
+/* Which of the map's rooms a point is in, or -1 where none of them is.
+ *
+ * Rooms can share a footprint -- a gallery over a hall -- so where more than one
+ * answers, the one whose floor and ceiling the point is BETWEEN is the one it is
+ * in. Where none of them holds it at that height, the first room that holds it
+ * at all is taken: a light a few units under a floor is a light somebody meant
+ * for that room, and refusing it would be refusing over a rounding. */
+static int hwr_placed_room_of(const struct hwr_world *world, int16_t at_x,
+                              int16_t at_y, int16_t at_z)
+{
+    int fallback = -1;
+    size_t s;
+
+    for (s = 0; s < world->sector_count && s <= 0xffffu; s++) {
+        const struct hwr_sector *sector = &world->sectors[s];
+        int32_t low;
+        int32_t high;
+
+        if (!hwr_placed_inside(world, sector, at_x, at_y))
+            continue;
+        if (fallback < 0)
+            fallback = (int)s;
+        low = sector->floor_z;
+        high = sector->ceiling_z;
+        if (low > high) {
+            int32_t swap = low;
+
+            low = high;
+            high = swap;
+        }
+        if ((int32_t)at_z >= low && (int32_t)at_z <= high)
+            return (int)s;
+    }
+    return fallback;
+}
+
+void hwr_lights_stage_placed(const struct hwr_world *world)
+{
+    size_t wanted = hwr_look_placed_count();
+    size_t i;
+
+    g_placed_count = 0;
+    g_placed_generation = hwr_look_placed_generation();
+    if (world == NULL || !world->valid || wanted == 0u)
+        return;
+    /* Past this line a map is actually walked, and that is the whole of what
+     * this counter is for. */
+    g_placed_walks++;
+    for (i = 0; i < wanted && g_placed_count < HWR_PLACED_MAX; i++) {
+        struct hwr_look_light light;
+        int16_t at_x = 0;
+        int16_t at_y = 0;
+        int16_t at_z = 0;
+        int room;
+
+        if (!hwr_look_placed_at(i, &at_x, &at_y, &at_z, &light))
+            continue;
+        /* THE ONE FIELD A LIGHT HANGING IN THE AIR CANNOT ANSWER FOR ITSELF.
+         * Every other light in the mod takes its colour from something that is
+         * there -- the sprite a torch is drawn with, the entry a surface was
+         * granted by -- and this one has nothing there at all. Rather than give
+         * every free-standing light in the game the one torch colour and say
+         * nothing about it, the file is asked for the colour and told when it
+         * did not give one. */
+        if (!light.has_color) {
+            fprintf(stderr, "[renderer_overhaul] the light at (%d, %d, %d) is "
+                            "given no colour; a light standing on its own has "
+                            "nothing to take one from, so it lights nothing\n",
+                    at_x, at_y, at_z);
+            continue;
+        }
+        room = hwr_placed_room_of(world, at_x, at_y, at_z);
+        if (room < 0) {
+            fprintf(stderr, "[renderer_overhaul] the light at (%d, %d, %d) is "
+                            "inside no room this map has, so nothing holds "
+                            "it\n", at_x, at_y, at_z);
+            continue;
+        }
+        g_placed[g_placed_count].sector_index = (uint16_t)room;
+        g_placed[g_placed_count].world_x = at_x;
+        g_placed[g_placed_count].world_y = at_y;
+        g_placed[g_placed_count].world_z = at_z;
+        g_placed[g_placed_count].light = light;
+        g_placed_count++;
+    }
+}
+
 /* ------------------------------------------------------------ the candidates */
 
 struct hwr_light_candidate {
@@ -859,8 +1045,10 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     const struct hwr_world *world = frame->world;
     const struct hwr_sector *sector;
     struct hwr_look_light named;
-    struct hwr_look_light placed;
-    int by_place;
+    struct hwr_look_light tagged;
+    struct hwr_look_light numbered;
+    int by_tag;
+    int by_number;
     float glow_intensity = 1.0f;
     float glow_range = 1.0f;
 
@@ -891,18 +1079,26 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     /* And the game config's word, which is the one place a person overrules the
      * map: a fullbright decal that is plainly not a light is refused here.
      *
-     * It is asked in the two spellings it has, and in the order it ranks them:
-     * what a KIND of thing gives off, and then what THIS ONE does. A placed
-     * thing is the most specific statement anybody made about a light, so it is
-     * the last word -- and `off` is the whole entry rather than a field, so the
-     * most specific table naming a thing at all is the one that answers for
-     * whether it is a light. That is what lets one brazier of a kind be turned
-     * off with every other brazier of that kind left alight, and one hearth be
-     * called a light in a map whose decals of that graphic are not. */
+     * It is asked in the THREE spellings it has, and in the order it ranks them,
+     * least specific first:
+     *
+     *   what a KIND of thing gives off, keyed by the graphic;
+     *   what a GROUP of them does, keyed by the id tag a creator typed to gather
+     *   them -- more specific than a kind, because a kind is every torch in the
+     *   game and a tag is the ones somebody grouped by hand;
+     *   and what THIS ONE does, keyed by its own object number, which names
+     *   exactly one thing and is therefore the last word.
+     *
+     * `off` is the whole entry rather than a field, so the MOST SPECIFIC TABLE
+     * NAMING A THING AT ALL is the one that answers for whether it is a light.
+     * That is what lets one brazier of a kind be turned off with every other
+     * brazier of that kind left alight, one tagged group be refused whole, and
+     * one hearth be called a light in a map whose decals of that graphic are
+     * not. */
     (void)hwr_look_light_for(object->graphic_id, &named);
-    by_place = hwr_look_light_at(object->world_x, object->world_y,
-                                 object->world_z, &placed);
-    if (by_place ? placed.off : named.off) {
+    by_tag = hwr_look_light_for_object_id(object->object_id, &tagged);
+    by_number = hwr_look_light_for_object(object->map_index, &numbered);
+    if (by_number ? numbered.off : (by_tag ? tagged.off : named.off)) {
         g_stats.refused++;
         return 0;
     }
@@ -947,21 +1143,37 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
         }
     }
     /* What the game config says about this particular graphic, over all of it --
-     * and then what it says about THIS ONE over that, FIELD by field, so a
-     * hearth may be made stronger than every other brazier of its kind without
-     * restating the colour its kind was already given. */
-    if (by_place) {
-        if (placed.has_intensity) {
+     * then what it says about the GROUP this one is tagged into over that, then
+     * what it says about THIS ONE by number over that. FIELD by field at every
+     * step, so a hearth may be made stronger than every other brazier of its
+     * kind without restating the colour its kind was already given, and a tagged
+     * corridor may be given one colour without restating the strengths. */
+    if (by_tag) {
+        if (tagged.has_intensity) {
             named.has_intensity = 1;
-            named.intensity = placed.intensity;
+            named.intensity = tagged.intensity;
         }
-        if (placed.has_range) {
+        if (tagged.has_range) {
             named.has_range = 1;
-            named.range = placed.range;
+            named.range = tagged.range;
         }
-        if (placed.has_color) {
+        if (tagged.has_color) {
             named.has_color = 1;
-            named.color = placed.color;
+            named.color = tagged.color;
+        }
+    }
+    if (by_number) {
+        if (numbered.has_intensity) {
+            named.has_intensity = 1;
+            named.intensity = numbered.intensity;
+        }
+        if (numbered.has_range) {
+            named.has_range = 1;
+            named.range = numbered.range;
+        }
+        if (numbered.has_color) {
+            named.has_color = 1;
+            named.color = numbered.color;
         }
     }
     if (named.has_intensity)
@@ -1073,8 +1285,8 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
         for (i = 0; i < frame->objects->count; i++) {
             const struct hwr_object *object = &frame->objects->items[i];
 
-            hwr_look_object_seen(object->world_x, object->world_y,
-                                 object->world_z, object->graphic_id);
+            hwr_look_object_seen(object->map_index, object->object_id,
+                                 object->graphic_id);
         }
         hwr_look_objects_settled();
     }
@@ -1209,6 +1421,120 @@ static size_t hwr_lights_seed_glow_faces(const struct hwr_lights_frame *frame,
     return count;
 }
 
+/* One free-standing light into one light. There is nothing to compose here and
+ * that is the point: no map mark to read, no kind to fall back on, no sprite to
+ * take a colour from. What the file said IS the light, and the only things this
+ * adds are the containments every other class is held by.
+ *
+ * The strength and the reach fall to the settings rows where the entry says
+ * nothing, exactly as a torch's do, so a person may hang a light and tune the
+ * whole rig afterwards without going back through the file. */
+static int hwr_light_from_placed(const struct hwr_lights_frame *frame,
+                                 const struct hwr_placed_light *placed,
+                                 struct hwr_light_candidate *out)
+{
+    const struct hwr_world *world = frame->world;
+    const struct hwr_sector *sector;
+    float glow_intensity = 1.0f;
+    float glow_range = 1.0f;
+
+    if (placed->sector_index >= world->sector_count)
+        return 0;
+    sector = &world->sectors[placed->sector_index];
+    /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
+     * is a light in a room that cannot be seen from here. */
+    if (frame->pvs_valid && frame->visible != NULL &&
+        placed->sector_index < frame->visible_count &&
+        !frame->visible[placed->sector_index]) {
+        g_stats.unseen++;
+        return 0;
+    }
+    memset(out, 0, sizeof *out);
+    out->source = (uint8_t)HWR_LIGHT_CLASS_PLACED;
+    /* Nothing numbers a light that belongs to nothing, so what tells two of them
+     * apart across frames is where each hangs -- which is exactly what the
+     * retained set already matches on. The source number is left at nought
+     * rather than invented, and the CLASS is what keeps it from colliding with a
+     * torch of graphic nought standing in the same place. */
+    out->source_id = 0u;
+    out->sector_index = placed->sector_index;
+    out->world_x = placed->world_x;
+    out->world_y = placed->world_y;
+    out->world_z = placed->world_z;
+    out->light.world_x = (float)placed->world_x;
+    out->light.world_y = (float)placed->world_y;
+    out->light.world_z = (float)placed->world_z;
+    /* The map's own candle word, through exactly the recipe every other light
+     * takes it through -- named rather than copied, so the two cannot drift. */
+    hwr_gl_glow_factors(frame->candle_glow, g_settings.glow_scale,
+                        &glow_intensity, &glow_range);
+    out->light.intensity = g_settings.intensity * glow_intensity;
+    out->light.range = g_settings.range * glow_range;
+    /* The colour is the file's, always: an entry without one is refused where
+     * the map is staged, so by here there is one. */
+    out->light.color[0] = (float)((placed->light.color >> 16) & 0xffu) / 255.0f;
+    out->light.color[1] = (float)((placed->light.color >> 8) & 0xffu) / 255.0f;
+    out->light.color[2] = (float)(placed->light.color & 0xffu) / 255.0f;
+    if (placed->light.has_intensity)
+        out->light.intensity = placed->light.intensity;
+    if (placed->light.has_range)
+        out->light.range = placed->light.range;
+    /* CONTAINMENT: the world-Z window, its own room's floor and ceiling with
+     * slack either side. Ordered here so a map with a ceiling under its floor
+     * cannot invert it. */
+    {
+        float low = (float)sector->floor_z;
+        float high = (float)sector->ceiling_z;
+
+        if (low > high) {
+            float swap = low;
+
+            low = high;
+            high = swap;
+        }
+        out->light.z_lo = low - g_settings.z_slack;
+        out->light.z_hi = high + g_settings.z_slack;
+    }
+    /* CONTAINMENT: the reach. */
+    if (!(out->light.range > 0.0f))
+        return 0;
+    if (!(out->light.intensity > 0.0f))
+        return 0;
+    return 1;
+}
+
+static size_t hwr_lights_seed_placed(const struct hwr_lights_frame *frame,
+                                     struct hwr_light_candidate *candidates,
+                                     size_t max)
+{
+    const uint8_t *hop;
+    size_t count = 0;
+    size_t i;
+
+    /* WHICH ROOM EACH ONE HANGS IN IS NOT ASKED HERE. It was worked out when the
+     * map was staged, and this is the one comparison that says so: the only
+     * thing that can move the answer without a map load is somebody editing the
+     * game config and asking for it to be read again, and that moves the look
+     * layer's own generation. */
+    if (g_placed_generation != hwr_look_placed_generation())
+        hwr_lights_stage_placed(frame->world);
+    if (g_placed_count == 0u)
+        return 0;
+    hop = hwr_lights_hop_containment(frame);
+    for (i = 0; i < g_placed_count && count < max; i++) {
+        struct hwr_light_candidate candidate;
+
+        if (!hwr_light_from_placed(frame, &g_placed[i], &candidate))
+            continue;
+        if (hop != NULL && hop[candidate.sector_index] == 0xffu) {
+            g_stats.too_far++;
+            continue;
+        }
+        candidates[count++] = candidate;
+    }
+    return count;
+}
+
 size_t hwr_lights_build(const struct hwr_lights_frame *frame,
                         struct hwr_gl_point_light *out, size_t max)
 {
@@ -1267,6 +1593,14 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
             break;
         case HWR_LIGHT_CLASS_ENVIRONMENT:
             /* Seeded at the faces a map leaves open to the sky. */
+            break;
+        case HWR_LIGHT_CLASS_PLACED:
+            /* The lights a game config hangs where the map has none. Their
+             * rooms were worked out when the map was staged, exactly as the
+             * granted faces' were. */
+            candidate_count += hwr_lights_seed_placed(
+                frame, candidates + candidate_count,
+                HWR_LIGHT_CANDIDATE_MAX - candidate_count);
             break;
         case HWR_LIGHT_CLASS_COUNT:
             /* Not a class: the loop above never reaches it. */

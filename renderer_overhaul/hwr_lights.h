@@ -31,6 +31,21 @@ enum hwr_light_class {
      * light rather than a direction: a sealed cellar has no such face and so
      * has nothing to seed from, rather than being attenuated toward nothing. */
     HWR_LIGHT_CLASS_ENVIRONMENT,
+    /* A light a game config hangs at three numbers of its own, tied to no
+     * object and to no face. Every other class FINDS lights the map already
+     * has; this one is the only one where somebody puts a light where the map
+     * has none, which is why it is a class of its own rather than a corner of
+     * the object class: what names a light across frames is its class and its
+     * source number, and a light with no object behind it would otherwise be
+     * indistinguishable from a torch that happened to stand in the same spot.
+     *
+     * It has no row of its own to be asked for. Every other class answers a
+     * question about the world -- do the map's torches light it, does its lava
+     * -- and a person can reasonably want one and not the other. A free-standing
+     * light exists only because somebody wrote it down, so the only honest
+     * switch for it is the whole rig's, and the way to be rid of one is to
+     * delete it. */
+    HWR_LIGHT_CLASS_PLACED,
     HWR_LIGHT_CLASS_COUNT
 };
 
@@ -142,11 +157,30 @@ void hwr_lights_reset(void);
  * at all. */
 void hwr_lights_stage_glow_faces(const struct hwr_world *world);
 
+/* And the same for the free-standing lights a game config hangs in this map:
+ * which ROOM each one is in.
+ *
+ * A light needs a room for the same three containments every other light is
+ * held by -- the portal walk, its room's floor and ceiling, and the doorway
+ * count of last resort -- and a light that hangs at three numbers has no room
+ * written beside it. Which room contains a point is a fact about the MAP, so it
+ * is worked out ONCE here, exactly as the granted faces are, by asking each
+ * room's own wall loop whether the point is inside it. That is the same
+ * question the community map editor asks when somebody drops an object into a
+ * room, so a light hung in the editor's sector 12 belongs to sector 12 here.
+ *
+ * A light inside no room at all is not seeded and says so once: three numbers
+ * outside the building are a typing mistake, and a light nothing contains would
+ * be a light with no containments. */
+void hwr_lights_stage_placed(const struct hwr_world *world);
+
 /* How many times that walk has been taken.
  *
  * A claim that a frame does not walk a map looking for granted faces is a claim
  * about something that did NOT happen, and only a counter can state one. */
 unsigned long hwr_lights_glow_face_walks(void);
+/* And the same count for the free-standing lights, for the same reason. */
+unsigned long hwr_lights_placed_walks(void);
 
 /* The colour one decoded sprite frame throws, through a map's own palette:
  * the average of its texels weighted by the square of the engine's own
