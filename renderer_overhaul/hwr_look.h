@@ -49,6 +49,15 @@
  *               Each field is separately present or absent, so a map may raise
  *               a strength without restating a colour.
  *
+ *               And under "objects", ONE placed thing rather than a kind of
+ *               them, addressed by where it stands. That is the most specific
+ *               statement anybody can make about a light, so it is the last
+ *               word: the hearth in one room burns hotter than every other
+ *               brazier of its kind. Objects are described under a map and
+ *               never under "everywhere" -- a position is a position in ONE
+ *               map, and the same three numbers elsewhere are a different
+ *               corner of a different building.
+ *
  * A member named exactly `notes`, at any level, is documentation -- a piece of
  * text or a list of them -- and is never read as data.
  *
@@ -147,6 +156,40 @@ struct hwr_look_light {
  * when there is one. A graphic nobody named leaves `out` cleared, which is
  * every field absent -- the settings rows answer for it whole. */
 int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out);
+
+/* The same for ONE placed thing, addressed by where it stands: the three exact
+ * numbers the map's own object section carries for it.
+ *
+ * The position is the identity because it is authored map data, streamed
+ * whole out of the map file and written back into a save byte for byte -- a
+ * brazier is at the same three numbers on the twentieth visit as on the first.
+ * It is also the identity the light rig already names a light by across frames,
+ * so the file and the rig agree by construction rather than by coincidence.
+ *
+ * A position nobody named leaves `out` cleared. Whether the entry AGREES with
+ * what stands there is not asked here: the graphic written beside a position is
+ * a check on the entry rather than part of its key, and the checking is done
+ * once against the map's own objects rather than once per frame per light. */
+int hwr_look_light_at(int16_t world_x, int16_t world_y, int16_t world_z,
+                      struct hwr_look_light *out);
+
+/* Whether the map's own objects are still to be offered to the table above.
+ * Answers 0 once they have been -- and 0 on every map that has no entries to
+ * check, which is what keeps this off the frame's own cost. */
+int hwr_look_objects_pending(void);
+/* One of the map's own objects. EVERY object is offered, not only the ones
+ * that become lights: an object refused as not a light is still an object
+ * standing there, and an entry addressing one must not be reported as
+ * addressing nothing.
+ *
+ * This is where the two remarks about an entry are made -- an entry whose
+ * graphic is not the one the map draws that thing with says so, and the entry
+ * is applied anyway. */
+void hwr_look_object_seen(int16_t world_x, int16_t world_y, int16_t world_z,
+                          uint16_t graphic_id);
+/* The map holds nothing else. Every entry nothing stood at says so, once per
+ * entry per map, so a mistyped position is visible rather than silent. */
+void hwr_look_objects_settled(void);
 
 void hwr_look_clear(void);
 

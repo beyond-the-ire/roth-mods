@@ -248,7 +248,15 @@ putting the file back puts the selection back.
     "STUDY1": {
       "notes": "Lamplit and enclosed; its own candles carry it.",
       "settings": { "room_light_reach": 0.72 },
-      "lights": { "graphics": { "0x0412": { "strength": 2.0 } } }
+      "lights": {
+        "graphics": { "0x0412": { "strength": 2.0 } },
+        "objects": [
+          { "notes": "the hearth", "at": [1284, -2210, 96],
+            "strength": 2.6, "reach": 700, "colour": "#ff9040" },
+          { "notes": "a bright decal, not a light",
+            "at": [980, -2044, 72], "off": true }
+        ]
+      }
     }
   }
 }
@@ -280,6 +288,26 @@ strength without restating a colour. `off` is the whole entry rather than a fiel
 marks unshaded that is plainly not a light — a glowing decal, a bright pickup — is refused outright.
 Running the game with `HWR_OBJ_DUMP` set to a file name writes out every object a map holds along
 with the graphic it is drawn with, which is where those numbers come from.
+
+`objects`, under the same `lights`, says the same thing about **one particular thing** rather than
+about a kind of them: the hearth in one room, not every brazier in the game. It is a **list**, and
+each entry is addressed by **where the thing stands** — `"at": [x, y, z]`, the three numbers the map
+itself carries for it, which the same `HWR_OBJ_DUMP` file lists beside every object's graphic. A
+position is not a name, which is why this is a list and not a block, and it belongs to one map: an
+`objects` list is written **under a map** and never under `everywhere`, because the same three
+numbers in another map are a different corner of a different building.
+
+What one entry says wins over whatever `graphics` said about its kind — the most specific statement
+anybody made is the one in force — and it composes field by field with it, so one hearth may be made
+stronger without restating the colour every brazier already has. `off` is the whole entry here too:
+turning one thing off leaves every other thing of its kind alight, and naming one thing in a map
+whose whole kind is `off` makes that one a light again.
+
+You may write a `graphic` beside a position as well. It is a **check**, not part of the address: if
+what stands there is drawn with something else the entry is still applied and the game says so,
+which is how a list written for one version of a map tells you it has gone stale. An entry standing
+at a position nothing occupies says so too, once, naming the map — so a mistyped number is visible
+rather than silently doing nothing.
 
 Colours are written `"#rrggbb"`. JSON has no comment character for a hash to collide with, so a
 colour here is written the way a person writes one; the bare six digits are accepted too.

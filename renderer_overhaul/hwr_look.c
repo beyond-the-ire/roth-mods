@@ -26,6 +26,13 @@
 /* How many graphics one scope may say something about. A place has a handful
  * of things that give light; this is room for one that is nothing but. */
 #define HWR_LOOK_MAX_LIGHTS 64u
+/* And how many PLACED things one map may name. A hand-tuned map picks out the
+ * few lights that carry a room -- the hearth, the brazier at the top of the
+ * stairs -- so this is far past what tuning takes, and it is the same number as
+ * the graphics above so that neither is the one somebody has to remember. Every
+ * place carries a table of this size whether it fills one or not, which is what
+ * it costs; it is the same bargain the graphics table already makes. */
+#define HWR_LOOK_MAX_OBJECTS 64u
 /* The shape this build reads. A file that names a later one is read anyway and
  * says so, which is what lets an older build be honest about a newer file
  * rather than guess at it. */
@@ -79,11 +86,39 @@ struct hwr_look_lights {
     size_t count;
 };
 
+/* What ONE placed thing gives off. The key is where it stands, which is three
+ * exact numbers out of the map's own object section rather than a name: a
+ * position is what a person can find, check and reason about, and it survives a
+ * save and a re-visit unchanged.
+ *
+ * The graphic beside it is a CHECK rather than part of the key. An entry whose
+ * graphic is not the one the map draws that thing with is still applied, and
+ * says so -- which is what catches a stale entry after a map has been
+ * re-authored, the one place addressing by position is weak. */
+struct hwr_look_object_entry {
+    int16_t world_x;
+    int16_t world_y;
+    int16_t world_z;
+    int has_graphic;
+    uint16_t graphic_id;
+    struct hwr_look_light light;
+};
+
+struct hwr_look_objects {
+    struct hwr_look_object_entry items[HWR_LOOK_MAX_OBJECTS];
+    size_t count;
+};
+
 /* One answer, whether it is the one every place gets or one place's own: they
- * have the same shape, and that is the whole of the composition rule. */
+ * have the same shape, and that is the whole of the composition rule.
+ *
+ * The one exception is the objects table, and it is an exception because the
+ * thing it is keyed by has no meaning outside one map. It is read only under a
+ * map; under `everywhere` it is refused with a note. */
 struct hwr_look_scope {
     struct hwr_look_values values;
     struct hwr_look_lights lights;
+    struct hwr_look_objects objects;
 };
 
 struct hwr_look_map {
@@ -105,6 +140,15 @@ static struct hwr_look_file g_look;
 static int g_look_present;
 static struct hwr_look_values g_effective;
 static struct hwr_look_lights g_effective_lights;
+static struct hwr_look_objects g_effective_objects;
+/* What has been SAID about each entry on the map in force, and whether the
+ * map's own objects have been offered yet. Kept beside the entries rather than
+ * in them, because what an entry is and what has been said about it are two
+ * different things: one is the file's answer and moves when the file does, the
+ * other is a conversation that starts again on every map. */
+static unsigned char g_object_matched[HWR_LOOK_MAX_OBJECTS];
+static unsigned char g_object_told[HWR_LOOK_MAX_OBJECTS];
+static int g_objects_settled;
 static char g_look_map[HWR_LOOK_NAME];
 static uint64_t g_look_hash;
 static uint64_t g_look_candidate_hash;
@@ -611,6 +655,29 @@ static void hwr_look_lights_merge(struct hwr_look_lights *into,
     }
 }
 
+/* The entry for one position in one scope, created where there is not one.
+ * Two entries written for one position are two statements about one thing, so
+ * the second is laid over the first rather than standing beside it. NULL means
+ * the map is already carrying as many placed things as it may. */
+static struct hwr_look_object_entry *hwr_look_object_entry(
+    struct hwr_look_objects *objects, int16_t x, int16_t y, int16_t z)
+{
+    size_t i;
+
+    for (i = 0; i < objects->count; i++) {
+        if (objects->items[i].world_x == x && objects->items[i].world_y == y &&
+            objects->items[i].world_z == z)
+            return &objects->items[i];
+    }
+    if (objects->count >= HWR_LOOK_MAX_OBJECTS)
+        return NULL;
+    memset(&objects->items[objects->count], 0, sizeof objects->items[0]);
+    objects->items[objects->count].world_x = x;
+    objects->items[objects->count].world_y = y;
+    objects->items[objects->count].world_z = z;
+    return &objects->items[objects->count++];
+}
+
 static const struct hwr_look_map *hwr_look_find_map(
     const struct hwr_look_file *file, const char *name)
 {
@@ -730,24 +797,103 @@ static void hwr_look_read_settings(const struct hwr_json_doc *doc, int object,
     }
 }
 
-/* What one graphic gives off. Every field is separately present or absent, and
- * absent means saying nothing about it rather than answering nought. */
+/* Whether a grant is refused outright, wherever it is keyed from. `off` is the
+ * whole entry rather than a field: a thing the map marks unshaded that is
+ * plainly not a light is refused, and what it would have given off is not
+ * read. */
+static int hwr_look_grant_off(const struct hwr_json_doc *doc, int node,
+                              const char *where, int report)
+{
+    int child = hwr_json_member(doc, node, "off");
+    int off = 0;
+
+    if (child >= 0 && !hwr_json_as_bool(doc, child, &off)) {
+        hwr_look_note(report, where, "'off' is true or false");
+        return 0;
+    }
+    return off;
+}
+
+/* One field of what a grant gives off. Every field is separately present or
+ * absent, and absent means saying nothing about it rather than answering
+ * nought.
+ *
+ * Answers 0 for a name that is none of these three, so a table with names of
+ * its own -- where a thing stands, which graphic it should be -- answers for
+ * those and lets this answer for the rest. The three fields are then spelled
+ * once for both tables and cannot drift into two spellings. */
+static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
+                                struct hwr_look_light *into, const char *where,
+                                int report)
+{
+    const char *field = hwr_json_name(doc, child);
+    double number = 0.0;
+    uint32_t rgb = 0;
+
+    if (field == NULL)
+        return 0;
+    if (strcmp(field, "strength") == 0) {
+        if (!hwr_json_as_number(doc, child, &number)) {
+            hwr_look_note(report, where, "the strength is a number");
+            return 1;
+        }
+        into->has_intensity = 1;
+        into->intensity = (float)number;
+        return 1;
+    }
+    if (strcmp(field, "reach") == 0) {
+        if (!hwr_json_as_number(doc, child, &number)) {
+            hwr_look_note(report, where, "the reach is a number");
+            return 1;
+        }
+        into->has_range = 1;
+        into->range = (float)number;
+        return 1;
+    }
+    if (strcmp(field, "colour") == 0) {
+        if (!hwr_look_color(hwr_json_as_text(doc, child), &rgb)) {
+            hwr_look_note(report, where, "the colour is six hexadecimal "
+                                         "digits, such as \"#ffb46e\"");
+            return 1;
+        }
+        into->has_color = 1;
+        into->color = rgb;
+        return 1;
+    }
+    return 0;
+}
+
+/* A graphic number, however it is spelled: a string in any base, which is what
+ * a table keyed by one uses, or a bare number where one is written beside a
+ * position. Answers 0 for anything that is not one. */
+static int hwr_look_graphic_number(const char *text, uint16_t *out)
+{
+    unsigned long graphic;
+    char *end = NULL;
+
+    if (text == NULL || text[0] == 0)
+        return 0;
+    graphic = strtoul(text, &end, 0);
+    if (end == text || *end != 0 || graphic > 0xffffuL)
+        return 0;
+    *out = (uint16_t)graphic;
+    return 1;
+}
+
+/* What one graphic gives off. */
 static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
                                 struct hwr_look_lights *into,
                                 const char *where, int report)
 {
     const char *key = hwr_json_name(doc, node);
     struct hwr_look_light_entry *entry;
-    unsigned long graphic;
     char inside[HWR_LOOK_WHERE];
-    char *end = NULL;
-    int off = 0;
+    uint16_t graphic = 0;
     int child;
 
     if (key == NULL)
         return;
-    graphic = strtoul(key, &end, 0);
-    if (end == key || *end != 0 || graphic > 0xffffuL) {
+    if (!hwr_look_graphic_number(key, &graphic)) {
         hwr_look_note(report, where, "'%s' is not a graphic number", key);
         return;
     }
@@ -757,65 +903,174 @@ static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
                                       "off");
         return;
     }
-    entry = hwr_look_light_entry(into, (uint16_t)graphic);
+    entry = hwr_look_light_entry(into, graphic);
     if (entry == NULL) {
         hwr_look_note(report, inside, "that is more lights than one place may "
                                       "describe");
         return;
     }
-    child = hwr_json_member(doc, node, "off");
-    if (child >= 0 && !hwr_json_as_bool(doc, child, &off)) {
-        hwr_look_note(report, inside, "'off' is true or false");
-        off = 0;
-    }
-    /* `off` is the whole entry rather than a field: a thing the map marks
-     * unshaded that is plainly not a light is refused outright, and nothing
-     * else in the entry is read. */
-    if (off) {
+    if (hwr_look_grant_off(doc, node, inside, report)) {
         entry->light.off = 1;
         return;
     }
     for (child = hwr_json_first(doc, node); child >= 0;
          child = hwr_json_next(doc, child)) {
         const char *field = hwr_json_name(doc, child);
-        double number = 0.0;
-        uint32_t rgb = 0;
 
         if (field == NULL || hwr_look_is_notes(field) ||
             strcmp(field, "off") == 0)
             continue;
-        if (strcmp(field, "strength") == 0) {
-            if (!hwr_json_as_number(doc, child, &number)) {
-                hwr_look_note(report, inside, "the strength is a number");
-                continue;
-            }
-            entry->light.has_intensity = 1;
-            entry->light.intensity = (float)number;
-        } else if (strcmp(field, "reach") == 0) {
-            if (!hwr_json_as_number(doc, child, &number)) {
-                hwr_look_note(report, inside, "the reach is a number");
-                continue;
-            }
-            entry->light.has_range = 1;
-            entry->light.range = (float)number;
-        } else if (strcmp(field, "colour") == 0) {
-            if (!hwr_look_color(hwr_json_as_text(doc, child), &rgb)) {
-                hwr_look_note(report, inside, "the colour is six hexadecimal "
-                                              "digits, such as \"#ffb46e\"");
-                continue;
-            }
-            entry->light.has_color = 1;
-            entry->light.color = rgb;
-        } else {
+        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
-        }
     }
 }
 
-static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
-                                 struct hwr_look_lights *into,
+/* Where one placed thing stands. Three exact numbers, read as sixteen-bit
+ * integers because that is what the map's own object section carries: a
+ * position that will not fit in one is a position no object can be standing at,
+ * and saying so turns a mistyped number into a complaint rather than into a
+ * match that will never be made. */
+static int hwr_look_read_at(const struct hwr_json_doc *doc, int node,
+                            int16_t out[3], const char *where, int report)
+{
+    size_t read = 0;
+    int child;
+
+    if (hwr_json_type(doc, node) != HWR_JSON_ARRAY) {
+        hwr_look_note(report, where, "'at' is where the thing stands, written "
+                                     "[x, y, z]");
+        return 0;
+    }
+    for (child = hwr_json_first(doc, node); child >= 0;
+         child = hwr_json_next(doc, child)) {
+        double number = 0.0;
+
+        if (read >= 3u) {
+            hwr_look_note(report, where, "'at' is three numbers: x, y and z");
+            return 0;
+        }
+        if (!hwr_json_as_number(doc, child, &number)) {
+            hwr_look_note(report, where, "'at' is three numbers: x, y and z");
+            return 0;
+        }
+        if (number < -32768.0 || number > 32767.0 ||
+            number != (double)(int)number) {
+            hwr_look_note(report, where, "a position is a whole number between "
+                                         "-32768 and 32767");
+            return 0;
+        }
+        out[read++] = (int16_t)number;
+    }
+    if (read != 3u) {
+        hwr_look_note(report, where, "'at' is three numbers: x, y and z");
+        return 0;
+    }
+    return 1;
+}
+
+/* One placed thing: where it stands, optionally which graphic it should be, and
+ * what it gives off.
+ *
+ * The address is read BEFORE `off` is asked about, which is the one place the
+ * "nothing else in the entry is read" rule has an edge worth stating: where a
+ * thing stands and which graphic it is are what ADDRESS the entry rather than
+ * what it gives off, so an entry that turns one thing off is still checked
+ * against what actually stands there. An entry nobody can check is an entry
+ * that goes stale in silence. */
+static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
+                                 struct hwr_look_objects *into, size_t index,
                                  const char *where, int report)
+{
+    struct hwr_look_object_entry *entry;
+    char inside[HWR_LOOK_WHERE];
+    char label[24];
+    int16_t at[3];
+    int child;
+
+    snprintf(label, sizeof label, "%u", (unsigned)index);
+    hwr_look_where(inside, where, label);
+    if (hwr_json_type(doc, node) != HWR_JSON_OBJECT) {
+        hwr_look_note(report, inside, "one placed thing is a block of where it "
+                                      "stands and what it gives off");
+        return;
+    }
+    child = hwr_json_member(doc, node, "at");
+    if (child < 0) {
+        hwr_look_note(report, inside, "a placed thing is addressed by where it "
+                                      "stands, written \"at\": [x, y, z]");
+        return;
+    }
+    if (!hwr_look_read_at(doc, child, at, inside, report))
+        return;
+    entry = hwr_look_object_entry(into, at[0], at[1], at[2]);
+    if (entry == NULL) {
+        hwr_look_note(report, inside, "that is more placed things than one map "
+                                      "may describe");
+        return;
+    }
+    child = hwr_json_member(doc, node, "graphic");
+    if (child >= 0) {
+        const char *text = hwr_json_as_text(doc, child);
+        char written[64];
+        uint16_t graphic = 0;
+
+        if (text == NULL) {
+            hwr_json_render(doc, child, written, sizeof written);
+            text = written;
+        }
+        if (!hwr_look_graphic_number(text, &graphic))
+            hwr_look_note(report, inside, "the graphic is a number, such as "
+                                          "\"0x0412\"");
+        else {
+            entry->has_graphic = 1;
+            entry->graphic_id = graphic;
+        }
+    }
+    if (hwr_look_grant_off(doc, node, inside, report)) {
+        entry->light.off = 1;
+        return;
+    }
+    for (child = hwr_json_first(doc, node); child >= 0;
+         child = hwr_json_next(doc, child)) {
+        const char *field = hwr_json_name(doc, child);
+
+        if (field == NULL || hwr_look_is_notes(field) ||
+            strcmp(field, "at") == 0 || strcmp(field, "graphic") == 0 ||
+            strcmp(field, "off") == 0)
+            continue;
+        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
+            hwr_look_note(report, inside, "'%s' is not something a light gives "
+                                          "off", field);
+    }
+}
+
+/* The placed things of one map. A LIST rather than a block, because its key is
+ * a position and a position is not a name. */
+static void hwr_look_read_objects(const struct hwr_json_doc *doc, int array,
+                                  struct hwr_look_objects *into,
+                                  const char *where, int report)
+{
+    size_t index = 0;
+    int child;
+
+    if (hwr_json_type(doc, array) != HWR_JSON_ARRAY) {
+        hwr_look_note(report, where, "the placed things are a list, because "
+                                     "each is addressed by where it stands "
+                                     "rather than by a name");
+        return;
+    }
+    for (child = hwr_json_first(doc, array); child >= 0;
+         child = hwr_json_next(doc, child))
+        hwr_look_read_object(doc, child, into, index++, where, report);
+}
+
+/* `placed` says whether this scope may address one particular thing, which only
+ * a map's own scope may: a position is a position in ONE map, and the same
+ * three numbers elsewhere are a different corner of a different building. */
+static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
+                                 struct hwr_look_scope *into,
+                                 const char *where, int report, int placed)
 {
     char inside[HWR_LOOK_WHERE];
     int child;
@@ -845,8 +1100,18 @@ static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
                  light = hwr_json_next(doc, light)) {
                 if (hwr_look_is_notes(hwr_json_name(doc, light)))
                     continue;
-                hwr_look_read_light(doc, light, into, inside, report);
+                hwr_look_read_light(doc, light, &into->lights, inside, report);
             }
+        } else if (strcmp(name, "objects") == 0) {
+            hwr_look_where(inside, where, "objects");
+            if (!placed) {
+                hwr_look_note(report, inside, "a position is a position in ONE "
+                                              "map, so a placed thing is "
+                                              "described under a map rather "
+                                              "than everywhere");
+                continue;
+            }
+            hwr_look_read_objects(doc, child, &into->objects, inside, report);
         } else {
             hwr_look_note(report, where, "'%s' is not something this build "
                                          "reads", name);
@@ -857,7 +1122,7 @@ static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
 /* One answer, whichever it is: the one every place gets, or one place's own. */
 static void hwr_look_read_scope(const struct hwr_json_doc *doc, int object,
                                 struct hwr_look_scope *into, const char *where,
-                                int report)
+                                int report, int placed)
 {
     char inside[HWR_LOOK_WHERE];
     int child;
@@ -877,7 +1142,7 @@ static void hwr_look_read_scope(const struct hwr_json_doc *doc, int object,
             hwr_look_read_settings(doc, child, &into->values, inside, report);
         } else if (strcmp(name, "lights") == 0) {
             hwr_look_where(inside, where, "lights");
-            hwr_look_read_lights(doc, child, &into->lights, inside, report);
+            hwr_look_read_lights(doc, child, into, inside, report, placed);
         } else {
             hwr_look_note(report, where, "'%s' is not something this build "
                                          "reads", name);
@@ -929,7 +1194,7 @@ static int hwr_look_build(struct hwr_look_file *file,
             snprintf(file->title, sizeof file->title, "%s", title);
         } else if (strcmp(name, "everywhere") == 0) {
             hwr_look_read_scope(doc, child, &file->everywhere, "everywhere",
-                                report);
+                                report, 0);
         } else if (strcmp(name, "maps") == 0) {
             int entry;
 
@@ -971,7 +1236,7 @@ static int hwr_look_build(struct hwr_look_file *file,
                 hwr_look_read_scope(doc, entry,
                                     &file->maps[(size_t)(found - file->maps)]
                                         .scope,
-                                    where, report);
+                                    where, report, 1);
             }
         } else {
             hwr_look_note(report, "the file", "'%s' is not something this "
@@ -1116,12 +1381,14 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
 static void hwr_look_compose(const struct hwr_look_file *file,
                              const char *map_name,
                              struct hwr_look_values *out,
-                             struct hwr_look_lights *out_lights)
+                             struct hwr_look_lights *out_lights,
+                             struct hwr_look_objects *out_objects)
 {
     const struct hwr_look_map *map;
 
     memset(out, 0, sizeof *out);
     memset(out_lights, 0, sizeof *out_lights);
+    memset(out_objects, 0, sizeof *out_objects);
     if (!g_look_present)
         return;
     hwr_look_merge(out, &file->everywhere.values);
@@ -1130,13 +1397,18 @@ static void hwr_look_compose(const struct hwr_look_file *file,
     if (map != NULL) {
         hwr_look_merge(out, &map->scope.values);
         hwr_look_lights_merge(out_lights, &map->scope.lights);
+        /* And the placed things, which are the last word and come from ONE
+         * scope: there is no game-wide table of them to compose with, because
+         * a position outside the map it belongs to names nothing. */
+        *out_objects = map->scope.objects;
     }
 }
 
 /* Publishes a freshly composed override set and reports what moved, so the rows
  * that changed value are applied and nothing else is disturbed. */
 static void hwr_look_publish(const struct hwr_look_values *next,
-                             const struct hwr_look_lights *next_lights)
+                             const struct hwr_look_lights *next_lights,
+                             const struct hwr_look_objects *next_objects)
 {
     uint32_t changed = 0;
     size_t count = hwr_schema_count();
@@ -1144,12 +1416,24 @@ static void hwr_look_publish(const struct hwr_look_values *next,
 
     /* The lights table is not a row and raises no row's bit of its own, so it
      * raises the rig's: what it changes is what the lights that are not at the
-     * eye are worth, which is the same thing every row of that family changes. */
+     * eye are worth, which is the same thing every row of that family changes.
+     * The placed things are the same table said more precisely, so they raise
+     * the same bit. */
     if (next_lights->count != g_effective_lights.count ||
         memcmp(next_lights->items, g_effective_lights.items,
-               next_lights->count * sizeof next_lights->items[0]) != 0)
+               next_lights->count * sizeof next_lights->items[0]) != 0 ||
+        next_objects->count != g_effective_objects.count ||
+        memcmp(next_objects->items, g_effective_objects.items,
+               next_objects->count * sizeof next_objects->items[0]) != 0)
         changed |= HWR_CHANGE_TRUECOLOR;
     g_effective_lights = *next_lights;
+    g_effective_objects = *next_objects;
+    /* A new set of placed things is a new conversation about them: what has
+     * been said is about the map in force, and the map in force has just been
+     * decided. */
+    memset(g_object_matched, 0, sizeof g_object_matched);
+    memset(g_object_told, 0, sizeof g_object_told);
+    g_objects_settled = 0;
     for (i = 0; i < count; i++) {
         int had = hwr_row_set_has(&g_effective.present, (int)i);
         int has = hwr_row_set_has(&next->present, (int)i);
@@ -1180,10 +1464,12 @@ static void hwr_look_publish_nothing(void)
 {
     struct hwr_look_values empty;
     struct hwr_look_lights no_lights;
+    struct hwr_look_objects no_objects;
 
     memset(&empty, 0, sizeof empty);
     memset(&no_lights, 0, sizeof no_lights);
-    hwr_look_publish(&empty, &no_lights);
+    memset(&no_objects, 0, sizeof no_objects);
+    hwr_look_publish(&empty, &no_lights, &no_objects);
 }
 
 static void hwr_look_say_what_was_read(const struct hwr_look_file *file)
@@ -1366,10 +1652,11 @@ void hwr_look_select_map(const char *map_name)
 {
     struct hwr_look_values next;
     struct hwr_look_lights next_lights;
+    struct hwr_look_objects next_objects;
 
     hwr_look_map_name(g_look_map, HWR_LOOK_NAME, map_name);
-    hwr_look_compose(&g_look, g_look_map, &next, &next_lights);
-    hwr_look_publish(&next, &next_lights);
+    hwr_look_compose(&g_look, g_look_map, &next, &next_lights, &next_objects);
+    hwr_look_publish(&next, &next_lights, &next_objects);
 }
 
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
@@ -1428,11 +1715,97 @@ int hwr_look_light_for(uint16_t graphic_id, struct hwr_look_light *out)
     return 0;
 }
 
+int hwr_look_light_at(int16_t world_x, int16_t world_y, int16_t world_z,
+                      struct hwr_look_light *out)
+{
+    size_t i;
+
+    if (out == NULL)
+        return 0;
+    memset(out, 0, sizeof *out);
+    for (i = 0; i < g_effective_objects.count; i++) {
+        const struct hwr_look_object_entry *entry =
+            &g_effective_objects.items[i];
+
+        if (entry->world_x != world_x || entry->world_y != world_y ||
+            entry->world_z != world_z)
+            continue;
+        *out = entry->light;
+        return 1;
+    }
+    return 0;
+}
+
+int hwr_look_objects_pending(void)
+{
+    return !g_objects_settled && g_effective_objects.count != 0u;
+}
+
+void hwr_look_object_seen(int16_t world_x, int16_t world_y, int16_t world_z,
+                          uint16_t graphic_id)
+{
+    size_t i;
+
+    if (g_objects_settled)
+        return;
+    for (i = 0; i < g_effective_objects.count; i++) {
+        const struct hwr_look_object_entry *entry =
+            &g_effective_objects.items[i];
+
+        if (entry->world_x != world_x || entry->world_y != world_y ||
+            entry->world_z != world_z)
+            continue;
+        g_object_matched[i] = 1u;
+        /* The graphic beside a position is a CHECK rather than part of the key,
+         * so an entry that names the wrong one is applied and says so. That is
+         * what catches an entry gone stale after a map has been re-authored,
+         * which is the one place addressing a thing by where it stands is
+         * weak -- and the entry is still applied, because the thing standing
+         * there is the thing somebody was describing. */
+        if (entry->has_graphic && entry->graphic_id != graphic_id &&
+            !g_object_told[i]) {
+            g_object_told[i] = 1u;
+            fprintf(stderr, "[renderer_overhaul] %s: the object at "
+                            "(%d, %d, %d) on %s is drawn with %#06x, not the "
+                            "%#06x written beside it; the entry is applied "
+                            "anyway\n",
+                    g_look_path, world_x, world_y, world_z, g_look_map,
+                    (unsigned)graphic_id, (unsigned)entry->graphic_id);
+        }
+    }
+}
+
+void hwr_look_objects_settled(void)
+{
+    size_t i;
+
+    if (g_objects_settled)
+        return;
+    g_objects_settled = 1;
+    for (i = 0; i < g_effective_objects.count; i++) {
+        const struct hwr_look_object_entry *entry =
+            &g_effective_objects.items[i];
+
+        if (g_object_matched[i])
+            continue;
+        /* A position nothing stands at is a typed number that will never do
+         * anything, and one that says nothing is one nobody finds. */
+        fprintf(stderr, "[renderer_overhaul] %s: no object stands at "
+                        "(%d, %d, %d) on %s\n",
+                g_look_path, entry->world_x, entry->world_y, entry->world_z,
+                g_look_map);
+    }
+}
+
 void hwr_look_clear(void)
 {
     memset(&g_look, 0, sizeof g_look);
     memset(&g_effective, 0, sizeof g_effective);
     memset(&g_effective_lights, 0, sizeof g_effective_lights);
+    memset(&g_effective_objects, 0, sizeof g_effective_objects);
+    memset(g_object_matched, 0, sizeof g_object_matched);
+    memset(g_object_told, 0, sizeof g_object_told);
+    g_objects_settled = 0;
     g_look_present = 0;
     g_look_path[0] = 0;
     g_look_dir[0] = 0;

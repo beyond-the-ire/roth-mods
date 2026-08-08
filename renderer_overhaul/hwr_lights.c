@@ -462,6 +462,8 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     const struct hwr_world *world = frame->world;
     const struct hwr_sector *sector;
     struct hwr_look_light named;
+    struct hwr_look_light placed;
+    int by_place;
     float glow_intensity = 1.0f;
     float glow_range = 1.0f;
 
@@ -489,9 +491,21 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     if (hwr_object_composed_light(object->seed, sector->light) != 0)
         return 0;
     g_stats.marked++;
-    /* And the look file's word, which is the one place a person overrules the
-     * map: a fullbright decal that is plainly not a light is refused here. */
-    if (hwr_look_light_for(object->graphic_id, &named) && named.off) {
+    /* And the game config's word, which is the one place a person overrules the
+     * map: a fullbright decal that is plainly not a light is refused here.
+     *
+     * It is asked in the two spellings it has, and in the order it ranks them:
+     * what a KIND of thing gives off, and then what THIS ONE does. A placed
+     * thing is the most specific statement anybody made about a light, so it is
+     * the last word -- and `off` is the whole entry rather than a field, so the
+     * most specific table naming a thing at all is the one that answers for
+     * whether it is a light. That is what lets one brazier of a kind be turned
+     * off with every other brazier of that kind left alight, and one hearth be
+     * called a light in a map whose decals of that graphic are not. */
+    (void)hwr_look_light_for(object->graphic_id, &named);
+    by_place = hwr_look_light_at(object->world_x, object->world_y,
+                                 object->world_z, &placed);
+    if (by_place ? placed.off : named.off) {
         g_stats.refused++;
         return 0;
     }
@@ -534,7 +548,24 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
             out->light.color[2] = sprite_color[2];
         }
     }
-    /* What the look file says about this particular graphic, over all of it. */
+    /* What the game config says about this particular graphic, over all of it --
+     * and then what it says about THIS ONE over that, FIELD by field, so a
+     * hearth may be made stronger than every other brazier of its kind without
+     * restating the colour its kind was already given. */
+    if (by_place) {
+        if (placed.has_intensity) {
+            named.has_intensity = 1;
+            named.intensity = placed.intensity;
+        }
+        if (placed.has_range) {
+            named.has_range = 1;
+            named.range = placed.range;
+        }
+        if (placed.has_color) {
+            named.has_color = 1;
+            named.color = placed.color;
+        }
+    }
     if (named.has_intensity)
         out->light.intensity = named.intensity;
     if (named.has_range)
@@ -581,6 +612,28 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
 
     if (frame->objects == NULL || !frame->objects->valid)
         return 0;
+    /* THE GAME CONFIG'S OWN PLACED THINGS, offered every object the map holds
+     * before any of them is judged.
+     *
+     * EVERY object, not only the ones that become lights: an object refused as
+     * not a light, or standing in a room the walk did not draw, is still an
+     * object standing there, and an entry addressing one must never be reported
+     * as addressing nothing. That is why this is a walk of its own rather than a
+     * line inside the seeding below -- the seeding's own answer is about
+     * whether a thing lights the room, and this question is about whether it
+     * exists.
+     *
+     * Taken ONCE PER MAP rather than once per frame, and not taken at all on a
+     * map with nothing to check, which is every map until somebody tunes one. */
+    if (hwr_look_objects_pending()) {
+        for (i = 0; i < frame->objects->count; i++) {
+            const struct hwr_object *object = &frame->objects->items[i];
+
+            hwr_look_object_seen(object->world_x, object->world_y,
+                                 object->world_z, object->graphic_id);
+        }
+        hwr_look_objects_settled();
+    }
     /* CONTAINMENT: the hop cap, worked out once for the frame rather than per
      * candidate -- AND ONLY WHERE THERE IS NO DRAWN SET TO CONTAIN BY.
      *
