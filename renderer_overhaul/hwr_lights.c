@@ -3,6 +3,7 @@
 #include "hwr_das.h"
 #include "hwr_look.h"
 #include "hwr_objects.h"
+#include "hwr_sprite_span.h"
 #include "hwr_sprites.h"
 #include "hwr_world.h"
 
@@ -346,25 +347,34 @@ struct hwr_light_color_entry {
 static struct hwr_light_color_entry g_color_cache[HWR_LIGHT_COLOR_CACHE];
 static size_t g_color_cache_count;
 
-static int hwr_light_sprite_color(const struct hwr_lights_frame *frame,
-                                  const struct hwr_object *object,
-                                  float out[3])
+/* WHICH SPRITE ONE THING IS DRAWN AS, resolved through the engine's own face
+ * resolver. Two things about a light are read off it -- the colour it throws and
+ * how tall it stands -- so it is resolved ONCE per object per frame and handed
+ * to both, rather than each of them asking. */
+static int hwr_light_sprite_of(const struct hwr_lights_frame *frame,
+                               const struct hwr_object *object,
+                               struct hwr_sprite_lookup *out)
 {
-    struct hwr_sprite_lookup lookup;
-    struct hwr_sprite_frame sprite;
-    struct hwr_light_color_entry *slot;
-    size_t i;
-
     if (frame->api == NULL || frame->world == NULL ||
         (frame->map_archive == NULL && frame->shared_archive == NULL))
         return 0;
     if (hwr_sprites_resolve(frame->api, frame->map_archive,
                             frame->shared_archive, object->graphic_id,
                             object->facing, frame->view_yaw, 0,
-                            object->backref, &lookup) != 0)
+                            object->backref, out) != 0)
         return 0;
-    if (lookup.archive == NULL)
-        return 0;
+    return out->archive != NULL;
+}
+
+static int hwr_light_sprite_color(const struct hwr_lights_frame *frame,
+                                  const struct hwr_sprite_lookup *lookup_in,
+                                  float out[3])
+{
+    struct hwr_sprite_lookup lookup = *lookup_in;
+    struct hwr_sprite_frame sprite;
+    struct hwr_light_color_entry *slot;
+    size_t i;
+
     for (i = 0; i < g_color_cache_count; i++) {
         slot = &g_color_cache[i];
         if (slot->used && slot->serial == lookup.archive->open_serial &&
@@ -621,7 +631,74 @@ static size_t g_glow_face_count;
  * means nothing has been worked out; the look layer's own generation is never
  * nought, so the two can never be confused. */
 static uint32_t g_glow_face_generation;
+/* AND THE MAP AS IT STOOD WHEN THAT ANSWER WAS WORKED OUT, which is not the
+ * same thing as the map that was loaded: see the stamp below. */
+static uint32_t g_glow_face_stamp;
 static unsigned long g_glow_face_walks;
+
+/* WHAT THE GRANTED SET IS WORKED OUT FROM, in one number.
+ *
+ * Which faces carry a granted texture is a fact about the map -- but the map's
+ * own surfaces MOVE while it is played. A material command repaints a face, an
+ * animated surface steps its face through a set of pictures, a lift carries a
+ * floor up and a scripted mover walks a corner across the room. A candidate set
+ * worked out once at load and never again answers for the map as it was staged
+ * and for no later moment: a face that turns INTO the granted texture never
+ * lights, and one that turns out of it lights forever. That is exactly the
+ * complaint this answers.
+ *
+ * So the same fields the staging walk READS are stamped here, and the staging
+ * is taken again when the stamp moves: sector heights and flat ids, slab
+ * surfaces and heights, wall texture ids, and the corners the faces run
+ * between. Those are what decide both WHICH faces are granted and WHERE each
+ * one's light stands. Nothing else is in it -- pan bytes scroll texels rather
+ * than move a face, and the doors carry no faces this walk ever reaches.
+ *
+ * It is the same shape of answer the sun's caster mesh keeps for the same
+ * reason (hwr_sun.c) and it is paid for on the same terms: only a map with
+ * something granted on it is ever stamped, which is every map until somebody
+ * writes a texture or a face into a game config, and a frame in which nothing
+ * moved costs one comparison after it. */
+static uint32_t hwr_glow_mix(uint32_t stamp, int32_t value)
+{
+    stamp ^= (uint32_t)value & 0xffffu;
+    return stamp * 16777619u;
+}
+
+static uint32_t hwr_glow_surface_stamp(const struct hwr_world *world)
+{
+    uint32_t stamp = 2166136261u;
+    size_t i;
+
+    for (i = 0; i < world->sector_count; i++) {
+        const struct hwr_sector *sector = &world->sectors[i];
+
+        stamp = hwr_glow_mix(stamp, sector->floor_flat_id);
+        stamp = hwr_glow_mix(stamp, sector->ceiling_flat_id);
+        stamp = hwr_glow_mix(stamp, sector->floor_z);
+        stamp = hwr_glow_mix(stamp, sector->ceiling_z);
+    }
+    for (i = 0; i < world->slab_count; i++) {
+        const struct hwr_slab *slab = &world->slabs[i];
+
+        stamp = hwr_glow_mix(stamp, (int32_t)slab->lower_surface_id);
+        stamp = hwr_glow_mix(stamp, (int32_t)slab->upper_surface_id);
+        stamp = hwr_glow_mix(stamp, slab->lower_z);
+        stamp = hwr_glow_mix(stamp, slab->upper_z);
+    }
+    for (i = 0; i < world->wall_count; i++) {
+        const struct hwr_wall *wall = &world->walls[i];
+
+        stamp = hwr_glow_mix(stamp, (int32_t)wall->middle_id);
+        stamp = hwr_glow_mix(stamp, (int32_t)wall->upper_id);
+        stamp = hwr_glow_mix(stamp, (int32_t)wall->lower_id);
+    }
+    for (i = 0; i < world->vertex_count; i++) {
+        stamp = hwr_glow_mix(stamp, world->vertices[i].world_x);
+        stamp = hwr_glow_mix(stamp, world->vertices[i].world_y);
+    }
+    return stamp;
+}
 
 /* ------------------------------------------------- the free-standing lights
  *
@@ -673,6 +750,7 @@ void hwr_lights_reset(void)
     memset(g_glow_faces, 0, sizeof g_glow_faces);
     g_glow_face_count = 0;
     g_glow_face_generation = 0;
+    g_glow_face_stamp = 0;
     /* And the rooms the free-standing lights were found to hang in, which are
      * rooms of the map that was loaded and of no other. */
     memset(g_placed, 0, sizeof g_placed);
@@ -883,6 +961,7 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
     g_glow_grant_count = 0;
     g_glow_face_count = 0;
     g_glow_face_generation = hwr_look_glow_generation();
+    g_glow_face_stamp = 0;
     if (named > HWR_GLOW_NAMED_MAX)
         named = HWR_GLOW_NAMED_MAX;
     memset(named_by_id, 0, sizeof named_by_id);
@@ -891,6 +970,10 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
     memset(named_told, 0, sizeof named_told);
     if (world == NULL || !world->valid || (textures == 0u && named == 0u))
         return;
+    /* THE MAP AS IT STANDS AT THIS MOMENT, taken before the walk that reads it,
+     * so what was worked out and what it was worked out FROM are the same
+     * moment. */
+    g_glow_face_stamp = hwr_glow_surface_stamp(world);
     for (i = 0; i < textures && g_glow_grant_count < HWR_GLOW_GRANT_MAX; i++) {
         uint16_t texture_id = 0;
         int map_scoped = 0;
@@ -1515,6 +1598,161 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
     return !named.off;
 }
 
+/* ------------------------------------------------- where a thing's light is
+ *
+ * A thing that gives light is DRAWN as a sprite standing in the room, and its
+ * light has to come from where that sprite is rather than from the point the
+ * map happens to hang it by. Two things follow from that, and they are the
+ * whole of this section.
+ */
+
+/* THE MIDDLE OF THE SPRITE, up its own height from the anchor.
+ *
+ * A map record's z is where the sprite is HUNG -- its feet for a thing standing
+ * on the floor, its head for one hung from a bracket -- so a light at that
+ * number is a light at the bottom or the top of the flame rather than in it. A
+ * torch lit from its own feet washes the floor under it and leaves the wall
+ * beside the flame dark, which is not what a torch does.
+ *
+ * How tall the sprite stands is the emitter's own sizing law, NAMED rather than
+ * copied (hwr_sprite_span.h): the same frame, the same block modifier, the same
+ * anchor branch and the same projection match the quad is drawn with. A middle
+ * worked out from a transcription would leave the light out of the sprite the
+ * first time either copy moved.
+ *
+ * It is taken at the frame the light's COLOUR is taken at, and for the same
+ * reason: a height that crawled with an animation would be a light nobody
+ * wrote. Answers 0 where the frame carries no projection to size against or the
+ * sprite cannot be read, and then the anchor stands -- which is where the light
+ * was before any of this. */
+static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
+                                   const struct hwr_sprite_lookup *lookup,
+                                   const struct hwr_object *object,
+                                   float *out_z)
+{
+    struct hwr_sprite_frame sprite;
+    int16_t origin_x = 0;
+    int16_t origin_y = 0;
+    int32_t z_top = 0;
+    int32_t z_bottom = 0;
+
+    if (!(frame->sprite_vscale > 0.0f))
+        return 0;
+    if (hwr_sprites_frame(lookup, &sprite) != 0 || sprite.width == 0u)
+        return 0;
+    hwr_sprite_origin(lookup, &origin_x, &origin_y);
+    hwr_sprite_vertical_span((int32_t)object->world_z, object->flags9,
+                             sprite.flags, sprite.width, origin_y,
+                             (double)frame->sprite_vscale, &z_top, &z_bottom);
+    *out_z = (float)(((double)z_top + (double)z_bottom) * 0.5);
+    return 1;
+}
+
+/* AND CLEAR OF THE SURFACE IT IS MOUNTED ON.
+ *
+ * A sconce, a bracket torch or a lit sigil is drawn FLAT ON A WALL -- the
+ * engine's own rotated path, record +9 bit 0x80 (hwr_objects.h) -- and the map
+ * hangs it two to eight units off that wall's plane. A light there lights the
+ * wall it is on at grazing incidence and nowhere else: the floor, the ceiling
+ * and every other wall of the room take it, and the one surface the flame is
+ * actually against stays dark, which reads as a torch mounted on a shadow.
+ *
+ * WHICH wall it is mounted on is the nearest face of its own room, and the
+ * direction to push is that face's own interior normal -- (dy, -dx), the
+ * engine's own visibility rule, which is the same normal a granted face's light
+ * is pushed along and is measured POSITIVE for every marked object of every
+ * shipped map. Its own facing is deliberately NOT used for the direction: the
+ * authored facing is anti-parallel to the room's normal as often as it is
+ * parallel, so it says which way the art is turned rather than which side of
+ * the wall the room is on.
+ *
+ * The push is a CLEARANCE rather than a shove: the light is moved along that
+ * normal until it is HWR_GLOW_FACE_OFFSET clear of the face -- the same clear
+ * a granted face's own light is given -- and a thing already that clear does
+ * not move at all. A rotated sprite standing in the open, which is what a
+ * hanging banner in the middle of a hall is, is therefore left exactly where it
+ * is: nothing is mounted on a wall it is nowhere near.
+ *
+ * Worked in the sixteen bits the map is authored in without wrapping, exactly
+ * as the room test below it is: a room that straddles the wrap is not a room
+ * anybody builds, and pretending to handle one would be arithmetic nobody could
+ * check. Answers 0 where nothing moved. */
+static int hwr_light_wall_clearance(const struct hwr_world *world,
+                                    const struct hwr_object *object,
+                                    float *x, float *y)
+{
+    const struct hwr_sector *sector;
+    double near_distance = 0.0;
+    double near_normal_x = 0.0;
+    double near_normal_y = 0.0;
+    double near_signed = 0.0;
+    int found = 0;
+    size_t w;
+
+    if ((object->flags9 & HWR_OBJECT_FLAGS9_ROTATED) == 0)
+        return 0;
+    if (world == NULL || object->sector_index >= world->sector_count)
+        return 0;
+    sector = &world->sectors[object->sector_index];
+    for (w = 0; w < sector->wall_count; w++) {
+        size_t wall_index = sector->first_wall + w;
+        const struct hwr_wall *wall;
+        const struct hwr_vertex *a;
+        const struct hwr_vertex *b;
+        double dx;
+        double dy;
+        double length;
+        double along;
+        double distance;
+        double normal_x;
+        double normal_y;
+        double from_x;
+        double from_y;
+
+        if (wall_index >= world->wall_count)
+            break;
+        wall = &world->walls[wall_index];
+        if (wall->vertex_a_index >= world->vertex_count ||
+            wall->vertex_b_index >= world->vertex_count)
+            continue;
+        a = &world->vertices[wall->vertex_a_index];
+        b = &world->vertices[wall->vertex_b_index];
+        dx = (double)b->world_x - (double)a->world_x;
+        dy = (double)b->world_y - (double)a->world_y;
+        length = sqrt(dx * dx + dy * dy);
+        if (!(length > 0.0))
+            continue;
+        from_x = (double)object->world_x - (double)a->world_x;
+        from_y = (double)object->world_y - (double)a->world_y;
+        /* To the SEGMENT, so the wall it stands against is the one it is
+         * against rather than whichever infinite line passes nearest. */
+        along = (from_x * dx + from_y * dy) / (length * length);
+        if (along < 0.0)
+            along = 0.0;
+        else if (along > 1.0)
+            along = 1.0;
+        distance = sqrt((from_x - along * dx) * (from_x - along * dx) +
+                        (from_y - along * dy) * (from_y - along * dy));
+        if (found && !(distance < near_distance))
+            continue;
+        normal_x = dy / length;
+        normal_y = -dx / length;
+        found = 1;
+        near_distance = distance;
+        near_normal_x = normal_x;
+        near_normal_y = normal_y;
+        /* And to its PLANE, which is what the light has to be clear of. */
+        near_signed = from_x * normal_x + from_y * normal_y;
+    }
+    if (!found || near_signed >= (double)HWR_GLOW_FACE_OFFSET)
+        return 0;
+    *x = (float)((double)*x +
+                 near_normal_x * ((double)HWR_GLOW_FACE_OFFSET - near_signed));
+    *y = (float)((double)*y +
+                 near_normal_y * ((double)HWR_GLOW_FACE_OFFSET - near_signed));
+    return 1;
+}
+
 /* One object into one light, with everything the rows and the map and the look
  * file have to say about it already spent. Returns 0 when the object is not a
  * light at all. */
@@ -1525,6 +1763,8 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     const struct hwr_world *world = frame->world;
     const struct hwr_sector *sector;
     struct hwr_look_light named;
+    struct hwr_sprite_lookup lookup;
+    int resolved;
     int granted;
     int marked;
     float glow_intensity = 1.0f;
@@ -1599,12 +1839,28 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_OBJECT;
     out->source_id = object->graphic_id;
     out->sector_index = object->sector_index;
+    /* WHAT NAMES THIS LIGHT ACROSS FRAMES is where the THING stands -- the
+     * record's own three numbers -- and not where its light is emitted from.
+     * The two are different on purpose (see the emit point below), and a name
+     * made of the emit point would make a light that stood still into a
+     * different light every time the canvas or the animation moved it, which is
+     * the fade and the hysteresis starting again for nothing. */
     out->world_x = object->world_x;
     out->world_y = object->world_y;
     out->world_z = object->world_z;
+    /* THE EMIT POINT: the middle of the sprite, clear of whatever it is mounted
+     * on. Both are worked out beside the object record they belong to; where
+     * neither has anything to say, this is the anchor, which is where the light
+     * stood before either existed. */
+    resolved = hwr_light_sprite_of(frame, object, &lookup);
     out->light.world_x = (float)object->world_x;
     out->light.world_y = (float)object->world_y;
     out->light.world_z = (float)object->world_z;
+    if (resolved)
+        (void)hwr_light_sprite_middle(frame, &lookup, object,
+                                      &out->light.world_z);
+    (void)hwr_light_wall_clearance(world, object, &out->light.world_x,
+                                   &out->light.world_y);
     /* The map's own candle word, through exactly the recipe the light the
      * player carries takes it through -- named rather than copied, so the two
      * cannot drift. */
@@ -1628,7 +1884,7 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
         /* A sprite that has no colour to give -- one cut entirely away, or one
          * drawn in the palette's own black -- leaves the chosen colour
          * standing rather than turning the light black. */
-        if (hwr_light_sprite_color(frame, object, sprite_color)) {
+        if (resolved && hwr_light_sprite_color(frame, &lookup, sprite_color)) {
             out->light.color[0] = sprite_color[0];
             out->light.color[1] = sprite_color[1];
             out->light.color[2] = sprite_color[2];
@@ -1866,14 +2122,33 @@ static size_t hwr_lights_seed_glow_faces(const struct hwr_lights_frame *frame,
     size_t i;
 
     /* WHERE THE GRANTED FACES ARE IS NOT ASKED HERE. It was worked out when the
-     * map was staged, and this is the one comparison that says so: the only
-     * thing that can move the answer without a map load is somebody editing the
-     * game config and asking for it to be read again, and that moves the look
-     * layer's own generation. A frame in which nothing has changed does not
-     * walk a wall. */
-    if (g_glow_face_generation != hwr_look_glow_generation())
+     * map was staged, and these are the two comparisons that say so.
+     *
+     * The first is what was GRANTED: somebody editing the game config and it
+     * being read again, which moves the look layer's own generation.
+     *
+     * The second is the MAP ITSELF: a face repainted by a material command, an
+     * animated surface stepping onto or off the granted picture, a lift that
+     * carried the floor its light stands over. Those move the map's own surfaces
+     * under an answer worked out when it was staged, and a set that did not
+     * follow them would light a face that no longer carries the texture and
+     * leave dark one that just took it up. A face animating between a granted
+     * picture and an ungranted one therefore pulses with its own animation,
+     * which is what the map is doing.
+     *
+     * Both are worked out only where something is granted at all -- which is
+     * every map until somebody describes one -- and a frame in which nothing
+     * moved walks no wall. */
+    if (g_glow_face_generation != hwr_look_glow_generation()) {
         hwr_lights_stage_glow_faces(frame->world, frame->map_archive,
                                     frame->shared_archive);
+    } else if (hwr_look_texture_count() != 0u || hwr_look_face_count() != 0u) {
+        uint32_t stamp = hwr_glow_surface_stamp(frame->world);
+
+        if (stamp != g_glow_face_stamp)
+            hwr_lights_stage_glow_faces(frame->world, frame->map_archive,
+                                        frame->shared_archive);
+    }
     if (g_glow_face_count == 0u)
         return 0;
     hop = hwr_lights_hop_containment(frame);

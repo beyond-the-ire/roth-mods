@@ -12,6 +12,7 @@ HEADERS := hwr_settings.h hwr_schema.h hwr_gl.h hwr_world.h hwr_das.h hwr_scene.
            hwr_input.h hwr_composite.h hwr_chrome.h hwr_ownership.h \
            hwr_overlay.h hwr_overlay_draw.h hwr_sysinfo.h \
            hwr_enh_truecolor.h hwr_look.h hwr_lights.h hwr_json.h hwr_sun.h hwr_sun_math.h \
+           hwr_sprite_span.h \
            $(ROTH_SDK)/include/roth_sdk.h \
            $(ROTH_SDK)/include/roth_sdk_overrides.h
 

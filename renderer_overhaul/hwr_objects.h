@@ -45,6 +45,21 @@ enum hwr_object_flags {
     HWR_OBJECT_FLAG_NO_SHADOW = 1u << 3
 };
 
+/* MAP RECORD +9 BIT 0x80: THE ENGINE'S OWN MARK FOR A THING MOUNTED ON A
+ * SURFACE.
+ *
+ * It selects the engine's ROTATED projection (rwss_rotated_tail,
+ * renderer.c:6093-6148): the quad is built in view space at an angle taken from
+ * the record's authored FACING rather than from the camera, so it lies flat in
+ * the world and stays pinned where it is as the view moves -- which is what a
+ * torch bracket, a wall sconce or a painted sigil does and what a barrel does
+ * not. Everything without it is drawn camera-facing and is mounted on nothing.
+ *
+ * Named here, beside the record it is read from, because more than one thing
+ * asks the question now: the emitter, which orients the quad by it, and the
+ * seeding, which has to know whether a light stands against a surface. */
+#define HWR_OBJECT_FLAGS9_ROTATED 0x80u
+
 struct hwr_object {
     int16_t world_x;
     int16_t world_y;

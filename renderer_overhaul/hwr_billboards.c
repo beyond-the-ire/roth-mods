@@ -1,6 +1,7 @@
 #include "hwr_billboards.h"
 
 #include "hwr_lights.h"
+#include "hwr_sprite_span.h"
 #include "hwr_sprites.h"
 #include "hwr_util.h"
 
@@ -16,13 +17,9 @@
  * the 7x32 translucent ground-shadow oval. Block header: +0xa flags (0x0404),
  * +0xc width (7), +0xe height (0x20), texels at +0x10. In-window low obj1. */
 #define VA_G_SHADOW_RECORD       0x29e5cu
-/* The engine's type-1 billboard projects its horizontal extent with this focal
- * (g_view_params_block+0xc) and its vertical extent with g_perspective_scale,
- * while the mod's world projection uses focal_x/focal_y. The size is matched by
- * scaling the engine's pre-focal extent by the ratio of the two focals, which is
- * exact and independent of depth. */
-#define VA_G_VIEW_PARAMS_XSCALE  0x8527cu
-#define VA_G_PERSPECTIVE_SCALE   0x85288u
+/* The two the engine's own billboard sizing is read from -- g_view_params_block
+ * +0xc and g_perspective_scale -- are named beside that law, in
+ * hwr_sprite_span.h, because everything that sizes a sprite needs both. */
 #define VA_G_ANIM_CLOCK          0x8532au
 #define VA_G_ACTOR_SLOT_BIAS     0x91e03u
 #define VA_G_WALKER_SLOT_BIAS    0x90fe3u
@@ -1127,23 +1124,16 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
     yaw = camera->yaw;
     focal_x = (double)camera->source_focal_x;
     focal_y = (double)camera->source_focal_y;
-    /* The engine's type-1 billboard projects its horizontal extent with
-     * view_params_block+0xc and its vertical with g_perspective_scale, dividing
-     * by g_view_clip_plane -- a view depth carried in a x256 fixed point (near
-     * plane 0x1000 = 16 world units). The mod's world shader projects with
-     * camera focal_x/focal_y against a x1 world depth (s*dy - c*dx). Matching the
-     * engine's projected pixels therefore scales the pre-projection extent by
-     * (engine_focal / mod_focal) and DIVIDES by the 256 view-depth fixed point:
-     *   half_w_world = extent_h * Xscale / (focal_x * 256)
-     *   vext_world   = extent_v * Pscale / (focal_y * 256)
-     * (finalize_draw_list_entry renderer.c:7738-7768; proj64 :7284). Reading both
-     * focals keeps it exact regardless of the Xscale:focal ratios. */
+    /* The projection match, which is the shared sprite-span law's own first
+     * half (hwr_sprite_span.h): the engine's pre-projection extents scaled by
+     * the ratio of its focals to the mod's and divided by the x256 view depth
+     * it carries. Named rather than worked out here, because the seeding sizes
+     * a sprite by the same two numbers. */
+    if (!hwr_sprite_scales(api, focal_x, focal_y, &hscale, &vscale))
+        return 0;                                         /* no projection staged yet */
+    /* The two engine numbers behind them, for the trace lines alone. */
     xscale = (double)(int32_t)api->game_ram->u32(VA_G_VIEW_PARAMS_XSCALE);
     pscale = (double)(int32_t)api->game_ram->u32(VA_G_PERSPECTIVE_SCALE);
-    if (focal_x <= 0.0 || focal_y <= 0.0 || xscale <= 0.0 || pscale <= 0.0)
-        return 0;                                         /* no projection staged yet */
-    hscale = xscale / (focal_x * 256.0);
-    vscale = pscale / (focal_y * 256.0);
 
     /* Primary worklist bounds remain in engine screen space. Map them through
      * the same focal/centre change as the target camera. Reflected spans were
@@ -1171,8 +1161,8 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         uint32_t obj_floor_id = 0u;
         uint16_t tw, th, fa;
         uint8_t sector_light = 0, sector_flags = 0, seed, composed, material;
-        double half_w, famod, vext_d, rx, ry, cx, cy;
-        int32_t disp, vext, z_top, z_bottom;
+        double half_w, famod, rx, ry, cx, cy;
+        int32_t vext, z_top, z_bottom;
         int16_t xl, yl, xr, yr, origin_x, origin_y;
         int translucent, do_trace, cl, is_flat;
         struct hwr_bb_clip clip;
@@ -1411,72 +1401,18 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
          * half a_h = (frame.height*2) << cl (renderer.c:7720/7738); vertical
          * ecxv = frame.width*2, block-modifier scaled (w980, :7723-7736). The
          * modifier nibble sets cl {6,7,7+t} and the vertical scale {0.5,1,2^t}. */
-        /* Signed DAS origin prefix (FAT flag 8; hwr_das.c:527). The engine loads
-         * the 4-byte prefix into the resolved block and applies it before the
-         * anchor branch: low word = a flip-aware HORIZONTAL origin added to the
-         * view X the quad centres on (renderer.c:5667-5669), high word = a
-         * VERTICAL origin folded into the displacement (renderer.c:7758). It is
-         * per-resolved-leaf; grouped children carry their own child data, not the
-         * entry prefix, and the grouped (statue) path already matches at origin 0,
-         * so the prefix is applied only to plain/animated leaves. */
-        origin_x = 0;
-        origin_y = 0;
-        if (lookup.klass == HWR_DAS_CLASS_PLAIN ||
-            lookup.klass == HWR_DAS_CLASS_ANIMATED) {
-            const struct hwr_das_entry *le =
-                &lookup.archive->entries[lookup.entry_id];
-            origin_x = (int16_t)(uint16_t)(le->size_prefix & 0xffffu);
-            origin_y = (int16_t)(uint16_t)(le->size_prefix >> 16);
-        }
-        if (lookup.flip)                            /* x-flip mirrors origin_x (renderer.c:5668) */
-            origin_x = (int16_t)(-origin_x);
-
-        famod = 1.0;
-        cl = 7;
-        if ((fa & 0x80u) != 0) {
-            if ((fa & 0x6000u) != 0) {
-                int t = (int)(((uint32_t)(fa << 3) | (fa >> 13)) & 3u);
-                famod = (double)(1u << t);
-                cl = 7 + t;
-            } else {
-                famod = 0.5;
-                cl = 6;
-            }
-        }
+        /* The origin prefix, the block modifier and the vertical span are the
+         * shared sprite-span law (hwr_sprite_span.h), named rather than spelled
+         * out here: the seeding puts a thing's light at the middle of the sprite
+         * it is drawn as, and a light hung at the middle of a second copy of
+         * this arithmetic would drift out of the sprite the first time either
+         * copy was touched. */
+        hwr_sprite_origin(&lookup, &origin_x, &origin_y);
+        hwr_sprite_modifier(fa, &famod, &cl);
         half_w = (double)((uint32_t)((uint32_t)th * 2u) << cl) * hscale;
-        vext_d = 2.0 * (double)tw * famod * vscale;
-        vext = (int32_t)(vext_d + 0.5);
-        /* Low-nibble vertical displacement edxv = 2*(dl&0xf), plus the prefix's
-         * vertical origin -- but NOT on the rotated path, which omits it
-         * (renderer.c:7756-7758 vs 6129-6134). */
-        {
-            double disp_units = 2.0 * (double)(fa & 0xfu)
-                              + ((o->flags9 & 0x80u) ? 0.0 : (double)origin_y);
-            double disp_d = disp_units * vscale;
-            disp = (int32_t)(disp_d + (disp_d >= 0.0 ? 0.5 : -0.5));
-        }
-
-        /* Vertical anchor + displacement (finalize_draw_list_entry,
-         * renderer.c:7754-7768). The engine's vertical anchor is
-         * eaxv = eye_z - objZ in screen-DOWN units, and the modifier byte's low
-         * nibble is a displacement edxv = 2*(dl&0xf) [+ the block's authored
-         * vertical bias, renderer.c:7758, not yet mirrored]:
-         *   default 0x8N (bit 0x10 clear): eaxv_final = eaxv + edxv  (7760)
-         *     -> feet (bottom edge) world z = objZ - edxv, head = feet + height.
-         *   0x9N (bit 0x10 set): eaxv_final = eaxv - edxv + height    (7759)
-         *     -> head (top edge)  world z = objZ + edxv, feet = head - height.
-         * World z increases UPWARD (floor-visible test is eye_z > floor_z), so
-         * z_top (the texture's v=0 head row) is the LARGER z. The displacement
-         * sign therefore DIFFERS between the two anchors -- 0x9N adds, 0x8N
-         * SUBTRACTS -- which is why wall items (0x9N) sat correctly while floor
-         * items (0x8N) sat too high under a single-sign +disp. */
-        if ((fa & 0x10u) != 0) {
-            z_top = (int32_t)o->world_z + disp;      /* head at objZ + edxv */
-            z_bottom = z_top - vext;
-        } else {
-            z_bottom = (int32_t)o->world_z - disp;   /* feet at objZ - edxv */
-            z_top = z_bottom + vext;
-        }
+        hwr_sprite_vertical_span((int32_t)o->world_z, o->flags9, fa, tw,
+                                 origin_y, vscale, &z_top, &z_bottom);
+        vext = z_top - z_bottom;
 
         /* Horizontal axis. A camera-facing object spans the camera-right world
          * vector (yaw_sin, yaw_cos)/16384. A FIXED-ORIENTATION face (map record
@@ -1489,7 +1425,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
          * pinned to the wall as the view moves. The half-extent is the same as
          * the billboard's (the engine's ext*|sincos| reaches the same 256*height
          * magnitude), so only the direction differs. */
-        if ((o->flags9 & 0x80u) != 0) {
+        if ((o->flags9 & HWR_OBJECT_FLAGS9_ROTATED) != 0) {
             uint32_t phi = 2u * (uint32_t)o->facing + 0x80u;
             double ax = (double)hwr_bb_sincos(api, phi);          /* sin(phi) */
             double ay = (double)hwr_bb_sincos(api, phi + 0x80u);  /* cos(phi) */
@@ -1525,7 +1461,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
             material |= (uint8_t)HWR_GL_MATERIAL_TRANSLUCENT;
         if (lookup.flip)
             material |= (uint8_t)HWR_GL_MATERIAL_HFLIP;
-        is_flat = (o->flags9 & 0x80u) != 0;
+        is_flat = (o->flags9 & HWR_OBJECT_FLAGS9_ROTATED) != 0;
 
         /* Camera-facing objects recover negatively-offset pixels over their own
          * floor. Fixed-orientation wall art instead recovers pixels authored

@@ -218,6 +218,14 @@ a file with letters, digits, `-`, `_` and `.` only: the name is what the setting
 selection as, and one carrying a space or a `#` cannot be written down, so it is left out of the
 list and the game says why.
 
+**Editing the chosen file while the game is running is the point of it.** Save it, and about a
+second later what it says is in force — no button, no map change, nothing to select. The game keeps
+an eye on the file it is using and reads it again whenever it changes, and it waits until the file
+has stopped changing before reading it, so catching an editor mid-save cannot leave you with half a
+description. If a save has a mistake in it — a missing brace, a stray comma — nothing is lost:
+whatever was in force stays in force, the game says what is wrong with the file once, and the next
+good save is picked up as usual.
+
 **Reload From File** on the settings screen reads the settings again, lists the folder again, and
 reads the chosen description again — so a file dropped into that folder while the game is running
 turns up in the list without a restart. If the settings file names a description that is no longer
@@ -309,6 +317,15 @@ than a dark sprite with a halo round it.
 picture and a surface is painted with one, so leaving `colour` out takes the colour from that picture:
 a torch throws its own flame's colour, a cold ward its own. Only `placed` has no picture of any kind
 behind it, and only `placed` therefore requires a colour to be written.
+
+**A thing's light comes from the middle of the thing.** A map hangs an object by its feet or by its
+head, and a light at that point would sit below the flame or above it: a torch would wash the floor
+and leave the wall beside it dark. So the light is emitted from halfway up the sprite as it is
+actually drawn. And a torch, sconce or ward mounted flat on a wall is hung a few units off it, close
+enough that its own wall would only ever be grazed by its light and would stay dark while the floor,
+the ceiling and the far wall lit up — so a mounted thing's light stands clear of the wall it is
+mounted on, and the wall behind it is lit like any other surface. A thing standing out in the room is
+lit from where it stands and is not moved at all.
 
 #### `lights` — five tables
 
@@ -411,6 +428,12 @@ Two things about it are worth knowing before you write one:
 - **A grant lights the room; it does not repaint the surface.** Whether a face is drawn fullbright
   stays what the map itself says and what the game's own colours do with it. This adds a light beside
   the lava, not a new way of drawing lava.
+- **A surface that changes while you play is followed.** Maps repaint walls and floors as they run —
+  a lever changes a panel, a surface steps through a set of pictures — and the lights follow that: a
+  face that takes up a granted texture lights from then on, and one that is repainted away from it
+  goes out. A surface that flips between a granted picture and an ungranted one pulses with its own
+  animation, which is the map doing exactly what it was authored to do. A floor carried up by a lift
+  takes its light with it.
 
 One light is placed **per room per texture**, in the middle of that room's granted faces and just
 clear of them, however many faces there are: a lake of lava is one light over the lake rather than

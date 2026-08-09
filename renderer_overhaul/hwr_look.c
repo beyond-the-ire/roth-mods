@@ -288,6 +288,23 @@ static uint64_t g_look_candidate_hash;
 static uint32_t g_look_candidate_polls;
 static uint32_t g_look_frames_until_poll;
 static int g_look_reload_pending;
+/* The content the watcher has ALREADY asked for, which is not the same thing as
+ * the content in force: a file that settles at something that cannot be loaded
+ * -- one missing brace -- leaves what was in force standing, so the hash in
+ * force never becomes this one. Without it the same broken save would be asked
+ * for again at every poll, and the sentence saying what is wrong with it would
+ * be printed every second for as long as it stayed broken. */
+static uint64_t g_look_asked_hash;
+/* What the watcher saw settle, so the read that carries the request out can
+ * tell a file that changed AGAIN in between from the one it was asked to load.
+ * A request that came from anywhere else carries no expectation. */
+static int g_look_reload_expects_hash;
+static uint64_t g_look_reload_hash;
+/* Which write of the settings store the layer has already answered for, kept
+ * beside the selection itself: a draft moved off the chosen file and back onto
+ * it NETS to no change in the row, and somebody who did that after editing the
+ * file is asking for what is on disk now. */
+static uint32_t g_look_followed_serial;
 
 /* The picker's own members: what the folder was found to hold, in the shape
  * the settings table takes an enumeration in. The token is the file's name
@@ -1890,6 +1907,11 @@ static char *hwr_look_slurp(size_t *out_length, const char **why)
  *  -1  there is one and it could not be read, which costs the file and
  *      nothing else: whatever was in force stays in force
  *
+ * `content_hash` is written for a file that was READ, whether or not it went on
+ * to parse. That is what lets the watcher tell one broken save from the next
+ * one and say what is wrong with each exactly once, instead of either saying it
+ * every second or never saying it at all.
+ *
  * The middle answer is the quiet one. The last is not: JSON has no line-level
  * recovery, because one missing brace moves every following line into a
  * different place, so a file with one is reported whole and loaded not at
@@ -1918,6 +1940,7 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
         hash ^= (unsigned char)bytes[i];
         hash *= UINT64_C(1099511628211);
     }
+    *content_hash = hash;
     memset(&doc, 0, sizeof doc);
     if (!hwr_json_parse(&doc, bytes, length, g_look_path)) {
         free(bytes);
@@ -1935,7 +1958,6 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
         memset(file, 0, sizeof *file);
         return -1;
     }
-    *content_hash = hash;
     return 1;
 }
 
@@ -2114,6 +2136,7 @@ static void hwr_look_stand_down(int report)
     g_look_hash = 0;
     g_look_candidate_hash = 0;
     g_look_candidate_polls = 0;
+    g_look_asked_hash = 0;
     hwr_look_publish_nothing();
     if (!report)
         return;
@@ -2136,8 +2159,12 @@ static void hwr_look_stand_down(int report)
  *
  * A file that is there and cannot be read costs the FILE and nothing else:
  * whatever was in force stays in force, which is what a person editing one
- * wants and what one missing brace must never be allowed to undo. */
-static void hwr_look_take_selection(int report)
+ * wants and what one missing brace must never be allowed to undo.
+ *
+ * `expect`, where the watcher passes one, is the content it saw settle: a file
+ * that has changed again between settling and being read is left to settle once
+ * more rather than loaded half written. */
+static void hwr_look_take_selection(int report, const uint64_t *expect)
 {
     const char *token = hwr_look_selected_token();
     struct hwr_look_file *next;
@@ -2145,6 +2172,7 @@ static void hwr_look_take_selection(int report)
     int read;
 
     g_look_followed = hwr_settings_get()->game_config;
+    g_look_followed_serial = hwr_settings_write_serial();
     if (token[0] == 0) {
         g_look_path[0] = 0;
         hwr_look_stand_down(report);
@@ -2157,6 +2185,10 @@ static void hwr_look_take_selection(int report)
     if (next == NULL)
         return;
     read = hwr_look_read(next, &hash, report);
+    /* Whatever was there has now been asked for, loadable or not: this is what
+     * keeps one broken save to one sentence. */
+    if (read != 0)
+        g_look_asked_hash = hash;
     if (read < 0) {
         /* The file said so itself while it was being read. Whatever was in
          * force is what a person had before they broke it, and it stands. */
@@ -2166,6 +2198,15 @@ static void hwr_look_take_selection(int report)
     if (read == 0) {
         free(next);
         hwr_look_stand_down(report);
+        return;
+    }
+    if (expect != NULL && hash != *expect) {
+        /* It changed again between settling and being read. Let it settle once
+         * more rather than loading a file nobody has seen twice. */
+        free(next);
+        g_look_candidate_hash = hash;
+        g_look_candidate_polls = 1;
+        g_look_asked_hash = g_look_hash;
         return;
     }
     g_look = *next;
@@ -2184,18 +2225,41 @@ void hwr_look_load(const char *plugin_dir)
         snprintf(g_look_dir, sizeof g_look_dir, "%s", plugin_dir);
     hwr_look_note_retired_file();
     g_look_map[0] = 0;
-    hwr_look_take_selection(1);
+    hwr_look_take_selection(1, NULL);
 }
 
 void hwr_look_follow_selection(void)
 {
-    if (hwr_settings_get()->game_config == g_look_followed)
+    uint32_t serial = hwr_settings_write_serial();
+    int moved = hwr_settings_get()->game_config != g_look_followed;
+
+    /* Two comparisons per pump, and deliberately not an apply hook: the look's
+     * overrides have to be in force BEFORE the hooks that consume them run, and
+     * publishing from inside one would invert that order. */
+    if (!moved && serial == g_look_followed_serial)
         return;
-    /* One comparison per pump, and deliberately not an apply hook: the look's
-     * overrides have to be in force BEFORE the hooks that consume them run,
-     * and publishing from inside one would invert that order. */
     g_look_followed = hwr_settings_get()->game_config;
-    g_look_reload_pending = 1;
+    g_look_followed_serial = serial;
+    if (moved) {
+        g_look_reload_pending = 1;
+        return;
+    }
+    /* THE SAME NAME, SAID AGAIN. Somebody has written the settings store --
+     * applied, or reloaded it from its own file -- and the row came out where
+     * it went in, which is exactly what a draft moved off the chosen file and
+     * back onto it does. That is not "nothing happened": a person who edited
+     * the file and then reached for the picker is asking for what is on disk
+     * NOW, and the model in memory is what was read the last time.
+     *
+     * So it is read again, unconditionally. A timestamp would answer this
+     * cheaper and would answer it WRONG: a filesystem that keeps whole seconds
+     * cannot tell two saves inside one apart, and a file whose new text is the
+     * same length as its old one is the ordinary case rather than a corner of
+     * it -- one digit changed. What this costs is one read of a file of a few
+     * kilobytes, once, when somebody presses a button; what the cheaper answer
+     * costs is an edit that silently does nothing. */
+    if (g_look_path[0] != 0)
+        g_look_reload_pending = 1;
 }
 
 void hwr_look_request_reload(void)
@@ -2203,19 +2267,29 @@ void hwr_look_request_reload(void)
     if (g_look_dir[0] == 0)
         return;
     g_look_reload_pending = 1;
+    g_look_reload_expects_hash = 0;
 }
 
+/* THE FILE WATCHER, which is not a development convenience and does not ask to
+ * be switched on: the game config file is a file people EDIT while the game is
+ * running, and an edit that needs a button pressed before it counts is an edit
+ * that gets made twice. Saving the chosen file puts it in force within about a
+ * second, on the same terms Reload From File already had.
+ *
+ * Every thirty frames, and never oftener: a read of a file this size is
+ * nothing, but a read per frame would be sixty of them a second for as long as
+ * the game is up.
+ *
+ * A changed file must be seen TWICE with the same content before it is asked
+ * for, so an editor's truncate-and-rewrite intermediate state -- which is a
+ * different file for a few milliseconds -- is never what gets loaded. */
 void hwr_look_poll(void)
 {
-    static int watch = -1;
     struct hwr_look_file *probe;
     uint64_t hash = 0;
+    int read;
 
-    if (watch < 0) {
-        const char *setting = getenv("HWR_CFG_WATCH");
-        watch = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
-    }
-    if (!watch || g_look_path[0] == 0)
+    if (g_look_path[0] == 0)
         return;
     if (g_look_frames_until_poll != 0) {
         g_look_frames_until_poll--;
@@ -2225,15 +2299,17 @@ void hwr_look_poll(void)
     probe = (struct hwr_look_file *)malloc(sizeof *probe);
     if (probe == NULL)
         return;
-    /* A file that is not there and a file half written are both nothing to ask
-     * for: the first is already answered for and the second will be read again
-     * in thirty frames, whole. */
-    if (hwr_look_read(probe, &hash, 0) <= 0) {
-        free(probe);
-        return;
-    }
+    read = hwr_look_read(probe, &hash, 0);
     free(probe);
-    if (hash == g_look_hash) {
+    /* A file that is not there is already answered for: the selection keeps its
+     * place in the list, and what was in force stays in force until somebody
+     * puts the file back. */
+    if (read == 0)
+        return;
+    /* The content in force, and the content already asked for -- which are two
+     * different things, because a file that cannot be loaded never becomes the
+     * one in force. Either way there is nothing here to ask for again. */
+    if (hash == g_look_hash || hash == g_look_asked_hash) {
         g_look_candidate_polls = 0;
         return;
     }
@@ -2242,25 +2318,35 @@ void hwr_look_poll(void)
         g_look_candidate_polls = 1;
         return;
     }
-    /* Two polls of the same content before asking for it, so an editor's
-     * truncate-and-rewrite intermediate state is never what gets loaded. */
     if (g_look_candidate_polls++ < 1)
         return;
+    /* Asking is all the watcher does. The reading happens where every other
+     * reading happens -- the settings pump's safe point -- so a file can never
+     * land in the middle of a frame, and a file that turns out to be broken
+     * says so THERE, once, in the same sentence Reload From File would get. */
     g_look_reload_pending = 1;
+    g_look_reload_expects_hash = 1;
+    g_look_reload_hash = hash;
 }
 
 void hwr_look_drain_request(void)
 {
+    uint64_t expected;
+    int expects;
+
     if (!g_look_reload_pending)
         return;
     g_look_reload_pending = 0;
+    expects = g_look_reload_expects_hash;
+    expected = g_look_reload_hash;
+    g_look_reload_expects_hash = 0;
     /* Whatever the picker names, read again. The folder itself is listed by the
      * settings file's own reload, which runs first in the pump and is what
      * Reload From File asks for beside this -- so by the time this runs, a file
      * put in the folder while the game was running is already in the picker. A
      * request that came from the file watcher instead is about the CONTENT of
      * the chosen file, and the folder has not moved for it. */
-    hwr_look_take_selection(1);
+    hwr_look_take_selection(1, expects ? &expected : NULL);
 }
 
 void hwr_look_select_map(const char *map_name)
@@ -2660,6 +2746,10 @@ void hwr_look_clear(void)
     g_look_candidate_hash = 0;
     g_look_candidate_polls = 0;
     g_look_reload_pending = 0;
+    g_look_asked_hash = 0;
+    g_look_reload_expects_hash = 0;
+    g_look_reload_hash = 0;
+    g_look_frames_until_poll = 0;
     /* The list back to none alone, and the selection with it. The row's value
      * is a place in that list, so a selection left standing over a list that
      * no longer holds it would be a value the row itself refuses -- which is a
@@ -2667,4 +2757,5 @@ void hwr_look_clear(void)
     hwr_look_slots_reset();
     hwr_settings_set_game_config(0);
     g_look_followed = 0;
+    g_look_followed_serial = hwr_settings_write_serial();
 }

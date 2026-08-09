@@ -8,6 +8,7 @@
 
 #include "hwr_gl.h"
 #include "hwr_lights.h"
+#include "hwr_sprite_span.h"
 #include "hwr_sun.h"
 
 #include "hwr_util.h"
@@ -6238,6 +6239,8 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     {
         struct hwr_gl_point_light lights[HWR_GL_POINT_LIGHT_MAX];
         struct hwr_lights_frame frame;
+        double hscale = 0.0;
+        double vscale = 0.0;
         size_t count;
 
         memset(&frame, 0, sizeof frame);
@@ -6247,6 +6250,14 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         frame.map_archive = scene->map_archive;
         frame.shared_archive = scene->shared_archive;
         frame.view_yaw = api->game_ram->u16(VA_G_SKY_YAW);
+        /* How tall a sprite stands in the world, in the one number the seeding
+         * needs of it: a thing's light comes from the middle of the sprite it is
+         * drawn as, and that middle is the emitter's own sizing law rather than
+         * a second opinion about it. A view with no projection staged yet hands
+         * over nothing and leaves every light at its object's anchor. */
+        if (hwr_sprite_scales(api, (double)camera.source_focal_x,
+                              (double)camera.source_focal_y, &hscale, &vscale))
+            frame.sprite_vscale = (float)vscale;
         /* The primary view's own visibility, which is the frame's: one light
          * set serves every view, so what a mirror shows is lit by the lights of
          * the rooms the player can see rather than by a second walk of its own.

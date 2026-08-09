@@ -137,12 +137,25 @@ void hwr_look_load(const char *plugin_dir);
  * THE FILE IS READ FROM DISK EVERY TIME the selection moves, including a move
  * away from a file and straight back to it. The model in memory is what was
  * read last time, and a person who has just edited a file and reached for the
- * picker is asking for what is on disk now. */
+ * picker is asking for what is on disk now.
+ *
+ * A move away and back again inside ONE draft nets to no change in the row at
+ * all, and that case is answered too: wherever the settings store has been
+ * written -- applied, or reloaded from its own file -- and the row came out
+ * where it went in, the chosen file is read again anyway. That is one read of
+ * a small file when somebody presses a button, against an edit that would
+ * otherwise silently do nothing. */
 void hwr_look_follow_selection(void);
 /* Asks for the folder to be listed again and the chosen file read again at the
  * next safe point. */
 void hwr_look_request_reload(void);
-/* The optional development watcher, on the same switch the settings file uses. */
+/* THE FILE WATCHER, which always runs: saving the chosen game config file puts
+ * it in force within about a second, with no button pressed and no map change.
+ * Called once a frame; it reads the file on every thirtieth call, and a changed
+ * file must be seen TWICE with the same content before it is asked for, so an
+ * editor's truncate-and-rewrite intermediate never loads. All it does is ASK --
+ * the reading happens at the settings pump's own safe point, where a file that
+ * turns out to be broken keeps what was in force and says so once. */
 void hwr_look_poll(void);
 /* Carries out a pending request. Called from the settings pump, so a reload can
  * never land inside a render. */

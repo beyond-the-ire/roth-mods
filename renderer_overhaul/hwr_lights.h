@@ -96,12 +96,23 @@ struct hwr_lights_frame {
     const struct hwr_world *world;
     const struct hwr_objects *objects;
     /* The sprite a thing is drawn with, which is where its light gets its
-     * colour. Absent archives leave every light the chosen colour, which is
-     * exactly what the other colour source is. */
+     * colour AND its height. Absent archives leave every light the chosen
+     * colour, which is exactly what the other colour source is, and leave it
+     * standing at its object's own anchor. */
     const struct roth_api_v1 *api;
     struct hwr_das_archive *map_archive;
     struct hwr_das_archive *shared_archive;
     uint16_t view_yaw;
+    /* The VERTICAL half of the sprite-sizing law's projection match
+     * (hwr_sprite_span.h), which is what turns a sprite's texels into the
+     * height it stands in the world. The seeding needs it because a thing's
+     * light is emitted from the middle of the sprite it is drawn as. Nought
+     * means no projection is staged, and then a light stays at the anchor.
+     *
+     * Handed over rather than read here, because it is a fact about the VIEW --
+     * the engine's own perspective scale against the canvas the mod draws into
+     * -- and the seeding takes no view of its own. */
+    float sprite_vscale;
     /* The sectors the engine's own portal walk drew, and whether that answer
      * is a real cull set at all. A light in a sector the walk did not reach is
      * a light in a room that cannot be seen. */
