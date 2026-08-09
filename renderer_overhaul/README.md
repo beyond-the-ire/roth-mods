@@ -255,8 +255,8 @@ putting the file back puts the selection back.
           { "notes": "the standing candelabra, which the map never lit",
             "index": 70,
             "colour": "#ffb46e", "strength": 1.4, "reach": 420 },
-          { "notes": "every arcane ward the author tagged alike",
-            "id": 36, "colour": "#7fe0a0", "reach": 300 }
+          { "notes": "every arcane ward its author gave one ID",
+            "id": 36, "reach": 300 }
         ],
         "faces": [
           { "notes": "the sigil wall in the north room",
@@ -296,14 +296,19 @@ Editor prints for the same thing.** Write what is on your screen.
 
 #### The one-glance rule
 
-> **An object gives light of its own when its `Lighting` field reads 0 in the editor. A grant with a
-> `colour` in it makes anything a light — marked or not.**
+> **An object gives light of its own when its `Lighting` field reads 0 in the editor. A grant makes
+> anything a light — marked or not — and a thing made one is drawn lit as well.**
 
 That is the whole of it. Select a thing in the editor: if `Lighting` is 0 the game already lights the
 room with it and a grant is *tuning*; if it is anything else the game draws it as an ordinary object,
-and a grant with a `colour` is what turns it into a light. Without a colour there is nothing to
-light it with — an unlit sprite is drawn no differently from a chair, so reading a colour off it
-would give you the colour of the chair — and the game says so rather than doing nothing quietly.
+and naming it in a grant is what turns it into a light. A thing made a light that way is also **drawn
+undarkened**, exactly as the map's own lights are, so it looks like the thing lighting the room rather
+than a dark sprite with a halo round it.
+
+**The colour is optional wherever there is a picture to read it off.** A thing is drawn with a
+picture and a surface is painted with one, so leaving `colour` out takes the colour from that picture:
+a torch throws its own flame's colour, a cold ward its own. Only `placed` has no picture of any kind
+behind it, and only `placed` therefore requires a colour to be written.
 
 #### `lights` — five tables
 
@@ -312,10 +317,10 @@ one map**:
 
 | table | keyed by | reaches |
 |---|---|---|
-| `sprites` | the editor's **Texture Index / Texture Source** pair, `"34/0"` | every object drawn with that sprite |
+| `sprites` | either number the editor prints for one picture: the **Texture Index / Texture Source** pair, `"34/0"`, or the single picture number, `"4130"` | every object drawn with that sprite |
 | `textures` | a texture number, `"100"` | every wall band and every floor and ceiling painted with it |
-| `objects` | `"index"` (`Object: N`) or `"id"` (`ID:`) | one object, or one tagged group of them |
-| `faces` | `"index"` (`Face: N`) or `"id"` (`Face ID`) | one face, or one tagged group of them |
+| `objects` | `"index"` (`Object: N`) or `"id"` (`ID:`) | one object, or one group sharing an ID |
+| `faces` | `"index"` (`Face: N`) or `"id"` (`Face ID`) | one face, or one group sharing a Face ID |
 | `placed` | three numbers | nothing at all — a light where the map has none |
 
 Each entry says what the thing gives off, and each field stands on its own:
@@ -327,8 +332,8 @@ Each entry says what the thing gives off, and each field stands on its own:
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 
 The **most specific statement anybody made is the one in force**, and the tables compose **field by
-field** — so one object may be made stronger than the group it is tagged with without restating the
-colour its kind already carries:
+field** — so one object may be made stronger than the group it shares an ID with without restating
+the colour its kind already carries:
 
 > blanket (`sprites`, `textures`) → `"id"` group → `"index"` one thing
 
@@ -344,26 +349,45 @@ wherever the game draws it.
 
 `sprites` is keyed by the pair the editor's **object panel** shows for a selected object — its
 **Texture Index**, an oblique, its **Texture Source**. `"34/0"` is Texture Index 34, Texture Source 0,
-which on the first study map is the lit torch; `"111/0"` is the arcane wall ward, and `"93/0"` the
-empty candelabra that is plainly not a light at all. It answers for every object of that kind in the
-game.
+which on the first study map is the lit torch; `"112/0"` is an arcane wall ward the map does *not*
+light, and `"93/0"` the empty candelabra that is plainly not a light at all. It answers for every
+object of that kind in the game.
+
+**The same picture has a second number, and both are accepted.** The editor's picture-picking window
+shows one number per picture rather than a pair: that number is the picture's own place in the archive
+it lives in. A map's own archive holds its object pictures from **4096**; the shared archive holds its
+own from **0**. So
+
+| Texture Source | picture number |
+|---|---|
+| 0 | `4096 + Texture Index` |
+| 1 | `4352 + Texture Index` |
+| 2 | `0 + Texture Index` |
+| 3 | `256 + Texture Index` |
+
+and `"112/0"` and `"4208"` are one key naming one picture. Write whichever number is in front of you.
+A picture number in `4096`–`4607` belongs to **the map's own archive**, so which picture it is depends
+on the map you are looking at — exactly as the pair does, since the pair is read against the same
+archive. Numbers in `0`–`511` are the shared archive's and mean the same picture on every map of the
+game. Anything between the two ranges is a *world texture* rather than an object's picture and is
+refused with a note.
 
 `objects` names one of them, or a group, the way the editor names it. Two ways, and an entry uses
 exactly one:
 
 - **`"index": N`** — the object's own number, which the editor shows as **`Object: N`** when you
   select it. It names exactly one thing.
-- **`"id": N`** — the tag the editor shows as **`ID:`**, which the map's creator typed to gather
+- **`"id": N`** — the number the editor shows as **`ID:`**, which the map's creator typed to gather
   objects into a group for the command system. It is *meant* to be shared, so an entry keyed by it
-  applies to **every object carrying that tag** — which is how a whole set of wards gets tuned in a
-  single line. `"id": 0` is refused and says so: 0 is the untagged default that most objects carry.
+  applies to **every object with that ID** — which is how a whole set of wards gets tuned in a
+  single line. `"id": 0` is refused and says so: 0 is the default that most objects carry.
 
 An entry that writes both, or neither, is refused with a note and the rest of the file is read.
 
 **Numbers move when a map is edited.** The object number is a position in the map's own list, so
 deleting an object in the editor shifts the number of every object after it. For a map that is
-finished, `index` is exact and stable. For a map still being built, the **ID tag is the stable
-handle**: it travels with the object it was typed on.
+finished, `index` is exact and stable. For a map still being built, the **ID is the stable handle**:
+it travels with the object it was typed on.
 
 #### Naming geometry: `textures` and `faces`
 
@@ -373,11 +397,17 @@ a wall's three bands, a room's floor and ceiling, and the two faces of a block s
 
 Two things about it are worth knowing before you write one:
 
-- **The colour is required.** A thing that gives light is drawn as a cut-out sprite, so the game can
-  tell the flame from the bracket it hangs on and read the light's colour off it. A wall texture is
-  not cut out of anything — every texel is the surface — so the same reading over lava returns the
-  colour of the rock around it. A grant without a `colour` lights nothing and the game says so.
-  Write it once in `everywhere` and a map may raise the strength without restating it.
+- **The colour comes off the texture's own bright part where it is not written.** A wall is not a
+  cut-out the way a sprite is — every texel of it is the surface — so a plain average over lava
+  returns the colour of the rock the lava is set in. The law here is therefore the picture's **bright
+  part**: every texel at least half as bright as the brightest texel in it, weighted by brightness.
+  Read that way lava throws its glow, a cold rune throws its line, and a surface painted one flat
+  colour throws that colour. Write a `colour` and that is what is used instead; a texture whose
+  picture cannot be read at all lights nothing and says so.
+- **A texture is not a sprite.** This table is keyed by what a **surface** is painted with; `sprites`
+  is keyed by the picture an **object** is drawn with. A pair like `"112/0"` written here, or a
+  picture number like `"4208"`, names nothing any wall can be painted with — and the game says which
+  table the line belongs in rather than leaving it quiet.
 - **A grant lights the room; it does not repaint the surface.** Whether a face is drawn fullbright
   stays what the map itself says and what the game's own colours do with it. This adds a light beside
   the lava, not a new way of drawing lava.
@@ -397,8 +427,8 @@ pair for a face:
   wall. It names exactly one face.
 - **`"id": N`** — the read-only **`Face ID`** the editor shows beside it, which is the handle the
   map's command system addresses a face by. One texture-mapping record may be shared by several
-  faces, so this names a **group** of them. `"id": 0` is refused: it is what a face with no tag reads
-  as.
+  faces, so this names a **group** of them. `"id": 0` is refused: it is what a face with none of its
+  own reads as.
 
 A named face keeps a light of its **own**, at the middle of that face pushed just clear of it, rather
 than being averaged into the middle of the room with the rest — the most specific statement wins here
@@ -406,14 +436,15 @@ too. A face named `off` is taken out of its room's blanket as well. And what a n
 laid over whatever `textures` already said about the texture it is painted with, so a face may be
 made stronger without restating the colour its texture carries.
 
-A face has no `Lighting` field of its own, so a face grant always needs a `colour` somewhere in that
-composition, for exactly the reason a texture grant does.
+A face has no `Lighting` field of its own, so a named face always emits. Where nothing in that
+composition states a `colour`, one is read off the texture the face is actually painted with, by the
+same bright-part law a texture grant uses.
 
 #### Reading the numbers off a map
 
 Running the game with **`HWR_OBJ_DUMP`** set to a file name writes out every object the map **draws**,
 with **its number in the first column**, then where it stands, then the sprite pair it is drawn with
-and its `id` tag — all decimal, all the numbers the editor shows for the same thing. After those come
+and its `ID` — all decimal, all the numbers the editor shows for the same thing. After those come
 the numbers of the records the map holds and never draws: an entry naming one of those can never
 light anything, and the game says so by name rather than pretending the object is not there.
 
@@ -427,18 +458,24 @@ to have its sign flipped before it is written here. Y and Z agree between the tw
 Each of these is said **once per map**, on the error stream, the same place the settings file's own
 notes go:
 
-- an entry naming a thing the map does not mark, with no colour anywhere in its composition to make
-  it one — *"object 70 on STUDY1 is not one of the lights the map marks; give the entry a colour to
-  make it one, or it lights nothing"*;
 - an entry naming a **hidden** record — *"object 273 on STUDY1 is hidden and never drawn; it cannot be
   a light"* — rather than claiming the map has no such object;
 - a number past the end of the map's own list — *"STUDY1 numbers no object 900; its objects are
   numbered 0 to 273"*;
-- a tag nothing on the map carries, for objects and for faces alike;
+- an `ID` nothing on the map carries, for objects and for faces alike;
 - a face number the map does not have;
-- and a `textures` key written **under a map** that no face or flat of that map is painted with. A
-  `textures` key written in `everywhere` stays quiet on maps that do not use it, because a game-wide
-  entry is meant to name nothing on most of a game's maps.
+- a `sprites` key written **under a map** that no object drawn there uses, named in both spellings —
+  *"nothing on STUDY1 is drawn with the sprite 200/0, which is picture 4296"*;
+- a `textures` key written **under a map** that no face or flat of that map is painted with;
+- a `textures` key that is really a sprite — a pair, or a picture number — with the table it belongs
+  in named;
+- and a member of a block **given more than once**, naming it: *"'sprites' is given more than once
+  here; only the last one counts, and everything the earlier one said is thrown away"*. JSON keeps the
+  last of two members of one name, which is the right answer and a silent one — pasting four blocks
+  together and losing two of them looks exactly like a file that was never written.
+
+A `sprites` or `textures` key written in `everywhere` stays quiet on maps that do not use it, because
+a game-wide entry is meant to name nothing on most of a game's maps.
 
 ### Lights the map never had: `placed`
 
@@ -457,10 +494,9 @@ object at all**, hung at three numbers you choose because there is nothing stand
   three numbers `HWR_OBJ_DUMP` prints for the objects around it, which is the easiest way to find a
   sensible one. If you take a position off the **ROTH Editor's** position boxes instead, **flip the
   sign of X**: the editor displays it negated. Y and Z agree.
-- **`colour` is required**, for exactly the reason a granted texture's is: there is nothing to read
-  one off. A torch is drawn as a cut-out sprite the game can take a colour from; a light hanging in
-  the air has no sprite, no object and no map mark. An entry without a colour lights nothing and says
-  so.
+- **`colour` is required**, and this is the one table where it is, because it is the one table with
+  no picture behind it. A torch has a sprite the game can take a colour from and lava has a texture;
+  a light hanging in the air has neither. An entry without a colour lights nothing and says so.
 - `strength` and `reach` are optional and fall to the settings screen's own values, so you can hang a
   light and tune the whole rig afterwards.
 - There is **no `off`**. An entry here exists only because you wrote it, so the way to be rid of one

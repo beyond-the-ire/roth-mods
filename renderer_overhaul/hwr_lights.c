@@ -154,6 +154,180 @@ int hwr_lights_frame_color(const uint8_t *pixels, size_t count,
     return 1;
 }
 
+/* THE OTHER PICTURE, AND WHY IT NEEDS A LAW OF ITS OWN.
+ *
+ * The reading above works because a sprite is a CUT-OUT: index zero says "not
+ * the thing", so what is averaged is the torch and never the wall behind it. A
+ * world texture is cut out of nothing. Every texel of it is the surface, so the
+ * same average over lava returns the colour of the rock the lava sits in --
+ * which is grey, and which is not what anybody meant by granting the lava a
+ * light.
+ *
+ * So the answer is taken over THE BRIGHT PART ONLY: every texel at least half as
+ * bright as the brightest texel in the picture, each weighted by the square of
+ * the same luminance. Lava's glow outvotes its crust; a cold rune's line
+ * outvotes the stone it is cut into; a wall painted one flat colour answers that
+ * colour, because there every texel is as bright as the brightest.
+ *
+ * Half, rather than some tuned fraction, because it is the one threshold that
+ * needs no defending: it is the point at which a texel is contributing as much
+ * light as the brightest thing in the picture is. */
+int hwr_lights_texture_color(const uint8_t *pixels, size_t count,
+                             const uint8_t palette[768], float out[3])
+{
+    double sum[3] = { 0.0, 0.0, 0.0 };
+    double weight_total = 0.0;
+    double brightest = 0.0;
+    double peak;
+    size_t i;
+    int c;
+
+    if (pixels == NULL || palette == NULL || out == NULL || count == 0u)
+        return 0;
+    /* What the brightest texel of this picture is worth. Taken over the whole
+     * of it first, because the threshold below is a fact about the picture
+     * rather than a number chosen for one texture. */
+    for (i = 0; i < count; i++) {
+        unsigned index = pixels[i];
+        double luminance = (double)palette[index * 3u] * 4.0 +
+                           (double)palette[index * 3u + 1u] * 8.0 +
+                           (double)palette[index * 3u + 2u];
+
+        if (luminance > brightest)
+            brightest = luminance;
+    }
+    if (!(brightest > 0.0))
+        return 0;
+    for (i = 0; i < count; i++) {
+        unsigned index = pixels[i];
+        double r = (double)palette[index * 3u];
+        double g = (double)palette[index * 3u + 1u];
+        double b = (double)palette[index * 3u + 2u];
+        double luminance = r * 4.0 + g * 8.0 + b;
+
+        /* THE BRIGHT PART. Written as a doubling rather than as a halving so
+         * that the comparison is exact in the integers the palette is stored
+         * in and cannot land differently on two machines. */
+        if (luminance * 2.0 < brightest)
+            continue;
+        sum[0] += r * luminance * luminance;
+        sum[1] += g * luminance * luminance;
+        sum[2] += b * luminance * luminance;
+        weight_total += luminance * luminance;
+    }
+    if (weight_total <= 0.0)
+        return 0;
+    peak = 0.0;
+    for (c = 0; c < 3; c++) {
+        sum[c] /= weight_total;
+        if (sum[c] > peak)
+            peak = sum[c];
+    }
+    if (peak <= 0.0)
+        return 0;
+    /* Normalized exactly as a sprite's is: a colour row carries a hue, and how
+     * much light there is of it is the strength beside it. */
+    for (c = 0; c < 3; c++)
+        out[c] = (float)(sum[c] / peak);
+    return 1;
+}
+
+/* A colour triple back into the six digits a grant carries one in, so that a
+ * derived colour and a written one are the same kind of thing everywhere
+ * downstream of here and nothing has to know which it got. */
+static uint32_t hwr_light_color_to_rgb(const float color[3])
+{
+    uint32_t packed = 0;
+    int c;
+
+    for (c = 0; c < 3; c++) {
+        double level = (double)color[c] * 255.0;
+        long step = lround(level < 0.0 ? 0.0 : (level > 255.0 ? 255.0 : level));
+
+        packed = (packed << 8) | (uint32_t)step;
+    }
+    return packed;
+}
+
+/* THE TEXELS ONE WORLD TEXTURE IS DRAWN FROM, out of whichever archive holds
+ * it. The split is the same one every other reader of these ids uses -- below
+ * the shared archive's first id the map's own, above it the shared one -- so a
+ * granted texture is found exactly where the surface carrying it is found.
+ *
+ * A texture nobody has asked for yet is decoded here; one that is already
+ * decoded is not decoded again. Directory placeholders and anything else with
+ * no pixels of its own answer nothing rather than guessing. */
+static int hwr_light_texture_pixels(struct hwr_das_archive *map_archive,
+                                    struct hwr_das_archive *shared_archive,
+                                    uint16_t texture_id,
+                                    const uint8_t **out_pixels,
+                                    size_t *out_count)
+{
+    struct hwr_das_archive *owner = NULL;
+    const struct hwr_das_entry *entry;
+    size_t entry_id = 0;
+
+    *out_pixels = NULL;
+    *out_count = 0;
+    if (hwr_sprites_locate(map_archive, shared_archive, texture_id, &owner,
+                           &entry_id) != 0 || owner == NULL)
+        return 0;
+    if (hwr_das_decode(owner, entry_id) != 0)
+        return 0;
+    entry = hwr_das_entry(owner, entry_id);
+    if (entry == NULL)
+        return 0;
+    if (entry->resource_class == HWR_DAS_CLASS_PLAIN) {
+        if (entry->raw_payload == NULL || entry->raw_payload_size < 6u ||
+            entry->width == 0u || entry->height == 0u)
+            return 0;
+        *out_count = (size_t)entry->width * (size_t)entry->height;
+        if (*out_count > entry->raw_payload_size - 6u) {
+            *out_count = 0;
+            return 0;
+        }
+        *out_pixels = entry->raw_payload + 6u;
+        return 1;
+    }
+    if (entry->resource_class == HWR_DAS_CLASS_ANIMATED) {
+        /* The frame it is drawn at when the map is staged, which is the frame
+         * an animation is authored to read as. A light whose colour crawled
+         * with the animation would be a light nobody wrote. */
+        if (entry->frame_count == 0u || entry->frames == NULL ||
+            entry->frames[0].pixels == NULL)
+            return 0;
+        *out_count = (size_t)entry->frames[0].width *
+                     (size_t)entry->frames[0].height;
+        *out_pixels = entry->frames[0].pixels;
+        return *out_count != 0u;
+    }
+    return 0;
+}
+
+/* What a granted surface throws where the file did not say: the colour of the
+ * texture's own bright part, in the six digits a grant carries one in. Answers 0
+ * where there is no picture to read -- no archive, no such texture, or a texture
+ * with no colour in it at all. */
+static int hwr_light_texture_grant_color(const struct hwr_world *world,
+                                         struct hwr_das_archive *map_archive,
+                                         struct hwr_das_archive *shared_archive,
+                                         uint16_t texture_id, uint32_t *out)
+{
+    const uint8_t *pixels = NULL;
+    size_t count = 0;
+    float color[3];
+
+    if (world == NULL)
+        return 0;
+    if (!hwr_light_texture_pixels(map_archive, shared_archive, texture_id,
+                                  &pixels, &count))
+        return 0;
+    if (!hwr_lights_texture_color(pixels, count, world->luts.palette, color))
+        return 0;
+    *out = hwr_light_color_to_rgb(color);
+    return 1;
+}
+
 /* One resolved leaf's colour, kept by what identifies that leaf rather than by
  * the object that asked: many torches share one sprite, and a sprite is the
  * same sprite whichever of them is looking at it. */
@@ -396,6 +570,14 @@ static uint64_t g_last_ns;
  * -- clear of the surface, and too little to carry a light through anything
  * thicker than a pane. */
 #define HWR_GLOW_FACE_OFFSET 16
+/* Where a map's own archive stops holding the pictures its SURFACES are painted
+ * with and starts holding the ones its OBJECTS are drawn with. Nothing is ever
+ * painted with a number at or above the first, so a texture grant written on one
+ * is a `sprites` line in the wrong table -- which is worth saying rather than
+ * merely missing. The pair is the same one the game config's own reader folds a
+ * single picture number by. */
+#define HWR_GLOW_OBJECT_PICTURE_FIRST 4096u
+#define HWR_GLOW_OBJECT_PICTURE_LIMIT 4608u
 
 struct hwr_glow_grant {
     uint16_t texture_id;
@@ -418,7 +600,7 @@ struct hwr_glow_grant {
  *
  * The composed grant is carried HERE rather than referenced through the grant
  * table, because a named face's answer is its own: whatever the texture blanket
- * said, then its tag, then its number. */
+ * said, then its ID, then its number. */
 struct hwr_glow_face {
     uint16_t sector_index;
     /* What names this light across frames for the fade and the hysteresis: the
@@ -682,7 +864,9 @@ static int hwr_glow_face_point(const struct hwr_world *world,
     return 1;
 }
 
-void hwr_lights_stage_glow_faces(const struct hwr_world *world)
+void hwr_lights_stage_glow_faces(const struct hwr_world *world,
+                                 struct hwr_das_archive *map_archive,
+                                 struct hwr_das_archive *shared_archive)
 {
     size_t textures = hwr_look_texture_count();
     size_t named = hwr_look_face_count();
@@ -718,25 +902,55 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
          * with it, this is not a light. */
         if (light.off)
             continue;
-        /* THE ONE FIELD A TEXTURE CANNOT ANSWER FOR ITSELF, and the reason it
-         * is required rather than defaulted.
+        /* AND THE ONE NUMBER THAT IS A MISTAKE RATHER THAN A MISS, said where
+         * the key is read rather than where the walk ends.
          *
-         * A thing that gives light is drawn with a sprite, and a sprite is cut
-         * from its background: the mask says which texels are the thing, so the
-         * flame can be separated from the bracket it hangs on and its colour
-         * read off. A world texture has no mask -- every texel is the surface
-         * -- so the same average over lava returns the colour of the rock
-         * around it, and no weighting recovers the difference on a picture that
-         * is bright all over. Rather than give every granted texture in the
-         * game the one torch colour and say nothing, the file is asked for the
-         * colour and told when it did not give one. */
-        if (!light.has_color) {
-            fprintf(stderr, "[renderer_overhaul] the texture %u is granted a "
-                            "light with no colour; a texture has no colour of "
-                            "its own to read one from, so nothing is lit from "
-                            "it\n",
+         * A map's own archive keeps the pictures its walls, floors and ceilings
+         * are painted with below 4096, and the pictures its OBJECTS are drawn
+         * with from 4096 up. So a texture number in that upper range names an
+         * object's picture, which no surface anywhere can be painted with --
+         * this is not a texture that happens to be missing from one map, it is
+         * a `sprites` line written in the wrong table, and it is wrong on every
+         * map in the game. Said whatever the scope, because it can never be
+         * right and can therefore never fire on a good case; and said here, so
+         * that a person gets THIS sentence rather than a complaint about the
+         * colour of a picture that was never the point. */
+        if (texture_id >= HWR_GLOW_OBJECT_PICTURE_FIRST &&
+            texture_id < HWR_GLOW_OBJECT_PICTURE_LIMIT) {
+            fprintf(stderr, "[renderer_overhaul] the texture %u is the number "
+                            "of a picture an OBJECT is drawn with rather than "
+                            "one a surface is painted with, so nothing is "
+                            "painted with it anywhere; a light for the thing "
+                            "standing there is written in 'sprites'\n",
                     (unsigned)texture_id);
             continue;
+        }
+        /* AND THE COLOUR, WHERE THE FILE DID NOT STATE ONE: off the texture's
+         * OWN TEXELS, by the law written beside the reading -- its brightest
+         * texels alone, so lava is lit by its glow and not by the rock the glow
+         * is set in. A wall is not a cut-out the way a sprite is, which is why
+         * it takes a law of its own rather than the sprite's.
+         *
+         * A picture that cannot be read at all -- no archive, no such texture,
+         * nothing but the palette's own black in it -- leaves the grant with no
+         * colour to give, and that is said once rather than lit with a colour
+         * nobody chose. */
+        if (!light.has_color) {
+            uint32_t derived = 0;
+
+            if (hwr_light_texture_grant_color(world, map_archive,
+                                              shared_archive, texture_id,
+                                              &derived)) {
+                light.has_color = 1;
+                light.color = derived;
+            } else {
+                fprintf(stderr, "[renderer_overhaul] the texture %u is granted "
+                                "a light with no colour, and its own picture "
+                                "could not be read to take one from, so "
+                                "nothing is lit from it\n",
+                        (unsigned)texture_id);
+                continue;
+            }
         }
         g_glow_grants[g_glow_grant_count].texture_id = texture_id;
         g_glow_grants[g_glow_grant_count].map_scoped = (uint8_t)(map_scoped != 0);
@@ -882,8 +1096,29 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
                 if (blanket >= 0)
                     hwr_look_light_over(&light, &g_glow_grants[blanket].light);
                 hwr_look_light_over(&light, &face_light);
+                /* AND THE SAME DERIVATION FOR A FACE, off the texture the face
+                 * is actually PAINTED with: its middle band first, then the two
+                 * bands above and below it, which is the order the face itself
+                 * is read in. A face is a painted surface exactly as a flat is,
+                 * so a face grant that states no colour is no more helpless
+                 * than a texture grant that states none. */
                 if (!light.has_color) {
-                    /* Said once per entry rather than once per face: a tag may
+                    uint32_t derived = 0;
+
+                    for (k = 0; k < 3u; k++) {
+                        if (ids[k] < 0 || ids[k] >= 0x1600)
+                            continue;
+                        if (hwr_light_texture_grant_color(
+                                world, map_archive, shared_archive,
+                                (uint16_t)ids[k], &derived)) {
+                            light.has_color = 1;
+                            light.color = derived;
+                            break;
+                        }
+                    }
+                }
+                if (!light.has_color) {
+                    /* Said once per entry rather than once per face: one ID may
                      * name thirty faces, and thirty copies of one sentence is
                      * not thirty pieces of news. */
                     for (e = 0; e < named; e++) {
@@ -892,18 +1127,19 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
                         named_told[e] = 1u;
                         if (named_by_id[e])
                             fprintf(stderr, "[renderer_overhaul] the faces "
-                                            "tagged %lu are granted a light "
-                                            "with no colour; a face has no "
-                                            "colour of its own to read one "
-                                            "from, so nothing is lit from "
-                                            "them\n",
+                                            "with ID %lu are granted a light "
+                                            "with no colour, and the pictures "
+                                            "they are painted with could not "
+                                            "be read to take one from, so "
+                                            "nothing is lit from them\n",
                                     (unsigned long)named_key[e]);
                         else
                             fprintf(stderr, "[renderer_overhaul] the face %lu "
                                             "is granted a light with no "
-                                            "colour; a face has no colour of "
-                                            "its own to read one from, so "
-                                            "nothing is lit from it\n",
+                                            "colour, and the picture it is "
+                                            "painted with could not be read to "
+                                            "take one from, so nothing is lit "
+                                            "from it\n",
                                     (unsigned long)named_key[e]);
                     }
                     continue;
@@ -981,8 +1217,8 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world)
         if (named_matched[i] || named_key[i] == 0xffffffffu)
             continue;
         if (named_by_id[i])
-            fprintf(stderr, "[renderer_overhaul] no face of this map is tagged "
-                            "%lu\n", (unsigned long)named_key[i]);
+            fprintf(stderr, "[renderer_overhaul] no face of this map carries "
+                            "the ID %lu\n", (unsigned long)named_key[i]);
         else
             fprintf(stderr, "[renderer_overhaul] this map has no face %lu; its "
                             "faces are numbered 0 to %lu\n",
@@ -1248,6 +1484,37 @@ static int hwr_light_object_marked(const struct hwr_world *world,
     return hwr_object_composed_light(object->seed, sector_light) == 0;
 }
 
+/* AND WHETHER A GAME CONFIG MADE ONE, which is the same question asked of the
+ * other side. Exported, because the DRAWING has to ask it too: a thing that
+ * lights the room around it and is itself drawn dark is a halo with nothing in
+ * the middle of it, and the map's own lights have never looked like that.
+ *
+ * Every refusal the seeding makes before it looks at a grant is made here in
+ * the same order, so the two can only ever agree -- and the family switch is
+ * the first of them, which is what keeps every other shading law byte for byte
+ * where it was. */
+int hwr_lights_object_promoted(const struct hwr_world *world,
+                               const struct hwr_object *object)
+{
+    struct hwr_look_light named;
+
+    if (world == NULL || object == NULL)
+        return 0;
+    if ((g_settings.classes & (1u << (unsigned)HWR_LIGHT_CLASS_OBJECT)) == 0u)
+        return 0;
+    if (object->sector_index == (uint16_t)HWR_OBJECT_NO_SECTOR ||
+        object->sector_index >= world->sector_count)
+        return 0;
+    if ((object->flags & HWR_OBJECT_FLAG_REFLECTION_ONLY) != 0)
+        return 0;
+    if (hwr_light_object_marked(world, object))
+        return 0;                    /* the map already says so; nothing to add */
+    if (!hwr_look_object_grant(object->map_index, object->object_id,
+                               object->graphic_id, &named))
+        return 0;
+    return !named.off;
+}
+
 /* One object into one light, with everything the rows and the map and the look
  * file have to say about it already spent. Returns 0 when the object is not a
  * light at all. */
@@ -1282,8 +1549,8 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
      *
      * The three tables that can name one object are composed by the look layer
      * in the order they rank, least specific first: what a KIND of thing gives
-     * off, keyed by the sprite; what a GROUP of them does, keyed by the id tag
-     * a creator typed to gather them; and what THIS ONE does, keyed by its own
+     * off, keyed by the sprite; what a GROUP of them does, keyed by the ID a
+     * creator typed to gather them; and what THIS ONE does, keyed by its own
      * object number, which names exactly one thing and is therefore the last
      * word. `off` comes whole from the most specific of the three naming it.
      *
@@ -1302,13 +1569,13 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
      * either side noticing. */
     marked = hwr_light_object_marked(world, object);
     if (!marked) {
-        /* PROMOTION, and the one field it cannot do without. A thing the map
-         * never lit is drawn as an ordinary sprite, so there is no honest
-         * colour to read a light off it -- the average of an unlit candelabra
-         * is the colour of brass. A grant that names one and gives a colour
-         * makes it a light; a grant that names one and gives none lights
-         * nothing, and the look layer says so once, naming the entry. */
-        if (!granted || named.off || !named.has_color)
+        /* PROMOTION. A thing the map never lit is made a light by any grant
+         * naming it that does not refuse it -- the colour included, because a
+         * promoted thing has a sprite exactly as a marked one does and the
+         * colour is read off it by the same law. A grant that states a colour
+         * of its own is still the last word; a grant that states none is not an
+         * entry that does nothing. */
+        if (!granted || named.off)
             return 0;
         g_stats.promoted++;
     } else {
@@ -1348,13 +1615,14 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->light.color[0] = g_settings.color[0];
     out->light.color[1] = g_settings.color[1];
     out->light.color[2] = g_settings.color[2];
-    /* THE COLOUR OFF THE SPRITE, and only where the map itself marked the thing.
-     * A marked sprite is drawn as a cut-out with a flame in it, so an average
-     * over what is not cut away is the flame's own colour. A thing the map never
-     * lit is drawn no differently from a chair, so the same reading returns the
-     * colour of the chair -- which is why a promotion carries its own colour and
-     * why nothing is read off the sprite for one. */
-    if (g_settings.color_from_sprite && marked) {
+    /* THE COLOUR OFF THE SPRITE -- ONE LAW, FOR EVERY THING THAT GIVES LIGHT.
+     * A sprite is drawn as a cut-out, so an average over what is not cut away is
+     * the colour of the thing itself: a torch answers with its flame and a cold
+     * sigil with its own light. That is as true of a thing a game config made a
+     * light as of one the map marked, so the reading is the same reading and the
+     * promoted case is not a case here at all. Where the rows ask for the one
+     * colour beside them instead, that is what both get. */
+    if (g_settings.color_from_sprite) {
         float sprite_color[3];
 
         /* A sprite that has no colour to give -- one cut entirely away, or one
@@ -1472,10 +1740,10 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
      * whether a thing lights the room, and this question is about whether it
      * exists.
      *
-     * The map's own MARK is offered with each one, because the question a person
-     * needs answered is not only "is it there" but "can this entry ever do
-     * anything to it": an entry naming a thing the map does not mark, and giving
-     * no colour, is an entry that will never light anything.
+     * The picture each one is DRAWN with is offered too, because the sprite
+     * blanket is addressed by that rather than by a number out of this map's own
+     * lists, and a blanket a map draws nothing with is as silent a mistake as a
+     * number nothing answers to.
      *
      * And the records the map numbers and never draws are offered too, so that
      * "there is no object 70" is never said about an object 70 that is there and
@@ -1488,8 +1756,7 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
             const struct hwr_object *object = &frame->objects->items[i];
 
             hwr_look_object_seen(object->map_index, object->object_id,
-                                 object->graphic_id,
-                                 hwr_light_object_marked(frame->world, object));
+                                 object->graphic_id);
         }
         for (i = 0; i < frame->objects->hidden_count; i++)
             hwr_look_object_hidden(frame->objects->hidden[i]);
@@ -1605,7 +1872,8 @@ static size_t hwr_lights_seed_glow_faces(const struct hwr_lights_frame *frame,
      * layer's own generation. A frame in which nothing has changed does not
      * walk a wall. */
     if (g_glow_face_generation != hwr_look_glow_generation())
-        hwr_lights_stage_glow_faces(frame->world);
+        hwr_lights_stage_glow_faces(frame->world, frame->map_archive,
+                                    frame->shared_archive);
     if (g_glow_face_count == 0u)
         return 0;
     hop = hwr_lights_hop_containment(frame);

@@ -508,9 +508,9 @@ static void hwr_json_attach(struct hwr_json_parser *parser, int index,
                 if (frame->last_child == child)
                     frame->last_child = previous;
                 hwr_json_note(parser, line,
-                              "'%s' is given more than once in the same "
-                              "place; the last one is the one that counts",
-                              name);
+                              "'%s' is given more than once here; only the "
+                              "last one counts, and everything the earlier "
+                              "one said is thrown away", name);
                 break;
             }
             previous = child;

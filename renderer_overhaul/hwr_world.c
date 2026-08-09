@@ -481,15 +481,15 @@ int hwr_world_snapshot(struct hwr_world *world, const struct roth_api_v1 *api)
                 return hwr_world_fail(world, "wall %u mapping cannot be read", (unsigned)wall_index);
             }
             hwr_parse_wall(wall);
-            /* THE FACE TAG, read here and nowhere else: it is authored rather
+            /* THE FACE ID, read here and nowhere else: it is authored rather
              * than moved by the running game, so the refresh below has no
              * reason to ask for it again.
              *
              * It exists only where the mapping record says it does, and a
              * record that says so and then runs off the end of the section is
-             * a record with no tag rather than a map that cannot be read -- a
-             * tag is an authoring aid, and refusing the whole world over one
-             * would cost the picture for it. */
+             * a record with none of its own rather than a map that cannot be
+             * read -- it is an authoring aid, and refusing the whole world over
+             * one would cost the picture for it. */
             wall->face_tag = 0;
             if ((wall->mapping_type & 0x80u) != 0 &&
                 wall->mapping_offset <= 0xfff3u) {

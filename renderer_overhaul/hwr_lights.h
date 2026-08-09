@@ -6,6 +6,7 @@
 #include <stddef.h>
 
 struct hwr_das_archive;
+struct hwr_object;
 struct hwr_objects;
 struct hwr_world;
 struct roth_api_v1;
@@ -136,6 +137,22 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
  * map's archives either. */
 void hwr_lights_reset(void);
 
+/* Whether this object is a light ONLY because a game config said so: the map
+ * itself does not mark it, and a grant names it and does not refuse it.
+ *
+ * Asked by the DRAWING as well as by the seeding, and that is the whole reason
+ * it is here rather than folded into the seeder: a thing that lights a room has
+ * to LOOK lit, exactly as the things the map marks itself do, or a granted torch
+ * is a dark sprite with a halo round it. One function, so the two answers cannot
+ * drift into two rules.
+ *
+ * Answers 0 wherever the object class is not being seeded at all -- which is
+ * every shading law but the modern one, and the modern one with the family or
+ * its object row switched off. Nothing a game config says may move a picture
+ * drawn by the other two laws, and this is where that is held. */
+int hwr_lights_object_promoted(const struct hwr_world *world,
+                               const struct hwr_object *object);
+
 /* Works out, for the map now staged, where the faces a game config grants a
  * light actually are.
  *
@@ -152,10 +169,15 @@ void hwr_lights_reset(void);
  * faces sharing one texture; one light each would fill a sixteen-slot array
  * with near-identical lights and starve every torch in the room.
  *
- * Called with the world a map load has just snapshotted. A map with nothing
- * granted -- which is every map until somebody describes one -- costs no walk
- * at all. */
-void hwr_lights_stage_glow_faces(const struct hwr_world *world);
+ * Called with the world a map load has just snapshotted, and with the two
+ * archives its pictures live in: a grant that states no colour takes one off the
+ * texture's own texels, which is a read of the picture rather than of the map.
+ * Absent archives leave such a grant with no colour to give, and it says so. A
+ * map with nothing granted -- which is every map until somebody describes one --
+ * costs no walk and no read at all. */
+void hwr_lights_stage_glow_faces(const struct hwr_world *world,
+                                 struct hwr_das_archive *map_archive,
+                                 struct hwr_das_archive *shared_archive);
 
 /* And the same for the free-standing lights a game config hangs in this map:
  * which ROOM each one is in.
@@ -196,6 +218,25 @@ unsigned long hwr_lights_placed_walks(void);
 int hwr_lights_frame_color(const uint8_t *pixels, size_t count,
                            const uint8_t palette[768], float out[3]);
 
+/* And the colour one WORLD TEXTURE throws, which is a different law because a
+ * wall is a different picture.
+ *
+ * A sprite is cut out of its background, so the mask already says which texels
+ * are the thing and an average over what is left is the thing's own colour. A
+ * wall texture is cut out of nothing -- every texel is the surface -- so the
+ * same average over lava returns the colour of the rock it is set in. What is
+ * wanted is the GLOW rather than the stone around it, so the answer is taken
+ * over the texture's BRIGHTEST texels alone: every texel at least half as bright
+ * as the brightest one in the picture, each weighted by the square of the
+ * engine's own green-weighted luminance, normalized so the strongest channel is
+ * one. Lava answers orange, a cold rune answers blue, and a wall that is one
+ * flat colour answers that colour, since then every texel is its own brightest.
+ *
+ * Returns nonzero when there was any colour to find; a texture that is entirely
+ * the palette's own black leaves `out` alone. */
+int hwr_lights_texture_color(const uint8_t *pixels, size_t count,
+                             const uint8_t palette[768], float out[3]);
+
 /* How many lights the last build considered before the cap, and how many it
  * dropped at each containment. Diagnostic: the seeding is where a light leaks
  * from, so what it refused is worth being able to read. */
@@ -208,10 +249,10 @@ struct hwr_lights_stats {
     unsigned long too_far;     /* past the hop cap */
     unsigned long capped;      /* more candidates than slots */
     unsigned long fading;      /* still going out from an earlier frame */
-    /* A thing the map does NOT mark that a game config named, with a colour,
-     * and thereby made a light. Counted apart from the marked ones because the
-     * two answer different questions: one is what the map itself says, the
-     * other is what somebody wrote over it. */
+    /* A thing the map does NOT mark that a game config named, and thereby made
+     * a light. Counted apart from the marked ones because the two answer
+     * different questions: one is what the map itself says, the other is what
+     * somebody wrote over it. */
     unsigned long promoted;
 };
 const struct hwr_lights_stats *hwr_lights_last_stats(void);

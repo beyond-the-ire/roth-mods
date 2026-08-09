@@ -1,5 +1,6 @@
 #include "hwr_billboards.h"
 
+#include "hwr_lights.h"
 #include "hwr_sprites.h"
 #include "hwr_util.h"
 
@@ -1377,6 +1378,23 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         }
         seed = o->seed;
         composed = hwr_object_composed_light(seed, sector_light);
+        /* AND WHAT A GAME CONFIG MADE A LIGHT LOOKS LIKE.
+         *
+         * The composed byte above IS the map's own mark: nought is the thing the
+         * map's author said was never to be darkened, which is why a torch is
+         * drawn at full brightness while the wall behind it falls away. A thing
+         * a game config makes a light is a light in every other respect, so it
+         * is drawn the same way -- otherwise it lights the room around it while
+         * being drawn as the dark sprite it was, which reads as a halo with
+         * nothing in the middle of it.
+         *
+         * The question is asked of the seeding rather than answered again here,
+         * so the thing that is drawn lit is exactly the thing that lights; and
+         * the seeding answers no wherever the object class is not being seeded,
+         * so under the original and the smooth laws this line cannot move a
+         * pixel. */
+        if (composed != 0u && hwr_lights_object_promoted(world, o))
+            composed = 0u;
 
         /* World size at 2 world units per texel -- the same density the wall
          * driver maps (texel = world_distance >> 1). Horizontal spans

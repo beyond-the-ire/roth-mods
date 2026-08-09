@@ -41,19 +41,20 @@ struct hwr_wall {
     uint16_t lower_id;
     /* The mapping record's own type byte. Its top bit is what says the record
      * carries the extra metadata after its first ten bytes -- the pan pair,
-     * and the tag below. */
+     * and the ID below. */
     uint8_t mapping_type;
-    /* THE FACE TAG: the word at the end of an extended mapping record, which
+    /* THE FACE ID: the word at the end of an extended mapping record, which
      * the community ROTH Editor shows as the read-only `Face ID` and which the
      * map command system addresses a face by.
      *
-     * It is a TAG rather than a number: one mapping record may be shared by
-     * many faces, so a tag names a GROUP exactly as an object's `ID:` does,
-     * and nought is the untagged default. A face whose record carries no
-     * extended metadata has no tag, which is nought here too.
+     * It is a GROUP HANDLE rather than a number: one mapping record may be
+     * shared by many faces, so it names a group exactly as an object's `ID:`
+     * does, and nought is what a face with none of its own reads as. A face
+     * whose record carries no extended metadata has none, which is nought here
+     * too.
      *
-     * Read once, when the map is staged: a tag is authored rather than moved
-     * by the running game, unlike the texture ids beside it. */
+     * Read once, when the map is staged: it is authored rather than moved by
+     * the running game, unlike the texture ids beside it. */
     uint16_t face_tag;
     uint8_t mapping_flags;
     uint8_t scale;

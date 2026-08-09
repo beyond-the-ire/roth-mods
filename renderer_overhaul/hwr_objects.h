@@ -51,7 +51,7 @@ struct hwr_object {
     int16_t world_z;
     uint16_t graphic_id;
     uint8_t facing;
-    /* Record +0xe: the creator-typed COMMAND-GROUP tag used by object-related
+    /* Record +0xe: the creator-typed COMMAND-GROUP ID used by object-related
      * map commands. One command acts on every record carrying the same value,
      * so it is deliberately SHARED rather than unique, and 0 is both the
      * untagged default and the command system's own word for "the source

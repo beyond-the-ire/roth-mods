@@ -463,7 +463,7 @@ void hwr_objects_dump(const struct hwr_objects *objects, const char *path,
         /* THE IDENTIFIERS ARE THE ONES THE EDITOR SHOWS, in the spelling it
          * shows them in. The sprite is the texture and source PAIR of the
          * object panel, in that order, which is also how a game config keys the
-         * table that answers for a kind of thing; the tag is the panel's `ID:`;
+         * table that answers for a kind of thing; the ID is the panel's `ID:`;
          * and both are decimal, because that is what the panel prints and this
          * file exists to be read beside it.
          *

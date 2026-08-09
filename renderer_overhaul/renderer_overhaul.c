@@ -2326,8 +2326,10 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
      * of the work is the containment test over the small set it leaves behind
      * -- and a map nothing is granted on costs no walk at all. What it does not
      * follow is a texture a script swaps mid-map: the answer is the map as it
-     * was staged, which is what "once per map" means. */
-    hwr_lights_stage_glow_faces(&g_world);
+     * was staged, which is what "once per map" means. The two archives go with
+     * it because a grant that states no colour takes one off the texture's own
+     * texels, and the texels live in the pictures rather than in the map. */
+    hwr_lights_stage_glow_faces(&g_world, &g_map_archive, &g_shared_archive);
     /* And the free-standing lights the game config hangs in this map, for the
      * same reason and in the same place: which ROOM each one is in is a fact
      * about the map's own footprints, so it is answered once beside the geometry
