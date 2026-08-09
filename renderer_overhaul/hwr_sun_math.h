@@ -33,12 +33,27 @@
  * keeps the re-centre itself rare. */
 #define HWR_SUNM_GUARD_SHARE (1.0f / 8.0f)
 
-/* The constant lookup bias, in light-space texels of world size. Two texels
- * plus one world unit: zero-thickness walls have no back face to hide acne
- * on, so the constant term carries what the caster pass's slope-scaled
- * polygon offset does not. */
+/* The lookup bias CEILING, in light-space texels of world size. Two texels
+ * plus one world unit: the first milestone read this flat constant at every
+ * fragment, and a flat constant is exactly what leaked light into the
+ * corners -- where a wall meets the ceiling that shades it, the depth
+ * separating the two runs to nothing, and every world unit of slack is a
+ * strip of the wall lit through the joint. The receiver-slope law below
+ * replaces it per fragment; the constant survives only as the worst case
+ * that law may never exceed. */
 #define HWR_SUNM_BIAS_TEXELS 2.0f
 #define HWR_SUNM_BIAS_WORLD 1.0f
+
+/* The floor under the receiver-slope bias, in world units: what covers the
+ * arithmetic itself (rounding, the interpolators) when the receiver faces
+ * the light head-on and its own slope term is nothing. */
+#define HWR_SUNM_BIAS_FLOOR_WORLD 1.0f
+
+/* How far the softness dial reaches, in light-space texels: the dial's top
+ * is a penumbra this many texels wide. The default of a tenth lands at half
+ * a texel, which is the single bilinear tap's own footprint -- so the
+ * default look IS the first milestone's free 2x2 PCF, to the bit. */
+#define HWR_SUNM_SOFT_MAX_TEXELS 5.0f
 
 static inline void hwr_sunm_direction(float yaw_deg, float elevation_deg,
                                       float out[3])
@@ -181,8 +196,8 @@ static inline void hwr_sunm_matrices(const struct hwr_sunm_window *window,
     lookup[15] = 1.0f;
 }
 
-/* The constant lookup bias for a window, in the [0,1] depth units the compare
- * runs in: the stated texel count at this window's own texel size, plus the
+/* The bias ceiling for a window, in the [0,1] depth units the compare runs
+ * in: the stated texel count at this window's own texel size, plus the
  * stated world-unit floor, over the window's whole depth extent. */
 static inline float hwr_sunm_bias(const struct hwr_sunm_window *window)
 {
@@ -190,6 +205,68 @@ static inline float hwr_sunm_bias(const struct hwr_sunm_window *window)
                        HWR_SUNM_BIAS_WORLD;
 
     return bias_world / (2.0f * window->depth_half);
+}
+
+/* The softness dial as a radius: nothing is hard, the top of the dial is
+ * the stated texel reach, and the walk between them is straight. */
+static inline float hwr_sunm_soft_radius(float softness)
+{
+    if (!(softness > 0.0f))
+        return 0.0f;
+    if (softness > 1.0f)
+        softness = 1.0f;
+    return softness * HWR_SUNM_SOFT_MAX_TEXELS;
+}
+
+/* How many ring taps a tier spends on that radius. A radius inside the
+ * single tap's own bilinear footprint takes no ring at all -- the centre
+ * tap IS the picture, which is what keeps the default look the first
+ * milestone's -- and past it the Medium tier stands four taps on the ring,
+ * the High tier eight. `wide` is the High tier saying so. */
+static inline int hwr_sunm_soft_taps(int wide, float radius_texels)
+{
+    if (!(radius_texels > 0.5f))
+        return 0;
+    return wide ? 8 : 4;
+}
+
+/* The receiver-slope bias law, evaluated the same way by the fragment stage
+ * and the offline twin: the fragment's own light-space depth gradient
+ * (per unit of the [0,1] lookup plane, one component per axis), scaled to
+ * the sampling footprint in texels, floored, and held under the ceiling.
+ * The gradient is what a flat constant could never be -- a wall facing the
+ * light has almost none and gets almost no slack, which is what closes the
+ * lit strip under a ceiling; a surface the light grazes has a large one
+ * and gets exactly the slack its own texel footprint spans. */
+static inline float hwr_sunm_bias_eval(float dzdu, float dzdv, float slope,
+                                       float floor_, float cap)
+{
+    float bias = (fabsf(dzdu) + fabsf(dzdv)) * slope + floor_;
+
+    return bias < cap ? bias : cap;
+}
+
+/* The floor term of that law for a window, in [0,1] depth units: a world
+ * unit plus the depth map's own quantum. */
+static inline float hwr_sunm_bias_floor(const struct hwr_sunm_window *window)
+{
+    float range = 2.0f * window->depth_half;
+
+    return (HWR_SUNM_BIAS_FLOOR_WORLD + range / 65536.0f) / range;
+}
+
+/* The slope scale of that law: the sampling footprint in texels -- half a
+ * texel from the fragment to its own texel's centre, half more when the
+ * compare filters, the ring radius when taps stand on one -- over the
+ * resolution, so multiplying the per-unit gradient by it yields depth
+ * units of slack. */
+static inline float hwr_sunm_bias_slope(int soft, int taps,
+                                        float radius_texels, int resolution)
+{
+    float footprint = 0.5f + (soft ? 0.5f : 0.0f) +
+                      (taps > 0 ? radius_texels : 0.0f);
+
+    return footprint / (float)resolution;
 }
 
 /* One object card: an upright quad anchored at the object's position,

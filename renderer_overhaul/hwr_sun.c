@@ -50,6 +50,7 @@ struct hwr_sun_rows {
     float yaw_deg;
     int object_shadows;
     int quality;
+    int texels;
     float softness;
     float span;
 };
@@ -70,6 +71,10 @@ static struct hwr_scene_mesh g_mesh;
 static struct hwr_gl_sun_vertex *g_static;
 static size_t g_static_count;
 static size_t g_static_capacity;
+/* Where the slice's two runs meet -- everything that blocks (solid and
+ * masked), then the translucent range that filters: the depth pass draws up
+ * to the split, the gobo pass from it. */
+static size_t g_static_gobo_first;
 static int g_static_built;
 static uint32_t g_static_generation;
 static uint32_t g_static_hash;
@@ -161,6 +166,8 @@ static void hwr_sun_apply(uint32_t mask, const struct hwr_settings *settings,
         hwr_sun_row_bool("sun_object_shadows", settings, 1);
     g_rows.quality = (int)hwr_sun_row_enum("sun_shadow_quality", settings,
                                            HWR_SUN_QUALITY_MEDIUM);
+    g_rows.texels = (int)hwr_sun_row_enum("sun_shadow_texels", settings,
+                                          HWR_SUN_TEXELS_CUTOUT);
     g_rows.softness = hwr_sun_row_float("sun_shadow_softness", settings, 0.1f);
     g_rows.span = hwr_sun_row_float("sun_shadow_span", settings, 4096.0f);
     if (!(g_rows.span >= 1024.0f))
@@ -183,6 +190,7 @@ void hwr_sun_stage_map(const struct hwr_world *world)
     g_staged = 0;
     g_static_built = 0;
     g_static_count = 0;
+    g_static_gobo_first = 0;
     g_static_upload_due = 0;
     g_window.valid = 0;
     g_dir_valid = 0;
@@ -205,6 +213,7 @@ void hwr_sun_reset(void)
     g_staged = 0;
     g_static_built = 0;
     g_static_count = 0;
+    g_static_gobo_first = 0;
     g_static_upload_due = 0;
     g_window.valid = 0;
     g_dir_valid = 0;
@@ -336,11 +345,11 @@ static struct hwr_gl_sun_vertex *hwr_sun_grow(struct hwr_gl_sun_vertex **list,
 
 /* Which of the frame's casters a surface of the map mesh is, if any.
  * Returns 0 to skip it, 1 to cast solid, 2 to cast with the masked-texel
- * cut-out. The exclusions are the design's own: sky caps are screen-space
- * synthetics; the open-sky ceiling family (flat id 0 or 1) is the sky being
- * open by the map's own statement; translucent surfaces do not block the
- * beam in this round -- dimming them is the gobo pass's job, and until it
- * ships the light passes whole rather than being wrongly walled out. */
+ * cut-out, 3 to filter rather than cast -- the translucent range, drawn by
+ * the gobo pass alone, where its texels multiply the pass weight into the
+ * beam instead of walling it out. The exclusions are the design's own: sky
+ * caps are screen-space synthetics; the open-sky ceiling family (flat id 0
+ * or 1) is the sky being open by the map's own statement. */
 static int hwr_sun_classify(const struct hwr_scene *scene,
                             const struct hwr_world *world,
                             const struct hwr_mesh_surface *surface)
@@ -378,8 +387,9 @@ static int hwr_sun_classify(const struct hwr_scene *scene,
     }
     if ((qflags & 0x400u) != 0) {
         /* The translucent range: masked panes, transparent flats, and the
-         * blend-capable portal bands. None of them blocks the beam here. */
-        return 0;
+         * blend-capable portal bands. None of them blocks the beam -- they
+         * dim it, which is the gobo pass's whole job. */
+        return 3;
     }
     if ((surface->flags & HWR_SURFACE_MASKED) != 0 && width != 0 &&
         height != 0)
@@ -405,13 +415,20 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
     uint8_t flags = 0;
     size_t i;
 
-    if (cutout == 2) {
+    if (cutout >= 2) {
         int16_t id = surface->texture_id;
 
         offset = scene->textures[id].offset;
         width = scene->textures[id].width;
         height = scene->textures[id].height;
-        flags = HWR_GL_SUN_MASKED;
+        /* A masked caster cuts holes; a translucent one filters -- and one
+         * that is both keeps both laws, exactly as the eye-ray pass reads
+         * it: holes discard, everything else writes the pass weight. */
+        flags = cutout == 3
+              ? (uint8_t)(HWR_GL_SUN_TRANSLUCENT |
+                          ((surface->flags & HWR_SURFACE_MASKED) != 0
+                               ? HWR_GL_SUN_MASKED : 0u))
+              : (uint8_t)HWR_GL_SUN_MASKED;
     }
     out = hwr_sun_grow(&g_static, &g_static_count, &g_static_capacity,
                        surface->vertex_count);
@@ -476,25 +493,34 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
 /* Builds the static slice whole: the map's own mesh -- every sector, wall,
  * slab and door, visibility-gated by nothing -- classified and converted.
  * The roof above a window is exactly the point: the eye's drawn set rarely
- * holds it, and shadows must not depend on where the eye walked. */
+ * holds it, and shadows must not depend on where the eye walked. The slice
+ * lands in three runs -- solid, masked, translucent -- and the split the GL
+ * passes read is the last: depth draws everything that blocks, gobo draws
+ * the translucent range that filters. */
 static int hwr_sun_build_static(const struct hwr_scene *scene,
                                 const struct hwr_world *world)
 {
+    int class_pass;
     size_t i;
 
     g_static_count = 0;
+    g_static_gobo_first = 0;
     if (hwr_scene_build_mesh(&g_mesh, world, 0) != 0)
         return -1;
-    for (i = 0; i < g_mesh.surface_count; i++) {
-        const struct hwr_mesh_surface *surface = &g_mesh.surfaces[i];
-        int class = hwr_sun_classify(scene, world, surface);
+    for (class_pass = 1; class_pass <= 3; class_pass++) {
+        if (class_pass == 3)
+            g_static_gobo_first = g_static_count;
+        for (i = 0; i < g_mesh.surface_count; i++) {
+            const struct hwr_mesh_surface *surface = &g_mesh.surfaces[i];
+            int class = hwr_sun_classify(scene, world, surface);
 
-        if (class == 0)
-            continue;
-        if (hwr_sun_emit_surface(scene, surface,
-                                 g_mesh.vertices + surface->first_vertex,
-                                 class) != 0)
-            return -1;
+            if (class != class_pass)
+                continue;
+            if (hwr_sun_emit_surface(scene, surface,
+                                     g_mesh.vertices + surface->first_vertex,
+                                     class) != 0)
+                return -1;
+        }
     }
     g_static_builds++;
     return 0;
@@ -889,7 +915,8 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
         force = 1;
     }
     if (g_static_upload_due &&
-        hwr_gl_sun_upload_static(g_static, g_static_count))
+        hwr_gl_sun_upload_static(g_static, g_static_count,
+                                 g_static_gobo_first))
         g_static_upload_due = 0;
     switch (g_rows.quality) {
     case HWR_SUN_QUALITY_LOW:
@@ -920,10 +947,23 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
     sun.intensity = g_rows.intensity;
     hwr_sunm_matrices(&g_window, g_dir, g_right, g_up, sun.clip, sun.lookup);
     sun.resolution = resolution;
-    sun.cutouts = g_rows.quality != HWR_SUN_QUALITY_LOW;
+    /* The texels row owns what casts -- masks cut the depth pass and the
+     * translucent range dims the beam through the gobo -- at every quality
+     * tier; the quality row keeps its own meaning, which is how finely the
+     * map resolves and what the soft edge may cost. */
+    sun.cutouts = g_rows.texels == HWR_SUN_TEXELS_CUTOUT;
+    sun.gobo = sun.cutouts;
     sun.soft = g_rows.quality != HWR_SUN_QUALITY_LOW &&
                g_rows.softness > 0.0f;
+    sun.soft_radius = sun.soft ? hwr_sunm_soft_radius(g_rows.softness) : 0.0f;
+    sun.soft_taps = sun.soft
+                  ? hwr_sunm_soft_taps(g_rows.quality == HWR_SUN_QUALITY_HIGH,
+                                       sun.soft_radius)
+                  : 0;
     sun.bias = hwr_sunm_bias(&g_window);
+    sun.bias_floor = hwr_sunm_bias_floor(&g_window);
+    sun.bias_slope = hwr_sunm_bias_slope(sun.soft, sun.soft_taps,
+                                         sun.soft_radius, resolution);
     hwr_gl_set_sun(&sun);
     hwr_gl_sun_set_dynamic(g_dynamic, g_dynamic_count);
     if (hwr_sun_debug() && (moved || force)) {

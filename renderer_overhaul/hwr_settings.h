@@ -119,16 +119,28 @@ enum hwr_point_color_source {
     HWR_POINT_COLOR_FIXED
 };
 
-/* The quality tier of the sun and moon light's shadow map. Low is the depth
- * map at its small size with hard edges and geometry-only world casters;
- * Medium is the full picture -- masked textures cut their own holes in the
- * shadow -- at the size where window bars resolve; High is the same at twice
- * that. There is no shadowless beam: the depth map is the beam's only
- * containment, so the tier below Low is the light's own switch. */
+/* The quality tier of the sun and moon light's shadow map: how finely it
+ * resolves and what the soft edge may cost. Low is the depth map at its
+ * small size with hard edges; Medium is the size where window bars resolve;
+ * High is twice that with the wide softness ring. There is no shadowless
+ * beam: the depth map is the beam's only containment, so the tier below Low
+ * is the light's own switch. What CASTS is not this row's question -- the
+ * texels row below owns it at every tier. */
 enum hwr_sun_quality {
     HWR_SUN_QUALITY_LOW = 0,
     HWR_SUN_QUALITY_MEDIUM,
     HWR_SUN_QUALITY_HIGH
+};
+
+/* What casts the sun and moon light's shadows. Solid is geometry alone:
+ * every caster blocks whole, the way a wall does. Cutout is the textures
+ * having their say -- a grate's holes are holes in the shadow itself, and
+ * the translucent range dims the beam by what the map's own blend tables
+ * let through. Tinted glass is a later step of the same ladder and ships
+ * when it can do something honest. */
+enum hwr_sun_texels {
+    HWR_SUN_TEXELS_SOLID = 0,
+    HWR_SUN_TEXELS_CUTOUT
 };
 
 /* Whether the world image is dithered where it is finally turned into screen
@@ -380,7 +392,10 @@ struct hwr_settings {
      * escape hatch, not the default. */
     int sun_object_shadows;
     enum hwr_sun_quality sun_shadow_quality;
-    /* Edge softness, hard to barely-soft. Zero is the hard edge. */
+    /* What casts: geometry alone, or the textures having their say. */
+    enum hwr_sun_texels sun_shadow_texels;
+    /* Edge softness as a real penumbra radius, hard to soft; the default
+     * rests barely off hard, at the single bilinear tap's own footprint. */
     float sun_shadow_softness;
     /* The moving shadow window's side, in world units: resolution where the
      * player is, clamped-to-lit beyond it. */

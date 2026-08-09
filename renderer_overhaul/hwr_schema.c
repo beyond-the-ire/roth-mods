@@ -30,6 +30,8 @@ _Static_assert(sizeof(enum hwr_light_scope) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_sun_quality) == sizeof(int32_t),
                "enum fields must be four bytes wide");
+_Static_assert(sizeof(enum hwr_sun_texels) == sizeof(int32_t),
+               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -93,6 +95,14 @@ static const struct hwr_enum_value HWR_SUN_QUALITY_VALUES[] = {
     { "low",    HWR_SUN_QUALITY_LOW,    "Low" },
     { "medium", HWR_SUN_QUALITY_MEDIUM, "Medium" },
     { "high",   HWR_SUN_QUALITY_HIGH,   "High" }
+};
+
+/* The what-casts ladder ends here for now: the tinted step is reserved for
+ * the milestone that can colour the beam honestly, and shipping its token
+ * before then would be a switch wired to nothing. */
+static const struct hwr_enum_value HWR_SUN_TEXELS_VALUES[] = {
+    { "solid",  HWR_SUN_TEXELS_SOLID,  "Solid shapes" },
+    { "cutout", HWR_SUN_TEXELS_CUTOUT, "Texture cut-outs" }
 };
 
 /* Retired, and kept only so that a configuration file written for an earlier
@@ -2160,8 +2170,32 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "Shadow quality",
         .help = "How finely the sky light's shadows resolve. Medium is sharp "
                 "enough for window bars to draw their own pattern on the "
-                "floor; Low trades the texture cut-outs and the soft edge "
-                "for speed; High doubles the detail again."
+                "floor; Low trades fineness and the soft edge for speed; "
+                "High doubles the detail again and widens the softness "
+                "range."
+    },
+    {
+        .key = "sun_shadow_texels",
+        .type = HWR_VT_ENUM,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, sun_shadow_texels),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .e = HWR_SUN_TEXELS_CUTOUT },
+        .original = { .e = HWR_SUN_TEXELS_CUTOUT },
+        .values = HWR_SUN_TEXELS_VALUES,
+        .value_count = HWR_COUNT_OF(HWR_SUN_TEXELS_VALUES),
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Shadows from textures",
+        .help = "What casts the sky light's shadows. Texture cut-outs let "
+                "a grate's holes pass light and a translucent pane dim the "
+                "beam by what it lets through; solid shapes cast every "
+                "surface whole, whatever is painted on it."
     },
     {
         .key = "sun_object_shadows",
@@ -2203,8 +2237,10 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Shadow edge softness",
-        .help = "How softly a shadow's edge goes over from dark to lit. "
-                "Nothing is a hard edge; the default is barely softened."
+        .help = "How wide a shadow's edge goes over from dark to lit. "
+                "Nothing is a hard edge, the default is barely softened, "
+                "and the top of the dial is a hand's width of penumbra. "
+                "Low quality always keeps the hard edge."
     },
     {
         .key = "sun_shadow_span",

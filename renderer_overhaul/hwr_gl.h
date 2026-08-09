@@ -502,13 +502,17 @@ _Static_assert(sizeof(struct hwr_gl_sun_vertex) == 32,
 
 enum hwr_gl_sun_vertex_flags {
     /* The surface's texture carries the block-transparency bit: its index-0
-     * texels are holes and the depth pass discards them -- at the tiers that
-     * ask for cut-outs. */
+     * texels are holes and the depth pass discards them -- when the texels
+     * row asks for cut-outs. */
     HWR_GL_SUN_MASKED = 1u << 0,
     /* An object card: its outline IS its identity, so its index-0 discard is
      * not a tier question -- a card without it is a rectangle, not a rough
      * shadow. Every tier honours this one. */
-    HWR_GL_SUN_CARD = 1u << 1
+    HWR_GL_SUN_CARD = 1u << 1,
+    /* The translucent range: a surface the beam passes THROUGH rather than
+     * stops at. It never writes depth -- it is drawn only by the gobo pass,
+     * where its texels multiply the pass weight into the light. */
+    HWR_GL_SUN_TRANSLUCENT = 1u << 2
 };
 
 /* The directional key light and the light-space depth map that gates it,
@@ -535,25 +539,52 @@ struct hwr_gl_sun {
     /* Depth-map side in texels. A change re-takes the storage. */
     int resolution;
     /* Whether world-geometry masked casters take the texel discard (the
-     * Medium tier's cut-outs). Object cards discard at every tier. */
+     * texels row's cut-outs). Object cards discard at every tier. */
     int cutouts;
+    /* Whether the transmittance plane -- the gobo -- is rendered and read:
+     * the translucent range dims the beam by its pass weight instead of
+     * being ignored. Zero is the solid law: no plane exists, no VRAM is
+     * spent on one, and the key term is the depth compare alone. */
+    int gobo;
     /* Nonzero selects the LINEAR depth compare -- the free 2x2 PCF, the
      * barely-soft edge. Zero is the hard edge. */
     int soft;
-    /* Constant lookup bias in [0,1] depth units, stated by the window owner
-     * in world texels and converted where the window's depth extent is
-     * known. */
+    /* The softness radius: how many ring taps the fragment takes around the
+     * centre one, and how far out they stand, in light-space texels. Zero
+     * taps is the single centre tap -- the free 2x2 PCF -- to the bit, which
+     * is what the barely-soft default resolves to. */
+    int soft_taps;
+    float soft_radius;
+    /* The lookup bias CEILING in [0,1] depth units: the flat constant the
+     * first milestone read everywhere, kept as the worst case the law below
+     * may never exceed. */
     float bias;
+    /* The receiver-slope law's two staged terms: the floor every compare
+     * keeps (quantization plus a world unit), and the per-texel slope scale
+     * the fragment multiplies its own light-space depth gradient by. Both
+     * zero means the law is absent and the ceiling alone is the bias --
+     * which is the first milestone's arithmetic, kept reachable so the
+     * offline twin can hold the corner leak against it. */
+    float bias_floor;
+    float bias_slope;
 };
 
 /* Publishes the frame's sun. NULL or active==0 stands the whole machinery
  * down; the key uniforms then keep the zero rest they have always had. */
 void hwr_gl_set_sun(const struct hwr_gl_sun *sun);
 /* Replaces the static caster slice (the map's own geometry). Uploaded once
- * and drawn every sun render until replaced; count 0 clears it. Returns 0
- * when no context exists yet, in which case the caller retries next frame. */
+ * and drawn every sun render until replaced; count 0 clears it. The slice
+ * arrives in two runs and the split index says where they meet: the depth
+ * pass draws [0, gobo_first) -- everything that BLOCKS, cut-outs included
+ * -- and the gobo pass draws [gobo_first, count), the translucent range
+ * that FILTERS. A depth caster never writes the gobo: its occlusion is
+ * already whole in the depth map, and the gobo plane has no depth of its
+ * own, so a masked caster writing there would darken its own lit face --
+ * the self-shadow the card law's half-texel push exists to prevent.
+ * Returns 0 when no context exists yet, in which case the caller retries
+ * next frame. */
 int hwr_gl_sun_upload_static(const struct hwr_gl_sun_vertex *vertices,
-                             size_t count);
+                             size_t count, size_t gobo_first);
 /* Hands over this frame's dynamic caster slice (object cards, mesh props).
  * The array must stay valid until the frame's scene render returns; it is
  * streamed into the pass's own buffer there. */
@@ -563,6 +594,10 @@ void hwr_gl_sun_set_dynamic(const struct hwr_gl_sun_vertex *vertices,
  * in [0,1], resolution*resolution). The offline twin compares its own CPU
  * projection against exactly these texels. Returns 0 when no map stands. */
 int hwr_gl_sun_read_depth(float *out, int resolution);
+/* Copies the light-space transmittance plane of the last sun render, the
+ * same shape: 1 where the beam passes whole, the pass weight where a pane
+ * dims it, 0 under opaque paint. Returns 0 when no gobo was rendered. */
+int hwr_gl_sun_read_gobo(float *out, int resolution);
 /* Whether the last scene render laid a sun depth map down at all -- the
  * sealed-map gate reads it: a map with no sky face must never build one. */
 int hwr_gl_sun_map_valid(void);
