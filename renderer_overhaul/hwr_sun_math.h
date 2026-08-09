@@ -252,6 +252,51 @@ static inline float hwr_sunm_bias_eval(float dzdu, float dzdv, float slope,
     return bias < cap ? bias : cap;
 }
 
+/* The receiver's light-space depth gradient, ANALYTIC: from the receiver's
+ * own plane normal and the lookup matrix, never from screen derivatives.
+ *
+ * Screen derivatives are exact only inside one plane's pixels. At every
+ * plane JOINT -- a wall meeting its floor, two walls meeting in a corner, a
+ * wall's silhouette against whatever stands behind it -- the rasterizer's
+ * 2x2 quads straddle two planes and the derivatives mix them, the gradient
+ * blows up, and the bias law's ceiling clamp then hands those exact pixels
+ * the flat-constant slack the law exists to retire: a one-pixel line of sky
+ * along the joint. That line, on the director's own save, was the pillar-top
+ * leak and the floor-seam and corner hairlines beside it. The receiver's
+ * plane is a fact the vertices already carry as their packed normal, so the
+ * gradient is derived from it instead, which is also exactly what the
+ * offline twin computes -- one law, both sides.
+ *
+ * The rows of `lookup` are the linear map's three gradients in world space:
+ * a = d(u)/dP, b = d(v)/dP, c = d(z)/dP. A step t in the receiver's plane
+ * with no v movement is t = n x b (perpendicular to both), and along it
+ * dz/du = (c.t)/(a.t); the same with a for the v axis. Returns 0 -- caller
+ * falls back to the bias ceiling -- where the plane degenerates in the light
+ * plane, which is a receiver the light grazes: its key term is fading to
+ * nothing on the same dot product, so the ceiling there lights nothing. */
+static inline int hwr_sunm_receiver_gradient(const float normal[3],
+                                             const float lookup[16],
+                                             float *gu, float *gv)
+{
+    float ax = lookup[0], ay = lookup[4], az = lookup[8];
+    float bx = lookup[1], by = lookup[5], bz = lookup[9];
+    float cx = lookup[2], cy = lookup[6], cz = lookup[10];
+    float t1x = normal[1] * bz - normal[2] * by;
+    float t1y = normal[2] * bx - normal[0] * bz;
+    float t1z = normal[0] * by - normal[1] * bx;
+    float t2x = normal[1] * az - normal[2] * ay;
+    float t2y = normal[2] * ax - normal[0] * az;
+    float t2z = normal[0] * ay - normal[1] * ax;
+    float au = ax * t1x + ay * t1y + az * t1z;
+    float bv = bx * t2x + by * t2y + bz * t2z;
+
+    if (!(au > 1e-12f || au < -1e-12f) || !(bv > 1e-12f || bv < -1e-12f))
+        return 0;
+    *gu = (cx * t1x + cy * t1y + cz * t1z) / au;
+    *gv = (cx * t2x + cy * t2y + cz * t2z) / bv;
+    return 1;
+}
+
 /* The floor term of that law for a window, in [0,1] depth units: a world
  * unit plus the depth map's own quantum. */
 static inline float hwr_sunm_bias_floor(const struct hwr_sunm_window *window)

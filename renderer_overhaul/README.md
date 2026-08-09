@@ -218,20 +218,22 @@ a file with letters, digits, `-`, `_` and `.` only: the name is what the setting
 selection as, and one carrying a space or a `#` cannot be written down, so it is left out of the
 list and the game says why.
 
-**Editing the chosen file while the game is running is the point of it.** Save it, and about a
-second later what it says is in force — no button, no map change, nothing to select. The game keeps
-an eye on the file it is using and reads it again whenever it changes, and it waits until the file
-has stopped changing before reading it, so catching an editor mid-save cannot leave you with half a
-description. If a save has a mistake in it — a missing brace, a stray comma — nothing is lost:
-whatever was in force stays in force, the game says what is wrong with the file once, and the next
-good save is picked up as usual.
+**Editing the chosen file while the game is running is the point of it.** Save it, then press
+**Reload game config** — the button directly under the Game config picker on the settings screen.
+It reads the chosen file from disk and puts the whole of it back into force where you stand: the
+dials it sets come back into force, and the lights it grants or hangs on the map you are in are restaged
+without waiting for a map change — a light you added appears, one you removed goes out. If a save
+has a mistake in it — a missing brace, a stray comma — nothing is lost: whatever was in force
+stays in force, the game says what is wrong with the file once, and the next good save is read
+when you press the button again. (For mod development there is also a file watcher that picks up
+saves on its own: start the game with `HWR_CFG_WATCH=1`; it is off otherwise.)
 
 **Reload From File** on the settings screen reads the settings again, lists the folder again, and
-reads the chosen description again — so a file dropped into that folder while the game is running
-turns up in the list without a restart. If the settings file names a description that is no longer
-in the folder, nothing else is disturbed: the rest of your settings load exactly as they were, the
-list keeps the name with `(missing)` beside it, every map falls back to the settings alone, and
-putting the file back puts the selection back.
+reads the chosen description again through that same complete road — so a file dropped into that
+folder while the game is running turns up in the list without a restart. If the settings file
+names a description that is no longer in the folder, nothing else is disturbed: the rest of your
+settings load exactly as they were, the list keeps the name with `(missing)` beside it, every map
+falls back to the settings alone, and putting the file back puts the selection back.
 
 ### What is in one
 

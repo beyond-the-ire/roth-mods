@@ -418,13 +418,6 @@ void hwr_settings_defaults(struct hwr_settings *settings);
 void hwr_settings_init_defaults(void);
 const struct hwr_settings *hwr_settings_get(void);
 void hwr_settings_replace(const struct hwr_settings *settings);
-/* How many times the store has been written FROM OUTSIDE: a settings file read
- * whole, or the game config picker set by hand. It counts writes rather than
- * changes, which is the point of it -- a draft moved off a value and back onto
- * it commits nothing, so anything that has to notice somebody went to the
- * settings screen and applied cannot be told by a value that came out where it
- * went in. */
-uint32_t hwr_settings_write_serial(void);
 int hwr_settings_register_apply(hwr_settings_apply_fn apply, void *userdata);
 void hwr_settings_apply_pending(void);
 /* Raises change bits without a value in the store having moved. The look layer

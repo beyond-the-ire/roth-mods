@@ -122,6 +122,7 @@ typedef void (APIENTRY *hwr_gl_depth_func_fn)(GLenum);
 typedef void (APIENTRY *hwr_gl_depth_mask_fn)(GLboolean);
 typedef void (APIENTRY *hwr_gl_blend_func_fn)(GLenum, GLenum);
 typedef void (APIENTRY *hwr_gl_polygon_offset_fn)(GLfloat, GLfloat);
+typedef void (APIENTRY *hwr_gl_polygon_mode_fn)(GLenum, GLenum);
 typedef void (APIENTRY *hwr_gl_copy_tex_sub_image_2d_fn)(GLenum, GLint, GLint,
                                                          GLint, GLint, GLint,
                                                          GLsizei, GLsizei);
@@ -200,6 +201,7 @@ struct hwr_gl_functions {
     hwr_gl_depth_mask_fn depth_mask;
     hwr_gl_blend_func_fn blend_func;
     hwr_gl_polygon_offset_fn polygon_offset;
+    hwr_gl_polygon_mode_fn polygon_mode;
     PFNGLCLEARBUFFERUIVPROC clear_buffer_uiv;
     PFNGLCLEARBUFFERFVPROC clear_buffer_fv;
     PFNGLDRAWBUFFERSPROC draw_buffers;
@@ -879,6 +881,7 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(depth_mask, hwr_gl_depth_mask_fn, "glDepthMask");
     HWR_LOAD_GL(blend_func, hwr_gl_blend_func_fn, "glBlendFunc");
     HWR_LOAD_GL(polygon_offset, hwr_gl_polygon_offset_fn, "glPolygonOffset");
+    HWR_LOAD_GL(polygon_mode, hwr_gl_polygon_mode_fn, "glPolygonMode");
     HWR_LOAD_GL(clear_buffer_uiv, PFNGLCLEARBUFFERUIVPROC, "glClearBufferuiv");
     HWR_LOAD_GL(clear_buffer_fv, PFNGLCLEARBUFFERFVPROC, "glClearBufferfv");
     HWR_LOAD_GL(draw_buffers, PFNGLDRAWBUFFERSPROC, "glDrawBuffers");
@@ -961,6 +964,10 @@ static const char g_geometry_vertex_body[] =
      * which is every class a light never touches and every vertex of the
      * original picture. */
     "flat out vec3 v_normal;\n"
+    /* And the same normal in WORLD space, untouched, for the one law that
+     * runs in world space: the sun lookup. Zero says the vertex carries
+     * none. */
+    "flat out vec3 v_normal_world;\n"
     /* The fold's inverse. Zero counts as positive on both branches, so an
      * axis-aligned direction keeps the fold it was packed on; the language's own
      * sign() answers zero for zero and would lose it. */
@@ -1016,12 +1023,15 @@ static const char g_geometry_vertex_body[] =
      * transpose, so flipping the sideways component is all a reflected view
      * needs. World z is up and the view's third axis points down from the eye,
      * which is the axis the fragment tail rebuilds its position on. */
-    "  if (a_normal.x==0u && a_normal.y==0u) v_normal=vec3(0.0);\n"
-    "  else {\n"
+    "  if (a_normal.x==0u && a_normal.y==0u) {\n"
+    "    v_normal=vec3(0.0);\n"
+    "    v_normal_world=vec3(0.0);\n"
+    "  } else {\n"
     "    vec3 wn=hwr_normal_decode(a_normal);\n"
     "    float rx=s*wn.x+c*wn.y;\n"
     "    if (u_x_flip != 0) rx=-rx;\n"
     "    v_normal=vec3(rx,s*wn.y-c*wn.x,-wn.z);\n"
+    "    v_normal_world=wn;\n"
     "  }\n"
     "#endif\n"
     "}\n";
@@ -1675,6 +1685,7 @@ static const char g_geometry_fragment_body[] =
     "  return clamp(r,0.0,float(min(scale,31)));\n"
     "}\n"
     "flat in vec3 v_normal;\n"
+    "flat in vec3 v_normal_world;\n"
     /* The fragment's position relative to the eye, in world units, in the view's
      * own space -- which is the space every reflected view already lives in, so
      * a term written against it is right in a mirror with no reflection rule.
@@ -1911,6 +1922,29 @@ static const char g_geometry_fragment_body[] =
     "  float carry=clamp(dot(grad,uv-at),-u_sun_bias,u_sun_bias);\n"
     "  return texture(u_sun_shadow,vec3(uv,clamp(ref+carry,0.0,1.0)));\n"
     "}\n"
+    /* A neighbour tap, held to what its column can honestly say about THIS
+     * receiver. A dark answer stands: something in that column blocks the
+     * light above the receiver's depth. A LIT answer is only evidence where
+     * the column's first caster is the receiver's own surface -- the second
+     * compare, one band deeper, separates the two. Where light first lands
+     * far beyond the receiver's band, that column crossed the receiver's
+     * neighbourhood through ground no surface models -- the void past the
+     * map's sealed skin, or solid rock into the next room, whose boundary
+     * walls stand edge-on to the light and rasterize nothing -- and light
+     * cannot arrive through unmodelled rock. Those taps fall back to the
+     * fragment's own column instead of averaging phantom sky in: that
+     * average was the dim hairline of 'outside' light along floor seams,
+     * wall corners and the pillar top on the director's save. A genuine
+     * penumbra keeps both halves: its lit taps read the receiver's own
+     * surface, which lands inside the band. */
+    "float sun_tap(vec2 uv, float ref, vec2 grad, vec2 at, float own,\n"
+    "              float band) {\n"
+    "  float carry=clamp(dot(grad,uv-at),-u_sun_bias,u_sun_bias);\n"
+    "  float r=clamp(ref+carry,0.0,1.0);\n"
+    "  float lit=texture(u_sun_shadow,vec3(uv,r));\n"
+    "  float beyond=texture(u_sun_shadow,vec3(uv,clamp(r+band,0.0,1.0)));\n"
+    "  return lit*mix(1.0,own,beyond);\n"
+    "}\n"
     /* How much of the key light reaches this fragment: the depth compare at
      * the fragment's own world position -- the four-texel blend when the
      * softness dial stands off its rest, ring taps beyond it -- times what
@@ -1920,12 +1954,25 @@ static const char g_geometry_fragment_body[] =
      * the far field.
      *
      * The bias is the fragment's own: its light-space depth gradient, taken
-     * from the derivatives of the projected position, scaled to the half
+     * ANALYTICALLY from the receiver's own plane normal, scaled to the half
      * texel between a fragment and its own texel's centre and floored -- so
      * a wall facing the light carries almost none, which is what keeps the
      * strip under a ceiling dark, while a grazed floor carries exactly what
-     * its own footprint spans. The flat ceiling it is held under is the old
-     * law, and the fallback when the derivatives degenerate. */
+     * its own footprint spans.
+     *
+     * Not from screen derivatives, and that ruling is the whole of the
+     * seam-class fix: dFdx/dFdy are exact only inside one plane's pixels,
+     * and at every plane JOINT the 2x2 quads straddle two planes -- the
+     * mixed gradient blows up, the ceiling clamp hands those exact pixels
+     * the flat-constant slack, and the canvas draws a one-pixel line of sky
+     * along the joint. The floor-seam and corner hairlines and the pillar-top
+     * line on the director's save were exactly those pixels. The analytic
+     * gradient is also precisely what the offline twin computes, so the law
+     * gated is the law run. The derivative path survives only for the
+     * classes that carry no normal -- a standing figure's card -- whose
+     * interiors it is exact for. The flat ceiling is the fallback when
+     * either form degenerates, which for the analytic form is a receiver
+     * the light grazes: its key term dies on the same dot product. */
     "float sun_factor() {\n"
     "  if (u_sun_valid==0) return 1.0;\n"
     "  vec3 p=(u_sun_matrix*vec4(v_world,1.0)).xyz;\n"
@@ -1933,20 +1980,46 @@ static const char g_geometry_fragment_body[] =
     "  float bias=u_sun_bias;\n"
     "  vec2 grad=vec2(0.0);\n"
     "  if (u_sun_bias_slope>0.0) {\n"
-    "    vec3 px=dFdx(p); vec3 py=dFdy(p);\n"
-    "    float det=px.x*py.y-py.x*px.y;\n"
-    "    if (abs(det)>1e-16) {\n"
-    "      float du=(py.y*px.z-px.y*py.z)/det;\n"
-    "      float dv=(px.x*py.z-py.x*px.z)/det;\n"
-    "      grad=vec2(du,dv);\n"
-    "      bias=min((abs(du)+abs(dv))*u_sun_bias_slope+u_sun_bias_floor,\n"
-    "               u_sun_bias);\n"
+    "    bool derived=false;\n"
+    "    vec3 nw=v_normal_world;\n"
+    "    if (nw!=vec3(0.0)) {\n"
+    "      vec3 ga=vec3(u_sun_matrix[0].x,u_sun_matrix[1].x,u_sun_matrix[2].x);\n"
+    "      vec3 gb=vec3(u_sun_matrix[0].y,u_sun_matrix[1].y,u_sun_matrix[2].y);\n"
+    "      vec3 gc=vec3(u_sun_matrix[0].z,u_sun_matrix[1].z,u_sun_matrix[2].z);\n"
+    "      vec3 t1=cross(nw,gb);\n"
+    "      vec3 t2=cross(nw,ga);\n"
+    "      float au=dot(ga,t1);\n"
+    "      float bv=dot(gb,t2);\n"
+    "      if (abs(au)>1e-12 && abs(bv)>1e-12) {\n"
+    "        grad=vec2(dot(gc,t1)/au,dot(gc,t2)/bv);\n"
+    "        bias=min((abs(grad.x)+abs(grad.y))*u_sun_bias_slope+"
+    "u_sun_bias_floor,u_sun_bias);\n"
+    "        derived=true;\n"
+    "      }\n"
+    "    }\n"
+    "    if (!derived && nw==vec3(0.0)) {\n"
+    "      vec3 px=dFdx(p); vec3 py=dFdy(p);\n"
+    "      float det=px.x*py.y-py.x*px.y;\n"
+    "      if (abs(det)>1e-16) {\n"
+    "        float du=(py.y*px.z-px.y*py.z)/det;\n"
+    "        float dv=(px.x*py.z-py.x*px.z)/det;\n"
+    "        grad=vec2(du,dv);\n"
+    "        bias=min((abs(du)+abs(dv))*u_sun_bias_slope+u_sun_bias_floor,\n"
+    "                 u_sun_bias);\n"
+    "      }\n"
     "    }\n"
     "  }\n"
     "  float ref=clamp(p.z-bias,0.0,1.0);\n"
+    /* The fragment's own column, which is also what every neighbour tap
+     * falls back to where its column does not describe this receiver; and
+     * the receiver's own depth band, which is how a tap tells the two
+     * apart: the receiver's rasterized depth stands within the carried
+     * reference plus its own bias margin. */
+    "  float own=texture(u_sun_shadow,vec3(p.xy,ref));\n"
+    "  float band=2.0*bias+u_sun_bias_floor;\n"
     "  float s;\n"
     "  if (u_sun_soft==0 || u_sun_texel<=0.0) {\n"
-    "    s=texture(u_sun_shadow,vec3(p.xy,ref));\n"
+    "    s=own;\n"
     "  } else {\n"
     /* The barely-soft blend, by hand: the four nearest texels each compared
      * against the reference carried onto them, mixed by the fragment's own
@@ -1956,10 +2029,10 @@ static const char g_geometry_fragment_body[] =
     "    vec2 t=p.xy/u_sun_texel-0.5;\n"
     "    vec2 f=fract(t);\n"
     "    vec2 base=(t-f+0.5)*u_sun_texel;\n"
-    "    float s00=sun_compare(base,ref,grad,p.xy);\n"
-    "    float s10=sun_compare(base+vec2(u_sun_texel,0.0),ref,grad,p.xy);\n"
-    "    float s01=sun_compare(base+vec2(0.0,u_sun_texel),ref,grad,p.xy);\n"
-    "    float s11=sun_compare(base+vec2(u_sun_texel),ref,grad,p.xy);\n"
+    "    float s00=sun_tap(base,ref,grad,p.xy,own,band);\n"
+    "    float s10=sun_tap(base+vec2(u_sun_texel,0.0),ref,grad,p.xy,own,band);\n"
+    "    float s01=sun_tap(base+vec2(0.0,u_sun_texel),ref,grad,p.xy,own,band);\n"
+    "    float s11=sun_tap(base+vec2(u_sun_texel),ref,grad,p.xy,own,band);\n"
     "    s=mix(mix(s00,s10,f.x),mix(s01,s11,f.x),f.y);\n"
     "  }\n"
     "  if (u_sun_taps>0) {\n"
@@ -1967,7 +2040,7 @@ static const char g_geometry_fragment_body[] =
     "      vec2(0.7071,-0.7071),vec2(-0.7071,-0.7071),vec2(1.0,0.0),\n"
     "      vec2(-1.0,0.0),vec2(0.0,1.0),vec2(0.0,-1.0));\n"
     "    for (int i=0;i<u_sun_taps;i++)\n"
-    "      s+=sun_compare(p.xy+ring[i]*u_sun_radius,ref,grad,p.xy);\n"
+    "      s+=sun_tap(p.xy+ring[i]*u_sun_radius,ref,grad,p.xy,own,band);\n"
     "    s/=float(u_sun_taps+1);\n"
     "  }\n"
     "  if (u_sun_gobo_valid!=0) s*=texture(u_sun_gobo,p.xy).r;\n"
@@ -3589,6 +3662,35 @@ static void hwr_sun_render_map(void)
     if (dynamic_count != 0) {
         g_gl.bind_vertex_array(g_sun_dynamic_vao);
         g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)dynamic_count);
+    }
+    /* CONSERVATIVE EDGE COVERAGE: the same slice once more with the
+     * triangles drawn as lines. A polygon's rasterized footprint holds only
+     * the texels whose CENTRES it covers, so at every caster's edge the
+     * final sub-texel band of light columns crosses the caster in geometry
+     * yet finds no sample of it in the map -- and where that edge meets the
+     * surface it shades (a ceiling's rim on the wall below it), that band
+     * came back as a texel-tall line of sky along the joint: the pillar-top
+     * line on the director's save, at every quality tier. Line rasterization
+     * covers every texel the edge passes through, so the boundary texels
+     * take the caster's own edge depth and the column answers for the
+     * caster it crosses. Sun-side faces keep their light through the same
+     * arithmetic that already covers a joint's zero separation: their own
+     * depth stands within the receiver bias of the edge's. The cutout law
+     * is untouched -- the fragment program discards the same masked texels
+     * in either polygon mode. */
+    if (g_gl.polygon_mode != NULL) {
+        g_gl.polygon_mode(GL_FRONT_AND_BACK, GL_LINE);
+        g_gl.enable(GL_POLYGON_OFFSET_LINE);
+        if (g_sun_static_count != 0) {
+            g_gl.bind_vertex_array(g_sun_static_vao);
+            g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)g_sun_static_count);
+        }
+        if (dynamic_count != 0) {
+            g_gl.bind_vertex_array(g_sun_dynamic_vao);
+            g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)dynamic_count);
+        }
+        g_gl.disable(GL_POLYGON_OFFSET_LINE);
+        g_gl.polygon_mode(GL_FRONT_AND_BACK, GL_FILL);
     }
     /* The gobo pass: clear the plane to "everything passes", then multiply
      * in the TRANSLUCENT range with the depth test held LESS against the

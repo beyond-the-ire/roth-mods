@@ -300,11 +300,6 @@ static uint64_t g_look_asked_hash;
  * A request that came from anywhere else carries no expectation. */
 static int g_look_reload_expects_hash;
 static uint64_t g_look_reload_hash;
-/* Which write of the settings store the layer has already answered for, kept
- * beside the selection itself: a draft moved off the chosen file and back onto
- * it NETS to no change in the row, and somebody who did that after editing the
- * file is asking for what is on disk now. */
-static uint32_t g_look_followed_serial;
 
 /* The picker's own members: what the folder was found to hold, in the shape
  * the settings table takes an enumeration in. The token is the file's name
@@ -2172,7 +2167,6 @@ static void hwr_look_take_selection(int report, const uint64_t *expect)
     int read;
 
     g_look_followed = hwr_settings_get()->game_config;
-    g_look_followed_serial = hwr_settings_write_serial();
     if (token[0] == 0) {
         g_look_path[0] = 0;
         hwr_look_stand_down(report);
@@ -2217,6 +2211,21 @@ static void hwr_look_take_selection(int report, const uint64_t *expect)
     if (report)
         hwr_look_say_what_was_read(&g_look);
     hwr_look_select_map(g_look_map[0] != 0 ? g_look_map : NULL);
+    /* THE COMPLETE REAPPLY. A reload is a person asking for what the file
+     * says NOW, and half of what it says about a map was worked out against
+     * the world when the map was staged: which room each free-standing
+     * light hangs in, which faces carry a granted texture. Re-composing the
+     * tables without re-staging that state left the world missing lights
+     * the file grants until the next map load. So every reload path --
+     * the selection moved, Reload From File, the reload button, the dev
+     * watcher -- ends here, and here the map-scoped light state is marked
+     * stale unconditionally: the lights layer re-stages it at the next
+     * frame, against the world as it stands. One walk of the map per
+     * button press is what it costs. */
+    if (++g_glow_generation == 0u)
+        g_glow_generation = 1u;
+    if (++g_placed_generation == 0u)
+        g_placed_generation = 1u;
 }
 
 void hwr_look_load(const char *plugin_dir)
@@ -2230,36 +2239,19 @@ void hwr_look_load(const char *plugin_dir)
 
 void hwr_look_follow_selection(void)
 {
-    uint32_t serial = hwr_settings_write_serial();
-    int moved = hwr_settings_get()->game_config != g_look_followed;
-
-    /* Two comparisons per pump, and deliberately not an apply hook: the look's
-     * overrides have to be in force BEFORE the hooks that consume them run, and
-     * publishing from inside one would invert that order. */
-    if (!moved && serial == g_look_followed_serial)
+    if (hwr_settings_get()->game_config == g_look_followed)
         return;
-    g_look_followed = hwr_settings_get()->game_config;
-    g_look_followed_serial = serial;
-    if (moved) {
-        g_look_reload_pending = 1;
-        return;
-    }
-    /* THE SAME NAME, SAID AGAIN. Somebody has written the settings store --
-     * applied, or reloaded it from its own file -- and the row came out where
-     * it went in, which is exactly what a draft moved off the chosen file and
-     * back onto it does. That is not "nothing happened": a person who edited
-     * the file and then reached for the picker is asking for what is on disk
-     * NOW, and the model in memory is what was read the last time.
+    /* One comparison per pump, and deliberately not an apply hook: the look's
+     * overrides have to be in force BEFORE the hooks that consume them run,
+     * and publishing from inside one would invert that order.
      *
-     * So it is read again, unconditionally. A timestamp would answer this
-     * cheaper and would answer it WRONG: a filesystem that keeps whole seconds
-     * cannot tell two saves inside one apart, and a file whose new text is the
-     * same length as its old one is the ordinary case rather than a corner of
-     * it -- one digit changed. What this costs is one read of a file of a few
-     * kilobytes, once, when somebody presses a button; what the cheaper answer
-     * costs is an edit that silently does nothing. */
-    if (g_look_path[0] != 0)
-        g_look_reload_pending = 1;
+     * ONLY the picker moving asks for a read. A settings Apply that leaves
+     * the row where it was is not a request to re-read the game config --
+     * re-reading on every write of the store was asked for once and refused:
+     * a person who edited the file mid-map presses the reload button beside
+     * the picker, and that button is the whole of the contract. */
+    g_look_followed = hwr_settings_get()->game_config;
+    g_look_reload_pending = 1;
 }
 
 void hwr_look_request_reload(void)
@@ -2270,11 +2262,12 @@ void hwr_look_request_reload(void)
     g_look_reload_expects_hash = 0;
 }
 
-/* THE FILE WATCHER, which is not a development convenience and does not ask to
- * be switched on: the game config file is a file people EDIT while the game is
- * running, and an edit that needs a button pressed before it counts is an edit
- * that gets made twice. Saving the chosen file puts it in force within about a
- * second, on the same terms Reload From File already had.
+/* THE FILE WATCHER, a development convenience behind HWR_CFG_WATCH=1 and off
+ * otherwise -- the director's ruling, said plainly: the shipped build must
+ * not poll the disk and re-read the file on its own. A person who edited the
+ * chosen file presses the reload button beside the picker, or Reload From
+ * File; with the switch set, saving the file is picked up within about a
+ * second, on the same terms those buttons have.
  *
  * Every thirty frames, and never oftener: a read of a file this size is
  * nothing, but a read per frame would be sixty of them a second for as long as
@@ -2285,11 +2278,17 @@ void hwr_look_request_reload(void)
  * different file for a few milliseconds -- is never what gets loaded. */
 void hwr_look_poll(void)
 {
+    static int watch = -1;
     struct hwr_look_file *probe;
     uint64_t hash = 0;
     int read;
 
-    if (g_look_path[0] == 0)
+    if (watch < 0) {
+        const char *setting = getenv("HWR_CFG_WATCH");
+
+        watch = setting != NULL && setting[0] != '0' && setting[0] != 0 ? 1 : 0;
+    }
+    if (!watch || g_look_path[0] == 0)
         return;
     if (g_look_frames_until_poll != 0) {
         g_look_frames_until_poll--;
@@ -2357,8 +2356,17 @@ void hwr_look_select_map(const char *map_name)
     struct hwr_look_objects next_objects;
     struct hwr_look_faces next_faces;
     struct hwr_look_placed next_placed;
+    char reduced[HWR_LOOK_NAME];
 
-    hwr_look_map_name(g_look_map, HWR_LOOK_NAME, map_name);
+    /* Reduced into a buffer of its own FIRST: the reload path passes the
+     * held name back in as `map_name`, and the reducer writes its output's
+     * first byte before it reads its input -- reducing straight into
+     * g_look_map truncated the held name to nothing, the compose below then
+     * found no map, and one mid-map re-read silently dropped the whole map
+     * scope: every placed light, every grant and every per-map dial a person
+     * had written. That was the wipe. */
+    hwr_look_map_name(reduced, HWR_LOOK_NAME, map_name);
+    memcpy(g_look_map, reduced, HWR_LOOK_NAME);
     hwr_look_compose(&g_look, g_look_map, &next, &next_sprites, &next_textures,
                      &next_objects, &next_faces, &next_placed);
     hwr_look_publish(&next, &next_sprites, &next_textures, &next_objects,
@@ -2757,5 +2765,4 @@ void hwr_look_clear(void)
     hwr_look_slots_reset();
     hwr_settings_set_game_config(0);
     g_look_followed = 0;
-    g_look_followed_serial = hwr_settings_write_serial();
 }

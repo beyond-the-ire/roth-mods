@@ -75,8 +75,21 @@ enum {
     HWR_W_RESOLUTION,
     HWR_W_KEY,
     HWR_W_COLOR,
-    HWR_W_INFO
+    HWR_W_INFO,
+    /* A row that IS a button: no value, no store field, one press. The one
+     * of these the panel has sits directly under the Game config picker and
+     * re-reads the chosen file from disk, reapplying everything it says --
+     * the dials AND this map's lights. */
+    HWR_W_ACTION
 };
+
+/* The action row's own words, named once so the row and its help cannot
+ * drift. */
+static const char *const HWR_ROW_RELOAD_LABEL = "Reload game config";
+static const char *const HWR_ROW_RELOAD_HELP =
+    "Reads the chosen game config from disk and reapplies everything it "
+    "says: the dials it sets, and the lights it grants or hangs on the map "
+    "you are in, without waiting for a map change.";
 
 enum {
     HWR_EDIT_NONE = 0,
@@ -470,7 +483,8 @@ static int hwr_overlay_widget_of(const struct hwr_setting_desc *desc)
  * colour has neither, so it is typed rather than stepped. */
 static int hwr_overlay_widget_steps(int widget)
 {
-    return widget != HWR_W_COLOR && widget != HWR_W_INFO;
+    return widget != HWR_W_COLOR && widget != HWR_W_INFO &&
+           widget != HWR_W_ACTION;
 }
 
 /* A row whose parent is off in the draft is shown and never taken: a dependency
@@ -536,12 +550,25 @@ static void hwr_overlay_build_rows(void)
         row->widget = hwr_overlay_widget_of(desc);
         row->selectable = row->widget != HWR_W_INFO &&
                           hwr_overlay_row_enabled(desc);
+        /* The reload button, WITH the picker rather than in the bottom
+         * action row: what it acts on is the row above it, and a button
+         * about the game config that lived among Apply and Cancel would
+         * read as being about the settings file. It is a row of its own
+         * directly under the picker, the one place the eye already is. */
+        if (desc->key != NULL && strcmp(desc->key, "game_config") == 0 &&
+            g_row_count < HWR_OVERLAY_MAX_ROWS) {
+            row = &g_rows[g_row_count++];
+            row->index = -1;
+            row->partner = -1;
+            row->widget = HWR_W_ACTION;
+            row->selectable = 1;
+        }
     }
 }
 
 static const struct hwr_setting_desc *hwr_overlay_row_desc(int row)
 {
-    if (row < 0 || row >= g_row_count)
+    if (row < 0 || row >= g_row_count || g_rows[row].index < 0)
         return NULL;
     return hwr_schema_at((size_t)g_rows[row].index);
 }
@@ -955,12 +982,27 @@ static void hwr_overlay_step_resolution(const struct hwr_setting_desc *width_des
     }
 }
 
+/* The button pressed: the chosen game config read again from disk and
+ * reapplied whole at the next safe point -- the same complete road a
+ * selection change and Reload From File take, so the four ways of asking
+ * cannot come apart. */
+static void hwr_overlay_reload_game_config(void)
+{
+    hwr_look_request_reload();
+    hwr_overlay_status("Reading the game config from disk.", 0);
+}
+
 static void hwr_overlay_adjust(int row, int direction, int page, int extreme)
 {
     const struct hwr_setting_desc *desc = hwr_overlay_row_desc(row);
     const struct hwr_setting_desc *partner = hwr_overlay_row_partner(row);
     union hwr_value value;
 
+    if (row >= 0 && row < g_row_count && g_rows[row].widget == HWR_W_ACTION &&
+        g_rows[row].selectable) {
+        hwr_overlay_reload_game_config();
+        return;
+    }
     if (desc == NULL || !g_rows[row].selectable)
         return;
     switch (g_rows[row].widget) {
@@ -1534,6 +1576,24 @@ static void hwr_overlay_draw_row(const struct roth_api_v1 *api,
     uint8_t label_color = colors->text;
     uint8_t value_color = colors->gold_hi;
 
+    if (g_rows[row].widget == HWR_W_ACTION) {
+        /* The button: drawn in the value colour and indented under the row
+         * it belongs to, in brackets so it reads as a thing to press rather
+         * than a thing to set. */
+        hwr_overlay_draw_fill(canvas, layout->cx0, y, layout->content_x1,
+                              y + layout->row_h,
+                              hovered ? colors->gold_lo : colors->panel);
+        if (focused)
+            hwr_overlay_draw_border(canvas, layout->cx0, y,
+                                    layout->content_x1, y + layout->row_h,
+                                    colors->gold_hi);
+        snprintf(label, sizeof label, "    [ %s ]", HWR_ROW_RELOAD_LABEL);
+        hwr_overlay_draw_text(api, canvas, layout->cx0 + 3u,
+                              y + layout->scale,
+                              layout->content_x1 - layout->cx0 - 8u,
+                              colors->gold_hi, label);
+        return;
+    }
     if (desc == NULL)
         return;
     hwr_overlay_draw_fill(canvas, layout->cx0, y, layout->content_x1,
@@ -1737,6 +1797,10 @@ static void hwr_overlay_render(const struct roth_api_v1 *api,
         const struct hwr_setting_desc *desc =
             g_zone == HWR_ZONE_ROWS ? hwr_overlay_row_desc(g_focus) : NULL;
         const char *help = desc != NULL && desc->help != NULL ? desc->help : "";
+
+        if (g_zone == HWR_ZONE_ROWS && g_focus >= 0 && g_focus < g_row_count &&
+            g_rows[g_focus].widget == HWR_W_ACTION)
+            help = HWR_ROW_RELOAD_HELP;
         uint32_t width = layout->cx1 - layout->cx0 - 8u;
         int line;
 
@@ -1896,6 +1960,9 @@ static void hwr_overlay_move_focus(const struct hwr_overlay_layout *layout,
 static void hwr_overlay_activate(int row)
 {
     switch (g_rows[row].widget) {
+    case HWR_W_ACTION:
+        hwr_overlay_reload_game_config();
+        return;
     case HWR_W_TOGGLE:
         hwr_overlay_adjust(row, 1, 0, 0);
         return;

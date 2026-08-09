@@ -20,13 +20,6 @@ static struct hwr_settings g_settings;
 static struct hwr_apply_hook g_hooks[HWR_MAX_APPLY_HOOKS];
 static uint32_t g_hook_count;
 static uint32_t g_dirty;
-/* How many times the store has been written FROM OUTSIDE: a settings file read
- * whole, or the game config picker set by hand. It counts the writing rather
- * than the changing, which is the whole point of it -- a draft moved off a
- * value and back onto it commits nothing, and something that has to notice that
- * a person went to the settings screen and applied cannot be told by a value
- * that came out where it went in. */
-static uint32_t g_write_serial;
 
 void hwr_settings_defaults(struct hwr_settings *settings)
 {
@@ -91,11 +84,6 @@ static void hwr_settings_commit_key(const char *key, union hwr_value value)
     hwr_settings_commit(hwr_schema_find(key), value);
 }
 
-uint32_t hwr_settings_write_serial(void)
-{
-    return g_write_serial;
-}
-
 void hwr_settings_replace(const struct hwr_settings *settings)
 {
     size_t count = hwr_schema_count();
@@ -103,7 +91,6 @@ void hwr_settings_replace(const struct hwr_settings *settings)
 
     if (settings == NULL)
         return;
-    g_write_serial++;
     for (i = 0; i < count; i++) {
         const struct hwr_setting_desc *desc = hwr_schema_at(i);
         /* An alias is a second spelling of another row's field, so committing
@@ -240,7 +227,6 @@ void hwr_settings_set_game_config(int32_t slot)
 
     memset(&value, 0, sizeof value);
     value.e = slot;
-    g_write_serial++;
     hwr_settings_commit_key("game_config", value);
 }
 
