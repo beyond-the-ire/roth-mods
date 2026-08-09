@@ -237,6 +237,19 @@ unsigned long hwr_sun_static_builds(void)
     return g_static_builds;
 }
 
+unsigned long hwr_sun_static_dims(void)
+{
+    unsigned long count = 0;
+    size_t i;
+
+    for (i = 0; i < g_static_count; i++) {
+        if (g_static[i].flags == (uint8_t)HWR_GL_SUN_TRANSLUCENT &&
+            g_static[i].width == 0)
+            count++;
+    }
+    return count;
+}
+
 /* ------------------------------------------------------ change tracking */
 
 static uint32_t hwr_sun_mix(uint32_t hash, const void *bytes, size_t size)
@@ -344,9 +357,13 @@ static struct hwr_gl_sun_vertex *hwr_sun_grow(struct hwr_gl_sun_vertex **list,
  * Returns 0 to skip it, 1 to cast solid, 2 to cast with the masked-texel
  * cut-out, 3 to filter rather than cast -- the translucent range, drawn by
  * the gobo pass alone, where its texels multiply the pass weight into the
- * beam instead of walling it out. The exclusions are the design's own: sky
- * caps are screen-space synthetics; the open-sky ceiling family (flat id 0
- * or 1) is the sky being open by the map's own statement. */
+ * beam instead of walling it out -- and 4 to filter WHOLE: the
+ * palette-colour solid-blend wall part, which blends every pixel it covers
+ * in the eye's picture and so dims the whole beam by the same fitted
+ * weight, with no texels to consult and no depth to own. The exclusions
+ * are the design's own: sky caps are screen-space synthetics; the open-sky
+ * ceiling family (flat id 0 or 1) is the sky being open by the map's own
+ * statement. */
 static int hwr_sun_classify(const struct hwr_scene *scene,
                             const struct hwr_world *world,
                             const struct hwr_mesh_surface *surface)
@@ -375,11 +392,14 @@ static int hwr_sun_classify(const struct hwr_scene *scene,
     }
     if ((surface->flags & HWR_SURFACE_DIRECT) != 0) {
         /* A palette-colour wall part on the solid-colour BLEND writer is
-         * see-through; every other direct surface is paint on solid rock. */
+         * pixel-blending translucency: it joins the glass class in the
+         * gobo and dims the beam by the fitted weight -- it neither walls
+         * the light out nor passes it whole. Every other direct surface is
+         * paint on solid rock. */
         if ((surface->flags & HWR_SURFACE_FLAT) == 0 &&
             surface->kind != HWR_SURFACE_DOOR &&
             (surface->mapping_flags & 0x03u) == 0x03u)
-            return 0;
+            return 4;
         return 1;
     }
     if ((qflags & 0x400u) != 0) {
@@ -415,7 +435,13 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
     uint8_t flags = 0;
     size_t i;
 
-    if (cutout >= 2) {
+    if (cutout == 4) {
+        /* The palette-colour solid-blend part: translucent with no texels
+         * at all -- the caster program then dims its whole footprint by
+         * the fitted weight in the gobo pass and owns nothing in the depth
+         * pass. */
+        flags = (uint8_t)HWR_GL_SUN_TRANSLUCENT;
+    } else if (cutout >= 2) {
         int16_t id = surface->texture_id;
 
         offset = scene->textures[id].offset;
@@ -435,12 +461,42 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
                        surface->vertex_count);
     if (out == NULL)
         return -1;
+    /* The surface's own plane, packed for the line pass: the first
+     * non-degenerate triangle of the emitted fan. Orientation is
+     * irrelevant -- a plane's depth field has no sign. */
+    {
+        uint8_t nx = 0;
+        uint8_t ny = 0;
+
+        for (i = 0; i + 2u < surface->vertex_count; i++) {
+            double ux = (double)vertices[i + 1].x - vertices[0].x;
+            double uy = (double)vertices[i + 1].y - vertices[0].y;
+            double uz = (double)vertices[i + 1].z - vertices[0].z;
+            double wx = (double)vertices[i + 2].x - vertices[0].x;
+            double wy = (double)vertices[i + 2].y - vertices[0].y;
+            double wz = (double)vertices[i + 2].z - vertices[0].z;
+            double cx = uy * wz - uz * wy;
+            double cy = uz * wx - ux * wz;
+            double cz = ux * wy - uy * wx;
+            double len = sqrt(cx * cx + cy * cy + cz * cz);
+
+            if (len > 1e-6) {
+                hwr_normal_encode((float)(cx / len), (float)(cy / len),
+                                  (float)(cz / len), &nx, &ny);
+                break;
+            }
+        }
+        for (i = 0; i < surface->vertex_count; i++) {
+            out[i].normal_x = nx;
+            out[i].normal_y = ny;
+        }
+    }
     for (i = 0; i < surface->vertex_count; i++) {
         const struct hwr_mesh_vertex *source = &vertices[i];
         float u = 0.0f;
         float v = 0.0f;
 
-        if (flags != 0) {
+        if (flags != 0 && cutout != 4) {
             if (surface->kind == HWR_SURFACE_DOOR) {
                 /* Door leaves carry direct 0..1 coordinates; the eye emit
                  * scales them by the texture just under its edge. */
@@ -486,7 +542,6 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
         out[i].height = height;
         out[i].flags = flags;
         out[i].pad0 = 0;
-        out[i].pad1 = 0;
     }
     return 0;
 }
@@ -495,10 +550,11 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
  * slab and door, visibility-gated by nothing -- classified and converted.
  * The roof above a window is exactly the point: the eye's drawn set rarely
  * holds it, and shadows must not depend on where the eye walked. The slice
- * lands in three runs -- solid, masked, translucent -- and the split the GL
+ * lands in three runs -- solid, masked, translucent (the textured panes
+ * and the texel-less solid-blend dims together) -- and the split the GL
  * passes read is the last: the depth pass draws the whole slice (the
- * translucent range keeping depth only at its opaque paint), the gobo pass
- * the translucent range alone. */
+ * translucent range keeping depth only at its opaque paint, the dims
+ * keeping none), the gobo pass the translucent range alone. */
 static int hwr_sun_build_static(const struct hwr_scene *scene,
                                 const struct hwr_world *world)
 {
@@ -516,7 +572,9 @@ static int hwr_sun_build_static(const struct hwr_scene *scene,
             const struct hwr_mesh_surface *surface = &g_mesh.surfaces[i];
             int class = hwr_sun_classify(scene, world, surface);
 
-            if (class != class_pass)
+            /* Class 4 -- the solid-blend dim -- lives in the translucent
+             * run: gobo pass only, no depth. */
+            if (class != class_pass && !(class_pass == 3 && class == 4))
                 continue;
             if (hwr_sun_emit_surface(scene, surface,
                                      g_mesh.vertices + surface->first_vertex,
@@ -641,28 +699,54 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
                            triangles * 3u);
         if (out == NULL)
             return -1;
-        for (t = 0; t < triangles; t++) {
-            size_t corners[3];
-            size_t k;
+        {
+            /* The face's plane for the line pass, from its placed corners. */
+            uint8_t nx = 0;
+            uint8_t ny = 0;
+            size_t c;
 
-            corners[0] = 0;
-            corners[1] = t + 1u;
-            corners[2] = t + 2u;
-            for (k = 0; k < 3u; k++) {
-                struct hwr_gl_sun_vertex *vertex = &out[t * 3u + k];
-                size_t corner = corners[k];
+            for (c = 0; c + 2u < corner_count; c++) {
+                double ux = (double)corner_x[c + 1] - corner_x[0];
+                double uy = (double)corner_y[c + 1] - corner_y[0];
+                double uz = (double)corner_z[c + 1] - corner_z[0];
+                double wx = (double)corner_x[c + 2] - corner_x[0];
+                double wy = (double)corner_y[c + 2] - corner_y[0];
+                double wz = (double)corner_z[c + 2] - corner_z[0];
+                double cx = uy * wz - uz * wy;
+                double cy = uz * wx - ux * wz;
+                double cz = ux * wy - uy * wx;
+                double len = sqrt(cx * cx + cy * cy + cz * cz);
 
-                vertex->x = corner_x[corner];
-                vertex->y = corner_y[corner];
-                vertex->z = corner_z[corner];
-                vertex->u = flags != 0 ? corner_s[corner] : 0.0f;
-                vertex->v = flags != 0 ? corner_t[corner] : 0.0f;
-                vertex->offset = offset;
-                vertex->width = flags != 0 ? width : 0;
-                vertex->height = flags != 0 ? height : 0;
-                vertex->flags = flags;
-                vertex->pad0 = 0;
-                vertex->pad1 = 0;
+                if (len > 1e-6) {
+                    hwr_normal_encode((float)(cx / len), (float)(cy / len),
+                                      (float)(cz / len), &nx, &ny);
+                    break;
+                }
+            }
+            for (t = 0; t < triangles; t++) {
+                size_t corners[3];
+                size_t k;
+
+                corners[0] = 0;
+                corners[1] = t + 1u;
+                corners[2] = t + 2u;
+                for (k = 0; k < 3u; k++) {
+                    struct hwr_gl_sun_vertex *vertex = &out[t * 3u + k];
+                    size_t corner = corners[k];
+
+                    vertex->x = corner_x[corner];
+                    vertex->y = corner_y[corner];
+                    vertex->z = corner_z[corner];
+                    vertex->u = flags != 0 ? corner_s[corner] : 0.0f;
+                    vertex->v = flags != 0 ? corner_t[corner] : 0.0f;
+                    vertex->offset = offset;
+                    vertex->width = flags != 0 ? width : 0;
+                    vertex->height = flags != 0 ? height : 0;
+                    vertex->flags = flags;
+                    vertex->normal_x = nx;
+                    vertex->normal_y = ny;
+                    vertex->pad0 = 0;
+                }
             }
         }
     }
@@ -1013,7 +1097,7 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
                 "[renderer_overhaul] sun: dir=(%.4f %.4f %.4f) "
                 "yaw=%.1f elev=%.1f window a=%.0f b=%.0f d=%.0f span=%.0f "
                 "texel=%.2f res=%d casters static=%lu dynamic=%lu "
-                "sky-faces=%lu\n",
+                "sky-faces=%lu cam=(%.0f %.0f %d) cam_yaw=%d/%d\n",
                 (double)g_dir[0], (double)g_dir[1], (double)g_dir[2],
                 (double)g_rows.yaw_deg, (double)g_rows.elevation_deg,
                 (double)g_window.center_a, (double)g_window.center_b,
@@ -1021,6 +1105,8 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
                 (double)g_window.texel, resolution,
                 (unsigned long)g_static_count,
                 (unsigned long)g_dynamic_count,
-                (unsigned long)g_sky_faces);
+                (unsigned long)g_sky_faces, (double)cam_x, (double)cam_y,
+                (int)camera->eye_z, (int)camera->yaw_sin,
+                (int)camera->yaw_cos);
     }
 }

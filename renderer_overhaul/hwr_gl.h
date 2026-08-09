@@ -493,8 +493,16 @@ struct hwr_gl_sun_vertex {
     uint16_t width;
     uint16_t height;
     uint8_t flags;
+    /* The caster's own plane normal, packed as every receiver normal is
+     * (hwr_normal_encode). The conservative line pass reads it to write
+     * each edge texel the caster's PLANE depth at that texel's centre --
+     * the same value the fill rasterizer writes at covered texels -- so an
+     * edge texel never stands shallower than the plane the carried lookup
+     * references expect. Zero on both bytes says no plane is carried and
+     * the line keeps its own interpolated depth. */
+    uint8_t normal_x;
+    uint8_t normal_y;
     uint8_t pad0;
-    uint16_t pad1;
 };
 
 _Static_assert(sizeof(struct hwr_gl_sun_vertex) == 32,
@@ -514,7 +522,9 @@ enum hwr_gl_sun_vertex_flags {
      * surface is a hole (full light), a blend-range texel (high bit set)
      * filters the beam by the fitted pass weight through the gobo plane,
      * and every other texel is opaque paint: it writes depth and blocks the
-     * beam whole, exactly as a masked caster's paint does. */
+     * beam whole, exactly as a masked caster's paint does. Carried WITHOUT
+     * a texture (width 0), it is the palette-colour solid-blend part: the
+     * whole footprint filters by the fitted weight and owns no depth. */
     HWR_GL_SUN_TRANSLUCENT = 1u << 2
 };
 

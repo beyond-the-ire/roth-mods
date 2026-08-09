@@ -69,6 +69,9 @@
 #ifndef GL_DEPTH_COMPONENT16
 #define GL_DEPTH_COMPONENT16 0x81a5
 #endif
+#ifndef GL_DEPTH_COMPONENT24
+#define GL_DEPTH_COMPONENT24 0x81a6
+#endif
 #ifndef GL_DEPTH_CLAMP
 #define GL_DEPTH_CLAMP 0x864f
 #endif
@@ -309,6 +312,7 @@ static int g_blend_bytes_valid;
  * pass's own buffer at the render and never read after it. */
 static struct hwr_gl_sun g_sun;
 static GLuint g_sun_program;
+static GLuint g_sun_line_program;
 static GLuint g_sun_fbo;
 static GLuint g_sun_depth_texture;
 /* The transmittance plane beside it -- the gobo -- allocated only on the
@@ -1907,42 +1911,27 @@ static const char g_geometry_fragment_body[] =
      * this plane holds the whole beam over it. */
     "uniform sampler2D u_sun_gobo;\n"
     "uniform int u_sun_gobo_valid;\n"
-    /* One depth compare, at a texel that may stand a little way from the
-     * fragment: the reference is carried onto that texel along the
-     * fragment's own light-space depth gradient -- the receiver's plane,
-     * extrapolated -- so a compare against a neighbouring texel asks about
-     * the receiver where that texel is, not where the fragment is. This is
-     * what lets the soft filter and the ring read neighbours without the
-     * bias having to grow by every texel of reach they have: bias slack is
-     * a strip of light wherever a caster meets the surface it shades, and
-     * the extrapolation spends geometry instead of slack. The carry is
-     * clamped by the bias ceiling, so a degenerate gradient cannot carry
-     * the reference somewhere dishonest. */
-    "float sun_compare(vec2 uv, float ref, vec2 grad, vec2 at) {\n"
-    "  float carry=clamp(dot(grad,uv-at),-u_sun_bias,u_sun_bias);\n"
-    "  return texture(u_sun_shadow,vec3(uv,clamp(ref+carry,0.0,1.0)));\n"
-    "}\n"
     /* A neighbour tap, held to what its column can honestly say about THIS
-     * receiver. A dark answer stands: something in that column blocks the
-     * light above the receiver's depth. A LIT answer is only evidence where
-     * the column's first caster is the receiver's own surface -- the second
-     * compare, one band deeper, separates the two. Where light first lands
-     * far beyond the receiver's band, that column crossed the receiver's
-     * neighbourhood through ground no surface models -- the void past the
-     * map's sealed skin, or solid rock into the next room, whose boundary
-     * walls stand edge-on to the light and rasterize nothing -- and light
-     * cannot arrive through unmodelled rock. Those taps fall back to the
-     * fragment's own column instead of averaging phantom sky in: that
-     * average was the dim hairline of 'outside' light along floor seams,
-     * wall corners and the pillar top on the director's save. A genuine
-     * penumbra keeps both halves: its lit taps read the receiver's own
-     * surface, which lands inside the band. */
+     * receiver. The position snaps to its texel's centre first, so the
+     * carried reference and the stored texel describe the same point. A
+     * dark answer stands: something in that column blocks the light above
+     * the receiver's depth. A LIT answer is evidence only under the band
+     * rule of the sampling law (hwr_sun_math.h): the column's first caster
+     * must be the receiver's own surface -- the compare one band deeper
+     * separates that from a column that crossed into ground no surface
+     * models (the void past the map's skin, solid rock into the next
+     * room), whose average was the dim hairline of 'outside' light along
+     * the seams of the director's save. A refused tap falls back to the
+     * fragment's own carried compare; a genuine penumbra keeps both
+     * halves, its lit taps reading the receiver's own surface inside the
+     * band. */
     "float sun_tap(vec2 uv, float ref, vec2 grad, vec2 at, float own,\n"
     "              float band) {\n"
-    "  float carry=clamp(dot(grad,uv-at),-u_sun_bias,u_sun_bias);\n"
+    "  vec2 c=u_sun_texel>0.0?(floor(uv/u_sun_texel)+0.5)*u_sun_texel:uv;\n"
+    "  float carry=clamp(dot(grad,c-at),-u_sun_bias,u_sun_bias);\n"
     "  float r=clamp(ref+carry,0.0,1.0);\n"
-    "  float lit=texture(u_sun_shadow,vec3(uv,r));\n"
-    "  float beyond=texture(u_sun_shadow,vec3(uv,clamp(r+band,0.0,1.0)));\n"
+    "  float lit=texture(u_sun_shadow,vec3(c,r));\n"
+    "  float beyond=texture(u_sun_shadow,vec3(c,clamp(r+band,0.0,1.0)));\n"
     "  return lit*mix(1.0,own,beyond);\n"
     "}\n"
     /* How much of the key light reaches this fragment: the depth compare at
@@ -1953,34 +1942,24 @@ static const char g_geometry_fragment_body[] =
      * engine's own solid-fill distances, and the room's reach law carries
      * the far field.
      *
-     * The bias is the fragment's own: its light-space depth gradient, taken
-     * ANALYTICALLY from the receiver's own plane normal, scaled to the half
-     * texel between a fragment and its own texel's centre and floored -- so
-     * a wall facing the light carries almost none, which is what keeps the
-     * strip under a ceiling dark, while a grazed floor carries exactly what
-     * its own footprint spans.
-     *
-     * Not from screen derivatives, and that ruling is the whole of the
-     * seam-class fix: dFdx/dFdy are exact only inside one plane's pixels,
-     * and at every plane JOINT the 2x2 quads straddle two planes -- the
-     * mixed gradient blows up, the ceiling clamp hands those exact pixels
-     * the flat-constant slack, and the canvas draws a one-pixel line of sky
-     * along the joint. The floor-seam and corner hairlines and the pillar-top
-     * line on the director's save were exactly those pixels. The analytic
-     * gradient is also precisely what the offline twin computes, so the law
-     * gated is the law run. The derivative path survives only for the
-     * classes that carry no normal -- a standing figure's card -- whose
-     * interiors it is exact for. The flat ceiling is the fallback when
-     * either form degenerates, which for the analytic form is a receiver
-     * the light grazes: its key term dies on the same dot product. */
+     * This is the executable half of THE SAMPLING LAW stated whole at the
+     * top of hwr_sun_math.h. In one line: every compare's reference is
+     * carried along the receiver's own plane to the exact texel centre it
+     * reads, and the bias pays for arithmetic alone -- the floor for a
+     * receiver whose plane is known (every world surface, via its packed
+     * normal), the derivative slope law for the plane-less classes (a
+     * standing figure's card), the ceiling where either degenerates. The
+     * own-texel carry below is what retired the slope slack here: with the
+     * reference exact at the texel centre, a wall facing the light and a
+     * grazed floor alike need no slack a joint could leak through. */
     "float sun_factor() {\n"
     "  if (u_sun_valid==0) return 1.0;\n"
     "  vec3 p=(u_sun_matrix*vec4(v_world,1.0)).xyz;\n"
     "  if (p.x<0.0 || p.x>1.0 || p.y<0.0 || p.y>1.0) return 1.0;\n"
     "  float bias=u_sun_bias;\n"
     "  vec2 grad=vec2(0.0);\n"
+    "  bool planar=false;\n"
     "  if (u_sun_bias_slope>0.0) {\n"
-    "    bool derived=false;\n"
     "    vec3 nw=v_normal_world;\n"
     "    if (nw!=vec3(0.0)) {\n"
     "      vec3 ga=vec3(u_sun_matrix[0].x,u_sun_matrix[1].x,u_sun_matrix[2].x);\n"
@@ -1992,12 +1971,11 @@ static const char g_geometry_fragment_body[] =
     "      float bv=dot(gb,t2);\n"
     "      if (abs(au)>1e-12 && abs(bv)>1e-12) {\n"
     "        grad=vec2(dot(gc,t1)/au,dot(gc,t2)/bv);\n"
-    "        bias=min((abs(grad.x)+abs(grad.y))*u_sun_bias_slope+"
-    "u_sun_bias_floor,u_sun_bias);\n"
-    "        derived=true;\n"
+    "        bias=min(u_sun_bias_floor,u_sun_bias);\n"
+    "        planar=true;\n"
     "      }\n"
     "    }\n"
-    "    if (!derived && nw==vec3(0.0)) {\n"
+    "    if (!planar && nw==vec3(0.0)) {\n"
     "      vec3 px=dFdx(p); vec3 py=dFdy(p);\n"
     "      float det=px.x*py.y-py.x*px.y;\n"
     "      if (abs(det)>1e-16) {\n"
@@ -2010,13 +1988,30 @@ static const char g_geometry_fragment_body[] =
     "    }\n"
     "  }\n"
     "  float ref=clamp(p.z-bias,0.0,1.0);\n"
-    /* The fragment's own column, which is also what every neighbour tap
-     * falls back to where its column does not describe this receiver; and
-     * the receiver's own depth band, which is how a tap tells the two
-     * apart: the receiver's rasterized depth stands within the carried
-     * reference plus its own bias margin. */
-    "  float own=texture(u_sun_shadow,vec3(p.xy,ref));\n"
+    /* The fragment's own column -- the NEAREST compare reads the texel
+     * containing p.xy, so the reference is carried to that texel's CENTRE
+     * exactly as the soft taps carry theirs: for a plane-carrying receiver
+     * the compare is then exact at the point compared, and the floor is
+     * the whole of the slack. The own carry obeys the band rule too: where
+     * the own texel's centre stands past the receiver's physical edge (a
+     * fragment hard against a joint, its texel centre over the joint), the
+     * carried plane extrapolates into open sky above the very ceiling that
+     * seals the joint -- the lit answer lands far beyond the band, and the
+     * compare retakes UNCARRIED at the fragment itself, which is the
+     * honest local question. That extrapolated own was the last bright
+     * strip on the director's pillar. */
     "  float band=2.0*bias+u_sun_bias_floor;\n"
+    "  float own;\n"
+    "  if (planar && u_sun_texel>0.0) {\n"
+    "    vec2 oc=(floor(p.xy/u_sun_texel)+0.5)*u_sun_texel;\n"
+    "    float ocarry=clamp(dot(grad,oc-p.xy),-u_sun_bias,u_sun_bias);\n"
+    "    float ro=clamp(ref+ocarry,0.0,1.0);\n"
+    "    float o1=texture(u_sun_shadow,vec3(p.xy,ro));\n"
+    "    float ob=texture(u_sun_shadow,vec3(p.xy,clamp(ro+band,0.0,1.0)));\n"
+    "    own=o1*mix(1.0,texture(u_sun_shadow,vec3(p.xy,ref)),ob);\n"
+    "  } else {\n"
+    "    own=texture(u_sun_shadow,vec3(p.xy,ref));\n"
+    "  }\n"
     "  float s;\n"
     "  if (u_sun_soft==0 || u_sun_texel<=0.0) {\n"
     "    s=own;\n"
@@ -3112,25 +3107,34 @@ static const char g_probe_fragment_shader[] =
  * outline the outline of its shadow; in its gobo pass it writes what each
  * see-through texel lets past -- the eye-ray transmittance recipe, verbatim,
  * re-aimed along the sun. */
+/* The caster program's two stages, version-less bodies compiled twice: the
+ * FILL program plain, and the LINE program under SUN_LINE_DEPTH, whose
+ * fragments replace the line's own interpolated depth with the caster
+ * PLANE's depth at the pixel centre (hwr_sun_math.h states why: a line
+ * sample lands up to half a texel off the centre, and on a steep caster
+ * that misplacement wrote edge texels shallower than the plane the carried
+ * lookup references expect). */
 static const char g_sun_vertex_shader[] =
-    "#version 330 core\n"
     "layout(location=0) in vec3 a_pos;\n"
     "layout(location=1) in vec2 a_uv;\n"
     "layout(location=2) in uint a_offset;\n"
     "layout(location=3) in uvec2 a_dims;\n"
     "layout(location=4) in uint a_flags;\n"
+    "layout(location=5) in uvec2 a_normal;\n"
     "uniform mat4 u_matrix;\n"
     "out vec2 v_uv;\n"
     "flat out uint v_offset;\n"
     "flat out uvec2 v_dims;\n"
     "flat out uint v_flags;\n"
+    "flat out uvec2 v_normal;\n"
+    "out vec3 v_wpos;\n"
     "void main() {\n"
     "  gl_Position=u_matrix*vec4(a_pos,1.0);\n"
     "  v_uv=a_uv; v_offset=a_offset; v_dims=a_dims; v_flags=a_flags;\n"
+    "  v_normal=a_normal; v_wpos=a_pos;\n"
     "}\n";
 
 static const char g_sun_fragment_shader[] =
-    "#version 330 core\n"
     "uniform usamplerBuffer u_texels;\n"
     /* Which of the two passes this draw is, and the weight a blend-range
      * texel writes -- the same least-squares fit of the map's own blend
@@ -3141,7 +3145,51 @@ static const char g_sun_fragment_shader[] =
     "flat in uint v_offset;\n"
     "flat in uvec2 v_dims;\n"
     "flat in uint v_flags;\n"
+    "flat in uvec2 v_normal;\n"
+    "in vec3 v_wpos;\n"
     "layout(location=0) out vec4 out_gobo;\n"
+    "#ifdef SUN_LINE_DEPTH\n"
+    "uniform mat4 u_matrix;\n"
+    "uniform float u_res;\n"
+    /* The same octahedral unpack the world stages run. */
+    "vec3 sun_normal_decode(uvec2 pn) {\n"
+    "  vec2 p=(vec2(pn)-128.0)/127.0;\n"
+    "  vec3 n=vec3(p,1.0-abs(p.x)-abs(p.y));\n"
+    "  if (n.z<0.0)\n"
+    "    n=vec3((1.0-abs(p.y))*(p.x>=0.0 ? 1.0 : -1.0),\n"
+    "           (1.0-abs(p.x))*(p.y>=0.0 ? 1.0 : -1.0), n.z);\n"
+    "  return normalize(n);\n"
+    "}\n"
+    /* The caster plane's depth at THIS pixel's centre -- held NO SHALLOWER
+     * than the line's own sample -- in window units, plus the write-side
+     * units offset the fill pass takes from polygon offset (gl_FragDepth
+     * bypasses that path). The max is load-bearing on both sides: the
+     * plane-at-centre term is what keeps an interior edge from writing a
+     * misplaced shallow sample onto its own plane's texel, and the
+     * line's-own-sample term is what keeps the plane from being written
+     * where it EXTRAPOLATES past the caster's physical edge -- a wall's
+     * top-edge line otherwise stamps phantom wall above the joint, and the
+     * own-texel carry then agrees with its own phantom: that agreement was
+     * the last thin line on the director's pillar. Falls back to the
+     * line's own depth where no plane is carried or it degenerates. */
+    "float sun_line_depth() {\n"
+    "  if (v_normal.x==0u && v_normal.y==0u) return gl_FragCoord.z;\n"
+    "  vec3 n=sun_normal_decode(v_normal);\n"
+    "  vec3 ga=vec3(u_matrix[0].x,u_matrix[1].x,u_matrix[2].x);\n"
+    "  vec3 gb=vec3(u_matrix[0].y,u_matrix[1].y,u_matrix[2].y);\n"
+    "  vec3 gc=vec3(u_matrix[0].z,u_matrix[1].z,u_matrix[2].z);\n"
+    "  vec3 t1=cross(n,gb);\n"
+    "  vec3 t2=cross(n,ga);\n"
+    "  float au=dot(ga,t1);\n"
+    "  float bv=dot(gb,t2);\n"
+    "  if (abs(au)<=1e-12 || abs(bv)<=1e-12) return gl_FragCoord.z;\n"
+    "  vec3 p=(u_matrix*vec4(v_wpos,1.0)).xyz;\n"
+    "  vec2 c=gl_FragCoord.xy*(2.0/u_res)-1.0;\n"
+    "  float zc=p.z+(dot(gc,t1)/au)*(c.x-p.x)+(dot(gc,t2)/bv)*(c.y-p.y);\n"
+    "  return clamp(max(zc*0.5+0.5,gl_FragCoord.z)+4.0/16777216.0,\n"
+    "               0.0,1.0);\n"
+    "}\n"
+    "#endif\n"
     /* The per-texel law of the translucent range, both passes reading the
      * SAME classes the eye-ray transmittance pass reads: an index-0 texel of
      * a masked surface is a hole and is discarded everywhere -- full light;
@@ -3153,6 +3201,9 @@ static const char g_sun_fragment_shader[] =
      * its light (blocking-behind is the depth map's job; a zero written
      * here would blacken the very face the paint stands on). */
     "void main() {\n"
+    "#ifdef SUN_LINE_DEPTH\n"
+    "  gl_FragDepth=sun_line_depth();\n"
+    "#endif\n"
     "  int w=int(v_dims.x), h=int(v_dims.y);\n"
     "  uint texel=255u;\n"
     "  if ((v_flags & 7u)!=0u && w>0 && h>0) {\n"
@@ -3289,6 +3340,8 @@ static void hwr_destroy_programs(void)
         g_gl.delete_program(g_index_restore_program);
     if (g_sun_program != 0)
         g_gl.delete_program(g_sun_program);
+    if (g_sun_line_program != 0)
+        g_gl.delete_program(g_sun_line_program);
     g_geometry_program = 0;
     g_sky_program = 0;
     g_resolve_program = 0;
@@ -3297,6 +3350,7 @@ static void hwr_destroy_programs(void)
     g_truecolor_resolve_program = 0;
     g_index_restore_program = 0;
     g_sun_program = 0;
+    g_sun_line_program = 0;
     g_sun_failed = 0;
 }
 
@@ -3355,6 +3409,10 @@ static void hwr_sun_bind_attributes(void)
     g_gl.vertex_attrib_i_pointer(4, 1, GL_UNSIGNED_BYTE, stride,
                                  (const void *)offsetof(
                                      struct hwr_gl_sun_vertex, flags));
+    g_gl.enable_vertex_attrib_array(5);
+    g_gl.vertex_attrib_i_pointer(5, 2, GL_UNSIGNED_BYTE, stride,
+                                 (const void *)offsetof(
+                                     struct hwr_gl_sun_vertex, normal_x));
 }
 
 /* Brings the sun pass's own objects up: the program, the two array objects,
@@ -3369,10 +3427,25 @@ static int hwr_sun_ensure_objects(void)
         return 0;
     if (resolution < 64 || resolution > 8192)
         return 0;
-    if (g_sun_program == 0) {
-        g_sun_program = hwr_link_program(g_sun_vertex_shader,
-                                         g_sun_fragment_shader);
-        if (g_sun_program == 0) {
+    if (g_sun_program == 0 || g_sun_line_program == 0) {
+        static const char version[] = "#version 330 core\n";
+        static const char line_define[] = "#define SUN_LINE_DEPTH 1\n";
+        const char *vs[3];
+        const char *fs[3];
+
+        vs[0] = version;
+        vs[1] = "";
+        vs[2] = g_sun_vertex_shader;
+        fs[0] = version;
+        fs[1] = "";
+        fs[2] = g_sun_fragment_shader;
+        if (g_sun_program == 0)
+            g_sun_program = hwr_link_program_sources(vs, 3, fs, 3);
+        vs[1] = line_define;
+        fs[1] = line_define;
+        if (g_sun_line_program == 0)
+            g_sun_line_program = hwr_link_program_sources(vs, 3, fs, 3);
+        if (g_sun_program == 0 || g_sun_line_program == 0) {
             fprintf(stderr, "[renderer_overhaul] sun caster program: %s\n",
                     g_error);
             g_sun_failed = 1;
@@ -3407,9 +3480,14 @@ static int hwr_sun_ensure_objects(void)
         g_gl.gen_textures(1, &g_sun_depth_texture);
         g_gl.active_texture(GL_TEXTURE0 + 11);
         g_gl.bind_texture(GL_TEXTURE_2D, g_sun_depth_texture);
-        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16,
+        /* 24-bit depth: the map's quantum is part of the lookup law's floor
+         * (hwr_sunm_bias_floor), and at 16 bits that quantum -- an eighth of
+         * a world unit at the default window, five of them under the caster
+         * pass's units offset -- was a whole visible strip of light at every
+         * concave joint on its own. At 24 bits the quantum term is dust. */
+        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24,
                           (GLsizei)resolution, (GLsizei)resolution, 0,
-                          GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, NULL);
+                          GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
         /* Beyond the window's edge the lookup clamps to LIT: the border holds
          * the far plane, so the compare passes wherever the window ends. The
          * shader carries the same rule explicitly; the border is what keeps
@@ -3670,17 +3748,28 @@ static void hwr_sun_render_map(void)
      * yet finds no sample of it in the map -- and where that edge meets the
      * surface it shades (a ceiling's rim on the wall below it), that band
      * came back as a texel-tall line of sky along the joint: the pillar-top
-     * line on the director's save, at every quality tier. Line rasterization
-     * covers every texel the edge passes through, so the boundary texels
-     * take the caster's own edge depth and the column answers for the
-     * caster it crosses. Sun-side faces keep their light through the same
-     * arithmetic that already covers a joint's zero separation: their own
-     * depth stands within the receiver bias of the edge's. The cutout law
-     * is untouched -- the fragment program discards the same masked texels
-     * in either polygon mode. */
-    if (g_gl.polygon_mode != NULL) {
+     * line on the director's save, at every quality tier. The pass runs its
+     * own program: each line fragment writes the caster PLANE's depth at
+     * its pixel's centre -- the value the fill rasterizer writes at covered
+     * texels -- because the line's own samples land up to half a texel off
+     * the centre, and on a steep caster that misplacement wrote edge texels
+     * shallower than the plane the carried lookup references expect: a
+     * texel-wide false shadow along every mesh edge. The cutout law is
+     * untouched -- both programs discard the same masked texels. */
+    if (g_gl.polygon_mode != NULL && g_sun_line_program != 0) {
+        g_gl.use_program(g_sun_line_program);
+        hwr_set_sampler(g_sun_line_program, "u_texels", 0);
+        {
+            GLint location =
+                g_gl.get_uniform_location(g_sun_line_program, "u_matrix");
+
+            if (location >= 0)
+                g_gl.uniform_matrix_4fv(location, 1, GL_FALSE, g_sun.clip);
+        }
+        hwr_uniform_1i(g_sun_line_program, "u_gobo_pass", 0);
+        hwr_uniform_1f(g_sun_line_program, "u_res",
+                       (GLfloat)g_sun_depth_resolution);
         g_gl.polygon_mode(GL_FRONT_AND_BACK, GL_LINE);
-        g_gl.enable(GL_POLYGON_OFFSET_LINE);
         if (g_sun_static_count != 0) {
             g_gl.bind_vertex_array(g_sun_static_vao);
             g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)g_sun_static_count);
@@ -3689,8 +3778,8 @@ static void hwr_sun_render_map(void)
             g_gl.bind_vertex_array(g_sun_dynamic_vao);
             g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)dynamic_count);
         }
-        g_gl.disable(GL_POLYGON_OFFSET_LINE);
         g_gl.polygon_mode(GL_FRONT_AND_BACK, GL_FILL);
+        g_gl.use_program(g_sun_program);
     }
     /* The gobo pass: clear the plane to "everything passes", then multiply
      * in the TRANSLUCENT range with the depth test held LESS against the

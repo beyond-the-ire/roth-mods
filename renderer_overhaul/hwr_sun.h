@@ -35,6 +35,10 @@ size_t hwr_sun_sky_faces(void);
  * sealed map builds nothing is a claim about something that did not happen,
  * and only a counter can state one. */
 unsigned long hwr_sun_static_builds(void);
+/* How many vertices of the static slice are palette-colour solid-blend
+ * DIMS (translucent with no texels): the offline gate holds the class to
+ * the map's own walls. */
+unsigned long hwr_sun_static_dims(void);
 
 /* One frame's whole sun work: ensures the static slice is current, rebuilds
  * the dynamic slice, advances the moving window, and publishes everything to
