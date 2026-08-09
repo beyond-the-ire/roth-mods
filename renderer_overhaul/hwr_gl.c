@@ -318,8 +318,9 @@ static int g_sun_depth_resolution;
 static GLuint g_sun_static_vao;
 static GLuint g_sun_static_vbo;
 static size_t g_sun_static_count;
-/* Where the slice's two runs meet: the depth pass draws [0, gobo_first),
- * the gobo pass [gobo_first, count) -- the translucent range alone. */
+/* Where the slice's two runs meet: the depth pass draws the whole slice
+ * (the translucent range keeps depth only at its opaque paint), the gobo
+ * pass [gobo_first, count) -- the translucent range alone. */
 static size_t g_sun_static_gobo_first;
 /* The static slice waiting for a context, so a caster set built before the
  * first frame is not lost: uploaded on the first sun render that finds it. */
@@ -1885,50 +1886,88 @@ static const char g_geometry_fragment_body[] =
      * bias, which is the first milestone's arithmetic kept reachable. */
     "uniform float u_sun_bias_floor;\n"
     "uniform float u_sun_bias_slope;\n"
+    "uniform int u_sun_soft;\n"
+    "uniform float u_sun_texel;\n"         /* one depth-map texel, in uv */
     "uniform int u_sun_taps;\n"
     "uniform float u_sun_radius;\n"        /* ring radius, in lookup uv */
     /* The transmittance plane in the light's own space -- the gobo: 1 where
-     * the beam passes whole, the pass weight where a pane dims it, 0 under
-     * opaque paint. Valid only on the frames the texels row renders one. */
+     * the beam passes whole, the pass weight where a pane filters it; the
+     * translucent range's opaque paint blocks through the depth map and
+     * this plane holds the whole beam over it. */
     "uniform sampler2D u_sun_gobo;\n"
     "uniform int u_sun_gobo_valid;\n"
+    /* One depth compare, at a texel that may stand a little way from the
+     * fragment: the reference is carried onto that texel along the
+     * fragment's own light-space depth gradient -- the receiver's plane,
+     * extrapolated -- so a compare against a neighbouring texel asks about
+     * the receiver where that texel is, not where the fragment is. This is
+     * what lets the soft filter and the ring read neighbours without the
+     * bias having to grow by every texel of reach they have: bias slack is
+     * a strip of light wherever a caster meets the surface it shades, and
+     * the extrapolation spends geometry instead of slack. The carry is
+     * clamped by the bias ceiling, so a degenerate gradient cannot carry
+     * the reference somewhere dishonest. */
+    "float sun_compare(vec2 uv, float ref, vec2 grad, vec2 at) {\n"
+    "  float carry=clamp(dot(grad,uv-at),-u_sun_bias,u_sun_bias);\n"
+    "  return texture(u_sun_shadow,vec3(uv,clamp(ref+carry,0.0,1.0)));\n"
+    "}\n"
     /* How much of the key light reaches this fragment: the depth compare at
-     * the fragment's own world position -- with ring taps around it when the
-     * softness dial stands off its rest -- times what the translucent range
-     * let through. Outside the moving window the answer clamps to LIT -- at
-     * the default span that edge is past the engine's own solid-fill
-     * distances, and the room's reach law carries the far field.
+     * the fragment's own world position -- the four-texel blend when the
+     * softness dial stands off its rest, ring taps beyond it -- times what
+     * the translucent range let through. Outside the moving window the
+     * answer clamps to LIT -- at the default span that edge is past the
+     * engine's own solid-fill distances, and the room's reach law carries
+     * the far field.
      *
      * The bias is the fragment's own: its light-space depth gradient, taken
-     * from the derivatives of the projected position, scaled to the texels
-     * the compare actually reads and floored -- so a wall facing the light
-     * carries almost none, which is what keeps the strip under a ceiling
-     * dark, while a grazed floor carries exactly what its footprint spans.
-     * The flat ceiling it is held under is the old law, and the fallback
-     * when the derivatives degenerate. */
+     * from the derivatives of the projected position, scaled to the half
+     * texel between a fragment and its own texel's centre and floored -- so
+     * a wall facing the light carries almost none, which is what keeps the
+     * strip under a ceiling dark, while a grazed floor carries exactly what
+     * its own footprint spans. The flat ceiling it is held under is the old
+     * law, and the fallback when the derivatives degenerate. */
     "float sun_factor() {\n"
     "  if (u_sun_valid==0) return 1.0;\n"
     "  vec3 p=(u_sun_matrix*vec4(v_world,1.0)).xyz;\n"
     "  if (p.x<0.0 || p.x>1.0 || p.y<0.0 || p.y>1.0) return 1.0;\n"
     "  float bias=u_sun_bias;\n"
+    "  vec2 grad=vec2(0.0);\n"
     "  if (u_sun_bias_slope>0.0) {\n"
     "    vec3 px=dFdx(p); vec3 py=dFdy(p);\n"
     "    float det=px.x*py.y-py.x*px.y;\n"
     "    if (abs(det)>1e-16) {\n"
     "      float du=(py.y*px.z-px.y*py.z)/det;\n"
     "      float dv=(px.x*py.z-py.x*px.z)/det;\n"
+    "      grad=vec2(du,dv);\n"
     "      bias=min((abs(du)+abs(dv))*u_sun_bias_slope+u_sun_bias_floor,\n"
     "               u_sun_bias);\n"
     "    }\n"
     "  }\n"
     "  float ref=clamp(p.z-bias,0.0,1.0);\n"
-    "  float s=texture(u_sun_shadow,vec3(p.xy,ref));\n"
+    "  float s;\n"
+    "  if (u_sun_soft==0 || u_sun_texel<=0.0) {\n"
+    "    s=texture(u_sun_shadow,vec3(p.xy,ref));\n"
+    "  } else {\n"
+    /* The barely-soft blend, by hand: the four nearest texels each compared
+     * against the reference carried onto them, mixed by the fragment's own
+     * position between their centres -- the same picture the hardware
+     * filter draws on a plane, without the texel of bias slack it would
+     * need at a shading joint. */
+    "    vec2 t=p.xy/u_sun_texel-0.5;\n"
+    "    vec2 f=fract(t);\n"
+    "    vec2 base=(t-f+0.5)*u_sun_texel;\n"
+    "    float s00=sun_compare(base,ref,grad,p.xy);\n"
+    "    float s10=sun_compare(base+vec2(u_sun_texel,0.0),ref,grad,p.xy);\n"
+    "    float s01=sun_compare(base+vec2(0.0,u_sun_texel),ref,grad,p.xy);\n"
+    "    float s11=sun_compare(base+vec2(u_sun_texel),ref,grad,p.xy);\n"
+    "    s=mix(mix(s00,s10,f.x),mix(s01,s11,f.x),f.y);\n"
+    "  }\n"
     "  if (u_sun_taps>0) {\n"
     "    const vec2 ring[8]=vec2[8](vec2(0.7071,0.7071),vec2(-0.7071,0.7071),\n"
     "      vec2(0.7071,-0.7071),vec2(-0.7071,-0.7071),vec2(1.0,0.0),\n"
     "      vec2(-1.0,0.0),vec2(0.0,1.0),vec2(0.0,-1.0));\n"
     "    for (int i=0;i<u_sun_taps;i++)\n"
-    "      s+=texture(u_sun_shadow,vec3(p.xy+ring[i]*u_sun_radius,ref));\n"
+    "      s+=sun_compare(p.xy+ring[i]*u_sun_radius,ref,grad,p.xy);\n"
     "    s/=float(u_sun_taps+1);\n"
     "  }\n"
     "  if (u_sun_gobo_valid!=0) s*=texture(u_sun_gobo,p.xy).r;\n"
@@ -3020,11 +3059,7 @@ static const char g_sun_vertex_shader[] =
 static const char g_sun_fragment_shader[] =
     "#version 330 core\n"
     "uniform usamplerBuffer u_texels;\n"
-    /* Whether world-geometry masked casters take the discard (the texels
-     * row's cut-outs). An object card takes it whatever this says: a card
-     * without its outline is a rectangle, not a rough shadow. */
-    "uniform int u_cutout;\n"
-    /* Which of the two passes this draw is, and the weight a see-through
+    /* Which of the two passes this draw is, and the weight a blend-range
      * texel writes -- the same least-squares fit of the map's own blend
      * table the eye-ray plane multiplies by. */
     "uniform int u_gobo_pass;\n"
@@ -3034,6 +3069,16 @@ static const char g_sun_fragment_shader[] =
     "flat in uvec2 v_dims;\n"
     "flat in uint v_flags;\n"
     "layout(location=0) out vec4 out_gobo;\n"
+    /* The per-texel law of the translucent range, both passes reading the
+     * SAME classes the eye-ray transmittance pass reads: an index-0 texel of
+     * a masked surface is a hole and is discarded everywhere -- full light;
+     * a blend-range texel (high bit set, the texel the map's own blend
+     * tables pass) filters -- no depth, the gobo multiplies the fitted
+     * weight; every other texel is opaque paint -- it writes DEPTH and
+     * blocks the beam whole, exactly as a masked caster's paint does, and
+     * the gobo pass leaves it alone so the paint's own sun-side face keeps
+     * its light (blocking-behind is the depth map's job; a zero written
+     * here would blacken the very face the paint stands on). */
     "void main() {\n"
     "  int w=int(v_dims.x), h=int(v_dims.y);\n"
     "  uint texel=255u;\n"
@@ -3042,22 +3087,19 @@ static const char g_sun_fragment_shader[] =
     "    int ix=int(floor(v_uv.y)) % w; if (ix<0) ix+=w;\n"
     "    texel=texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "  }\n"
-    /* The gobo pass: a hole is not a surface and the plane keeps the whole
-     * light it was cleared to; every other texel of the translucent range
-     * passes the blend weight -- the eye-ray pass's own law for the
-     * translucent class. A barred pane keeps both its laws: holes pass
-     * whole, bars pass the weight. */
+    "  if ((v_flags & 1u)!=0u && texel==0u) discard;\n"
     "  if (u_gobo_pass!=0) {\n"
-    "    float through=0.0;\n"
-    "    if ((v_flags & 1u)!=0u && texel==0u) discard;\n"
-    "    if ((v_flags & 4u)!=0u) through=u_gobo_blend;\n"
-    "    out_gobo=vec4(through,through,through,1.0);\n"
+    /* The gobo pass draws the translucent range alone: blend-range texels
+     * multiply the weight in, opaque paint is discarded -- its block is
+     * already whole in the depth map. */
+    "    if ((texel & 128u)==0u) discard;\n"
+    "    out_gobo=vec4(u_gobo_blend,u_gobo_blend,u_gobo_blend,1.0);\n"
     "    return;\n"
     "  }\n"
     "  out_gobo=vec4(0.0);\n"
-    "  if ((v_flags & 1u)!=0u && (u_cutout!=0 || (v_flags & 2u)!=0u)) {\n"
-    "    if (texel==0u) discard;\n"
-    "  }\n"
+    /* The depth pass: a translucent surface owns depth only at its opaque
+     * paint -- its blend-range texels pass light and are discarded here. */
+    "  if ((v_flags & 4u)!=0u && (texel & 128u)!=0u) discard;\n"
     "}\n";
 
 static GLuint hwr_compile_shader_sources(GLenum type,
@@ -3329,47 +3371,41 @@ static int hwr_sun_ensure_objects(void)
         g_sun_depth_resolution = resolution;
         g_gl.active_texture(GL_TEXTURE0);
     }
-    /* The gobo plane, present exactly while the texels row wants one: R8 at
+    /* The gobo plane, alive exactly as long as the sun machinery is: R8 at
      * the depth map's own resolution (a quarter of its bytes), colour
      * attachment 0 of the same framebuffer -- each pass says with its draw
-     * buffers whether it writes it. Freed the moment the row stops asking,
-     * so the solid law spends no VRAM on a plane it never reads. */
-    if (g_sun.gobo) {
-        if (g_sun_gobo_texture == 0) {
-            g_gl.gen_textures(1, &g_sun_gobo_texture);
-            g_gl.active_texture(GL_TEXTURE0 + 12);
-            g_gl.bind_texture(GL_TEXTURE_2D, g_sun_gobo_texture);
-            g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)resolution,
-                              (GLsizei)resolution, 0, GL_RED,
-                              GL_UNSIGNED_BYTE, NULL);
-            g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                 GL_CLAMP_TO_EDGE);
-            g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                 GL_CLAMP_TO_EDGE);
-            g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                                 GL_LINEAR);
-            g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                                 GL_LINEAR);
-            g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_sun_fbo);
-            g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                        GL_TEXTURE_2D, g_sun_gobo_texture, 0);
-            g_gl.active_texture(GL_TEXTURE0);
-        }
-    } else if (g_sun_gobo_texture != 0) {
+     * buffers whether it writes it. Its lifecycle follows the sun being
+     * live, and hwr_sun_destroy_objects takes it down with everything
+     * else. */
+    if (g_sun_gobo_texture == 0) {
+        g_gl.gen_textures(1, &g_sun_gobo_texture);
+        g_gl.active_texture(GL_TEXTURE0 + 12);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_sun_gobo_texture);
+        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R8, (GLsizei)resolution,
+                          (GLsizei)resolution, 0, GL_RED,
+                          GL_UNSIGNED_BYTE, NULL);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                             GL_LINEAR);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                             GL_LINEAR);
         g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_sun_fbo);
         g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                    GL_TEXTURE_2D, 0, 0);
-        hwr_delete_texture(&g_sun_gobo_texture);
+                                    GL_TEXTURE_2D, g_sun_gobo_texture, 0);
+        g_gl.active_texture(GL_TEXTURE0);
     }
-    /* The edge softness follows the frame: LINEAR is the free 2x2 PCF the
-     * barely-soft default reads through, NEAREST the hard edge (the Low tier,
-     * and a softness dial at exactly nothing). */
+    /* The compare stays NEAREST at every softness: the soft edge is blended
+     * by hand in the fragment stage, each texel compared against the
+     * reference carried onto it -- the hardware filter blends compares of
+     * ONE reference, which at a shading joint is a texel of bias slack, and
+     * slack there is a strip of light. */
     g_gl.active_texture(GL_TEXTURE0 + 11);
     g_gl.bind_texture(GL_TEXTURE_2D, g_sun_depth_texture);
-    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                         g_sun.soft ? GL_LINEAR : GL_NEAREST);
-    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                         g_sun.soft ? GL_LINEAR : GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     g_gl.active_texture(GL_TEXTURE0);
     return 1;
 }
@@ -3526,7 +3562,6 @@ static void hwr_sun_render_map(void)
         if (location >= 0)
             g_gl.uniform_matrix_4fv(location, 1, GL_FALSE, g_sun.clip);
     }
-    hwr_uniform_1i(g_sun_program, "u_cutout", g_sun.cutouts != 0);
     hwr_uniform_1i(g_sun_program, "u_gobo_pass", 0);
     g_gl.active_texture(GL_TEXTURE0);
     g_gl.bind_texture(GL_TEXTURE_2D, 0);
@@ -3543,10 +3578,13 @@ static void hwr_sun_render_map(void)
     g_gl.enable(GL_POLYGON_OFFSET_FILL);
     g_gl.polygon_offset(0.0f, 4.0f);
     g_gl.enable(GL_DEPTH_CLAMP);
-    if (g_sun_static_gobo_first != 0) {
+    /* The depth pass draws the WHOLE static slice -- the translucent range
+     * included, whose fragments keep depth only at their fully-opaque paint
+     * (the shader's per-texel law): a window's frame blocks the beam exactly
+     * as a wall does, while its glass and its holes leave the map alone. */
+    if (g_sun_static_count != 0) {
         g_gl.bind_vertex_array(g_sun_static_vao);
-        g_gl.draw_arrays(GL_TRIANGLES, 0,
-                         (GLsizei)g_sun_static_gobo_first);
+        g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)g_sun_static_count);
     }
     if (dynamic_count != 0) {
         g_gl.bind_vertex_array(g_sun_dynamic_vao);
@@ -3555,15 +3593,18 @@ static void hwr_sun_render_map(void)
     /* The gobo pass: clear the plane to "everything passes", then multiply
      * in the TRANSLUCENT range with the depth test held LESS against the
      * map just laid down -- only what stands sun-side of the opaque winner
-     * filters the beam. Multiplicative blending is the eye-ray pass's own
-     * law re-aimed along the sun. The depth casters -- masked geometry and
-     * the object cards -- never draw here: their occlusion is already
-     * whole in the depth map, and this plane has no depth of its own, so
-     * their writes could only darken their OWN lit faces (a card dimming
-     * the very sprite it stands for -- the self-shadow the half-texel push
-     * exists to prevent). What the eye-ray pass solves with its receive
-     * flag, this pass solves by the range it draws. */
-    if (g_sun.gobo && g_sun_gobo_texture != 0) {
+     * filters the beam, and only at its blend-range texels: opaque paint is
+     * discarded here (its block is already whole in the depth map, and a
+     * zero written at it would blacken its own sun-side face), holes are
+     * discarded everywhere. Multiplicative blending is the eye-ray pass's
+     * own law re-aimed along the sun. The masked depth casters and the
+     * object cards never draw here: their occlusion is already whole in
+     * the depth map, and this plane has no depth of its own, so their
+     * writes could only darken their OWN lit faces (a card dimming the
+     * very sprite it stands for -- the self-shadow the bias law exists to
+     * prevent). What the eye-ray pass solves with its receive flag, this
+     * pass solves by the range and the texels it draws. */
+    if (g_sun_gobo_texture != 0) {
         static const GLenum gobo_only[1] = { GL_COLOR_ATTACHMENT0 };
         static const GLfloat clear_gobo[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
@@ -5719,6 +5760,10 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
             hwr_uniform_1f(program, "u_sun_bias", g_sun.bias);
             hwr_uniform_1f(program, "u_sun_bias_floor", g_sun.bias_floor);
             hwr_uniform_1f(program, "u_sun_bias_slope", g_sun.bias_slope);
+            hwr_uniform_1i(program, "u_sun_soft", g_sun.soft);
+            hwr_uniform_1f(program, "u_sun_texel",
+                           g_sun.resolution > 0
+                               ? 1.0f / (float)g_sun.resolution : 0.0f);
             hwr_uniform_1i(program, "u_sun_taps", g_sun.soft_taps);
             hwr_uniform_1f(program, "u_sun_radius",
                            g_sun.resolution > 0
@@ -6752,7 +6797,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
          * a frame whose sun gobo multiplies it in, and never at all for any
          * other. */
         if (g_transmit_blend_pending &&
-            (hwr_transmit_wanted() || (hwr_sun_wanted() && g_sun.gobo)))
+            (hwr_transmit_wanted() || hwr_sun_wanted()))
             hwr_transmit_measure_blend();
     }
 

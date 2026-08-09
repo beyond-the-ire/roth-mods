@@ -46,8 +46,14 @@
 
 /* The floor under the receiver-slope bias, in world units: what covers the
  * arithmetic itself (rounding, the interpolators) when the receiver faces
- * the light head-on and its own slope term is nothing. */
-#define HWR_SUNM_BIAS_FLOOR_WORLD 1.0f
+ * the light head-on and its own slope term is nothing. A quarter unit,
+ * beside the depth quantum the floor term adds on top: a whole world unit
+ * here was most of the horizontal line of light the director found at a
+ * narrow wall's top -- where a wall meets the ceiling that shades it the
+ * geometric separation runs to nothing, and every unit of floor is a strip
+ * of the wall lit through the joint, while the arithmetic the floor exists
+ * to cover is on the depth quantum's own scale. */
+#define HWR_SUNM_BIAS_FLOOR_WORLD 0.25f
 
 /* How far the softness dial reaches, in light-space texels: the dial's top
  * is a penumbra this many texels wide. The default of a tenth lands at half
@@ -256,25 +262,106 @@ static inline float hwr_sunm_bias_floor(const struct hwr_sunm_window *window)
 }
 
 /* The slope scale of that law: the sampling footprint in texels -- half a
- * texel from the fragment to its own texel's centre, half more when the
- * compare filters, the ring radius when taps stand on one -- over the
- * resolution, so multiplying the per-unit gradient by it yields depth
- * units of slack. */
+ * texel, the distance from a fragment to its own texel's centre, and
+ * nothing more at ANY softness: every farther texel the soft blend or the
+ * ring reads is compared against the reference CARRIED onto it along the
+ * receiver's own depth gradient, so their distance never has to be bought
+ * with slack. Slack is a strip of light wherever a caster meets the surface
+ * it shades -- the narrow-wall line the director found was made of exactly
+ * the texels this footprint no longer pays for. */
 static inline float hwr_sunm_bias_slope(int soft, int taps,
                                         float radius_texels, int resolution)
 {
-    float footprint = 0.5f + (soft ? 0.5f : 0.0f) +
-                      (taps > 0 ? radius_texels : 0.0f);
+    (void)soft;
+    (void)taps;
+    (void)radius_texels;
+    return 0.5f / (float)resolution;
+}
 
-    return footprint / (float)resolution;
+/* The texel side of one decoded 3D-prop face, exactly as the eye emitter
+ * reads the same DAS fields (the four coordinate laws and the flip), so a
+ * tree's leaf holes are the same holes in its shadow that they are in its
+ * picture. `s` runs the atlas row axis (wraps by height), `t` the column
+ * axis (wraps by width) -- the caster program's own iy*w+ix addressing.
+ *
+ * The laws, by the face's own flag bits: 0x1000 carries packed per-corner
+ * coordinates; 0x20 stretches the picture by the scale nibbles; 0x200 is
+ * the floor mapping; everything else is the wall driver's row/column walk,
+ * with 0x100 reading the extents instead of the picture's size. The flip is
+ * the eye's own condition -- the face flag against the resolved child's --
+ * baked here as a reversed row coordinate. */
+static inline void hwr_sunm_mesh_uv(uint16_t face_flags, uint16_t extent_u,
+                                    uint16_t extent_v, uint8_t scale,
+                                    const uint8_t packed_control[4],
+                                    const uint8_t packed_a[4],
+                                    const uint8_t packed_b[4],
+                                    uint16_t width, uint16_t height,
+                                    int child_flip, float s[4], float t[4])
+{
+    int i;
+
+    if ((face_flags & 0x1000u) != 0) {
+        for (i = 0; i < 4; i++) {
+            s[i] = (float)((((uint16_t)(packed_control[i] & 0x80u)) << 1) |
+                           packed_a[i]);
+            t[i] = (float)((((uint16_t)(packed_control[i] & 0x40u)) << 2) |
+                           packed_b[i]);
+        }
+    } else if ((face_flags & 0x20u) != 0) {
+        uint8_t scale_h = (uint8_t)(scale & 0x0fu);
+        uint8_t scale_w = (uint8_t)(scale >> 4);
+        float u = (float)height;
+        float v = (float)width;
+
+        if (scale_h != 0)
+            u *= (float)(scale_h + 1u);
+        if (scale_w != 0)
+            v *= (float)(scale_w + 1u);
+        s[0] = 0.0f; s[1] = u; s[2] = u; s[3] = 0.0f;
+        t[0] = 0.0f; t[1] = 0.0f; t[2] = v; t[3] = v;
+    } else if ((face_flags & 0x200u) != 0) {
+        float u = (float)height;
+        float v = (float)width;
+
+        s[0] = u; s[1] = 0.0f; s[2] = 0.0f; s[3] = u;
+        t[0] = 0.0f; t[1] = 0.0f; t[2] = v; t[3] = v;
+    } else {
+        float row = (float)height;
+        float column = (float)width;
+
+        if ((face_flags & 0x100u) != 0) {
+            row = 0.5f * (float)extent_v;
+            column = 0.5f * (float)extent_u;
+        }
+        s[0] = 0.0f; s[1] = row;  s[2] = row;    s[3] = 0.0f;
+        t[0] = 0.0f; t[1] = 0.0f; t[2] = column; t[3] = column;
+    }
+    /* The eye's flip condition: the authored face flip (never on the packed
+     * law, which authors its corners directly) against the child's own. */
+    if ((((face_flags & 0x1000u) == 0 && (face_flags & 2u) != 0) ? 1 : 0) !=
+        (child_flip != 0)) {
+        for (i = 0; i < 4; i++)
+            s[i] = (float)height - s[i];
+    }
+}
+
+/* Which caster flags a decoded 3D-prop face carries: the transparency bit
+ * is the face's own (the DAS RENDER_FLAG transparency), and it is the whole
+ * of the law -- a masked face's index-0 texels are holes in its shadow, and
+ * every painted texel blocks whole, exactly the sprite cards' law. A face
+ * without it casts solid: a trunk has no cut-outs to honour. */
+static inline uint8_t hwr_sunm_mesh_flags(uint16_t face_flags)
+{
+    return (face_flags & 1u) != 0 ? (uint8_t)HWR_GL_SUN_MASKED : (uint8_t)0u;
 }
 
 /* One object card: an upright quad anchored at the object's position,
  * spanning the given horizontal axis (the light's own `right` for a
  * camera-facing object -- the billboard law with the light standing in for
- * the eye -- or the authored axis for fixed-orientation wall art), pushed
- * toward the light so the object's own drawn sprite is never darkened by its
- * own card. Texel u runs 0..height across the axis (the atlas row axis,
+ * the eye -- or the authored axis for fixed-orientation wall art). `push`
+ * moves it toward the light; the shipped emitter passes nothing there, the
+ * receiver-slope bias being what keeps the object's own drawn sprite in its
+ * light. Texel u runs 0..height across the axis (the atlas row axis,
  * reversed by `flip`), v runs 0..width top-down. Emits two triangles. */
 static inline void hwr_sunm_card(float center_x, float center_y,
                                  const float axis[2], float half_w,

@@ -50,7 +50,6 @@ struct hwr_sun_rows {
     float yaw_deg;
     int object_shadows;
     int quality;
-    int texels;
     float softness;
     float span;
 };
@@ -71,9 +70,9 @@ static struct hwr_scene_mesh g_mesh;
 static struct hwr_gl_sun_vertex *g_static;
 static size_t g_static_count;
 static size_t g_static_capacity;
-/* Where the slice's two runs meet -- everything that blocks (solid and
- * masked), then the translucent range that filters: the depth pass draws up
- * to the split, the gobo pass from it. */
+/* Where the slice's two runs meet -- everything that blocks whole (solid and
+ * masked), then the translucent range whose texels decide: the depth pass
+ * draws the whole slice, the gobo pass from the split on. */
 static size_t g_static_gobo_first;
 static int g_static_built;
 static uint32_t g_static_generation;
@@ -166,8 +165,6 @@ static void hwr_sun_apply(uint32_t mask, const struct hwr_settings *settings,
         hwr_sun_row_bool("sun_object_shadows", settings, 1);
     g_rows.quality = (int)hwr_sun_row_enum("sun_shadow_quality", settings,
                                            HWR_SUN_QUALITY_MEDIUM);
-    g_rows.texels = (int)hwr_sun_row_enum("sun_shadow_texels", settings,
-                                          HWR_SUN_TEXELS_CUTOUT);
     g_rows.softness = hwr_sun_row_float("sun_shadow_softness", settings, 0.1f);
     g_rows.span = hwr_sun_row_float("sun_shadow_span", settings, 4096.0f);
     if (!(g_rows.span >= 1024.0f))
@@ -387,8 +384,11 @@ static int hwr_sun_classify(const struct hwr_scene *scene,
     }
     if ((qflags & 0x400u) != 0) {
         /* The translucent range: masked panes, transparent flats, and the
-         * blend-capable portal bands. None of them blocks the beam -- they
-         * dim it, which is the gobo pass's whole job. */
+         * blend-capable portal bands. What each of their texels does is the
+         * texel's own class, read exactly as the eye-ray transmittance pass
+         * reads it: holes pass whole, blend-range texels filter through the
+         * gobo, and opaque paint writes depth and blocks -- a window's
+         * frame is a wall. */
         return 3;
     }
     if ((surface->flags & HWR_SURFACE_MASKED) != 0 && width != 0 &&
@@ -421,13 +421,14 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
         offset = scene->textures[id].offset;
         width = scene->textures[id].width;
         height = scene->textures[id].height;
-        /* A masked caster cuts holes; a translucent one filters -- and one
-         * that is both keeps both laws, exactly as the eye-ray pass reads
-         * it: holes discard, everything else writes the pass weight. */
+        /* A masked caster cuts holes; a translucent one carries the whole
+         * per-texel law. The masked sub-flag rides on EVERY textured member
+         * of the translucent range, not only the face-flagged ones, because
+         * that is the engine's own span-writer rule the eye pass mirrors:
+         * both blend writers skip index-0 texels, so index 0 is a hole on
+         * every transparency-bit texture whatever the face flags say. */
         flags = cutout == 3
-              ? (uint8_t)(HWR_GL_SUN_TRANSLUCENT |
-                          ((surface->flags & HWR_SURFACE_MASKED) != 0
-                               ? HWR_GL_SUN_MASKED : 0u))
+              ? (uint8_t)(HWR_GL_SUN_TRANSLUCENT | HWR_GL_SUN_MASKED)
               : (uint8_t)HWR_GL_SUN_MASKED;
     }
     out = hwr_sun_grow(&g_static, &g_static_count, &g_static_capacity,
@@ -495,8 +496,9 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
  * The roof above a window is exactly the point: the eye's drawn set rarely
  * holds it, and shadows must not depend on where the eye walked. The slice
  * lands in three runs -- solid, masked, translucent -- and the split the GL
- * passes read is the last: depth draws everything that blocks, gobo draws
- * the translucent range that filters. */
+ * passes read is the last: the depth pass draws the whole slice (the
+ * translucent range keeping depth only at its opaque paint), the gobo pass
+ * the translucent range alone. */
 static int hwr_sun_build_static(const struct hwr_scene *scene,
                                 const struct hwr_world *world)
 {
@@ -560,8 +562,12 @@ static uint16_t hwr_sun_light_yaw(const struct hwr_gl_camera *camera)
 
 /* One decoded 3D prop into the dynamic slice, as its real geometry: the mesh
  * emitter's own placement law (facing rotation in the engine's table, the
- * modular position add), faces emitted solid. Pins are camera-facing
- * decorations and are skipped. */
+ * modular position add), and the eye emitter's own texel law -- a masked
+ * face (the DAS transparency flag) carries its texture into the caster
+ * program, where its index-0 texels are holes in the shadow exactly as the
+ * sprite cards' are; a face without it casts solid, which is a trunk's
+ * honest shadow. Faces the eye never draws (the visibility flag clear) cast
+ * nothing; pins are camera-facing decorations and are skipped. */
 static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
                              const struct hwr_object *object,
                              const struct hwr_mesh_resource *resource,
@@ -575,9 +581,16 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
     for (face_index = 0; face_index < resource->face_count; face_index++) {
         const struct hwr_mesh_face *face =
             &meshes->faces[resource->first_face + face_index];
+        const struct hwr_mesh_material *material = NULL;
         float corner_x[4];
         float corner_y[4];
         float corner_z[4];
+        float corner_s[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float corner_t[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        uint32_t offset = 0;
+        uint16_t width = 0;
+        uint16_t height = 0;
+        uint8_t flags = 0;
         size_t corner_count = face->kind == HWR_MESH_FACE_QUAD ? 4u : 3u;
         size_t triangles;
         struct hwr_gl_sun_vertex *out;
@@ -585,6 +598,29 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
 
         if (face->kind == HWR_MESH_FACE_PIN)
             continue;
+        if ((face->texture_id & 0xff00u) != 0xff00u) {
+            /* A textured face the eye emitter skips casts nothing either. */
+            if ((face->flags & 8u) == 0)
+                continue;
+            if (face->material_index != UINT32_MAX &&
+                face->material_index < meshes->material_count)
+                material = &meshes->materials[face->material_index];
+        }
+        if (material != NULL) {
+            flags = hwr_sunm_mesh_flags(face->flags);
+            if (flags != 0) {
+                offset = material->base_offset +
+                         (uint32_t)material->frame_index *
+                         material->frame_bytes;
+                width = material->width;
+                height = material->height;
+                hwr_sunm_mesh_uv(face->flags, face->extent_u, face->extent_v,
+                                 face->scale, face->packed_control,
+                                 face->packed_a, face->packed_b, width,
+                                 height, material->child_flip != 0, corner_s,
+                                 corner_t);
+            }
+        }
         for (t = 0; t < corner_count; t++) {
             const struct hwr_mesh_local_vertex *local =
                 &meshes->vertices[resource->first_vertex + face->vertex[t]];
@@ -614,16 +650,17 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
             corners[2] = t + 2u;
             for (k = 0; k < 3u; k++) {
                 struct hwr_gl_sun_vertex *vertex = &out[t * 3u + k];
+                size_t corner = corners[k];
 
-                vertex->x = corner_x[corners[k]];
-                vertex->y = corner_y[corners[k]];
-                vertex->z = corner_z[corners[k]];
-                vertex->u = 0.0f;
-                vertex->v = 0.0f;
-                vertex->offset = 0;
-                vertex->width = 0;
-                vertex->height = 0;
-                vertex->flags = 0;
+                vertex->x = corner_x[corner];
+                vertex->y = corner_y[corner];
+                vertex->z = corner_z[corner];
+                vertex->u = flags != 0 ? corner_s[corner] : 0.0f;
+                vertex->v = flags != 0 ? corner_t[corner] : 0.0f;
+                vertex->offset = offset;
+                vertex->width = flags != 0 ? width : 0;
+                vertex->height = flags != 0 ? height : 0;
+                vertex->flags = flags;
                 vertex->pad0 = 0;
                 vertex->pad1 = 0;
             }
@@ -637,8 +674,8 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
  * seeder already names (nothing without an owner sector, no reflection-only
  * synthetics). Each becomes one upright quad faced to the light, sized by
  * the billboard emitter's own world-space law, its sprite frame resolved
- * with the light's yaw standing in for the view's, pushed half a light-space
- * texel toward the light so its own drawn sprite never darkens itself. */
+ * with the light's yaw standing in for the view's, standing exactly where
+ * the drawn sprite stands (the bias law owns the self-shadow question). */
 static void hwr_sun_build_dynamic(const struct hwr_scene *scene,
                                   const struct hwr_world *world,
                                   const struct hwr_objects *objects,
@@ -651,7 +688,14 @@ static void hwr_sun_build_dynamic(const struct hwr_scene *scene,
     double hscale;
     double vscale;
     uint16_t light_yaw;
-    float push = 0.5f * g_window.texel;
+    /* No push toward the light: the receiver-slope bias covers the card's
+     * own within-texel depth variation (plus the caster pass's units-only
+     * offset) with the floor's own margin, so the object's drawn sprite
+     * keeps its light against its own card with the card exactly where the
+     * sprite is. The half-texel push the first milestone stacked on top of
+     * a generous flat bias was slack -- and slack anywhere in this chain is
+     * a strip of light where a caster meets the surface that shades it. */
+    float push = 0.0f;
     size_t i;
 
     g_dynamic_count = 0;
@@ -947,12 +991,10 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
     sun.intensity = g_rows.intensity;
     hwr_sunm_matrices(&g_window, g_dir, g_right, g_up, sun.clip, sun.lookup);
     sun.resolution = resolution;
-    /* The texels row owns what casts -- masks cut the depth pass and the
-     * translucent range dims the beam through the gobo -- at every quality
-     * tier; the quality row keeps its own meaning, which is how finely the
-     * map resolves and what the soft edge may cost. */
-    sun.cutouts = g_rows.texels == HWR_SUN_TEXELS_CUTOUT;
-    sun.gobo = sun.cutouts;
+    /* Texture cut-outs are the only casting law: masks cut the depth pass
+     * and the translucent range filters per texel through the gobo, at
+     * every quality tier. The quality row keeps its own meaning, which is
+     * how finely the map resolves and what the soft edge may cost. */
     sun.soft = g_rows.quality != HWR_SUN_QUALITY_LOW &&
                g_rows.softness > 0.0f;
     sun.soft_radius = sun.soft ? hwr_sunm_soft_radius(g_rows.softness) : 0.0f;

@@ -502,16 +502,19 @@ _Static_assert(sizeof(struct hwr_gl_sun_vertex) == 32,
 
 enum hwr_gl_sun_vertex_flags {
     /* The surface's texture carries the block-transparency bit: its index-0
-     * texels are holes and the depth pass discards them -- when the texels
-     * row asks for cut-outs. */
+     * texels are holes and both passes discard them -- a hole is not a
+     * surface at all. */
     HWR_GL_SUN_MASKED = 1u << 0,
-    /* An object card: its outline IS its identity, so its index-0 discard is
-     * not a tier question -- a card without it is a rectangle, not a rough
-     * shadow. Every tier honours this one. */
+    /* An object card: its outline IS its identity -- a card without its
+     * index-0 discard is a rectangle, not a rough shadow. */
     HWR_GL_SUN_CARD = 1u << 1,
-    /* The translucent range: a surface the beam passes THROUGH rather than
-     * stops at. It never writes depth -- it is drawn only by the gobo pass,
-     * where its texels multiply the pass weight into the light. */
+    /* The translucent range: a surface whose texels decide per texel what
+     * the beam does, by the same rule the eye-ray transmittance pass reads
+     * off the map's own blend tables -- an index-0 texel of a masked
+     * surface is a hole (full light), a blend-range texel (high bit set)
+     * filters the beam by the fitted pass weight through the gobo plane,
+     * and every other texel is opaque paint: it writes depth and blocks the
+     * beam whole, exactly as a masked caster's paint does. */
     HWR_GL_SUN_TRANSLUCENT = 1u << 2
 };
 
@@ -538,14 +541,6 @@ struct hwr_gl_sun {
     float clip[16];
     /* Depth-map side in texels. A change re-takes the storage. */
     int resolution;
-    /* Whether world-geometry masked casters take the texel discard (the
-     * texels row's cut-outs). Object cards discard at every tier. */
-    int cutouts;
-    /* Whether the transmittance plane -- the gobo -- is rendered and read:
-     * the translucent range dims the beam by its pass weight instead of
-     * being ignored. Zero is the solid law: no plane exists, no VRAM is
-     * spent on one, and the key term is the depth compare alone. */
-    int gobo;
     /* Nonzero selects the LINEAR depth compare -- the free 2x2 PCF, the
      * barely-soft edge. Zero is the hard edge. */
     int soft;

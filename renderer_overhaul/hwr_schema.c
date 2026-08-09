@@ -30,8 +30,6 @@ _Static_assert(sizeof(enum hwr_light_scope) == sizeof(int32_t),
                "enum fields must be four bytes wide");
 _Static_assert(sizeof(enum hwr_sun_quality) == sizeof(int32_t),
                "enum fields must be four bytes wide");
-_Static_assert(sizeof(enum hwr_sun_texels) == sizeof(int32_t),
-               "enum fields must be four bytes wide");
 _Static_assert(sizeof(int) == sizeof(int32_t),
                "boolean fields must be four bytes wide");
 
@@ -97,12 +95,12 @@ static const struct hwr_enum_value HWR_SUN_QUALITY_VALUES[] = {
     { "high",   HWR_SUN_QUALITY_HIGH,   "High" }
 };
 
-/* The what-casts ladder ends here for now: the tinted step is reserved for
- * the milestone that can colour the beam honestly, and shipping its token
- * before then would be a switch wired to nothing. */
+/* Retired, and kept only so that a configuration file written for an earlier
+ * build still parses: texture cut-outs are the only casting law now, so
+ * neither token reaches a field. */
 static const struct hwr_enum_value HWR_SUN_TEXELS_VALUES[] = {
-    { "solid",  HWR_SUN_TEXELS_SOLID,  "Solid shapes" },
-    { "cutout", HWR_SUN_TEXELS_CUTOUT, "Texture cut-outs" }
+    { "solid",  0, "Solid shapes" },
+    { "cutout", 1, "Texture cut-outs" }
 };
 
 /* Retired, and kept only so that a configuration file written for an earlier
@@ -2175,27 +2173,23 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "range."
     },
     {
+        /* Retired: texture cut-outs are the only casting law -- a grate's
+         * holes pass light and a translucent pane filters the beam by the
+         * map's own per-texel rule, at every quality tier. The key is still
+         * accepted so an existing configuration file keeps loading whole. */
         .key = "sun_shadow_texels",
         .type = HWR_VT_ENUM,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
-        .apply_kind = HWR_APPLY_HOOK,
-        .change_bit = HWR_CHANGE_TRUECOLOR,
-        .offset = offsetof(struct hwr_settings, sun_shadow_texels),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
-                 HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .e = HWR_SUN_TEXELS_CUTOUT },
-        .original = { .e = HWR_SUN_TEXELS_CUTOUT },
+        .exposure = HWR_EXP_RETIRED,
+        .apply_kind = HWR_APPLY_NONE,
+        .change_bit = 0,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .flags = 0,
         .values = HWR_SUN_TEXELS_VALUES,
         .value_count = HWR_COUNT_OF(HWR_SUN_TEXELS_VALUES),
         .depends_on = -1,
-        .depends_on_key = "shading_mode",
-        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Shadows from textures",
-        .help = "What casts the sky light's shadows. Texture cut-outs let "
-                "a grate's holes pass light and a translucent pane dim the "
-                "beam by what it lets through; solid shapes cast every "
-                "surface whole, whatever is painted on it."
+        .help = "texture cut-outs are the only law the shadows follow now"
     },
     {
         .key = "sun_object_shadows",
