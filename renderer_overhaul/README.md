@@ -252,6 +252,9 @@ falls back to the settings alone, and putting the file back puts the selection b
       "textures": {
         "100": { "colour": "#7fe0a0", "strength": 1.2, "reach": 640 }
       }
+    },
+    "environment_lighting": {
+      "colour": "#ffede0", "strength": 0.8, "elevation": 45
     }
   },
 
@@ -259,6 +262,7 @@ falls back to the settings alone, and putting the file back puts the selection b
     "STUDY1": {
       "notes": "Lamplit and enclosed; its own candles carry it.",
       "settings": { "room_light_reach": 0.72 },
+      "environment_lighting": { "direction": 210 },
       "lights": {
         "sprites": { "34/0": { "strength": 2.0 } },
         "objects": [
@@ -300,6 +304,11 @@ a *screen* wants: the shading and the whole light rig may be written in one, and
 contrast of the picture may not. A row a map answers for is marked in red on the settings screen
 with what the map says, because moving that setting will not change the picture where you are
 standing.
+
+`environment_lighting` is the third thing a place may say, and it describes the sun or the moon —
+the light that comes down out of the sky rather than standing in a room. It is the one part of a
+place that is usually aimed per map, and it has [a section of its own](#the-skys-own-light-environment_lighting)
+below.
 
 **Every number in every one of these tables is decimal, and every one of them is a number the ROTH
 Editor prints for the same thing.** Write what is on your screen.
@@ -536,6 +545,74 @@ another map are a different corner of a different building. **Light from things 
 **Light from glowing textures** do not reach these — a light you wrote down is not a kind of thing the
 game has, so there is no separate switch for it — but **Torches and candles give light** turns them
 off with everything else.
+
+### The sky's own light: `environment_lighting`
+
+`environment_lighting` sits beside `settings` and `lights` rather than inside either, because it
+describes the one light in the game that is **not in the room with you**. It comes down out of the
+sky, enters wherever the map is open to it, and everything between it and the floor — roofs, walls,
+window bars, whatever is standing outside — casts a shadow into the room. A map with no opening to
+the sky is untouched by all of it and needs no entry at all.
+
+```json
+"everywhere": {
+  "environment_lighting": {
+    "colour": "#ffede0", "strength": 0.8, "elevation": 45
+  }
+},
+"maps": {
+  "TOWER1": {
+    "notes": "Night, high up. Moonlight through the north openings.",
+    "environment_lighting": {
+      "kind": "moon", "colour": "#b9c8ff", "strength": 0.35,
+      "elevation": 22, "direction": 210, "shadow_quality": "high"
+    }
+  },
+  "CRYPT1": { "environment_lighting": { "on": false } }
+}
+```
+
+| field | absent means | what it says |
+|---|---|---|
+| `on` | **automatic**: lit wherever the map is open to the sky | holds the light on, or out of a map that has openings and should not be lit through them |
+| `kind` | `"sun"` | `"sun"` or `"moon"` — **a label**, and nothing else: it decides which word the light is called by, while the colour and the strength are what it actually looks like |
+| `colour` | the game-wide answer | what colour the light from the sky is |
+| `strength` | the game-wide answer | how much of it there is |
+| `elevation` | the game-wide answer | how high it stands above the horizon, **in degrees**: low means long shadows reaching deep through side windows, high means short ones under things |
+| `direction` | the game-wide answer | which way it stands over the map, **in degrees** as a compass bearing — 0 north (the top of the map as the editor draws it), 90 east, 180 south, 270 west |
+| `object_shadows` | the settings screen's own | whether things standing in the world cast into it |
+| `shadow_quality` | the settings screen's own | `"low"`, `"medium"` or `"high"` |
+| `sky_ceilings` | the game's own reading | which ceilings are open to the sky, for a map it reads wrongly — see below |
+
+**`direction` is the per-map field.** These maps were built with no sun in them at all, so which of a
+map's openings catch the light is nobody's truth and everybody's choice: stand in the room, turn the
+**Sun compass direction** dial until the light falls where you want it, and write that number down
+under the map. Everything else usually wants saying once, under `everywhere`.
+
+**Every typed field above is also a settings key**, and the two are one statement written two ways:
+`direction` is `sun_yaw_deg`, `colour` is `sun_color`, `strength` is `sun_intensity`, `elevation` is
+`sun_elevation_deg`, `on` is `sun_light`, and the two shadow fields are `sun_object_shadows` and
+`sun_shadow_quality`. They land in the same place and compose by the same rule, so the block is the
+friendlier spelling rather than a second mechanism. Write a value **both** ways in one place and the
+block is the answer in force, and the game says so once.
+
+**`sky_ceilings` is the one place composition is not field by field.** Every other field of every
+other table is laid over the answer above it on its own; a list is one answer rather than a bag of
+fields, so **a map's `sky_ceilings` replaces the list above it** instead of adding to it — which is
+what lets a map take a ceiling *out* of the reading as well as put one in. It is an escape hatch, and
+most maps want no part of it: the game reads a ceiling as open sky when its texture number is 0 or 1,
+which is how the maps of this game say it. Write the list only where that reading is wrong for one
+map, write **every** ceiling that is open in it — including 0 and 1 if they still are — and an empty
+list says that none of them is.
+
+```json
+"TOWER1": { "environment_lighting": { "sky_ceilings": [1, 2609] } }
+```
+
+Because these are the same rows the settings screen holds, a map that answers for any of them marks
+them in red there with what the map says, and **Reload game config** puts an edited file in force
+where you stand — turn `direction`, save, press the button, and the shadows swing round without a map
+change.
 
 ### Documentation inside one: `notes`
 

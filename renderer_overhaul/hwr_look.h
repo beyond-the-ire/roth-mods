@@ -34,7 +34,7 @@
  * sides. Maps sharing a texture archive are still different maps here, which
  * is what makes a description a map's own.
  *
- * One place says two kinds of thing:
+ * One place says three kinds of thing:
  *
  *   "settings"  the dials, spelled exactly as the settings file spells them. A
  *               key is accepted when the settings table has a row of that name
@@ -75,6 +75,28 @@
  *               `everywhere`: a number in one map's own list, and three
  *               numbers inside one building, name nothing anywhere else.
  *
+ *   "environment_lighting"
+ *               THE SKY'S OWN LIGHT -- the sun, or the moon -- which is the
+ *               one light in the game that is not in the room with you. It is
+ *               aimed and coloured per map, because the maps were authored
+ *               with no sun at all and which openings catch the light is a
+ *               choice somebody makes with the map in front of them.
+ *
+ *               It is a FRIENDLIER SPELLING of settings keys rather than a
+ *               second way of overriding one: every typed field of it is a
+ *               settings row carrying the same map-override flag, so
+ *               `"direction": 210` and `"sun_yaw_deg": 210` are one statement
+ *               written two ways, and the block's fields are translated onto
+ *               those rows as the file is read. There is one merge, one
+ *               precedence chain and one publish. Where a place writes the
+ *               same value both ways the block is the answer in force, and
+ *               one note says so.
+ *
+ *               Two of its fields have no row and live in the model beside
+ *               the light grants: `kind`, which is a LABEL and decides which
+ *               word is used for the light and nothing else, and
+ *               `sky_ceilings`, which is a LIST.
+ *
  *               A GRANT CREATES A LIGHT. A thing the map itself marks unshaded
  *               is a light already and a grant tunes it; a thing the map does
  *               NOT mark is made one by any grant naming it, and is DRAWN as a
@@ -86,6 +108,12 @@
  *               the lights a map marks, a texture by the brightest part of its
  *               own picture. Only `placed` has nothing to read, and only
  *               `placed` therefore requires the colour to be written.
+ *
+ * EVERY FIELD OF EVERY TABLE COMPOSES FIELD BY FIELD, with exactly one
+ * exception: `sky_ceilings` is a LIST, and a list is one answer rather than a
+ * bag of fields, so a map's list REPLACES the one above it instead of adding
+ * to it. It is said here, in the shipped file and in the README, because a
+ * rule with one exception is the rule people get wrong.
  *
  * A member named exactly `notes`, at any level, is documentation -- a piece of
  * text or a list of them -- and is never read as data.
@@ -345,6 +373,40 @@ void hwr_look_object_hidden(uint32_t map_index);
  * too; one written game-wide stays quiet, because a game-wide line is written
  * once for a whole game and is meant to name nothing on most of its maps. */
 void hwr_look_objects_settled(uint32_t numbered);
+
+/* THE SKY'S OWN LIGHT, in the two parts of it that are not settings rows.
+ *
+ * Everything else the `environment_lighting` block says is translated onto the
+ * `sun_*` rows as the file is read, so it arrives through hwr_look_effective
+ * with every other overridden dial and needs nothing of its own here. These
+ * two have no row to be translated onto.
+ *
+ * The KIND is a label: it decides which word the light is called by and
+ * nothing else, because the colour and the strength are what it actually looks
+ * like. Absent, it is the sun. */
+enum hwr_look_sky_kind {
+    HWR_LOOK_SKY_SUN = 0,
+    HWR_LOOK_SKY_MOON = 1
+};
+int hwr_look_sky_kind(void);
+
+/* And WHICH CEILINGS ARE OPEN TO THE SKY, for the maps whose own ceilings do
+ * not say so the way the rest of the game's do. Where the place in force names
+ * any, that list is the whole answer -- it REPLACES the reading the renderer
+ * would have made rather than adding to it, which is the one place in this
+ * file where composition is not field by field. A list nobody wrote leaves the
+ * renderer's own reading standing, which is what `stated` answers; an EMPTY
+ * list is a statement of its own and means no ceiling of the map is open.
+ *
+ * `hwr_look_sky_ceiling` answers only for a place that states a list at all,
+ * so a caller asks `stated` first and keeps its own reading otherwise. */
+int hwr_look_sky_ceilings_stated(void);
+size_t hwr_look_sky_ceiling_count(void);
+int hwr_look_sky_ceiling(uint16_t flat_id);
+/* Moves when that list does and at no other time, so a renderer that works a
+ * map out once knows in one comparison whether its answer still stands. Never
+ * nought, so nought is free to mean nothing has been worked out yet. */
+uint32_t hwr_look_sky_generation(void);
 
 void hwr_look_clear(void);
 

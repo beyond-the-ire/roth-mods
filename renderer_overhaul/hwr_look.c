@@ -5,6 +5,7 @@
 
 #include <dirent.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +47,11 @@
  * where the map has none -- so a map that wants many is a map being re-lit
  * rather than adjusted, and this is generous room for that. */
 #define HWR_LOOK_MAX_PLACED 64u
+/* And how many CEILINGS one place may call open sky. This is an escape hatch
+ * for the handful of ceilings a map paints its own way, not a second way of
+ * describing a map's roof, so a place that wants many of them is a place where
+ * the reading itself is wrong. */
+#define HWR_LOOK_MAX_SKY_CEILINGS 16u
 /* The shape this build reads. A file that names a later one is read anyway and
  * says so, which is what lets an older build be honest about a newer file
  * rather than guess at it. */
@@ -213,6 +219,36 @@ struct hwr_look_placed {
     size_t count;
 };
 
+/* WHAT ONE PLACE SAYS ABOUT THE SKY'S OWN LIGHT that is not a settings row.
+ *
+ * The typed fields of the `environment_lighting` block -- whether it is lit at
+ * all, its colour, its strength, how high it stands and which way it faces,
+ * and the two shadow escapes -- are every one of them a row of the settings
+ * table that a map is allowed to answer for, so they are TRANSLATED onto those
+ * rows as the file is read and are held in `values` with every other override.
+ * One merge, one precedence chain, one publish.
+ *
+ * These two have no row to be translated onto:
+ *
+ *   THE KIND is a label. Whether a place calls its sky light the sun or the
+ *   moon decides which word is used for it and nothing else -- the colour and
+ *   the strength are what it actually looks like -- so it is a word this layer
+ *   carries rather than a value anything computes with.
+ *
+ *   THE OPEN CEILINGS are a LIST, and that makes them the one thing in this
+ *   file that does not compose field by field: a list is one answer rather
+ *   than a bag of fields, so a map's list REPLACES the one above it. Its
+ *   presence is its own flag because an EMPTY list is a real statement -- no
+ *   ceiling of this map is open to the sky -- and is a different thing from
+ *   saying nothing and leaving the renderer's own reading standing. */
+struct hwr_look_env {
+    int has_kind;
+    int kind;
+    int has_ceilings;
+    uint16_t ceilings[HWR_LOOK_MAX_SKY_CEILINGS];
+    size_t ceiling_count;
+};
+
 /* One answer, whether it is the one every place gets or one place's own: they
  * have the same shape, and that is the whole of the composition rule.
  *
@@ -227,6 +263,13 @@ struct hwr_look_scope {
     struct hwr_look_objects objects;
     struct hwr_look_faces faces;
     struct hwr_look_placed placed;
+    struct hwr_look_env env;
+    /* Which rows of `values` this place's `environment_lighting` block wrote,
+     * which is bookkeeping about the READING rather than part of the answer:
+     * it is what lets one row written both ways in one place resolve to the
+     * block whichever order the two were written in, and say so once. It is
+     * never merged and never published. */
+    struct hwr_row_set env_rows;
 };
 
 struct hwr_look_map {
@@ -252,6 +295,11 @@ static struct hwr_look_lights g_effective_textures;
 static struct hwr_look_objects g_effective_objects;
 static struct hwr_look_faces g_effective_faces;
 static struct hwr_look_placed g_effective_placed;
+static struct hwr_look_env g_effective_env;
+/* And the same for the ceilings a place calls open sky, which the sky light
+ * builds its casters against: a number that moves when the list does and at no
+ * other time, so a map is worked out once rather than once a frame. */
+static uint32_t g_sky_generation = 1u;
 /* A number that moves when anything the map's own geometry is lit FROM does --
  * the granted textures, the named faces -- and at no other time. What reads it
  * works a map out ONCE and then wants to know, in one comparison per frame,
@@ -819,6 +867,28 @@ static void hwr_look_lights_merge(struct hwr_look_lights *into,
     }
 }
 
+/* One place's sky light over another's -- the two parts of it that are not
+ * settings rows, because the rest is composed with every other overridden row.
+ *
+ * The KIND composes field by field like everything else. The CEILINGS do not,
+ * and this is the one place in the file where that is true: a list is one
+ * answer rather than a bag of fields, so a place that writes one REPLACES the
+ * list above it whole. Saying "the map adds two more" would leave nobody able
+ * to take one away. */
+static void hwr_look_env_over(struct hwr_look_env *into,
+                              const struct hwr_look_env *from)
+{
+    if (from->has_kind) {
+        into->has_kind = 1;
+        into->kind = from->kind;
+    }
+    if (from->has_ceilings) {
+        into->has_ceilings = 1;
+        into->ceiling_count = from->ceiling_count;
+        memcpy(into->ceilings, from->ceilings, sizeof into->ceilings);
+    }
+}
+
 /* The entry for one address in one scope, created where there is not one.
  * Two entries written for one address are two statements about one thing, so
  * the second is laid over the first rather than standing beside it -- and an
@@ -940,11 +1010,63 @@ static int hwr_look_is_notes(const char *name)
     return name != NULL && strcmp(name, "notes") == 0;
 }
 
+/* ---------------------------------------- the sky's own light, translated ---
+ *
+ * THE TRANSLATION TABLE: one field of the `environment_lighting` block, one
+ * row of the settings table. Every one of these rows carries the map-override
+ * flag, so each of them could equally be written in `settings` under its own
+ * name -- the block is a friendlier SPELLING of the same statement, and this
+ * is the whole of what makes it one. Both spellings then land in the same
+ * override set, so there is one merge, one precedence chain and one publish.
+ *
+ * THE ROW IS NAMED BY THE FIELD IT WRITES, and that is what keeps this table
+ * honest: `offsetof` is a compile-time name, so a row this table names and the
+ * settings no longer carry does not quietly stop arriving -- IT FAILS TO
+ * BUILD. The key handed to the settings table is the same identifier
+ * stringified, so the two halves of an entry cannot drift into two spellings
+ * either. Which row a key finds is still the settings table's own answer,
+ * asked for by name at the moment the file is read.
+ *
+ * `kind` and `sky_ceilings` are not here: neither is a row, and both live in
+ * the model beside the light grants. */
+#define HWR_LOOK_ENV_ROW(field) #field, offsetof(struct hwr_settings, field)
+
+struct hwr_look_env_row {
+    /* What the block calls it. */
+    const char *field;
+    /* The settings row it writes, and that row's own field in the settings, so
+     * that a row found by name can be held to the one this table meant. */
+    const char *key;
+    size_t offset;
+};
+
+static const struct hwr_look_env_row HWR_LOOK_ENV_TABLE[] = {
+    { "on",             HWR_LOOK_ENV_ROW(sun_light) },
+    { "colour",         HWR_LOOK_ENV_ROW(sun_color) },
+    { "strength",       HWR_LOOK_ENV_ROW(sun_intensity) },
+    { "elevation",      HWR_LOOK_ENV_ROW(sun_elevation_deg) },
+    { "direction",      HWR_LOOK_ENV_ROW(sun_yaw_deg) },
+    { "object_shadows", HWR_LOOK_ENV_ROW(sun_object_shadows) },
+    { "shadow_quality", HWR_LOOK_ENV_ROW(sun_shadow_quality) }
+};
+
+/* Seven fields, seven rows. Written down so that growing the block by a field
+ * that has no row, or losing one, is a decision somebody has to make on
+ * purpose rather than a line that slips in. */
+_Static_assert(sizeof HWR_LOOK_ENV_TABLE / sizeof HWR_LOOK_ENV_TABLE[0] == 7u,
+               "the environment lighting block translates onto seven rows");
+
 /* One key of a `settings` block against the settings table. A file may only
  * carry rows that say a map is allowed to override them, so there is no second
- * list of keys to keep in step with the first. */
+ * list of keys to keep in step with the first.
+ *
+ * `claimed` is the set of rows this place's `environment_lighting` block has
+ * already answered for, where there is one: a row written both ways in one
+ * place resolves to the block, whichever order the two were written in, and
+ * says so once. */
 static void hwr_look_read_setting(const struct hwr_json_doc *doc, int node,
                                   struct hwr_look_values *into,
+                                  const struct hwr_row_set *claimed,
                                   const char *where, int report)
 {
     const char *key = hwr_json_name(doc, node);
@@ -966,6 +1088,12 @@ static void hwr_look_read_setting(const struct hwr_json_doc *doc, int node,
         hwr_look_note(report, where, "'%s' cannot be overridden", key);
         return;
     }
+    if (claimed != NULL && hwr_row_set_has(claimed, index)) {
+        hwr_look_note(report, where, "'%s' is what the environment lighting "
+                                     "here already says; the environment "
+                                     "lighting is the answer in force", key);
+        return;
+    }
     if (hwr_json_type(doc, node) == HWR_JSON_OBJECT ||
         hwr_json_type(doc, node) == HWR_JSON_ARRAY) {
         hwr_look_note(report, where, "'%s' is a single value, not a list or a "
@@ -985,7 +1113,7 @@ static void hwr_look_read_setting(const struct hwr_json_doc *doc, int node,
 }
 
 static void hwr_look_read_settings(const struct hwr_json_doc *doc, int object,
-                                   struct hwr_look_values *into,
+                                   struct hwr_look_scope *into,
                                    const char *where, int report)
 {
     int child;
@@ -999,7 +1127,8 @@ static void hwr_look_read_settings(const struct hwr_json_doc *doc, int object,
          child = hwr_json_next(doc, child)) {
         if (hwr_look_is_notes(hwr_json_name(doc, child)))
             continue;
-        hwr_look_read_setting(doc, child, into, where, report);
+        hwr_look_read_setting(doc, child, &into->values, &into->env_rows, where,
+                              report);
     }
 }
 
@@ -1150,6 +1279,162 @@ static int hwr_look_sprite_number(const char *text, uint16_t *out)
         return 0;
     *out = (uint16_t)(index | (source << 8));
     return 1;
+}
+
+/* WHICH CEILINGS THIS PLACE CALLS OPEN SKY. A list rather than a block, and
+ * the one thing in the file that replaces rather than composes: a map's list is
+ * the whole answer where it writes one.
+ *
+ * An id is written as a number or as a piece of text in any base, exactly as a
+ * texture is, because it IS a texture number -- the one a sector's ceiling
+ * carries. An empty list is kept: it says that no ceiling of this map is open,
+ * which is a different statement from writing no list at all. */
+static void hwr_look_read_sky_ceilings(const struct hwr_json_doc *doc,
+                                       int node, struct hwr_look_env *into,
+                                       const char *where, int report)
+{
+    uint16_t ids[HWR_LOOK_MAX_SKY_CEILINGS];
+    size_t count = 0;
+    int child;
+
+    if (hwr_json_type(doc, node) != HWR_JSON_ARRAY) {
+        hwr_look_note(report, where, "'sky_ceilings' is a list of the ceiling "
+                                     "texture numbers that are open to the "
+                                     "sky, written [1, 2]");
+        return;
+    }
+    for (child = hwr_json_first(doc, node); child >= 0;
+         child = hwr_json_next(doc, child)) {
+        double number = 0.0;
+        uint16_t id = 0;
+
+        if (count >= HWR_LOOK_MAX_SKY_CEILINGS) {
+            hwr_look_note(report, where, "that is more open ceilings than one "
+                                         "place may name");
+            return;
+        }
+        if (hwr_json_as_number(doc, child, &number)) {
+            if (number < 0.0 || number > 65535.0 ||
+                number != (double)(long)number) {
+                hwr_look_note(report, where, "a ceiling is a whole texture "
+                                             "number between 0 and 65535");
+                return;
+            }
+            id = (uint16_t)number;
+        } else if (!hwr_look_texture_number(hwr_json_as_text(doc, child),
+                                            &id)) {
+            hwr_look_note(report, where, "a ceiling is a texture number, "
+                                         "written 1 or \"1\"");
+            return;
+        }
+        ids[count++] = id;
+    }
+    /* Written in one go at the end: a list that could not be read whole leaves
+     * whatever was there standing, rather than replacing it with the half of
+     * itself that parsed. */
+    memcpy(into->ceilings, ids, count * sizeof ids[0]);
+    into->ceiling_count = count;
+    into->has_ceilings = 1;
+}
+
+/* THE SKY'S OWN LIGHT, as one place describes it. Every typed field goes
+ * straight onto the settings row the table above pairs it with, read by that
+ * row's own reader -- so every bound, every token and every complaint is the
+ * settings screen's own, exactly as a key written in `settings` gets. */
+static void hwr_look_read_env(const struct hwr_json_doc *doc, int object,
+                              struct hwr_look_scope *into, const char *where,
+                              int report)
+{
+    int child;
+
+    if (hwr_json_type(doc, object) != HWR_JSON_OBJECT) {
+        hwr_look_note(report, where, "the environment lighting is a block of "
+                                     "what the sky's own light is like");
+        return;
+    }
+    for (child = hwr_json_first(doc, object); child >= 0;
+         child = hwr_json_next(doc, child)) {
+        const char *name = hwr_json_name(doc, child);
+        const struct hwr_setting_desc *desc;
+        union hwr_value parsed;
+        char message[128];
+        char text[192];
+        size_t entry;
+        int index;
+
+        if (name == NULL || hwr_look_is_notes(name))
+            continue;
+        if (strcmp(name, "kind") == 0) {
+            const char *word = hwr_json_as_text(doc, child);
+
+            /* A LABEL AND NOTHING ELSE. What the light looks like is its
+             * colour and its strength; this decides which word is used for
+             * it, so that a place lit by the moon is not called the sun. */
+            if (word != NULL && strcmp(word, "sun") == 0) {
+                into->env.has_kind = 1;
+                into->env.kind = HWR_LOOK_SKY_SUN;
+            } else if (word != NULL && strcmp(word, "moon") == 0) {
+                into->env.has_kind = 1;
+                into->env.kind = HWR_LOOK_SKY_MOON;
+            } else {
+                hwr_look_note(report, where, "'kind' is \"sun\" or \"moon\"");
+            }
+            continue;
+        }
+        if (strcmp(name, "sky_ceilings") == 0) {
+            hwr_look_read_sky_ceilings(doc, child, &into->env, where, report);
+            continue;
+        }
+        for (entry = 0; entry < sizeof HWR_LOOK_ENV_TABLE /
+                                sizeof HWR_LOOK_ENV_TABLE[0]; entry++) {
+            if (strcmp(name, HWR_LOOK_ENV_TABLE[entry].field) == 0)
+                break;
+        }
+        if (entry == sizeof HWR_LOOK_ENV_TABLE /
+                     sizeof HWR_LOOK_ENV_TABLE[0]) {
+            hwr_look_note(report, where, "'%s' is not something the "
+                                         "environment lighting says", name);
+            continue;
+        }
+        desc = hwr_schema_find(HWR_LOOK_ENV_TABLE[entry].key);
+        index = desc != NULL ? hwr_look_row_index(desc) : -1;
+        if (desc == NULL || index < 0 ||
+            desc->offset != HWR_LOOK_ENV_TABLE[entry].offset ||
+            (desc->flags & HWR_SF_MAP_OVERRIDE) == 0) {
+            /* The one complaint here that is not about the file: this build's
+             * own table names a setting this build's own settings do not
+             * answer for. Said in those words, so that nobody goes looking for
+             * the mistake in what they wrote. */
+            hwr_look_note(report, where, "'%s' has nothing to write to in this "
+                                         "build; this is a fault in the mod "
+                                         "rather than in the file", name);
+            continue;
+        }
+        if (hwr_json_type(doc, child) == HWR_JSON_OBJECT ||
+            hwr_json_type(doc, child) == HWR_JSON_ARRAY) {
+            hwr_look_note(report, where, "'%s' is a single value, not a list "
+                                         "or a block", name);
+            continue;
+        }
+        hwr_json_render(doc, child, text, sizeof text);
+        message[0] = 0;
+        if (!hwr_schema_parse(desc, text, &parsed, message, sizeof message)) {
+            hwr_look_note(report, where, "'%s': %s", name, message);
+            continue;
+        }
+        /* THE BLOCK IS THE ANSWER IN FORCE where this place writes the same
+         * value both ways. Said once, whichever of the two was written
+         * first: the settings reader refuses a row this set already holds,
+         * and this overwrites one the settings reader got to first. */
+        if (hwr_row_set_has(&into->values.present, index) &&
+            !hwr_row_set_has(&into->env_rows, index))
+            hwr_look_note(report, where, "'%s' is what '%s' in the settings "
+                                         "here already says; the environment "
+                                         "lighting is the answer in force",
+                          name, HWR_LOOK_ENV_TABLE[entry].key);
+        hwr_look_set(&into->values, index, parsed);
+        hwr_row_set_add(&into->env_rows, index);
+    }
 }
 
 /* What one keyed thing gives off: one sprite, or one texture.
@@ -1715,10 +2000,17 @@ static void hwr_look_read_scope(const struct hwr_json_doc *doc, int object,
             continue;
         if (strcmp(name, "settings") == 0) {
             hwr_look_where(inside, where, "settings");
-            hwr_look_read_settings(doc, child, &into->values, inside, report);
+            hwr_look_read_settings(doc, child, into, inside, report);
         } else if (strcmp(name, "lights") == 0) {
             hwr_look_where(inside, where, "lights");
             hwr_look_read_lights(doc, child, into, inside, report, placed);
+        } else if (strcmp(name, "environment_lighting") == 0) {
+            /* Read in EVERY scope: the sky is the same sky over a whole game,
+             * and what changes per map is which way its openings face -- which
+             * is exactly the field a map writes and the game-wide answer
+             * mostly does not. */
+            hwr_look_where(inside, where, "environment_lighting");
+            hwr_look_read_env(doc, child, into, inside, report);
         } else {
             hwr_look_note(report, where, "'%s' is not something this build "
                                          "reads", name);
@@ -1966,7 +2258,8 @@ static void hwr_look_compose(const struct hwr_look_file *file,
                              struct hwr_look_lights *out_textures,
                              struct hwr_look_objects *out_objects,
                              struct hwr_look_faces *out_faces,
-                             struct hwr_look_placed *out_placed)
+                             struct hwr_look_placed *out_placed,
+                             struct hwr_look_env *out_env)
 {
     const struct hwr_look_map *map;
 
@@ -1976,16 +2269,19 @@ static void hwr_look_compose(const struct hwr_look_file *file,
     memset(out_objects, 0, sizeof *out_objects);
     memset(out_faces, 0, sizeof *out_faces);
     memset(out_placed, 0, sizeof *out_placed);
+    memset(out_env, 0, sizeof *out_env);
     if (!g_look_present)
         return;
     hwr_look_merge(out, &file->everywhere.values);
     hwr_look_lights_merge(out_sprites, &file->everywhere.sprites, 0);
     hwr_look_lights_merge(out_textures, &file->everywhere.textures, 0);
+    hwr_look_env_over(out_env, &file->everywhere.env);
     map = hwr_look_find_map(file, map_name);
     if (map != NULL) {
         hwr_look_merge(out, &map->scope.values);
         hwr_look_lights_merge(out_sprites, &map->scope.sprites, 1);
         hwr_look_lights_merge(out_textures, &map->scope.textures, 1);
+        hwr_look_env_over(out_env, &map->scope.env);
         /* And the three tables that come from ONE scope: the map's own objects
          * and faces, which are the last word, and its free-standing lights.
          * There is no game-wide table of any of them to compose with, because a
@@ -2004,13 +2300,15 @@ static void hwr_look_publish(const struct hwr_look_values *next,
                              const struct hwr_look_lights *next_textures,
                              const struct hwr_look_objects *next_objects,
                              const struct hwr_look_faces *next_faces,
-                             const struct hwr_look_placed *next_placed)
+                             const struct hwr_look_placed *next_placed,
+                             const struct hwr_look_env *next_env)
 {
     uint32_t changed = 0;
     size_t count = hwr_schema_count();
     size_t i;
     int glow_moved;
     int placed_moved;
+    int sky_moved;
 
     /* The sprites table is not a row and raises no row's bit of its own, so it
      * raises the rig's: what it changes is what the lights that are not at the
@@ -2028,13 +2326,26 @@ static void hwr_look_publish(const struct hwr_look_values *next,
         next_placed->count != g_effective_placed.count ||
         memcmp(next_placed->items, g_effective_placed.items,
                next_placed->count * sizeof next_placed->items[0]) != 0;
+    /* And the ceilings the place in force calls open sky, which are the one
+     * part of the sky's own light that is not a row. What reads them builds a
+     * map's casters against them ONCE, so this comparison is what says that
+     * answer is stale -- and it is exact rather than raised on every reload,
+     * because a list that did not move is a map that does not need walking
+     * again. */
+    sky_moved =
+        next_env->has_ceilings != g_effective_env.has_ceilings ||
+        next_env->ceiling_count != g_effective_env.ceiling_count ||
+        memcmp(next_env->ceilings, g_effective_env.ceilings,
+               next_env->ceiling_count * sizeof next_env->ceilings[0]) != 0;
     if (next_sprites->count != g_effective_sprites.count ||
         memcmp(next_sprites->items, g_effective_sprites.items,
                next_sprites->count * sizeof next_sprites->items[0]) != 0 ||
         glow_moved || placed_moved ||
         next_objects->count != g_effective_objects.count ||
         memcmp(next_objects->items, g_effective_objects.items,
-               next_objects->count * sizeof next_objects->items[0]) != 0)
+               next_objects->count * sizeof next_objects->items[0]) != 0 ||
+        sky_moved || next_env->has_kind != g_effective_env.has_kind ||
+        next_env->kind != g_effective_env.kind)
         changed |= HWR_CHANGE_TRUECOLOR;
     g_effective_sprites = *next_sprites;
     /* And the one thing a seeding that works a whole map out ONCE has to be
@@ -2050,8 +2361,11 @@ static void hwr_look_publish(const struct hwr_look_values *next,
      * staged, and this is what says that answer is stale. */
     if (placed_moved && ++g_placed_generation == 0u)
         g_placed_generation = 1u;
+    if (sky_moved && ++g_sky_generation == 0u)
+        g_sky_generation = 1u;
     g_effective_placed = *next_placed;
     g_effective_objects = *next_objects;
+    g_effective_env = *next_env;
     /* A new set of objects is a new conversation about them: what has been said
      * is about the map in force, and the map in force has just been decided. */
     memset(g_object_matched, 0, sizeof g_object_matched);
@@ -2093,6 +2407,7 @@ static void hwr_look_publish_nothing(void)
     struct hwr_look_objects no_objects;
     struct hwr_look_faces no_faces;
     struct hwr_look_placed no_placed;
+    struct hwr_look_env no_env;
 
     memset(&empty, 0, sizeof empty);
     memset(&no_sprites, 0, sizeof no_sprites);
@@ -2100,8 +2415,9 @@ static void hwr_look_publish_nothing(void)
     memset(&no_objects, 0, sizeof no_objects);
     memset(&no_faces, 0, sizeof no_faces);
     memset(&no_placed, 0, sizeof no_placed);
+    memset(&no_env, 0, sizeof no_env);
     hwr_look_publish(&empty, &no_sprites, &no_textures, &no_objects, &no_faces,
-                     &no_placed);
+                     &no_placed, &no_env);
 }
 
 static void hwr_look_say_what_was_read(const struct hwr_look_file *file)
@@ -2356,6 +2672,7 @@ void hwr_look_select_map(const char *map_name)
     struct hwr_look_objects next_objects;
     struct hwr_look_faces next_faces;
     struct hwr_look_placed next_placed;
+    struct hwr_look_env next_env;
     char reduced[HWR_LOOK_NAME];
 
     /* Reduced into a buffer of its own FIRST: the reload path passes the
@@ -2368,9 +2685,9 @@ void hwr_look_select_map(const char *map_name)
     hwr_look_map_name(reduced, HWR_LOOK_NAME, map_name);
     memcpy(g_look_map, reduced, HWR_LOOK_NAME);
     hwr_look_compose(&g_look, g_look_map, &next, &next_sprites, &next_textures,
-                     &next_objects, &next_faces, &next_placed);
+                     &next_objects, &next_faces, &next_placed, &next_env);
     hwr_look_publish(&next, &next_sprites, &next_textures, &next_objects,
-                     &next_faces, &next_placed);
+                     &next_faces, &next_placed, &next_env);
 }
 
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
@@ -2610,6 +2927,41 @@ uint32_t hwr_look_placed_generation(void)
     return g_placed_generation;
 }
 
+/* ------------------------------------------------ the sky's own light --- */
+
+int hwr_look_sky_kind(void)
+{
+    return g_effective_env.has_kind ? g_effective_env.kind : HWR_LOOK_SKY_SUN;
+}
+
+int hwr_look_sky_ceilings_stated(void)
+{
+    return g_effective_env.has_ceilings;
+}
+
+size_t hwr_look_sky_ceiling_count(void)
+{
+    return g_effective_env.has_ceilings ? g_effective_env.ceiling_count : 0u;
+}
+
+int hwr_look_sky_ceiling(uint16_t flat_id)
+{
+    size_t i;
+
+    if (!g_effective_env.has_ceilings)
+        return 0;
+    for (i = 0; i < g_effective_env.ceiling_count; i++) {
+        if (g_effective_env.ceilings[i] == flat_id)
+            return 1;
+    }
+    return 0;
+}
+
+uint32_t hwr_look_sky_generation(void)
+{
+    return g_sky_generation;
+}
+
 int hwr_look_objects_pending(void)
 {
     return !g_objects_settled &&
@@ -2740,6 +3092,9 @@ void hwr_look_clear(void)
     if (g_effective_placed.count != 0u && ++g_placed_generation == 0u)
         g_placed_generation = 1u;
     memset(&g_effective_placed, 0, sizeof g_effective_placed);
+    if (g_effective_env.has_ceilings && ++g_sky_generation == 0u)
+        g_sky_generation = 1u;
+    memset(&g_effective_env, 0, sizeof g_effective_env);
     memset(&g_effective_objects, 0, sizeof g_effective_objects);
     memset(g_object_matched, 0, sizeof g_object_matched);
     memset(g_object_hidden, 0, sizeof g_object_hidden);

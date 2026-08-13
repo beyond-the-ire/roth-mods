@@ -237,6 +237,11 @@ unsigned long hwr_sun_static_builds(void)
     return g_static_builds;
 }
 
+unsigned long hwr_sun_static_vertices(void)
+{
+    return (unsigned long)g_static_count;
+}
+
 unsigned long hwr_sun_static_dims(void)
 {
     unsigned long count = 0;
@@ -270,12 +275,19 @@ static uint32_t hwr_sun_mix(uint32_t hash, const void *bytes, size_t size)
  * (scripted movers), and the door pool (pose and leaf textures). Pans and
  * animation frames are deliberately outside it: a scrolling or animating
  * texture moves its texels, not its geometry, and the texel store is shared
- * with the eye pass, so cut-outs follow without a rebuild. */
+ * with the eye pass, so cut-outs follow without a rebuild.
+ *
+ * The game config's own list of open ceilings is in here too, by its
+ * generation: which surfaces are casters at all is decided against it, so a
+ * file edited and reloaded mid-map rebuilds the slice at the next frame
+ * exactly as a lift moving does. */
 static uint32_t hwr_sun_world_hash(const struct hwr_world *world)
 {
     uint32_t hash = 2166136261u;
+    uint32_t sky = hwr_look_sky_generation();
     size_t i;
 
+    hash = hwr_sun_mix(hash, &sky, sizeof sky);
     for (i = 0; i < world->sector_count; i++) {
         const struct hwr_sector *sector = &world->sectors[i];
         int16_t values[6] = {
@@ -353,6 +365,22 @@ static struct hwr_gl_sun_vertex *hwr_sun_grow(struct hwr_gl_sun_vertex **list,
 
 /* ------------------------------------------------------ the static slice */
 
+/* WHETHER A CEILING IS THE MAP BEING OPEN TO THE SKY.
+ *
+ * The reading is the map's own statement: the open-sky ceiling family is flat
+ * id 0 or 1, and a sector carrying one has no roof over it. A handful of maps
+ * paint theirs another way, so the game config lets a place NAME the ceilings
+ * that are open -- and a list REPLACES this reading rather than adding to it,
+ * because a list is one answer rather than a bag of fields and because a map
+ * whose reading is wrong needs to be able to take 0 and 1 out of it as much as
+ * to put another number in. */
+static int hwr_sun_open_ceiling(int16_t ceiling)
+{
+    if (hwr_look_sky_ceilings_stated())
+        return hwr_look_sky_ceiling((uint16_t)ceiling);
+    return ceiling == 0 || ceiling == 1;
+}
+
 /* Which of the frame's casters a surface of the map mesh is, if any.
  * Returns 0 to skip it, 1 to cast solid, 2 to cast with the masked-texel
  * cut-out, 3 to filter rather than cast -- the translucent range, drawn by
@@ -380,7 +408,7 @@ static int hwr_sun_classify(const struct hwr_scene *scene,
         int16_t ceiling =
             world->sectors[surface->sector_index].ceiling_flat_id;
 
-        if (ceiling == 0 || ceiling == 1)
+        if (hwr_sun_open_ceiling(ceiling))
             return 0;
     }
     if (id >= 0 && id < 0x1600) {
@@ -1093,11 +1121,16 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
     hwr_gl_set_sun(&sun);
     hwr_gl_sun_set_dynamic(g_dynamic, g_dynamic_count);
     if (hwr_sun_debug() && (moved || force)) {
+        /* THE WORD THE PLACE CALLS ITS SKY LIGHT BY, which is the whole of
+         * what `kind` decides: the colour and the strength are what it looks
+         * like, and this is what it is called while somebody is reading a
+         * line about it. */
         fprintf(stderr,
-                "[renderer_overhaul] sun: dir=(%.4f %.4f %.4f) "
+                "[renderer_overhaul] %s: dir=(%.4f %.4f %.4f) "
                 "yaw=%.1f elev=%.1f window a=%.0f b=%.0f d=%.0f span=%.0f "
                 "texel=%.2f res=%d casters static=%lu dynamic=%lu "
                 "sky-faces=%lu cam=(%.0f %.0f %d) cam_yaw=%d/%d\n",
+                hwr_look_sky_kind() == HWR_LOOK_SKY_MOON ? "moon" : "sun",
                 (double)g_dir[0], (double)g_dir[1], (double)g_dir[2],
                 (double)g_rows.yaw_deg, (double)g_rows.elevation_deg,
                 (double)g_window.center_a, (double)g_window.center_b,

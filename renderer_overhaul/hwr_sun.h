@@ -35,6 +35,10 @@ size_t hwr_sun_sky_faces(void);
  * sealed map builds nothing is a claim about something that did not happen,
  * and only a counter can state one. */
 unsigned long hwr_sun_static_builds(void);
+/* How many vertices the static slice holds, which is the measurable form of
+ * "these surfaces cast and those do not": the offline gate moves the game
+ * config's open-ceiling list and holds the slice to what that list says. */
+unsigned long hwr_sun_static_vertices(void);
 /* How many vertices of the static slice are palette-colour solid-blend
  * DIMS (translucent with no texels): the offline gate holds the class to
  * the map's own walls. */
