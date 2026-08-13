@@ -1,5 +1,6 @@
 #include "hwr_gl.h"
 #include "hwr_perf.h"
+#include "hwr_point_math.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -26,6 +27,9 @@
 #endif
 #ifndef GL_RGBA8
 #define GL_RGBA8 0x8058
+#endif
+#ifndef GL_R32F
+#define GL_R32F 0x822e
 #endif
 #ifndef GL_FRAMEBUFFER
 #define GL_FRAMEBUFFER 0x8d40
@@ -344,6 +348,32 @@ static size_t g_sun_dynamic_count;
 static int g_sun_map_valid;
 /* Set once the sun program has failed to come up, so it is never retried. */
 static int g_sun_failed;
+
+/* The point-light shadow atlas: the frame's published state, the atlas and
+ * the perspective caster programs -- the sun's caster sources compiled once
+ * more under a define. The caster arrays inside g_pshadow are borrowed for
+ * the frame, exactly as the sun's dynamic slice is; they are streamed into
+ * this layer's own buffers at the render and never read after it. */
+static struct hwr_gl_pshadow g_pshadow;
+static GLuint g_ps_program;
+static GLuint g_ps_line_program;
+static GLuint g_ps_fbo;
+static GLuint g_ps_atlas_texture;
+static GLuint g_ps_depth_buffer;
+static int g_ps_resolution;
+static GLuint g_ps_vao;
+static GLuint g_ps_vbo;
+/* Which slice CONTENT the shared VBO holds, by the policy layer's own
+ * generation stamp: a rebuilt slice can keep its pointer, so bytes are
+ * claimed by the number rather than the address. Zero means none. */
+static uint32_t g_ps_static_uploaded;
+static size_t g_ps_static_uploaded_count;
+static GLuint g_ps_card_vao;
+static GLuint g_ps_card_vbo;
+/* Whether each tile of the atlas holds a rendered map this frame. */
+static int g_ps_tile_valid[HWR_GL_PSHADOW_MAX];
+static int g_ps_map_valid;
+static int g_ps_failed;
 
 /* Whether the colour plane still describes the same picture the index plane
  * does. The colour target persists exactly as the index target does -- that is
@@ -2041,6 +2071,121 @@ static const char g_geometry_fragment_body[] =
     "  if (u_sun_gobo_valid!=0) s*=texture(u_sun_gobo,p.xy).r;\n"
     "  return s;\n"
     "}\n"
+    /* THE POINT-LIGHT SHADOW LOOKUP: the sampling law of hwr_point_math.h,
+     * which is the sun's law spelled the general way. The stored value is
+     * radial distance over the light's range, six perspective faces per
+     * shadowed light in one atlas; the reference for every tap is the
+     * distance to where that TEXEL CENTRE'S OWN RAY meets the receiver's
+     * plane -- exact, two dot products, no linearization -- minus the floor;
+     * the flat ceiling where the plane is unknown or the ray grazes it; and
+     * every lit answer held to the band rule. The 2x2 blend is the sun's
+     * barely-soft rest, by hand, each texel compared against its own carried
+     * reference. */
+    "uniform sampler2D u_pshadow;\n"
+    "uniform int u_ps_valid;\n"
+    "uniform int u_ps_res;\n"
+    "uniform float u_ps_guard;\n"          /* the read window's share of a face */
+    "uniform float u_ps_floor;\n"          /* bias floor, world units */
+    "uniform float u_ps_ceiling;\n"        /* bias ceiling, world units */
+    /* World position and atlas tile of each light in the array below; the
+     * tile is -1 everywhere no shadow map stands for it. World rather than
+     * view space on purpose: the maps are rendered in world space, which
+     * every view shares -- the same reason the sun's lookup stays there. */
+    "uniform vec4 u_point_w[16];\n"
+    "void ps_basis(int f, out vec3 a, out vec3 uu, out vec3 vv) {\n"
+    "  if (f==0){a=vec3(1,0,0);uu=vec3(0,1,0);vv=vec3(0,0,1);}\n"
+    "  else if (f==1){a=vec3(-1,0,0);uu=vec3(0,-1,0);vv=vec3(0,0,1);}\n"
+    "  else if (f==2){a=vec3(0,1,0);uu=vec3(-1,0,0);vv=vec3(0,0,1);}\n"
+    "  else if (f==3){a=vec3(0,-1,0);uu=vec3(1,0,0);vv=vec3(0,0,1);}\n"
+    "  else if (f==4){a=vec3(0,0,1);uu=vec3(1,0,0);vv=vec3(0,1,0);}\n"
+    "  else {a=vec3(0,0,-1);uu=vec3(-1,0,0);vv=vec3(0,1,0);}\n"
+    "}\n"
+    "int ps_face(vec3 d) {\n"
+    "  vec3 ad=abs(d);\n"
+    "  if (ad.x>=ad.y&&ad.x>=ad.z) return d.x>=0.0?0:1;\n"
+    "  if (ad.y>=ad.z) return d.y>=0.0?2:3;\n"
+    "  return d.z>=0.0?4:5;\n"
+    "}\n"
+    "float ps_fetch(int tile,int f,ivec2 t) {\n"
+    "  t=clamp(t,ivec2(0),ivec2(u_ps_res-1));\n"
+    "  return texelFetch(u_pshadow,ivec2((f%3)*u_ps_res+t.x,\n"
+    "                    (tile*2+f/3)*u_ps_res+t.y),0).r;\n"
+    "}\n"
+    /* One texel's compare: the reference carried along the receiver's plane
+     * to the texel centre's own ray (clamped by the ceiling so a degenerate
+     * plane cannot carry it somewhere dishonest), the floor for arithmetic,
+     * and the band rule on every lit answer -- a lit texel whose stored
+     * caster stands past the receiver's band crossed unmodelled ground, and
+     * the fragment's own answer stands in. */
+    "float ps_tap(int tile,int f,ivec2 t,vec3 L,float R,vec3 p,vec3 n,\n"
+    "             bool planar,float od,float own,float band) {\n"
+    "  vec2 c=(vec2(t)+0.5)/float(u_ps_res);\n"
+    "  vec3 a,uu,vv; ps_basis(f,a,uu,vv);\n"
+    "  vec3 dc=a+((c.x-0.5)*2.0/u_ps_guard)*uu+((c.y-0.5)*2.0/u_ps_guard)*vv;\n"
+    "  float ref=od-u_ps_ceiling;\n"
+    "  if (planar) {\n"
+    "    float denom=dot(n,dc);\n"
+    "    if (abs(denom)>1e-6) {\n"
+    "      float tt=dot(n,p-L)/denom;\n"
+    "      if (tt>0.0)\n"
+    "        ref=od+clamp(tt*length(dc)-od,-u_ps_ceiling,u_ps_ceiling)\n"
+    "            -u_ps_floor;\n"
+    "    }\n"
+    "  }\n"
+    "  float stored=ps_fetch(tile,f,t)*R;\n"
+    "  float lit=stored>=ref?1.0:0.0;\n"
+    "  float beyond=stored>=ref+band?1.0:0.0;\n"
+    "  return lit*mix(1.0,own,beyond);\n"
+    "}\n"
+    "float ps_factor(int tile,vec3 L,float R) {\n"
+    "  vec3 p=v_world;\n"
+    "  vec3 d=p-L;\n"
+    "  float od=length(d);\n"
+    "  if (!(od>0.0)||!(R>0.0)) return 1.0;\n"
+    "  int f=ps_face(d);\n"
+    "  vec3 a,uu,vv; ps_basis(f,a,uu,vv);\n"
+    "  float major=dot(d,a);\n"
+    "  if (!(major>0.0)) return 1.0;\n"
+    "  vec2 uv=vec2(dot(d,uu),dot(d,vv))/major*u_ps_guard*0.5+0.5;\n"
+    "  vec3 n=v_normal_world;\n"
+    "  bool planar=n!=vec3(0.0);\n"
+    "  float band=(planar?2.0*u_ps_floor:2.0*u_ps_ceiling)+u_ps_floor;\n"
+    /* The fragment's own texel, carried to its centre; a band-refused own
+     * retakes uncarried at the fragment itself -- the honest local question,
+     * exactly the sun's own-carry fallback. */
+    "  ivec2 ot=ivec2(floor(uv*float(u_ps_res)));\n"
+    "  float own;\n"
+    "  {\n"
+    "    vec2 c=(vec2(ot)+0.5)/float(u_ps_res);\n"
+    "    vec3 dc=a+((c.x-0.5)*2.0/u_ps_guard)*uu+((c.y-0.5)*2.0/u_ps_guard)*vv;\n"
+    "    float ref=od-u_ps_ceiling;\n"
+    "    if (planar) {\n"
+    "      float denom=dot(n,dc);\n"
+    "      if (abs(denom)>1e-6) {\n"
+    "        float tt=dot(n,p-L)/denom;\n"
+    "        if (tt>0.0)\n"
+    "          ref=od+clamp(tt*length(dc)-od,-u_ps_ceiling,u_ps_ceiling)\n"
+    "              -u_ps_floor;\n"
+    "      }\n"
+    "    }\n"
+    "    float stored=ps_fetch(tile,f,ot)*R;\n"
+    "    float o1=stored>=ref?1.0:0.0;\n"
+    "    float ob=stored>=ref+band?1.0:0.0;\n"
+    "    float ouc=stored>=od-(planar?u_ps_floor:u_ps_ceiling)?1.0:0.0;\n"
+    "    own=o1*mix(1.0,ouc,ob);\n"
+    "  }\n"
+    /* The barely-soft 2x2, the sun's default look: the four nearest texels,
+     * each against its own carried reference, mixed by the fragment's own
+     * position between their centres. */
+    "  vec2 tt=uv*float(u_ps_res)-0.5;\n"
+    "  vec2 fr=fract(tt);\n"
+    "  ivec2 b=ivec2(floor(tt));\n"
+    "  float s00=ps_tap(tile,f,b,L,R,p,n,planar,od,own,band);\n"
+    "  float s10=ps_tap(tile,f,b+ivec2(1,0),L,R,p,n,planar,od,own,band);\n"
+    "  float s01=ps_tap(tile,f,b+ivec2(0,1),L,R,p,n,planar,od,own,band);\n"
+    "  float s11=ps_tap(tile,f,b+ivec2(1,1),L,R,p,n,planar,od,own,band);\n"
+    "  return mix(mix(s00,s10,fr.x),mix(s01,s11,fr.x),fr.y);\n"
+    "}\n"
     /* The lights that are NOT at the eye: a torch on a wall, a candle on a
      * table, a lit window. One array, whatever seeded them, so a class added
      * later is a seeder rather than a second lighting path -- and every one of
@@ -2246,12 +2391,21 @@ static const char g_geometry_fragment_body[] =
     "  float window=smoothstep(u_point_z[i].x,u_point_z[i].x+edge,zw)*\n"
     "               (1.0-smoothstep(u_point_z[i].y-edge,u_point_z[i].y,zw));\n"
     "  if (window<=0.0) return vec3(0.0);\n"
+    /* The shadow map, where this light carries one: the depth compare in
+     * world space, which every view shares. A light with no tile -- every
+     * light until a config entry opts in -- multiplies by one through a
+     * branch never taken. */
+    "  float shadow=1.0;\n"
+    "  int pstile=int(u_point_w[i].w);\n"
+    "  if (u_ps_valid!=0 && pstile>=0)\n"
+    "    shadow=ps_factor(pstile,u_point_w[i].xyz,reach);\n"
+    "  if (shadow<=0.0) return vec3(0.0);\n"
     /* The same falloff the light at the eye takes, from the one place all of
      * them take it, so the reach is where the pool ENDS rather than where it
      * stops being visible -- which is also what makes the reach a bound on the
      * leaking. */
     "  return light_space(u_point_b[i].rgb)*u_point_b[i].w*ndl*gain*\n"
-    "         light_falloff(r,reach)*window;\n"
+    "         light_falloff(r,reach)*window*shadow;\n"
     "}\n"
     /* Where the light landing on a surface stops adding up, as a knee rather
      * than as a cut.
@@ -3148,9 +3302,24 @@ static const char g_sun_fragment_shader[] =
     "flat in uvec2 v_normal;\n"
     "in vec3 v_wpos;\n"
     "layout(location=0) out vec4 out_gobo;\n"
+    "#ifdef PSHADOW\n"
+    /* The point-light variant: the same cut-out law under a perspective face
+     * matrix, storing RADIAL DISTANCE over the light's range in the colour
+     * plane -- the face depth buffer only orders fragments, and both are
+     * monotone along one ray, so the nearest fragment's distance is what
+     * lands (hwr_point_math.h). */
+    "uniform vec3 u_ps_light;\n"
+    "uniform float u_ps_range;\n"
+    "#endif\n"
     "#ifdef SUN_LINE_DEPTH\n"
     "uniform mat4 u_matrix;\n"
     "uniform float u_res;\n"
+    "#ifdef PSHADOW\n"
+    /* The face viewport's own origin, for pixel-centre ray reconstruction,
+     * and the guard share the matrix was built with. */
+    "uniform vec2 u_ps_vp;\n"
+    "uniform float u_ps_guard;\n"
+    "#endif\n"
     /* The same octahedral unpack the world stages run. */
     "vec3 sun_normal_decode(uvec2 pn) {\n"
     "  vec2 p=(vec2(pn)-128.0)/127.0;\n"
@@ -3189,6 +3358,40 @@ static const char g_sun_fragment_shader[] =
     "  return clamp(max(zc*0.5+0.5,gl_FragCoord.z)+4.0/16777216.0,\n"
     "               0.0,1.0);\n"
     "}\n"
+    "#ifdef PSHADOW\n"
+    /* The same conservative edge rule under the perspective face: the pixel
+     * centre's own RAY is reconstructed from the face matrix (its w row is
+     * the face axis, its x and y rows the guarded tangents), the caster
+     * plane's distance where that ray meets it is stamped -- held no NEARER
+     * than the line's own sample, so the plane is never written past the
+     * caster's physical edge -- and the depth written is that intersection's
+     * own, one quantum past the fill so fill and line agree texel for texel
+     * wherever the fill already owns the centre. */
+    "void ps_line(out float depth,out float dist) {\n"
+    "  float own=length(v_wpos-u_ps_light)/u_ps_range;\n"
+    "  depth=gl_FragCoord.z;\n"
+    "  dist=own+4.0/16777216.0;\n"
+    "  if (v_normal.x==0u && v_normal.y==0u) return;\n"
+    "  vec3 n=sun_normal_decode(v_normal);\n"
+    "  vec3 axis=vec3(u_matrix[0].w,u_matrix[1].w,u_matrix[2].w);\n"
+    "  vec3 ru=vec3(u_matrix[0].x,u_matrix[1].x,u_matrix[2].x);\n"
+    "  vec3 rv=vec3(u_matrix[0].y,u_matrix[1].y,u_matrix[2].y);\n"
+    "  vec2 ndc=((gl_FragCoord.xy-u_ps_vp)/u_res)*2.0-1.0;\n"
+    "  float gg=u_ps_guard*u_ps_guard;\n"
+    "  vec3 d=axis+(ndc.x/gg)*ru+(ndc.y/gg)*rv;\n"
+    "  float denom=dot(n,d);\n"
+    "  if (abs(denom)<=1e-6) return;\n"
+    "  float t=dot(n,v_wpos-u_ps_light)/denom;\n"
+    "  if (t<=0.0) return;\n"
+    "  dist=max(t*length(d)/u_ps_range,own)+4.0/16777216.0;\n"
+    "  float a=dot(vec3(u_matrix[0].z,u_matrix[1].z,u_matrix[2].z),axis);\n"
+    "  float b=u_matrix[3].z-a*u_matrix[3].w;\n"
+    "  float we=t*dot(axis,d);\n"
+    "  if (we<=0.0) return;\n"
+    "  depth=clamp(max(((a*we+b)/we)*0.5+0.5,gl_FragCoord.z)+4.0/16777216.0,\n"
+    "              0.0,1.0);\n"
+    "}\n"
+    "#endif\n"
     "#endif\n"
     /* The per-texel law of the translucent range, both passes reading the
      * SAME classes the eye-ray transmittance pass reads: an index-0 texel of
@@ -3201,7 +3404,7 @@ static const char g_sun_fragment_shader[] =
      * its light (blocking-behind is the depth map's job; a zero written
      * here would blacken the very face the paint stands on). */
     "void main() {\n"
-    "#ifdef SUN_LINE_DEPTH\n"
+    "#if defined(SUN_LINE_DEPTH) && !defined(PSHADOW)\n"
     "  gl_FragDepth=sun_line_depth();\n"
     "#endif\n"
     "  int w=int(v_dims.x), h=int(v_dims.y);\n"
@@ -3220,7 +3423,25 @@ static const char g_sun_fragment_shader[] =
     "    out_gobo=vec4(u_gobo_blend,u_gobo_blend,u_gobo_blend,1.0);\n"
     "    return;\n"
     "  }\n"
+    "#ifdef PSHADOW\n"
+    /* The point pass stores distance in the colour plane -- the fill the
+     * fragment's own, the line pass the caster plane's at the pixel centre
+     * (ps_line). Glass has no gobo here: its opaque paint blocks below
+     * exactly as the sun's does, and its blend-range texels pass whole,
+     * which is the prototype's stated limit. */
+    "#ifdef SUN_LINE_DEPTH\n"
+    "  {\n"
+    "    float pd; float pdist;\n"
+    "    ps_line(pd,pdist);\n"
+    "    gl_FragDepth=pd;\n"
+    "    out_gobo=vec4(pdist,0.0,0.0,1.0);\n"
+    "  }\n"
+    "#else\n"
+    "  out_gobo=vec4(length(v_wpos-u_ps_light)/u_ps_range,0.0,0.0,1.0);\n"
+    "#endif\n"
+    "#else\n"
     "  out_gobo=vec4(0.0);\n"
+    "#endif\n"
     /* The depth pass: a translucent surface owns depth only at its opaque
      * paint -- its blend-range texels pass light and are discarded here. */
     "  if ((v_flags & 4u)!=0u && (texel & 128u)!=0u) discard;\n"
@@ -3342,6 +3563,10 @@ static void hwr_destroy_programs(void)
         g_gl.delete_program(g_sun_program);
     if (g_sun_line_program != 0)
         g_gl.delete_program(g_sun_line_program);
+    if (g_ps_program != 0)
+        g_gl.delete_program(g_ps_program);
+    if (g_ps_line_program != 0)
+        g_gl.delete_program(g_ps_line_program);
     g_geometry_program = 0;
     g_sky_program = 0;
     g_resolve_program = 0;
@@ -3352,6 +3577,9 @@ static void hwr_destroy_programs(void)
     g_sun_program = 0;
     g_sun_line_program = 0;
     g_sun_failed = 0;
+    g_ps_program = 0;
+    g_ps_line_program = 0;
+    g_ps_failed = 0;
 }
 
 /* Releases every GL object the sun machinery holds. The published state and
@@ -3381,6 +3609,40 @@ static void hwr_sun_destroy_objects(void)
     g_sun_static_gobo_first = 0;
     g_sun_map_valid = 0;
     g_sun_gobo_valid = 0;
+}
+
+/* Releases every GL object the point-shadow machinery holds. The published
+ * state survives for the same reason the sun's does; the tile contents do
+ * not, so every tile is marked stale for the next frame that can render. */
+static void hwr_pshadow_destroy_objects(void)
+{
+    size_t i;
+
+    if (g_ps_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_ps_vao);
+    if (g_ps_card_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_ps_card_vao);
+    if (g_ps_vbo != 0)
+        g_gl.delete_buffers(1, &g_ps_vbo);
+    if (g_ps_card_vbo != 0)
+        g_gl.delete_buffers(1, &g_ps_card_vbo);
+    if (g_ps_fbo != 0)
+        g_gl.delete_framebuffers(1, &g_ps_fbo);
+    if (g_ps_depth_buffer != 0)
+        g_gl.delete_renderbuffers(1, &g_ps_depth_buffer);
+    hwr_delete_texture(&g_ps_atlas_texture);
+    g_ps_vao = 0;
+    g_ps_card_vao = 0;
+    g_ps_vbo = 0;
+    g_ps_card_vbo = 0;
+    g_ps_fbo = 0;
+    g_ps_depth_buffer = 0;
+    g_ps_resolution = 0;
+    g_ps_static_uploaded = 0;
+    g_ps_static_uploaded_count = 0;
+    for (i = 0; i < HWR_GL_PSHADOW_MAX; i++)
+        g_ps_tile_valid[i] = 0;
+    g_ps_map_valid = 0;
 }
 
 /* The caster vertex format, bound once per array object against the record
@@ -3641,6 +3903,10 @@ int hwr_gl_sun_map_valid(void)
 static void hwr_set_sampler(GLuint program, const char *name, GLint unit);
 static void hwr_uniform_1i(GLuint program, const char *name, GLint value);
 static void hwr_uniform_1f(GLuint program, const char *name, GLfloat value);
+static void hwr_uniform_2f(GLuint program, const char *name, GLfloat x,
+                           GLfloat y);
+static void hwr_uniform_3f(GLuint program, const char *name,
+                           GLfloat x, GLfloat y, GLfloat z);
 
 /* Whether the frame about to be rendered wants the sun machinery at all. The
  * key term lives inside the modern law alone, so any other law -- and any
@@ -3826,6 +4092,334 @@ static void hwr_sun_render_map(void)
     g_gl.disable(GL_POLYGON_OFFSET_FILL);
     g_gl.bind_vertex_array(0);
     g_sun_map_valid = 1;
+}
+
+/* ------------------------------------------ the point-light shadow atlas */
+
+void hwr_gl_pshadow_set(const struct hwr_gl_pshadow *ps)
+{
+    if (ps == NULL || !ps->active) {
+        memset(&g_pshadow, 0, sizeof g_pshadow);
+        return;
+    }
+    g_pshadow = *ps;
+    if (g_pshadow.count > HWR_GL_PSHADOW_MAX)
+        g_pshadow.count = HWR_GL_PSHADOW_MAX;
+}
+
+/* Brings the atlas machinery up: the two perspective caster programs (the
+ * sun's own sources under one more define), the two array objects, the R32F
+ * atlas and its ordering depth buffer. A failure stands the whole prototype
+ * down for the context's lifetime, exactly the sun's rule. */
+static int hwr_pshadow_ensure_objects(void)
+{
+    int resolution = g_pshadow.resolution;
+
+    if (g_ps_failed)
+        return 0;
+    if (resolution < 64 || resolution > 1024)
+        return 0;
+    if (g_ps_program == 0 || g_ps_line_program == 0) {
+        static const char version[] = "#version 330 core\n";
+        static const char ps_define[] = "#define PSHADOW 1\n";
+        static const char ps_line_define[] =
+            "#define PSHADOW 1\n#define SUN_LINE_DEPTH 1\n";
+        const char *vs[3];
+        const char *fs[3];
+
+        vs[0] = version;
+        vs[1] = ps_define;
+        vs[2] = g_sun_vertex_shader;
+        fs[0] = version;
+        fs[1] = ps_define;
+        fs[2] = g_sun_fragment_shader;
+        if (g_ps_program == 0)
+            g_ps_program = hwr_link_program_sources(vs, 3, fs, 3);
+        vs[1] = ps_line_define;
+        fs[1] = ps_line_define;
+        if (g_ps_line_program == 0)
+            g_ps_line_program = hwr_link_program_sources(vs, 3, fs, 3);
+        if (g_ps_program == 0 || g_ps_line_program == 0) {
+            fprintf(stderr,
+                    "[renderer_overhaul] point shadow caster program: %s\n",
+                    g_error);
+            g_ps_failed = 1;
+            return 0;
+        }
+    }
+    if (g_ps_vao == 0) {
+        g_gl.gen_vertex_arrays(1, &g_ps_vao);
+        g_gl.gen_buffers(1, &g_ps_vbo);
+        g_gl.bind_vertex_array(g_ps_vao);
+        g_gl.bind_buffer(GL_ARRAY_BUFFER, g_ps_vbo);
+        hwr_sun_bind_attributes();
+    }
+    if (g_ps_card_vao == 0) {
+        g_gl.gen_vertex_arrays(1, &g_ps_card_vao);
+        g_gl.gen_buffers(1, &g_ps_card_vbo);
+        g_gl.bind_vertex_array(g_ps_card_vao);
+        g_gl.bind_buffer(GL_ARRAY_BUFFER, g_ps_card_vbo);
+        hwr_sun_bind_attributes();
+    }
+    if (g_ps_fbo == 0)
+        g_gl.gen_framebuffers(1, &g_ps_fbo);
+    if (g_ps_atlas_texture == 0 || g_ps_resolution != resolution) {
+        GLsizei atlas_w = (GLsizei)(3 * resolution);
+        GLsizei atlas_h = (GLsizei)(2 * resolution * HWR_GL_PSHADOW_MAX);
+        GLenum status;
+        size_t i;
+
+        hwr_delete_texture(&g_ps_atlas_texture);
+        if (g_ps_depth_buffer != 0) {
+            g_gl.delete_renderbuffers(1, &g_ps_depth_buffer);
+            g_ps_depth_buffer = 0;
+        }
+        g_gl.gen_textures(1, &g_ps_atlas_texture);
+        g_gl.active_texture(GL_TEXTURE0 + 13);
+        g_gl.bind_texture(GL_TEXTURE_2D, g_ps_atlas_texture);
+        /* R32F: the store is world distance over range, compared by hand at
+         * the lookup, so its quantum is dust beside the bias floor. NEAREST
+         * on both filters -- the 2x2 blend is by hand, each texel against
+         * its own carried reference, the sun's own rule. */
+        g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R32F, atlas_w, atlas_h, 0,
+                          GL_RED, GL_FLOAT, NULL);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                             GL_CLAMP_TO_EDGE);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                             GL_NEAREST);
+        g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                             GL_NEAREST);
+        g_gl.gen_renderbuffers(1, &g_ps_depth_buffer);
+        g_gl.bind_renderbuffer(GL_RENDERBUFFER, g_ps_depth_buffer);
+        g_gl.renderbuffer_storage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24,
+                                  atlas_w, atlas_h);
+        g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_ps_fbo);
+        g_gl.framebuffer_texture_2d(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, g_ps_atlas_texture, 0);
+        g_gl.framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                      GL_RENDERBUFFER, g_ps_depth_buffer);
+        status = g_gl.check_framebuffer_status(GL_FRAMEBUFFER);
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            fprintf(stderr, "[renderer_overhaul] point shadow atlas "
+                            "incomplete (0x%x)\n", (unsigned)status);
+            hwr_pshadow_destroy_objects();
+            g_ps_failed = 1;
+            g_gl.active_texture(GL_TEXTURE0);
+            return 0;
+        }
+        g_ps_resolution = resolution;
+        g_ps_static_uploaded = 0;
+        g_ps_static_uploaded_count = 0;
+        for (i = 0; i < HWR_GL_PSHADOW_MAX; i++)
+            g_ps_tile_valid[i] = 0;
+        /* A fresh atlas holds "no caster anywhere" -- one, the far plane --
+         * so a tile a frame claims but never renders reads full light rather
+         * than whatever the allocation happened to hold. */
+        {
+            static const GLfloat clear_far[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+
+            g_gl.viewport(0, 0, atlas_w, atlas_h);
+            g_gl.disable(GL_SCISSOR_TEST);
+            {
+                static const GLenum color_only[1] = { GL_COLOR_ATTACHMENT0 };
+
+                g_gl.draw_buffers(1, color_only);
+            }
+            g_gl.clear_buffer_fv(GL_COLOR, 0, clear_far);
+        }
+        g_gl.active_texture(GL_TEXTURE0);
+    }
+    return 1;
+}
+
+/* One light's six faces into its atlas tile: fill then lines, the static
+ * slice then the light's own cards, each face a scissored viewport of its
+ * own. The caster and cut-out laws are the sun pass's, byte for byte -- the
+ * program is the same source -- and what a texel stores is the nearest
+ * caster's radial distance over the light's range (cleared to one: no
+ * caster, full light). */
+static void hwr_pshadow_render_tile(const struct hwr_gl_pshadow_light *light,
+                                    size_t static_count, size_t card_count)
+{
+    int resolution = g_ps_resolution;
+    float light_pos[3];
+    int face;
+
+    light_pos[0] = light->world[0];
+    light_pos[1] = light->world[1];
+    light_pos[2] = light->world[2];
+    for (face = 0; face < HWR_PSM_FACES; face++) {
+        float matrix[16];
+        GLint vx = (GLint)((face % 3) * resolution);
+        GLint vy = (GLint)((light->tile * 2 + face / 3) * resolution);
+        static const GLfloat clear_far[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        GLuint programs[2];
+        int pass;
+
+        hwr_psm_face_matrix(face, light_pos, light->range, resolution,
+                            matrix);
+        g_gl.viewport(vx, vy, (GLsizei)resolution, (GLsizei)resolution);
+        g_gl.scissor(vx, vy, (GLsizei)resolution, (GLsizei)resolution);
+        g_gl.clear_buffer_fv(GL_COLOR, 0, clear_far);
+        g_gl.clear(GL_DEPTH_BUFFER_BIT);
+        programs[0] = g_ps_program;
+        programs[1] = g_ps_line_program;
+        for (pass = 0; pass < 2; pass++) {
+            GLuint program = programs[pass];
+            GLint location;
+
+            if (pass == 1 && g_gl.polygon_mode == NULL)
+                break;
+            g_gl.use_program(program);
+            hwr_set_sampler(program, "u_texels", 0);
+            location = g_gl.get_uniform_location(program, "u_matrix");
+            if (location >= 0)
+                g_gl.uniform_matrix_4fv(location, 1, GL_FALSE, matrix);
+            hwr_uniform_1i(program, "u_gobo_pass", 0);
+            hwr_uniform_3f(program, "u_ps_light", light_pos[0], light_pos[1],
+                           light_pos[2]);
+            hwr_uniform_1f(program, "u_ps_range", light->range);
+            if (pass == 1) {
+                hwr_uniform_1f(program, "u_res", (GLfloat)resolution);
+                hwr_uniform_2f(program, "u_ps_vp", (GLfloat)vx, (GLfloat)vy);
+                hwr_uniform_1f(program, "u_ps_guard",
+                               hwr_psm_guard_share(resolution));
+                g_gl.polygon_mode(GL_FRONT_AND_BACK, GL_LINE);
+            }
+            if (static_count != 0) {
+                g_gl.bind_vertex_array(g_ps_vao);
+                g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)static_count);
+            }
+            if (card_count != 0) {
+                g_gl.bind_vertex_array(g_ps_card_vao);
+                g_gl.draw_arrays(GL_TRIANGLES, 0, (GLsizei)card_count);
+            }
+            if (pass == 1)
+                g_gl.polygon_mode(GL_FRONT_AND_BACK, GL_FILL);
+        }
+    }
+}
+
+/* Lays down whatever tiles the frame asked to be rebuilt. Runs beside the
+ * sun's map render, before any view; a frame with no shadowed light leaves
+ * the atlas exactly as it stands, which is the whole caching story. */
+static void hwr_pshadow_render_maps(void)
+{
+    size_t i;
+    int any = 0;
+
+    g_ps_map_valid = 0;
+    if (!g_pshadow.active || g_pshadow.count == 0 || !g_truecolor_active) {
+        /* The borrowed caster pointers die with the frame either way. */
+        for (i = 0; i < HWR_GL_PSHADOW_MAX; i++)
+            g_ps_tile_valid[i] = 0;
+        memset(&g_pshadow, 0, sizeof g_pshadow);
+        return;
+    }
+    if (!hwr_pshadow_ensure_objects())
+        return;
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_ps_fbo);
+    g_gl.enable(GL_SCISSOR_TEST);
+    g_gl.disable(GL_BLEND);
+    g_gl.enable(GL_DEPTH_TEST);
+    g_gl.depth_func(GL_LESS);
+    g_gl.depth_mask(GL_TRUE);
+    g_gl.enable(GL_DEPTH_CLAMP);
+    {
+        static const GLenum color_only[1] = { GL_COLOR_ATTACHMENT0 };
+
+        g_gl.draw_buffers(1, color_only);
+    }
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_2D, 0);
+    g_gl.bind_texture(GL_TEXTURE_BUFFER, g_texture_buffer_texture);
+    /* The shared static slice, uploaded once per content generation: a run
+     * of tiles rebuilt from one frame's slice streams it once, and a frame
+     * that rebuilds nothing streams nothing. */
+    for (i = 0; i < g_pshadow.count; i++) {
+        const struct hwr_gl_pshadow_light *light = &g_pshadow.lights[i];
+        size_t static_count = 0;
+        size_t card_count = 0;
+
+        if (light->tile < 0 || light->tile >= (int)HWR_GL_PSHADOW_MAX)
+            continue;
+        if (!light->rebuild) {
+            any = any || g_ps_tile_valid[light->tile];
+            continue;
+        }
+        if (g_pshadow.static_casters != NULL && g_pshadow.static_count != 0) {
+            if (g_ps_static_uploaded != g_pshadow.static_generation ||
+                g_ps_static_uploaded_count != g_pshadow.static_count) {
+                g_gl.bind_buffer(GL_ARRAY_BUFFER, g_ps_vbo);
+                g_gl.buffer_data(GL_ARRAY_BUFFER,
+                                 (GLsizeiptr)(g_pshadow.static_count *
+                                              sizeof *g_pshadow.static_casters),
+                                 g_pshadow.static_casters, GL_STREAM_DRAW);
+                g_ps_static_uploaded = g_pshadow.static_generation;
+                g_ps_static_uploaded_count = g_pshadow.static_count;
+            }
+            static_count = g_pshadow.static_count;
+        }
+        if (light->cards != NULL && light->card_count != 0) {
+            g_gl.bind_buffer(GL_ARRAY_BUFFER, g_ps_card_vbo);
+            g_gl.buffer_data(GL_ARRAY_BUFFER,
+                             (GLsizeiptr)(light->card_count *
+                                          sizeof *light->cards),
+                             light->cards, GL_STREAM_DRAW);
+            card_count = light->card_count;
+        }
+        hwr_pshadow_render_tile(light, static_count, card_count);
+        g_ps_tile_valid[light->tile] = 1;
+        any = 1;
+    }
+    /* A tile that was neither rebuilt nor claimed keeps its bytes but says
+     * nothing this frame; validity follows the frame's own claims. */
+    for (i = 0; i < g_pshadow.count; i++) {
+        const struct hwr_gl_pshadow_light *light = &g_pshadow.lights[i];
+
+        if (light->tile >= 0 && light->tile < (int)HWR_GL_PSHADOW_MAX &&
+            g_ps_tile_valid[light->tile])
+            any = 1;
+    }
+    g_ps_map_valid = any;
+    g_gl.disable(GL_DEPTH_CLAMP);
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.bind_vertex_array(0);
+}
+
+int hwr_gl_pshadow_read_tile(int tile, float *out, int resolution)
+{
+    GLint y;
+    int row;
+
+    if (!g_initialized || out == NULL || !g_ps_map_valid ||
+        g_ps_atlas_texture == 0 || resolution != g_ps_resolution ||
+        tile < 0 || tile >= (int)HWR_GL_PSHADOW_MAX ||
+        !hwr_platform_make_current())
+        return 0;
+    /* Read through the framebuffer, one tile's rows: glGetTexImage has no
+     * sub-rectangle, and the atlas holds every tile. */
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_ps_fbo);
+    g_gl.read_buffer(GL_COLOR_ATTACHMENT0);
+    g_gl.pixel_store_i(GL_PACK_ALIGNMENT, 1);
+    y = (GLint)(tile * 2 * resolution);
+    for (row = 0; row < 2 * resolution; row++)
+        g_gl.read_pixels(0, y + row, (GLsizei)(3 * resolution), 1, GL_RED,
+                         GL_FLOAT, out + (size_t)row * 3u * (size_t)resolution);
+    return hwr_gl_drain_errors() == 0;
+}
+
+int hwr_gl_pshadow_map_valid(void)
+{
+    return g_ps_map_valid;
+}
+
+int hwr_gl_pshadow_tile_ready(int tile)
+{
+    return tile >= 0 && tile < (int)HWR_GL_PSHADOW_MAX &&
+           g_ps_tile_valid[tile];
 }
 
 /* Links the four always-present programs on first use (or after a shutdown); a
@@ -5404,6 +5998,7 @@ static void hwr_bind_point_lights(GLuint program,
     GLfloat position_range[HWR_GL_POINT_LIGHT_MAX * 4];
     GLfloat color_energy[HWR_GL_POINT_LIGHT_MAX * 4];
     GLfloat window[HWR_GL_POINT_LIGHT_MAX * 2];
+    GLfloat world_tile[HWR_GL_POINT_LIGHT_MAX * 4];
     GLint location;
     size_t i;
 
@@ -5426,6 +6021,13 @@ static void hwr_bind_point_lights(GLuint program,
         color_energy[i * 4u + 3u] = light->intensity;
         window[i * 2u + 0u] = light->z_lo;
         window[i * 2u + 1u] = light->z_hi;
+        /* The world side of the same light, for the shadow lookup, which
+         * runs in world space exactly as the sun's does. The tile rides the
+         * fourth component; minus one is every light no map stands for. */
+        world_tile[i * 4u + 0u] = light->world_x;
+        world_tile[i * 4u + 1u] = light->world_y;
+        world_tile[i * 4u + 2u] = light->world_z;
+        world_tile[i * 4u + 3u] = (GLfloat)light->shadow_tile;
     }
     location = g_gl.get_uniform_location(program, "u_point_a");
     if (location >= 0)
@@ -5437,6 +6039,9 @@ static void hwr_bind_point_lights(GLuint program,
     location = g_gl.get_uniform_location(program, "u_point_z");
     if (location >= 0)
         g_gl.uniform_2fv(location, (GLsizei)g_point_light_count, window);
+    location = g_gl.get_uniform_location(program, "u_point_w");
+    if (location >= 0)
+        g_gl.uniform_4fv(location, (GLsizei)g_point_light_count, world_tile);
 }
 
 /* Verifies the uploaded lookup data three ways: the texture store bytes read
@@ -5967,6 +6572,22 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
         if (g_sun_gobo_valid) {
             g_gl.active_texture(GL_TEXTURE0 + 12);
             g_gl.bind_texture(GL_TEXTURE_2D, g_sun_gobo_texture);
+            g_gl.active_texture(GL_TEXTURE0);
+        }
+        /* The point-light shadow atlas, on the unit after the sun's pair.
+         * With no atlas the valid flag is nought and the lookup multiplies
+         * by one through a branch never taken. */
+        hwr_set_sampler(program, "u_pshadow", 13);
+        hwr_uniform_1i(program, "u_ps_valid", g_ps_map_valid);
+        if (g_ps_map_valid) {
+            hwr_uniform_1i(program, "u_ps_res", g_ps_resolution);
+            hwr_uniform_1f(program, "u_ps_guard",
+                           hwr_psm_guard_share(g_ps_resolution));
+            hwr_uniform_1f(program, "u_ps_floor", HWR_PSM_BIAS_FLOOR_WORLD);
+            hwr_uniform_1f(program, "u_ps_ceiling",
+                           HWR_PSM_BIAS_CEILING_WORLD);
+            g_gl.active_texture(GL_TEXTURE0 + 13);
+            g_gl.bind_texture(GL_TEXTURE_2D, g_ps_atlas_texture);
             g_gl.active_texture(GL_TEXTURE0);
         }
     }
@@ -7002,6 +7623,10 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         uint64_t sun_t0 = perf_enabled ? hwr_perf_now_ns() : 0;
 
         hwr_sun_render_map();
+        /* The point-light shadow tiles, by the same rule: once per frame,
+         * before any view, and only the tiles the frame said were stale --
+         * a static scene rebuilds nothing here at all. */
+        hwr_pshadow_render_maps();
         if (perf_enabled) {
             sun_ns = hwr_perf_now_ns() - sun_t0;
             perf_sun_sum += sun_ns;
@@ -7284,6 +7909,7 @@ void hwr_gl_shutdown(void)
     if (g_initialized && hwr_platform_make_current()) {
         hwr_destroy_scene_objects();
         hwr_sun_destroy_objects();
+        hwr_pshadow_destroy_objects();
         hwr_destroy_programs();
         hwr_destroy_framebuffer();
     }
@@ -7293,6 +7919,7 @@ void hwr_gl_shutdown(void)
     g_sun_static_pending_valid = 0;
     g_sun_dynamic = NULL;
     g_sun_dynamic_count = 0;
+    memset(&g_pshadow, 0, sizeof g_pshadow);
     hwr_platform_shutdown();
     free(g_pixels);
     g_pixels = NULL;

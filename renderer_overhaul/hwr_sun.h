@@ -54,4 +54,17 @@ void hwr_sun_frame(struct hwr_scene *scene, const struct hwr_world *world,
                    const struct roth_api_v1 *api,
                    const struct hwr_gl_camera *camera);
 
+/* THE STATIC CASTER SLICE, for anything else that shadows: one slice, one
+ * builder, one classify -- the point-light shadow tiles draw exactly what
+ * the sun draws, holes and dims included, because a wall is the same wall
+ * whichever light it blocks. Ensures the slice is current to the map's own
+ * mutable facts (the same hash the sun's frame keeps it current by; a
+ * sealed map builds it here even though the sun never will) and hands it
+ * over borrowed, with a stamp that moves exactly when its CONTENT does.
+ * Returns 0 with everything cleared where there is nothing to build from. */
+int hwr_sun_acquire_static(const struct hwr_scene *scene,
+                           const struct hwr_world *world,
+                           const struct hwr_gl_sun_vertex **out,
+                           size_t *count, uint32_t *stamp);
+
 #endif

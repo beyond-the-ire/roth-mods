@@ -1,0 +1,487 @@
+#include "hwr_pshadow.h"
+
+#include "hwr_gl.h"
+#include "hwr_point_math.h"
+#include "hwr_sprites.h"
+#include "hwr_sun.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The policy of the point-light shadow prototype; the design is stated in
+ * the header. What this file holds is the tile ledger -- which light owns
+ * which atlas tile and what STAMP its contents were rendered at -- and the
+ * per-light card emitter, which is the sun's own card law aimed at a point:
+ * the sizing arithmetic is the billboard emitter's, the geometry is
+ * hwr_sunm_card out of the shared header, and the axis is the horizontal
+ * perpendicular of the line from THIS light to the object
+ * (hwr_psm_card_axis) rather than one direction for the whole sky. */
+
+_Static_assert((unsigned)HWR_PSM_MAX_LIGHTS == (unsigned)HWR_GL_PSHADOW_MAX,
+               "the policy and execution tile budgets must agree");
+
+/* Engine globals, read the same way the sun's card emitter reads them. */
+#define VA_G_SINCOS_TABLE 0x72080u
+#define VA_G_VIEW_PARAMS_XSCALE 0x8527cu
+#define VA_G_PERSPECTIVE_SCALE 0x85288u
+
+/* The resolved DAS block's class bits the emitters key on. */
+#define HWR_PS_MESH_FLAG 0x8000u
+#define HWR_PS_DRAW_NOTHING_FLAG 0x20u
+
+struct hwr_ps_tile {
+    int used;
+    /* The light's identity across frames: where it hangs and how far it
+     * reaches, exactly the numbers the seeding derives deterministically. */
+    float x;
+    float y;
+    float z;
+    float range;
+    /* The stamp the tile's contents were last rendered at; zero is none. */
+    uint32_t stamp;
+    /* Whether this tile's light was seen this frame (scratch). */
+    int seen;
+    /* This light's card slice, owned here and borrowed by the GL layer for
+     * the frame of a rebuild. */
+    struct hwr_gl_sun_vertex *cards;
+    size_t card_count;
+    size_t card_capacity;
+};
+
+static struct hwr_ps_tile g_tiles[HWR_PSM_MAX_LIGHTS];
+static unsigned long g_tile_builds;
+
+/* HWR_PSHADOW_UNCACHED=1 defeats the tile cache -- every tile every frame --
+ * which exists for one purpose: measuring what the cache is worth. -1 until
+ * first read. */
+static int g_uncached = -1;
+
+static int hwr_pshadow_uncached(void)
+{
+    if (g_uncached < 0) {
+        const char *value = getenv("HWR_PSHADOW_UNCACHED");
+
+        g_uncached = value != NULL && value[0] != '0' && value[0] != 0;
+    }
+    return g_uncached;
+}
+
+unsigned long hwr_pshadow_tile_builds(void)
+{
+    return g_tile_builds;
+}
+
+void hwr_pshadow_reset(void)
+{
+    size_t i;
+
+    for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+        free(g_tiles[i].cards);
+        memset(&g_tiles[i], 0, sizeof g_tiles[i]);
+    }
+    hwr_gl_pshadow_set(NULL);
+}
+
+static uint32_t hwr_ps_mix(uint32_t hash, const void *bytes, size_t size)
+{
+    const uint8_t *p = (const uint8_t *)bytes;
+    size_t i;
+
+    for (i = 0; i < size; i++) {
+        hash ^= p[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static int32_t hwr_ps_sincos(const struct roth_api_v1 *api, uint32_t angle)
+{
+    return (int16_t)api->game_ram->u16(VA_G_SINCOS_TABLE +
+                                       (angle & 0x1ffu) * 2u);
+}
+
+static struct hwr_gl_sun_vertex *hwr_ps_grow(struct hwr_ps_tile *tile,
+                                             size_t extra)
+{
+    struct hwr_gl_sun_vertex *slot;
+
+    if (tile->card_count + extra > tile->card_capacity) {
+        size_t next = tile->card_capacity != 0 ? tile->card_capacity * 2u
+                                               : 64u;
+        struct hwr_gl_sun_vertex *grown;
+
+        while (next < tile->card_count + extra)
+            next *= 2u;
+        grown = (struct hwr_gl_sun_vertex *)realloc(
+            tile->cards, next * sizeof *grown);
+        if (grown == NULL)
+            return NULL;
+        tile->cards = grown;
+        tile->card_capacity = next;
+    }
+    slot = tile->cards + tile->card_count;
+    tile->card_count += extra;
+    return slot;
+}
+
+/* The card slice of one shadowed light: every object within its reach, one
+ * upright quad each, faced to THIS light.
+ *
+ * The sizing arithmetic below is the billboard emitter's own law, the same
+ * lines the sun's card emitter carries (hwr_sun.c documents each term); what
+ * differs is stated at each difference. The sprite FRAME is resolved with
+ * the view's own yaw rather than a per-object light yaw -- the card then
+ * carries the side the player sees, which for a cut-out silhouette is the
+ * prototype's stated approximation. */
+static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
+                               const struct hwr_scene *scene,
+                               const struct hwr_objects *objects,
+                               const struct roth_api_v1 *api,
+                               const struct hwr_gl_camera *camera)
+{
+    const struct hwr_billboards *bb = &scene->billboards;
+    double xscale;
+    double pscale;
+    double hscale;
+    double vscale;
+    size_t i;
+
+    tile->card_count = 0;
+    if (objects == NULL || !objects->valid || api == NULL ||
+        api->game_ram == NULL || !bb->built)
+        return;
+    xscale = (double)(int32_t)api->game_ram->u32(VA_G_VIEW_PARAMS_XSCALE);
+    pscale = (double)(int32_t)api->game_ram->u32(VA_G_PERSPECTIVE_SCALE);
+    if (camera->source_focal_x == 0 || camera->source_focal_y == 0 ||
+        xscale <= 0.0 || pscale <= 0.0)
+        return;
+    hscale = xscale / ((double)camera->source_focal_x * 256.0);
+    vscale = pscale / ((double)camera->source_focal_y * 256.0);
+    for (i = 0; i < objects->count; i++) {
+        const struct hwr_object *object = &objects->items[i];
+        struct hwr_sprite_lookup lookup;
+        struct hwr_sprite_frame frame;
+        const struct hwr_bb_slot *slot = NULL;
+        uint32_t offset;
+        uint16_t tw;
+        uint16_t th;
+        uint16_t fa;
+        int16_t origin_x = 0;
+        double famod;
+        unsigned cl;
+        double half_w;
+        double vext_d;
+        double disp_d;
+        float z_top;
+        float z_bottom;
+        float axis[2];
+        float center_x;
+        float center_y;
+        float dx;
+        float dy;
+        float flat;
+        int wall_art;
+        struct hwr_gl_sun_vertex *out;
+        static const float no_dir[3] = { 0.0f, 0.0f, 0.0f };
+
+        if (object->sector_index == (uint16_t)HWR_OBJECT_NO_SECTOR)
+            continue;
+        if ((object->flags & HWR_OBJECT_FLAG_REFLECTION_ONLY) != 0)
+            continue;
+        /* Reach cull, with a margin for the card's own width: a caster
+         * wholly outside the light's pool shadows nothing the pool lights. */
+        dx = (float)object->world_x - tile->x;
+        dy = (float)object->world_y - tile->y;
+        flat = sqrtf(dx * dx + dy * dy);
+        if (flat > tile->range + 512.0f)
+            continue;
+        if (hwr_sprites_resolve(api, scene->map_archive,
+                                scene->shared_archive, object->graphic_id,
+                                object->facing, camera->yaw, 0,
+                                object->backref, &lookup) != 0)
+            continue;
+        if (lookup.archive == NULL ||
+            lookup.entry_id >= lookup.archive->entry_count)
+            continue;
+        if (lookup.klass == HWR_DAS_CLASS_ANIMATED) {
+            int live = hwr_sprites_live_frame_index(api, lookup.archive_id);
+
+            if (live >= 0)
+                lookup.frame_index = (uint16_t)live;
+        }
+        /* Decoded 3D props are the prototype's stated open edge: their
+         * emitter is the sun's and has not been aimed at a point yet. */
+        if ((lookup.archive->entries[lookup.entry_id].payload_flags &
+             0xff00u) == HWR_PS_MESH_FLAG)
+            continue;
+        if (hwr_sprites_frame(&lookup, &frame) != 0)
+            continue;
+        if ((frame.flags & (uint16_t)HWR_PS_MESH_FLAG) != 0)
+            continue;
+        if ((frame.flags & (uint16_t)HWR_PS_DRAW_NOTHING_FLAG) != 0)
+            continue;
+        if (lookup.archive == bb->map_archive &&
+            lookup.entry_id < bb->map_dir_count)
+            slot = &bb->map_dir[lookup.entry_id];
+        else if (lookup.archive == bb->shared_archive &&
+                 lookup.entry_id < bb->shared_dir_count)
+            slot = &bb->shared_dir[lookup.entry_id];
+        if (slot == NULL || !slot->present)
+            continue;
+        if (slot->klass == HWR_DAS_CLASS_ANIMATED) {
+            uint16_t index = lookup.frame_index < slot->frame_count
+                           ? lookup.frame_index
+                           : (uint16_t)(slot->frame_count != 0
+                                            ? slot->frame_count - 1u : 0u);
+
+            offset = slot->base_offset + (uint32_t)index * slot->frame_bytes;
+            tw = slot->width;
+            th = slot->height;
+            fa = slot->flags;
+        } else if (slot->klass == HWR_DAS_CLASS_GROUPED) {
+            const struct hwr_bb_child *child = NULL;
+            uint16_t c;
+
+            for (c = 0; c < slot->child_count; c++) {
+                const struct hwr_bb_child *candidate =
+                    &bb->children[slot->child_first + c];
+
+                if (candidate->payload_offset ==
+                    (uint32_t)lookup.child_offset) {
+                    child = candidate;
+                    break;
+                }
+            }
+            if (child == NULL) {
+                offset = slot->base_offset;
+                tw = slot->width;
+                th = slot->height;
+                fa = slot->flags;
+            } else {
+                offset = child->atlas_offset;
+                tw = child->width;
+                th = child->height;
+                fa = child->flags;
+            }
+        } else {
+            offset = slot->base_offset;
+            tw = slot->width;
+            th = slot->height;
+            fa = slot->flags;
+        }
+        if (tw == 0 || th == 0)
+            continue;
+        if (lookup.klass == HWR_DAS_CLASS_PLAIN ||
+            lookup.klass == HWR_DAS_CLASS_ANIMATED) {
+            const struct hwr_das_entry *entry =
+                &lookup.archive->entries[lookup.entry_id];
+
+            origin_x = (int16_t)(uint16_t)(entry->size_prefix & 0xffffu);
+        }
+        if (lookup.flip)
+            origin_x = (int16_t)(-origin_x);
+        famod = 1.0;
+        cl = 7;
+        if ((fa & 0x80u) != 0) {
+            if ((fa & 0x6000u) != 0) {
+                unsigned t = (unsigned)((((uint32_t)fa << 3) |
+                                         ((uint32_t)fa >> 13)) & 3u);
+
+                famod = (double)(1u << t);
+                cl = 7u + t;
+            } else {
+                famod = 0.5;
+                cl = 6;
+            }
+        }
+        half_w = (double)((uint32_t)((uint32_t)th * 2u) << cl) * hscale;
+        vext_d = 2.0 * (double)tw * famod * vscale;
+        {
+            int16_t origin_y = 0;
+
+            if ((lookup.klass == HWR_DAS_CLASS_PLAIN ||
+                 lookup.klass == HWR_DAS_CLASS_ANIMATED) &&
+                (object->flags9 & 0x80u) == 0)
+                origin_y = (int16_t)(uint16_t)(
+                    lookup.archive->entries[lookup.entry_id].size_prefix >>
+                    16);
+            disp_d = (2.0 * (double)(fa & 0xfu) + (double)origin_y) * vscale;
+        }
+        if ((fa & 0x10u) != 0) {
+            z_top = (float)((double)object->world_z + disp_d);
+            z_bottom = (float)((double)z_top - vext_d);
+        } else {
+            z_bottom = (float)((double)object->world_z - disp_d);
+            z_top = (float)((double)z_bottom + vext_d);
+        }
+        wall_art = (object->flags9 & 0x80u) != 0;
+        if (wall_art) {
+            /* Pinned to its wall in the world: the authored axis, exactly
+             * the sun's rule -- and its own light stands CLEAR of the card
+             * by the wall-clearance law, so the bracket's shadow behind the
+             * flame is honest rather than a self-eclipse. */
+            uint32_t phi = 2u * (uint32_t)object->facing + 0x80u;
+
+            axis[0] = (float)hwr_ps_sincos(api, phi) / 16384.0f;
+            axis[1] = (float)hwr_ps_sincos(api, phi + 0x80u) / 16384.0f;
+        } else {
+            /* Faced to THIS light -- the billboard law with the light
+             * standing in for the eye, per object. An object standing (in
+             * plan) on the light has no honest facing, and an object whose
+             * card would CONTAIN the light is the light's own emitter (or a
+             * co-located one): either could only shadow the whole room, and
+             * both are skipped. */
+            if (!hwr_psm_card_axis(tile->x, tile->y,
+                                   (float)object->world_x,
+                                   (float)object->world_y, axis))
+                continue;
+            if (flat < (float)half_w + 4.0f)
+                continue;
+        }
+        center_x = (float)object->world_x + (float)origin_x * axis[0];
+        center_y = (float)object->world_y + (float)origin_x * axis[1];
+        out = hwr_ps_grow(tile, 6u);
+        if (out == NULL)
+            return;
+        hwr_sunm_card(center_x, center_y, axis, (float)half_w, z_top,
+                      z_bottom, no_dir, 0.0f, offset, tw, th,
+                      lookup.flip != 0, out);
+    }
+}
+
+void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
+                       const struct hwr_objects *objects,
+                       const struct roth_api_v1 *api,
+                       const struct hwr_gl_camera *camera,
+                       struct hwr_gl_point_light *lights, size_t count)
+{
+    struct hwr_gl_pshadow out;
+    const struct hwr_gl_sun_vertex *statics;
+    size_t static_count;
+    uint32_t static_stamp;
+    size_t wanted[HWR_PSM_MAX_LIGHTS];
+    size_t wanted_count = 0;
+    size_t i;
+    size_t k;
+
+    /* Which of the frame's lights ask for a map, in the array's own order --
+     * which is the ranking order the seeding already sorted by, so when more
+     * ask than there are tiles, the tiles go to the lights worth most. */
+    for (i = 0; i < count; i++) {
+        lights[i].shadow_tile = -1;
+        if (lights[i].shadow && wanted_count < HWR_PSM_MAX_LIGHTS)
+            wanted[wanted_count++] = i;
+    }
+    if (wanted_count == 0 || scene == NULL || world == NULL ||
+        camera == NULL) {
+        hwr_gl_pshadow_set(NULL);
+        return;
+    }
+    if (!hwr_sun_acquire_static(scene, world, &statics, &static_count,
+                                &static_stamp)) {
+        hwr_gl_pshadow_set(NULL);
+        return;
+    }
+    /* The tile ledger: a light that stood last frame keeps its tile (its
+     * contents are the whole cache), a tile whose light is gone is free, a
+     * new light takes a free one and starts from nothing. */
+    for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++)
+        g_tiles[i].seen = 0;
+    memset(&out, 0, sizeof out);
+    out.active = 1;
+    out.resolution = HWR_PSM_RESOLUTION;
+    out.static_casters = statics;
+    out.static_count = static_count;
+    out.static_generation = static_stamp;
+    for (k = 0; k < wanted_count; k++) {
+        struct hwr_gl_point_light *light = &lights[wanted[k]];
+        struct hwr_ps_tile *tile = NULL;
+        uint32_t stamp;
+        int rebuild;
+
+        for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+            if (g_tiles[i].used && !g_tiles[i].seen &&
+                g_tiles[i].x == light->world_x &&
+                g_tiles[i].y == light->world_y &&
+                g_tiles[i].z == light->world_z &&
+                g_tiles[i].range == light->range) {
+                tile = &g_tiles[i];
+                break;
+            }
+        }
+        if (tile == NULL) {
+            /* A free tile first; failing that, evict one whose light was not
+             * seen this frame. Never one already claimed this frame. */
+            for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+                if (!g_tiles[i].used) {
+                    tile = &g_tiles[i];
+                    break;
+                }
+            }
+            if (tile == NULL) {
+                for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+                    if (!g_tiles[i].seen) {
+                        tile = &g_tiles[i];
+                        break;
+                    }
+                }
+            }
+            if (tile == NULL)
+                continue;
+            tile->used = 1;
+            tile->x = light->world_x;
+            tile->y = light->world_y;
+            tile->z = light->world_z;
+            tile->range = light->range;
+            tile->stamp = 0;
+        }
+        tile->seen = 1;
+        /* The card slice is rebuilt every frame -- a walk over the objects
+         * within reach, a few quads -- because its BYTES are part of the
+         * stamp: an animated torch stepping a frame moves them and refreshes
+         * exactly this tile, and a still room hashes to what it was. */
+        hwr_ps_build_cards(tile, scene, objects, api, camera);
+        stamp = static_stamp;
+        stamp = hwr_ps_mix(stamp, &tile->x, sizeof tile->x);
+        stamp = hwr_ps_mix(stamp, &tile->y, sizeof tile->y);
+        stamp = hwr_ps_mix(stamp, &tile->z, sizeof tile->z);
+        stamp = hwr_ps_mix(stamp, &tile->range, sizeof tile->range);
+        if (tile->card_count != 0)
+            stamp = hwr_ps_mix(stamp, tile->cards,
+                               tile->card_count * sizeof tile->cards[0]);
+        if (stamp == 0u)
+            stamp = 1u;
+        /* Stale by stamp, never rendered, or the measurement switch: the
+         * readiness ask is what covers a frame the execution stood down
+         * for and a lost context -- a stamp alone would call such a tile
+         * current and never render it. */
+        rebuild = stamp != tile->stamp ||
+                  !hwr_gl_pshadow_tile_ready((int)(tile - g_tiles)) ||
+                  hwr_pshadow_uncached();
+        if (rebuild) {
+            tile->stamp = stamp;
+            g_tile_builds++;
+        }
+        light->shadow_tile = (int)(tile - g_tiles);
+        out.lights[out.count].world[0] = light->world_x;
+        out.lights[out.count].world[1] = light->world_y;
+        out.lights[out.count].world[2] = light->world_z;
+        out.lights[out.count].range = light->range;
+        out.lights[out.count].tile = light->shadow_tile;
+        out.lights[out.count].rebuild = rebuild;
+        out.lights[out.count].cards = tile->cards;
+        out.lights[out.count].card_count = tile->card_count;
+        out.count++;
+    }
+    /* A tile whose light went away keeps its bytes but loses its claim, so
+     * the same light coming back starts fresh rather than trusting a map
+     * whose atlas rows may since have been painted by another. */
+    for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+        if (g_tiles[i].used && !g_tiles[i].seen) {
+            g_tiles[i].used = 0;
+            g_tiles[i].stamp = 0;
+        }
+    }
+    hwr_gl_pshadow_set(out.count != 0 ? &out : NULL);
+}

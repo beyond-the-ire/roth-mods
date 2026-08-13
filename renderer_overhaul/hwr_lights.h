@@ -77,6 +77,10 @@ struct hwr_lights_settings {
     unsigned hops;
     float z_slack;
     float fade_seconds;
+    /* Whether a light a game config marks "shadows": true may carry the
+     * request at all -- the prototype's file-only kill switch, spent here so
+     * a refused request never reaches the shadow layer. */
+    int shadows;
 };
 
 /* Publishes what the rows ask for. Held whole rather than read per frame, for

@@ -24,6 +24,7 @@
 #include "hwr_look.h"
 #include "hwr_ownership.h"
 #include "hwr_sun.h"
+#include "hwr_pshadow.h"
 #include "hwr_overlay.h"
 #include "hwr_sysinfo.h"
 
@@ -334,8 +335,10 @@ static void hwr_map_data_clear(int keep_shared, int keep_map)
     hwr_objects_clear(&g_objects);
     hwr_objects_set_enabled(&g_objects, g_objects_enabled);
     memset(&g_sprite_census, 0, sizeof g_sprite_census);
-    /* The sun's casters and census describe the map being torn down. */
+    /* The sun's casters and census describe the map being torn down, and
+     * the point-light shadow tiles with them. */
     hwr_sun_reset();
+    hwr_pshadow_reset();
     hwr_world_clear(&g_world);
     /* A DAS file is closed only when it is not being carried across the
      * transition; keeping it open preserves its decoded payloads -- which the
@@ -2341,6 +2344,8 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
      * mesh itself is built lazily at the first frame that wants it, so the
      * census here builds nothing. */
     hwr_sun_stage_map(&g_world);
+    /* A new map's tiles describe nothing; the shadow ledger starts over. */
+    hwr_pshadow_reset();
     /* Pre-decode every sprite frame both archives hold: all of the shared sprite
      * set, and the per-map archive's object-graphic tail (ids at and above the
      * bias). The census feeds the object-layer stats line. Decoding is idempotent

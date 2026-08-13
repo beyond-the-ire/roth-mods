@@ -224,6 +224,13 @@ struct hwr_look_light {
     float range;
     int has_color;
     uint32_t color;
+    /* Whether this light casts shadows -- the PROTOTYPE's opt-in, per entry,
+     * because which lights are worth a shadow map is a choice somebody makes
+     * with the place in front of them. Absent is a real state (say nothing,
+     * compose from beneath) and false is another (refuse one granted
+     * beneath), which is why the pair. */
+    int has_shadows;
+    int shadows;
 };
 
 /* One grant laid over another, FIELD by field, with `off` left to the caller

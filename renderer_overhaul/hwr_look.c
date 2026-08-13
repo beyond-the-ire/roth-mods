@@ -841,6 +841,10 @@ void hwr_look_light_over(struct hwr_look_light *into,
         into->has_color = 1;
         into->color = from->color;
     }
+    if (from->has_shadows) {
+        into->has_shadows = 1;
+        into->shadows = from->shadows;
+    }
 }
 
 /* One scope's keyed entries over another's. `from_map` says whether this is the
@@ -1193,6 +1197,17 @@ static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
         }
         into->has_color = 1;
         into->color = rgb;
+        return 1;
+    }
+    if (strcmp(field, "shadows") == 0) {
+        int shadows = 0;
+
+        if (!hwr_json_as_bool(doc, child, &shadows)) {
+            hwr_look_note(report, where, "'shadows' is true or false");
+            return 1;
+        }
+        into->has_shadows = 1;
+        into->shadows = shadows;
         return 1;
     }
     return 0;

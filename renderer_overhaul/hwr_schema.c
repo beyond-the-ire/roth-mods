@@ -2018,6 +2018,30 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "when there is no longer room for it. Nothing appears or "
                 "disappears in a single frame."
     },
+    {
+        /* The shadow prototype's one switch, file-only on purpose: nothing
+         * casts until a game config marks a light "shadows": true, so the
+         * feature has no screen presence to speak of -- but a creator's
+         * choice needs a player's way back out, and this is it. */
+        .key = "point_shadows",
+        .type = HWR_VT_BOOL,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_ADVANCED,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_shadows),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .b = 1 },
+        .original = { .b = 1 },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "Shadows from marked lights",
+        .help = "Whether a light the game's own description marks as casting "
+                "shadows gets them. Nothing casts until a description asks; "
+                "turning this off refuses every such request."
+    },
     /* The sun and moon: one directional light per map, entering wherever the
      * map is open to the sky and gated per pixel by a real shadow map
      * rendered from the light. The family sits under the Modern shading law

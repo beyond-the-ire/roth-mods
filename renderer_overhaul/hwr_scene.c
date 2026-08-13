@@ -10,6 +10,7 @@
 #include "hwr_lights.h"
 #include "hwr_sprite_span.h"
 #include "hwr_sun.h"
+#include "hwr_pshadow.h"
 
 #include "hwr_util.h"
 #include "hwr_visibility.h"
@@ -6272,6 +6273,11 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         frame.candle_glow = world->luts.candle_glow;
         frame.now_ns = hwr_perf_now_ns();
         count = hwr_lights_build(&frame, lights, HWR_GL_POINT_LIGHT_MAX);
+        /* The shadow policy reads the built array's requests, assigns tiles
+         * and writes each light's tile back in before the array is handed
+         * over -- after the build (the requests ride the lights) and before
+         * the publish (the tiles ride them too). */
+        hwr_pshadow_frame(scene, world, objects, api, &camera, lights, count);
         hwr_gl_set_point_lights(lights, count);
     }
     return hwr_gl_scene_render(views, view_count, &published, width, height);

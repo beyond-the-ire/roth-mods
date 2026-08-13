@@ -614,6 +614,44 @@ static int hwr_sun_build_static(const struct hwr_scene *scene,
     return 0;
 }
 
+/* The slice for anything else that shadows, current by the same hash the
+ * frame keeps it current by. A build here marks the sun's own upload due
+ * exactly as the frame's build does, so whichever of the two runs first in
+ * a frame builds once and both read it. */
+int hwr_sun_acquire_static(const struct hwr_scene *scene,
+                           const struct hwr_world *world,
+                           const struct hwr_gl_sun_vertex **out,
+                           size_t *count, uint32_t *stamp)
+{
+    uint32_t hash;
+
+    *out = NULL;
+    *count = 0;
+    *stamp = 0;
+    if (!g_staged || scene == NULL || !scene->valid || world == NULL ||
+        !world->valid)
+        return 0;
+    hash = hwr_sun_world_hash(world);
+    if (!g_static_built || g_static_generation != g_map_generation ||
+        g_static_hash != hash) {
+        if (hwr_sun_build_static(scene, world) != 0)
+            return 0;
+        g_static_built = 1;
+        g_static_generation = g_map_generation;
+        g_static_hash = hash;
+        g_static_upload_due = 1;
+    }
+    *out = g_static;
+    *count = g_static_count;
+    /* The content stamp: the map generation folded with the mutable-fact
+     * hash, which moves exactly when a rebuild lands. Held off zero so zero
+     * can keep meaning "nothing yet" for every consumer. */
+    *stamp = (g_map_generation * 2654435761u) ^ g_static_hash;
+    if (*stamp == 0u)
+        *stamp = 1u;
+    return 1;
+}
+
 /* ----------------------------------------------------- the dynamic slice */
 
 static int32_t hwr_sun_sincos(const struct roth_api_v1 *api, uint32_t angle)

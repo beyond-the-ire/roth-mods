@@ -1839,6 +1839,11 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_OBJECT;
     out->source_id = object->graphic_id;
     out->sector_index = object->sector_index;
+    /* No shadow map until the grant asks for one and the file-only switch
+     * lets it; minus one is the tile of every light no map stands for. */
+    out->light.shadow = g_settings.shadows && granted && named.has_shadows &&
+                        named.shadows;
+    out->light.shadow_tile = -1;
     /* WHAT NAMES THIS LIGHT ACROSS FRAMES is where the THING stands -- the
      * record's own three numbers -- and not where its light is emitted from.
      * The two are different on purpose (see the emit point below), and a name
@@ -2068,6 +2073,9 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_GLOW_FACE;
     out->source_id = face->source_id;
     out->sector_index = face->sector_index;
+    out->light.shadow = g_settings.shadows && face->light.has_shadows &&
+                        face->light.shadows;
+    out->light.shadow_tile = -1;
     out->world_x = face->world_x;
     out->world_y = face->world_y;
     out->world_z = face->world_z;
@@ -2196,6 +2204,9 @@ static int hwr_light_from_placed(const struct hwr_lights_frame *frame,
     }
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)HWR_LIGHT_CLASS_PLACED;
+    out->light.shadow = g_settings.shadows && placed->light.has_shadows &&
+                        placed->light.shadows;
+    out->light.shadow_tile = -1;
     /* Nothing numbers a light that belongs to nothing, so what tells two of them
      * apart across frames is where each hangs -- which is exactly what the
      * retained set already matches on. The source number is left at nought

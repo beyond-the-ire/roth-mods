@@ -469,6 +469,15 @@ struct hwr_gl_point_light {
      * no vertex data -- it is what stops a torch lighting the room above it. */
     float z_lo;
     float z_hi;
+    /* Whether the game config asked this light to cast shadows -- the seeding
+     * carries the request; whether it is honoured is the shadow layer's call
+     * (the tile budget). Zero everywhere nothing asked, which is every light
+     * until a config entry says "shadows": true. */
+    int shadow;
+    /* Which atlas tile this light's shadow maps live in, or -1. Assigned by
+     * the point-shadow layer after the frame's lights are chosen; -1 is what
+     * every light carries where the prototype is off. */
+    int shadow_tile;
 };
 
 /* One caster vertex of the sun/moon light-space depth map.
@@ -573,6 +582,61 @@ struct hwr_gl_sun {
     float bias_floor;
     float bias_slope;
 };
+
+/* THE POINT-LIGHT SHADOW PROTOTYPE's execution side: one two-dimensional
+ * R32F atlas of cube-topology face maps (three faces across, two down, one
+ * such tile per shadowed light), rendered from the same caster vertex format
+ * the sun uses, by the same caster program compiled once more under a
+ * perspective define. The policy -- which lights, which tiles, when a tile
+ * is stale -- lives in hwr_pshadow.c; this layer only executes it. The law
+ * both sides compile is hwr_point_math.h. */
+#define HWR_GL_PSHADOW_MAX 4u
+
+struct hwr_gl_pshadow_light {
+    float world[3];
+    /* The far plane of the tile's six faces, and the unit the stored radial
+     * distances are normalized by: the light's own reach. */
+    float range;
+    int tile;
+    /* Render this tile's faces this frame. Off, the tile keeps what it
+     * holds -- which is the whole caching story: a static scene rebuilds
+     * nothing and the per-frame cost is the lookups alone. */
+    int rebuild;
+    /* This light's own object cards, borrowed until the frame's scene render
+     * returns; read only where rebuild says so. */
+    const struct hwr_gl_sun_vertex *cards;
+    size_t card_count;
+};
+
+struct hwr_gl_pshadow {
+    int active;
+    /* One face's texels on a side; a change re-takes the atlas storage. */
+    int resolution;
+    /* The static caster slice every rebuilt tile draws -- the sun's own,
+     * borrowed for the frame -- and the policy layer's generation stamp for
+     * its CONTENT: the pointer can survive a rebuild, so equality of bytes
+     * is claimed by the number rather than the address. */
+    const struct hwr_gl_sun_vertex *static_casters;
+    size_t static_count;
+    uint32_t static_generation;
+    size_t count;
+    struct hwr_gl_pshadow_light lights[HWR_GL_PSHADOW_MAX];
+};
+
+/* Publishes the frame's shadowed lights. NULL or active==0 stands the whole
+ * machinery down: no atlas, no programs, and the lookup multiplies by one. */
+void hwr_gl_pshadow_set(const struct hwr_gl_pshadow *ps);
+/* Copies one tile's face maps back for the offline twin, row-major floats,
+ * the atlas layout of hwr_point_math.h: 3*resolution across, 2*resolution
+ * down. Returns 0 where no atlas stands. */
+int hwr_gl_pshadow_read_tile(int tile, float *out, int resolution);
+/* Whether the last scene render had a live atlas at all. */
+int hwr_gl_pshadow_map_valid(void);
+/* Whether one tile holds a rendered map. The policy layer keeps asking for
+ * a rebuild until this says so, which is what covers a frame the execution
+ * stood down for (no context yet, another shading law) and a lost context:
+ * a stamp alone would call the tile current and never render it. */
+int hwr_gl_pshadow_tile_ready(int tile);
 
 /* Publishes the frame's sun. NULL or active==0 stands the whole machinery
  * down; the key uniforms then keep the zero rest they have always had. */

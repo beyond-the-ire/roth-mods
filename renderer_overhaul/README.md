@@ -374,6 +374,15 @@ Each entry says what the thing gives off, and each field stands on its own:
   here is written the way a person writes one; the bare six digits are accepted too.
 - **`strength`** — how bright, over the settings screen's own value.
 - **`reach`** — how far, in world units, over the settings screen's own value.
+- **`shadows`** — `true` asks for this light to cast real shadows: the walls, floors, doors and
+  things standing in its reach block it, with texture cut-outs honoured, instead of the light
+  passing through them. Nothing casts until an entry asks — a shadow map is rendered and kept per
+  shadowed light, so this is spent where it is worth spending: a handful of important, fixed
+  lights per map beats asking for every candle. At most four lights carry shadows at once; when
+  more ask, the ones contributing most to the picture get them. Decoded 3D props do not yet block
+  these lights, and glass dims none of them — a pane blocks only at its opaque paint. `false`
+  refuses one a broader entry granted. The advanced `point_shadows` setting refuses every such
+  request at once.
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 
 The **most specific statement anybody made is the one in force**, and the tables compose **field by
