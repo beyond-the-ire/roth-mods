@@ -530,11 +530,10 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .values = HWR_GAME_CONFIG_NONE,
         .value_count = HWR_COUNT_OF(HWR_GAME_CONFIG_NONE),
         .depends_on = -1,
-        .label = "Game config",
-        .help = "The game config override in force: which of the files in the "
-                "game configs folder describes this game's maps. Each one says "
-                "how particular places are lit; put one in that folder for a "
-                "map pack."
+        .label = "Config file in use",
+        .help = "Which of the files in the game configs folder describes this "
+                "game's maps. Each one says how particular places are lit; put "
+                "one in that folder for a map pack."
     },
     {
         /* The shading law. Original is the picture the game has always drawn,
@@ -1515,7 +1514,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Your light lights candlelit rooms",
+        .label = "How much of a candlelit room it lights",
         .help = "Rooms lit by candlelight are lit by YOUR light in this game: "
                 "the room says how far its own light carries and the candle "
                 "you hold supplies the rest. This is how much of that your "
@@ -1758,7 +1757,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Torches and candles give light",
+        .label = "Light from torches and candles",
         .help = "Lets the torches, candles and lit sigils a map places "
                 "actually light what is around them. They cast no shadows, so "
                 "one beside a doorway spills a little onto the far side of it."
@@ -1780,8 +1779,8 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Light from things the map marks",
         .help = "Where those lights come from: the things a map marks as "
-                "giving light of their own. Turning this off leaves the "
-                "setting above on with nothing seeding it."
+                "giving light of their own. Turning this off leaves the switch "
+                "above on with nothing left for it to light with."
     },
     {
         .key = "point_light_glow_faces",
@@ -1823,7 +1822,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How many light at once",
+        .label = "How many burn at once",
         .help = "How many of them may light the picture at the same time. "
                 "What is dropped is always whatever is contributing least "
                 "where you are standing, and it fades out rather than "
@@ -1915,10 +1914,11 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "The one torch colour",
-        .help = "The colour used when the setting above is not reading it "
-                "from the thing itself. Warmer than the light you carry, "
-                "because a wall torch is fire and a carried lamp is not."
+        .label = "Torch colour",
+        .help = "The colour a torch throws, unless a game config has named "
+                "one for that particular thing. Warmer than the light you "
+                "carry, because a wall torch is fire and a carried lamp is "
+                "not."
     },
     {
         .key = "point_light_glow_scale",
@@ -2042,7 +2042,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Sun and moon",
+        .label = "Light from the sky",
         .help = "An outdoor light that casts in through a map's openings to "
                 "the sky, with real shadows: walls, roofs, window bars and "
                 "outside objects all block it. Maps with no sky openings are "
@@ -2067,8 +2067,8 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Sun and moon colour",
         .help = "The colour of the light from the sky. Cool and dim reads as "
-                "moonlight, warm and strong as daylight; a game "
-                "configuration may name a different colour per map."
+                "moonlight, warm and strong as daylight; a game config may "
+                "name a different colour per map."
     },
     {
         .key = "sun_intensity",
@@ -2117,7 +2117,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Sun height above horizon",
+        .label = "Sun height above the horizon",
         .help = "How high the sun or moon stands, in degrees. Low means long "
                 "shadows and light reaching deep through side windows; high "
                 "means short shadows under things."
@@ -2146,7 +2146,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "bearing: 0 is north (the top of the map as the editor "
                 "shows it), 90 east, 180 south, 270 west. Maps were built "
                 "with no sun, so which windows catch the light is a per-map "
-                "choice; a game configuration may aim it per map."
+                "choice; a game config may aim it per map."
     },
     {
         .key = "sun_shadow_quality",

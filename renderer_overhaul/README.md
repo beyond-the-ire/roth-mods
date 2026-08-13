@@ -37,6 +37,22 @@ A setting that needs another one before it can do anything is shown dimmed until
 The light rig stays dimmed until the shading is **Modern**, which is the only shading that reads
 it.
 
+The **Enhancements** section is long, so its settings are gathered under headings — **Game
+config**, **Shading and picture**, **Room light**, **The light you carry**, **Items and figures**,
+**Torches and candles** and **Sun and moon** — and each heading opens and closes. `Enter` or a
+click on a heading opens or closes it, and the arrow keys do the same: left folds it away, right
+opens it. A heading shows `+` when it is closed and `-` when it is open.
+
+The section opens showing only what is doing something: a heading opens by itself when it holds a
+setting standing somewhere other than where it ships, or one the map you are in answers for.
+**Shading and picture** is always open, because everything below it is a dial on the shading law
+and does nothing at all until that law is chosen. Nothing in force is ever folded out of sight: a
+heading carries a `*` when something under it has been changed, and it carries the red mark, and
+says the map sets its own, when the map you are in answers for anything under it. Which headings
+are open is how you are reading the screen at that moment rather than a setting — it is never
+written to the settings file, and the section works out again which ones to open every time the
+screen is opened.
+
 Changes are collected as a draft and nothing takes effect until **Apply**, which writes the
 settings file and puts the whole file into force in one step. **Cancel** returns the draft to the
 settings in force, **Defaults** loads the built-in settings, **Original** restores the original
@@ -208,9 +224,10 @@ wants, and where it gives an answer, that answer is the one in force there.
 
 Those descriptions live in `game_configs/`, inside the mod folder, one file per game or map pack,
 each a `.json` file. The base game's own ships as `game_configs/roth.json`. Which one is in force
-is the **Game config** row at the top of the Enhancements section on the settings screen: it lists
-every file the folder holds, plus **None**, and choosing None — or taking the file out of the
-folder — leaves every map falling back to the settings screen alone.
+is the **Config file in use** row, under the **Game config** heading at the top of the Enhancements
+section on the settings screen: it lists every file the folder holds, plus **None**, and choosing
+None — or taking the file out of the folder — leaves every map falling back to the settings screen
+alone.
 
 A file is shown in that list by its own `for` line rather than by its file name, so
 `roth.json` reads as *Realms of the Haunting*. A file with no `for` line is shown by its name. Name
@@ -219,7 +236,7 @@ selection as, and one carrying a space or a `#` cannot be written down, so it is
 list and the game says why.
 
 **Editing the chosen file while the game is running is the point of it.** Save it, then press
-**Reload game config** — the button directly under the Game config picker on the settings screen.
+**Reload game config** — the button directly under that picker on the settings screen.
 It reads the chosen file from disk and puts the whole of it back into force where you stand: the
 dials it sets come back into force, and the lights it grants or hangs on the map you are in are restaged
 without waiting for a map change — a light you added appears, one you removed goes out. If a save
@@ -543,7 +560,7 @@ other light is held by. A light hung outside every room lights nothing and says 
 A `placed` list is written **under a map** and never under `everywhere`: the same three numbers in
 another map are a different corner of a different building. **Light from things the map marks** and
 **Light from glowing textures** do not reach these — a light you wrote down is not a kind of thing the
-game has, so there is no separate switch for it — but **Torches and candles give light** turns them
+game has, so there is no separate switch for it — but **Light from torches and candles** turns them
 off with everything else.
 
 ### The sky's own light: `environment_lighting`
@@ -733,7 +750,7 @@ Modern shading brings its own settings with it, all of them dimmed until it is c
   **Carried light aims ahead** puts the lamp's pool a little way in front of you instead of on top
   of you. It ships at zero: the candle cone already aims the light where you are looking, so the
   lamp no longer needs an aim of its own to read as directed.
-- **Your light lights candlelit rooms** is the other half of that light, and the half the game
+- **How much of a candlelit room it lights** is the other half of that light, and the half the game
   itself already had a word for. A room the map marks candlelit is drawn by the game at its own
   distance law less a fixed number of shade steps, and those steps are the candle rather than the
   room: the brightness around you in such a room IS the light in your hand. This is how much of it

@@ -56,8 +56,10 @@ enum { HWR_RING_SIZE = 32u };
  * below rather than the panel -- the panel scrolls -- and it has to stand clear
  * of the largest section the schema holds, because a section that reaches it
  * loses its LAST rows and says nothing. The enhancements section is the
- * largest, and adding the room's reach to it took that section to twenty-five. */
-enum { HWR_OVERLAY_MAX_ROWS = 40 };
+ * largest: its own settings, the reload button beside the picker, and one
+ * heading for each group they are gathered under, all of which are rows here
+ * when every group is open. */
+enum { HWR_OVERLAY_MAX_ROWS = 64 };
 /* One key of the ring carries whether shift was down with it. */
 #define HWR_RING_SHIFT 0x80u
 
@@ -80,7 +82,12 @@ enum {
      * of these the panel has sits directly under the Game config picker and
      * re-reads the chosen file from disk, reapplying everything it says --
      * the dials AND this map's lights. */
-    HWR_W_ACTION
+    HWR_W_ACTION,
+    /* A row that is a HEADING: the name of a group of settings, and the thing
+     * to press to open or close it. It has no value and no store field either,
+     * and what it carries instead is what its own rows would be saying if they
+     * were on screen. */
+    HWR_W_GROUP
 };
 
 /* The action row's own words, named once so the row and its help cannot
@@ -166,9 +173,78 @@ static const struct {
 #define HWR_RESOLUTION_COUNT \
     ((int)(sizeof HWR_RESOLUTIONS / sizeof HWR_RESOLUTIONS[0]))
 
+/* ---- the headings the enhancements are gathered under ----
+ *
+ * One section grew to thirty-odd settings and a single list that long is a
+ * list nobody reads: the eye has nowhere to stop and no way to tell which
+ * three rows belong to the thing it came for. So the section is drawn as
+ * headings that open and close, and what a person meets on opening it is the
+ * SUBJECTS rather than every dial of every one of them.
+ *
+ * A heading names the schema key it STARTS at and owns every row from there
+ * up to the next heading's key. That is deliberate and it is the whole reason
+ * there is no second list: a setting added to the table beside its family
+ * lands under that family's heading by being where it is, and there is
+ * nothing here that can drift from the table. The order a person reads is the
+ * order the table is written in, which is also the order the settings file is
+ * written in.
+ *
+ * It is a fact about the PANEL and nothing else. No heading has a key, a
+ * default or a value; nothing is written for one, nothing is read back for
+ * one, and no configuration carries whether a heading is open. */
+struct hwr_overlay_group {
+    int section;
+    const char *first_key;
+    const char *label;
+    const char *help;
+};
+
+static const struct hwr_overlay_group HWR_GROUPS[] = {
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "game_config", "Game config",
+        "Which description of this game's maps is in force, and the button "
+        "that reads it again from disk."
+    },
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "shading_mode", "Shading and picture",
+        "How the world is shaded, and the brightness and contrast of the "
+        "finished picture. Everything below this group is a dial on the "
+        "Modern law and does nothing under the other two."
+    },
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "room_light_gain", "Room light",
+        "The light a room gives off from the brightness the map was built "
+        "with: how much of it there is, how far it carries, and how dark it "
+        "is allowed to leave a surface."
+    },
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "player_light", "The light you carry",
+        "The lamp at your own position: its colour, its strength, how far it "
+        "reaches, and how much of a candlelit room it is asked to light."
+    },
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "sprite_light_gain", "Items and figures",
+        "How brightly people, creatures and things you can pick up take the "
+        "light around them."
+    },
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "point_light", "Torches and candles",
+        "The lights a map places in the world: where they come from, how "
+        "many burn at once, and what one is worth."
+    },
+    {
+        (int)HWR_CAT_ENHANCEMENTS, "sun_light", "Sun and moon",
+        "The outdoor light that casts in through a map's openings to the "
+        "sky, how it is aimed, and the shadows it throws."
+    }
+};
+#define HWR_GROUP_COUNT \
+    ((int)(sizeof HWR_GROUPS / sizeof HWR_GROUPS[0]))
+
 struct hwr_overlay_row {
     int index;      /* schema row */
     int partner;    /* the second schema row of a pair, or -1 */
+    int group;      /* the heading this row IS, or -1 for an ordinary row */
     int widget;
     int selectable;
 };
@@ -259,6 +335,12 @@ static int g_status_warn;
 static const struct hwr_setting_desc *g_warned_row;
 static struct hwr_overlay_row g_rows[HWR_OVERLAY_MAX_ROWS];
 static int g_row_count;
+/* Which headings are open. It lives here rather than in the settings store on
+ * purpose: what a person has folded away is how they are reading the screen at
+ * this moment, not something they want written down and restored on a machine
+ * they open the game on next year. It lasts as long as the game is running and
+ * is re-decided by the law below every time the panel is opened. */
+static uint8_t g_group_open[HWR_GROUP_COUNT];
 static int g_hover_kind;
 static int g_hover_index;
 static int g_cursor_owned;
@@ -484,7 +566,7 @@ static int hwr_overlay_widget_of(const struct hwr_setting_desc *desc)
 static int hwr_overlay_widget_steps(int widget)
 {
     return widget != HWR_W_COLOR && widget != HWR_W_INFO &&
-           widget != HWR_W_ACTION;
+           widget != HWR_W_ACTION && widget != HWR_W_GROUP;
 }
 
 /* A row whose parent is off in the draft is shown and never taken: a dependency
@@ -512,11 +594,124 @@ static int hwr_overlay_row_enabled(const struct hwr_setting_desc *desc)
     return hwr_schema_dependency_met(desc, &g_draft);
 }
 
+/* Which heading, if any, begins at this row. A section with no headings at all
+ * answers -1 to every row of itself, which is how every other section goes on
+ * being the flat list it always was. */
+static int hwr_overlay_group_at(int section, const struct hwr_setting_desc *desc)
+{
+    int i;
+
+    if (desc == NULL || desc->key == NULL)
+        return -1;
+    for (i = 0; i < HWR_GROUP_COUNT; i++) {
+        if (HWR_GROUPS[i].section == section &&
+            strcmp(HWR_GROUPS[i].first_key, desc->key) == 0)
+            return i;
+    }
+    return -1;
+}
+
+/* What a heading's own rows would be saying if they were on screen: whether any
+ * of them has been moved away from the settings in force, and whether the map
+ * being played answers for any of them.
+ *
+ * It walks the TABLE rather than the panel's row list, so a closed heading
+ * answers exactly what an open one does. That is the whole of the rule that
+ * keeps a folded group honest: nothing a person needs to see can be hidden by
+ * closing something, because the heading says it instead. */
+static void hwr_overlay_group_marks(int group, int *changed, int *overridden)
+{
+    const struct hwr_settings *saved = hwr_settings_get();
+    size_t count = hwr_schema_count();
+    size_t i;
+    int inside = 0;
+
+    *changed = 0;
+    *overridden = 0;
+    if (group < 0 || group >= HWR_GROUP_COUNT)
+        return;
+    for (i = 0; i < count; i++) {
+        const struct hwr_setting_desc *desc = hwr_schema_at(i);
+        int starts;
+
+        if ((int)desc->category != HWR_GROUPS[group].section ||
+            !hwr_overlay_row_visible(desc))
+            continue;
+        starts = hwr_overlay_group_at(HWR_GROUPS[group].section, desc);
+        if (starts == group)
+            inside = 1;
+        else if (starts >= 0)
+            inside = 0;
+        if (!inside || desc->offset == HWR_SCHEMA_NO_FIELD)
+            continue;
+        if (!hwr_schema_value_same(desc, hwr_schema_get(&g_draft, desc),
+                                   hwr_schema_get(saved, desc)))
+            *changed = 1;
+        if (hwr_look_overrides(desc))
+            *overridden = 1;
+    }
+}
+
+/* Whether a heading holds anything a person has a reason to be looking at:
+ * a setting standing somewhere other than where it ships, or one the map being
+ * played answers for. */
+static int hwr_overlay_group_active(int group)
+{
+    const struct hwr_settings *saved = hwr_settings_get();
+    size_t count = hwr_schema_count();
+    size_t i;
+    int inside = 0;
+
+    if (group < 0 || group >= HWR_GROUP_COUNT)
+        return 0;
+    for (i = 0; i < count; i++) {
+        const struct hwr_setting_desc *desc = hwr_schema_at(i);
+        int starts;
+
+        if ((int)desc->category != HWR_GROUPS[group].section ||
+            !hwr_overlay_row_visible(desc))
+            continue;
+        starts = hwr_overlay_group_at(HWR_GROUPS[group].section, desc);
+        if (starts == group)
+            inside = 1;
+        else if (starts >= 0)
+            inside = 0;
+        if (!inside || desc->offset == HWR_SCHEMA_NO_FIELD)
+            continue;
+        if (!hwr_schema_value_same(desc, hwr_schema_get(saved, desc), desc->def))
+            return 1;
+        if (hwr_look_overrides(desc))
+            return 1;
+    }
+    return 0;
+}
+
+/* THE LAW THE PANEL OPENS ON: a heading is open when it holds something that
+ * is doing anything -- a setting away from what it ships at, or one the map
+ * being played answers for -- and closed when it does not. The screen opens
+ * short, and nothing that is actually in force is folded out of sight.
+ *
+ * One heading is open whatever it holds, and it is the one the shading law is
+ * under: every other group on this section is a dial on that law and does
+ * nothing at all while it is set to the original picture. Folding away the one
+ * switch that brings the rest to life would be hiding the answer to the first
+ * question the section asks. */
+static void hwr_overlay_reset_groups(void)
+{
+    int i;
+
+    for (i = 0; i < HWR_GROUP_COUNT; i++)
+        g_group_open[i] = (uint8_t)(hwr_overlay_group_active(i) ||
+                                    strcmp(HWR_GROUPS[i].first_key,
+                                           "shading_mode") == 0);
+}
+
 static void hwr_overlay_build_rows(void)
 {
     size_t count = hwr_schema_count();
     struct hwr_row_set consumed;
     size_t i;
+    int group = -1;
 
     hwr_row_set_clear(&consumed);
     g_row_count = 0;
@@ -524,10 +719,32 @@ static void hwr_overlay_build_rows(void)
         const struct hwr_setting_desc *desc = hwr_schema_at(i);
         struct hwr_overlay_row *row;
         int partner = -1;
+        int starts;
 
         if ((int)desc->category != g_section || !hwr_overlay_row_visible(desc))
             continue;
         if (hwr_row_set_has(&consumed, (int)i))
+            continue;
+        /* A heading of its own row, before the first row it owns. */
+        starts = hwr_overlay_group_at(g_section, desc);
+        if (starts >= 0) {
+            group = starts;
+            row = &g_rows[g_row_count++];
+            row->index = -1;
+            row->partner = -1;
+            row->group = starts;
+            row->widget = HWR_W_GROUP;
+            row->selectable = 1;
+            if (g_row_count >= HWR_OVERLAY_MAX_ROWS)
+                break;
+        }
+        /* A closed heading's rows are not built at all, so everything that
+         * walks the row list -- the drawing, the hit test, the scroll, the
+         * focus -- goes on doing exactly what it did when there were no
+         * headings. What must not be lost with them is said by the heading
+         * and by the banner, both of which ask the table rather than this
+         * list. */
+        if (group >= 0 && !g_group_open[group])
             continue;
         if (desc->widget == HWR_WIDGET_RESOLUTION_PAIR) {
             size_t j;
@@ -547,6 +764,7 @@ static void hwr_overlay_build_rows(void)
         row = &g_rows[g_row_count++];
         row->index = (int)i;
         row->partner = partner;
+        row->group = -1;
         row->widget = hwr_overlay_widget_of(desc);
         row->selectable = row->widget != HWR_W_INFO &&
                           hwr_overlay_row_enabled(desc);
@@ -560,6 +778,7 @@ static void hwr_overlay_build_rows(void)
             row = &g_rows[g_row_count++];
             row->index = -1;
             row->partner = -1;
+            row->group = -1;
             row->widget = HWR_W_ACTION;
             row->selectable = 1;
         }
@@ -676,24 +895,29 @@ static int hwr_overlay_map_text(const struct hwr_setting_desc *desc, char *out,
 }
 
 /* Whether the section on screen holds a row the map being played answers for.
- * One walk of the rows this section built -- the layer knows which rows a map
- * answers for and the panel knows which of them are here, so neither has to
- * keep a count for the other.
+ * One walk of the section's own rows in the TABLE -- the layer knows which rows
+ * a map answers for and the table knows which of them belong here, so neither
+ * has to keep a count for the other.
  *
  * It asks exactly what the row marks ask, so the banner and the marks can never
  * disagree: a banner saying "the settings marked below" over a section with
- * nothing marked would be worse than no banner at all. */
+ * nothing marked would be worse than no banner at all. And it asks the table
+ * rather than the panel's row list on purpose: a row folded away inside a
+ * closed heading is still a row this map answers for, and the banner is half of
+ * what says so -- the heading carrying the mark is the other half. */
 static int hwr_overlay_section_overridden(void)
 {
-    int i;
+    size_t count = hwr_schema_count();
+    size_t i;
 
     if (hwr_look_current_map() == NULL)
         return 0;
-    for (i = 0; i < g_row_count; i++) {
-        const struct hwr_setting_desc *desc = hwr_overlay_row_desc(i);
+    for (i = 0; i < count; i++) {
+        const struct hwr_setting_desc *desc = hwr_schema_at(i);
 
-        if (desc != NULL && g_rows[i].widget != HWR_W_INFO &&
-            hwr_look_overrides(desc))
+        if ((int)desc->category == g_section &&
+            hwr_overlay_row_visible(desc) &&
+            desc->exposure != HWR_EXP_READONLY && hwr_look_overrides(desc))
             return 1;
     }
     return 0;
@@ -992,12 +1216,45 @@ static void hwr_overlay_reload_game_config(void)
     hwr_overlay_status("Reading the game config from disk.", 0);
 }
 
+/* A heading opened or closed, and the row list built again around it. The
+ * heading itself does not move -- only what comes AFTER it does -- so the
+ * focus stays exactly where the hand left it, and the scroll is pulled back
+ * only as far as the shorter list now reaches. */
+static void hwr_overlay_set_group_open(int row, int open)
+{
+    int group;
+
+    if (row < 0 || row >= g_row_count || g_rows[row].widget != HWR_W_GROUP)
+        return;
+    group = g_rows[row].group;
+    if (group < 0 || group >= HWR_GROUP_COUNT)
+        return;
+    if (g_group_open[group] == (uint8_t)(open != 0))
+        return;
+    g_group_open[group] = (uint8_t)(open != 0);
+    hwr_overlay_build_rows();
+    if (g_focus >= g_row_count)
+        g_focus = g_row_count > 0 ? g_row_count - 1 : 0;
+    if (g_scroll > g_row_count - 1)
+        g_scroll = g_row_count > 0 ? g_row_count - 1 : 0;
+    if (g_scroll < 0)
+        g_scroll = 0;
+    g_redraw = 1;
+}
+
 static void hwr_overlay_adjust(int row, int direction, int page, int extreme)
 {
     const struct hwr_setting_desc *desc = hwr_overlay_row_desc(row);
     const struct hwr_setting_desc *partner = hwr_overlay_row_partner(row);
     union hwr_value value;
 
+    if (row >= 0 && row < g_row_count && g_rows[row].widget == HWR_W_GROUP) {
+        /* The same two keys every other row takes: left folds it away, right
+         * opens it. */
+        if (direction != 0)
+            hwr_overlay_set_group_open(row, direction > 0);
+        return;
+    }
     if (row >= 0 && row < g_row_count && g_rows[row].widget == HWR_W_ACTION &&
         g_rows[row].selectable) {
         hwr_overlay_reload_game_config();
@@ -1576,6 +1833,42 @@ static void hwr_overlay_draw_row(const struct roth_api_v1 *api,
     uint8_t label_color = colors->text;
     uint8_t value_color = colors->gold_hi;
 
+    if (g_rows[row].widget == HWR_W_GROUP) {
+        int group = g_rows[row].group;
+        int changed = 0;
+        int overridden = 0;
+
+        if (group < 0 || group >= HWR_GROUP_COUNT)
+            return;
+        hwr_overlay_group_marks(group, &changed, &overridden);
+        hwr_overlay_draw_fill(canvas, layout->cx0, y, layout->content_x1,
+                              y + layout->row_h,
+                              hovered ? colors->gold_lo : colors->panel);
+        if (focused)
+            hwr_overlay_draw_border(canvas, layout->cx0, y,
+                                    layout->content_x1, y + layout->row_h,
+                                    colors->gold_hi);
+        /* The heading says three things at once and each is one glyph wide:
+         * whether it is open, whether anything under it has been moved, and --
+         * in the warning colour and only there -- whether the map being played
+         * answers for anything under it. The last is what lets a heading be
+         * closed over a red row without hiding it. */
+        snprintf(label, sizeof label, "%s %s%s",
+                 g_group_open[group] ? "-" : "+",
+                 changed ? "* " : "",
+                 HWR_GROUPS[group].label);
+        hwr_overlay_draw_text(api, canvas, layout->cx0 + 3u, y + layout->scale,
+                              layout->content_x1 - layout->cx0 - 8u,
+                              overridden ? colors->warn : colors->gold_hi,
+                              label);
+        if (overridden)
+            hwr_overlay_draw_text(api, canvas, layout->value_x + 12u,
+                                  y + layout->scale,
+                                  hwr_overlay_sub(layout->content_x1,
+                                                  layout->value_x + 26u),
+                                  colors->warn, "(this map sets its own)");
+        return;
+    }
     if (g_rows[row].widget == HWR_W_ACTION) {
         /* The button: drawn in the value colour and indented under the row
          * it belongs to, in brackets so it reads as a thing to press rather
@@ -1801,6 +2094,11 @@ static void hwr_overlay_render(const struct roth_api_v1 *api,
         if (g_zone == HWR_ZONE_ROWS && g_focus >= 0 && g_focus < g_row_count &&
             g_rows[g_focus].widget == HWR_W_ACTION)
             help = HWR_ROW_RELOAD_HELP;
+        else if (g_zone == HWR_ZONE_ROWS && g_focus >= 0 &&
+                 g_focus < g_row_count &&
+                 g_rows[g_focus].widget == HWR_W_GROUP &&
+                 g_rows[g_focus].group >= 0)
+            help = HWR_GROUPS[g_rows[g_focus].group].help;
         uint32_t width = layout->cx1 - layout->cx0 - 8u;
         int line;
 
@@ -1960,6 +2258,11 @@ static void hwr_overlay_move_focus(const struct hwr_overlay_layout *layout,
 static void hwr_overlay_activate(int row)
 {
     switch (g_rows[row].widget) {
+    case HWR_W_GROUP:
+        if (g_rows[row].group >= 0 && g_rows[row].group < HWR_GROUP_COUNT)
+            hwr_overlay_set_group_open(row,
+                                       !g_group_open[g_rows[row].group]);
+        return;
     case HWR_W_ACTION:
         hwr_overlay_reload_game_config();
         return;
@@ -2325,6 +2628,10 @@ static void hwr_overlay_open(void)
     g_buttons_prev = 0;
     hwr_overlay_ring_reset();
     hwr_overlay_reset_draft();
+    /* Which headings the screen opens on is decided here, once, against the
+     * settings in force and the map being played -- not carried over from
+     * whatever the last look at the panel happened to leave folded. */
+    hwr_overlay_reset_groups();
     hwr_overlay_build_rows();
     g_focus = hwr_overlay_first_selectable(0, 1);
     if (g_focus < 0)
@@ -2602,6 +2909,7 @@ void hwr_overlay_init(void)
 {
     memset(g_rows, 0, sizeof g_rows);
     g_row_count = 0;
+    hwr_overlay_reset_groups();
     g_edit_row = -1;
     g_hover_index = -1;
     g_status[0] = 0;
