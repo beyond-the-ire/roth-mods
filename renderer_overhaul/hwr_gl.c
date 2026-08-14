@@ -361,6 +361,9 @@ static GLuint g_ps_fbo;
 static GLuint g_ps_atlas_texture;
 static GLuint g_ps_depth_buffer;
 static int g_ps_resolution;
+/* How many tiles the standing atlas was allocated for. A published count that
+ * differs re-takes the storage, exactly as a changed resolution does. */
+static int g_ps_tiles;
 static GLuint g_ps_vao;
 static GLuint g_ps_vbo;
 /* Which slice CONTENT the shared VBO holds, by the policy layer's own
@@ -3428,7 +3431,7 @@ static const char g_sun_fragment_shader[] =
      * fragment's own, the line pass the caster plane's at the pixel centre
      * (ps_line). Glass has no gobo here: its opaque paint blocks below
      * exactly as the sun's does, and its blend-range texels pass whole,
-     * which is the prototype's stated limit. */
+     * which is the stated limit here. */
     "#ifdef SUN_LINE_DEPTH\n"
     "  {\n"
     "    float pd; float pdist;\n"
@@ -3638,6 +3641,7 @@ static void hwr_pshadow_destroy_objects(void)
     g_ps_fbo = 0;
     g_ps_depth_buffer = 0;
     g_ps_resolution = 0;
+    g_ps_tiles = 0;
     g_ps_static_uploaded = 0;
     g_ps_static_uploaded_count = 0;
     for (i = 0; i < HWR_GL_PSHADOW_MAX; i++)
@@ -4103,21 +4107,28 @@ void hwr_gl_pshadow_set(const struct hwr_gl_pshadow *ps)
         return;
     }
     g_pshadow = *ps;
-    if (g_pshadow.count > HWR_GL_PSHADOW_MAX)
-        g_pshadow.count = HWR_GL_PSHADOW_MAX;
+    if (g_pshadow.tiles > (int)HWR_GL_PSHADOW_MAX)
+        g_pshadow.tiles = (int)HWR_GL_PSHADOW_MAX;
+    if (g_pshadow.tiles < 0)
+        g_pshadow.tiles = 0;
+    if (g_pshadow.count > (size_t)g_pshadow.tiles)
+        g_pshadow.count = (size_t)g_pshadow.tiles;
 }
 
 /* Brings the atlas machinery up: the two perspective caster programs (the
  * sun's own sources under one more define), the two array objects, the R32F
- * atlas and its ordering depth buffer. A failure stands the whole prototype
+ * atlas and its ordering depth buffer. A failure stands the whole machinery
  * down for the context's lifetime, exactly the sun's rule. */
 static int hwr_pshadow_ensure_objects(void)
 {
     int resolution = g_pshadow.resolution;
+    int tiles = g_pshadow.tiles;
 
     if (g_ps_failed)
         return 0;
     if (resolution < 64 || resolution > 1024)
+        return 0;
+    if (tiles < 1 || tiles > (int)HWR_GL_PSHADOW_MAX)
         return 0;
     if (g_ps_program == 0 || g_ps_line_program == 0) {
         static const char version[] = "#version 330 core\n";
@@ -4163,9 +4174,10 @@ static int hwr_pshadow_ensure_objects(void)
     }
     if (g_ps_fbo == 0)
         g_gl.gen_framebuffers(1, &g_ps_fbo);
-    if (g_ps_atlas_texture == 0 || g_ps_resolution != resolution) {
+    if (g_ps_atlas_texture == 0 || g_ps_resolution != resolution ||
+        g_ps_tiles != tiles) {
         GLsizei atlas_w = (GLsizei)(3 * resolution);
-        GLsizei atlas_h = (GLsizei)(2 * resolution * HWR_GL_PSHADOW_MAX);
+        GLsizei atlas_h = (GLsizei)(2 * resolution * tiles);
         GLenum status;
         size_t i;
 
@@ -4180,7 +4192,14 @@ static int hwr_pshadow_ensure_objects(void)
         /* R32F: the store is world distance over range, compared by hand at
          * the lookup, so its quantum is dust beside the bias floor. NEAREST
          * on both filters -- the 2x2 blend is by hand, each texel against
-         * its own carried reference, the sun's own rule. */
+         * its own carried reference, the sun's own rule.
+         *
+         * WHAT ONE TILE COSTS, since the count is a player's dial and the
+         * storage follows it: at the shipping 256-texel face, a tile is
+         * 3*256 by 2*256 texels of R32F (1.5 MB) and its share of the
+         * ordering depth buffer (1.1 MB at 24 bits), so about 2.6 MB each --
+         * 10.5 MB at the count that ships, and 42 MB at the ceiling, which is
+         * every light the picture can carry. */
         g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R32F, atlas_w, atlas_h, 0,
                           GL_RED, GL_FLOAT, NULL);
         g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -4210,8 +4229,12 @@ static int hwr_pshadow_ensure_objects(void)
             return 0;
         }
         g_ps_resolution = resolution;
+        g_ps_tiles = tiles;
         g_ps_static_uploaded = 0;
         g_ps_static_uploaded_count = 0;
+        /* Every tile, not just the ones the new atlas holds: what a tile
+         * CONTAINS died with the old storage, and a tile index that comes
+         * back later must be rendered rather than believed. */
         for (i = 0; i < HWR_GL_PSHADOW_MAX; i++)
             g_ps_tile_valid[i] = 0;
         /* A fresh atlas holds "no caster anywhere" -- one, the far plane --
@@ -4343,7 +4366,7 @@ static void hwr_pshadow_render_maps(void)
         size_t static_count = 0;
         size_t card_count = 0;
 
-        if (light->tile < 0 || light->tile >= (int)HWR_GL_PSHADOW_MAX)
+        if (light->tile < 0 || light->tile >= g_ps_tiles)
             continue;
         if (!light->rebuild) {
             any = any || g_ps_tile_valid[light->tile];
@@ -4379,7 +4402,7 @@ static void hwr_pshadow_render_maps(void)
     for (i = 0; i < g_pshadow.count; i++) {
         const struct hwr_gl_pshadow_light *light = &g_pshadow.lights[i];
 
-        if (light->tile >= 0 && light->tile < (int)HWR_GL_PSHADOW_MAX &&
+        if (light->tile >= 0 && light->tile < g_ps_tiles &&
             g_ps_tile_valid[light->tile])
             any = 1;
     }
@@ -4396,7 +4419,7 @@ int hwr_gl_pshadow_read_tile(int tile, float *out, int resolution)
 
     if (!g_initialized || out == NULL || !g_ps_map_valid ||
         g_ps_atlas_texture == 0 || resolution != g_ps_resolution ||
-        tile < 0 || tile >= (int)HWR_GL_PSHADOW_MAX ||
+        tile < 0 || tile >= g_ps_tiles ||
         !hwr_platform_make_current())
         return 0;
     /* Read through the framebuffer, one tile's rows: glGetTexImage has no

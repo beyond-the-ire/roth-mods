@@ -230,7 +230,8 @@ static const struct hwr_overlay_group HWR_GROUPS[] = {
     {
         (int)HWR_CAT_ENHANCEMENTS, "point_light", "Torches and candles",
         "The lights a map places in the world: where they come from, how "
-        "many burn at once, and what one is worth."
+        "many burn at once, how many of them cast shadows, and what one is "
+        "worth."
     },
     {
         (int)HWR_CAT_ENHANCEMENTS, "sun_light", "Sun and moon",

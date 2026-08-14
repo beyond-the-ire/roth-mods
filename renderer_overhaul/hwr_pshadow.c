@@ -1,6 +1,7 @@
 #include "hwr_pshadow.h"
 
 #include "hwr_gl.h"
+#include "hwr_lights.h"
 #include "hwr_point_math.h"
 #include "hwr_sprites.h"
 #include "hwr_sun.h"
@@ -9,17 +10,28 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* The policy of the point-light shadow prototype; the design is stated in
- * the header. What this file holds is the tile ledger -- which light owns
- * which atlas tile and what STAMP its contents were rendered at -- and the
- * per-light card emitter, which is the sun's own card law aimed at a point:
- * the sizing arithmetic is the billboard emitter's, the geometry is
- * hwr_sunm_card out of the shared header, and the axis is the horizontal
- * perpendicular of the line from THIS light to the object
+/* The policy of the point-light shadows; the design is stated in the header.
+ * What this file holds is who casts -- the count in force, each light's own
+ * word over it, and the hysteresis that keeps a tile where it is -- the tile
+ * ledger (which light owns which atlas tile and what STAMP its contents were
+ * rendered at), and the per-light card emitter, which is the sun's own card
+ * law aimed at a point: the sizing arithmetic is the billboard emitter's, the
+ * geometry is hwr_sunm_card out of the shared header, and the axis is the
+ * horizontal perpendicular of the line from THIS light to the object
  * (hwr_psm_card_axis) rather than one direction for the whole sky. */
 
 _Static_assert((unsigned)HWR_PSM_MAX_LIGHTS == (unsigned)HWR_GL_PSHADOW_MAX,
-               "the policy and execution tile budgets must agree");
+               "the policy and execution tile ceilings must agree");
+_Static_assert((unsigned)HWR_PSM_MAX_LIGHTS ==
+                   (unsigned)HWR_GL_POINT_LIGHT_MAX,
+               "the tile ceiling is the light array's own: a light with no "
+               "slot in the picture has nothing to cast into");
+
+/* THE MARGIN a challenger must beat the light holding a tile by, which is the
+ * light array's own quarter (hwr_light_score's standing bonus) rather than a
+ * second number: one law about how much better is better, spelled once in
+ * each of the two places a set of lights settles. */
+#define HWR_PS_HYSTERESIS 1.25f
 
 /* Engine globals, read the same way the sun's card emitter reads them. */
 #define VA_G_SINCOS_TABLE 0x72080u
@@ -51,6 +63,10 @@ struct hwr_ps_tile {
 
 static struct hwr_ps_tile g_tiles[HWR_PSM_MAX_LIGHTS];
 static unsigned long g_tile_builds;
+/* How many tiles the ledger is keeping, which is the count in force as it
+ * stood when the ledger was last released. A published count that differs
+ * re-takes the atlas underneath, so the ledger goes with it. */
+static size_t g_budget;
 
 /* HWR_PSHADOW_UNCACHED=1 defeats the tile cache -- every tile every frame --
  * which exists for one purpose: measuring what the cache is worth. -1 until
@@ -72,7 +88,11 @@ unsigned long hwr_pshadow_tile_builds(void)
     return g_tile_builds;
 }
 
-void hwr_pshadow_reset(void)
+/* The ledger, released whole: no tile is anybody's and no tile's contents are
+ * believed. Every path that reaches it is one where what a tile HOLDS has
+ * stopped meaning anything -- a new map, a torn-down renderer, or a count
+ * change that re-takes the atlas storage underneath. */
+static void hwr_ps_forget_tiles(void)
 {
     size_t i;
 
@@ -80,7 +100,52 @@ void hwr_pshadow_reset(void)
         free(g_tiles[i].cards);
         memset(&g_tiles[i], 0, sizeof g_tiles[i]);
     }
+    g_budget = 0;
+}
+
+void hwr_pshadow_reset(void)
+{
+    hwr_ps_forget_tiles();
     hwr_gl_pshadow_set(NULL);
+}
+
+/* HOW MANY LIGHTS CAST, this frame: what the settings row asks for, held to
+ * how many lights the picture carries at all. A row above the light limit is
+ * "all of them" rather than a number -- there is nothing for a tile past the
+ * last light to be about -- and that is what makes the row uncapped upward
+ * without the storage being. */
+static size_t hwr_pshadow_budget(void)
+{
+    const struct hwr_lights_settings *settings = hwr_lights_get_settings();
+    size_t want;
+    size_t cap;
+
+    if (settings == NULL)
+        return 0;
+    want = (size_t)settings->shadow_lights;
+    cap = (size_t)settings->max;
+    if (cap > HWR_PSM_MAX_LIGHTS)
+        cap = HWR_PSM_MAX_LIGHTS;
+    return want < cap ? want : cap;
+}
+
+/* Whether this light is holding a tile in the ledger, and which. What names a
+ * light across frames here is where it hangs and how far it reaches -- the
+ * same four numbers the seeding derives deterministically, and the same ones
+ * the stamp is folded from. */
+static struct hwr_ps_tile *hwr_ps_held(const struct hwr_gl_point_light *light,
+                                       size_t budget)
+{
+    size_t i;
+
+    for (i = 0; i < budget; i++) {
+        if (g_tiles[i].used && g_tiles[i].x == light->world_x &&
+            g_tiles[i].y == light->world_y &&
+            g_tiles[i].z == light->world_z &&
+            g_tiles[i].range == light->range)
+            return &g_tiles[i];
+    }
+    return NULL;
 }
 
 static uint32_t hwr_ps_mix(uint32_t hash, const void *bytes, size_t size)
@@ -133,7 +198,7 @@ static struct hwr_gl_sun_vertex *hwr_ps_grow(struct hwr_ps_tile *tile,
  * differs is stated at each difference. The sprite FRAME is resolved with
  * the view's own yaw rather than a per-object light yaw -- the card then
  * carries the side the player sees, which for a cut-out silhouette is the
- * prototype's stated approximation. */
+ * approximation this round accepts and states. */
 static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
                                const struct hwr_scene *scene,
                                const struct hwr_objects *objects,
@@ -210,8 +275,8 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
             if (live >= 0)
                 lookup.frame_index = (uint16_t)live;
         }
-        /* Decoded 3D props are the prototype's stated open edge: their
-         * emitter is the sun's and has not been aimed at a point yet. */
+        /* Decoded 3D props are the stated open edge here: their emitter is
+         * the sun's and has not been aimed at a point yet. */
         if ((lookup.archive->entries[lookup.entry_id].payload_flags &
              0xff00u) == HWR_PS_MESH_FLAG)
             continue;
@@ -362,19 +427,85 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
     uint32_t static_stamp;
     size_t wanted[HWR_PSM_MAX_LIGHTS];
     size_t wanted_count = 0;
+    size_t budget = hwr_pshadow_budget();
     size_t i;
     size_t k;
 
-    /* Which of the frame's lights ask for a map, in the array's own order --
-     * which is the ranking order the seeding already sorted by, so when more
-     * ask than there are tiles, the tiles go to the lights worth most. */
-    for (i = 0; i < count; i++) {
+    /* A count that moved re-takes the atlas storage underneath, so nothing a
+     * tile holds survives one and the ledger is released whole. It happens on
+     * a settings change and nowhere else -- both numbers the count is worked
+     * out from are rows -- which is what keeps the storage still while
+     * somebody is walking. */
+    if (budget != g_budget) {
+        hwr_ps_forget_tiles();
+        g_budget = budget;
+    }
+    for (i = 0; i < count; i++)
         lights[i].shadow_tile = -1;
-        if (lights[i].shadow && wanted_count < HWR_PSM_MAX_LIGHTS)
+    if (budget == 0 || scene == NULL || world == NULL || camera == NULL) {
+        hwr_gl_pshadow_set(NULL);
+        return;
+    }
+    /* WHO CASTS, in two passes over the frame's lights.
+     *
+     * The PINNED first, in the array's own order: a game config that says
+     * "shadows": true about a light has said which lamp matters, and that
+     * outranks a ranking. It spends one of the count's tiles rather than
+     * standing beside them -- the count is what the picture can afford, and a
+     * pin that came free would make the row a suggestion.
+     *
+     * Then the REST fill what is left, worth-most first. The array arrives in
+     * the seeding's own ranking order, so first-come is nearest-and-strongest
+     * already; what is added here is the hysteresis, which lifts a light that
+     * is HOLDING a tile by the quarter margin and re-sorts. A light refused by
+     * its config entry is in neither pass. */
+    for (i = 0; i < count && wanted_count < budget; i++) {
+        if (lights[i].shadow_request == HWR_GL_SHADOW_ALWAYS)
             wanted[wanted_count++] = i;
     }
-    if (wanted_count == 0 || scene == NULL || world == NULL ||
-        camera == NULL) {
+    if (wanted_count < budget) {
+        struct {
+            size_t index;
+            float score;
+        } run[HWR_PSM_MAX_LIGHTS];
+        size_t run_count = 0;
+        size_t room = budget - wanted_count;
+
+        for (i = 0; i < count && run_count < HWR_PSM_MAX_LIGHTS; i++) {
+            float score;
+
+            if (lights[i].shadow_request != HWR_GL_SHADOW_FOLLOW)
+                continue;
+            score = lights[i].score;
+            if (hwr_ps_held(&lights[i], budget) != NULL)
+                score *= HWR_PS_HYSTERESIS;
+            run[run_count].index = i;
+            run[run_count].score = score;
+            run_count++;
+        }
+        /* Sorted by what each is worth, and STABLY, for the reason the
+         * seeding's own sort is: the array's order breaks a tie and that
+         * order does not move between frames. A light array with no scores at
+         * all -- an offline rig handing lights over directly -- is all ties,
+         * and the array's order is then the whole ranking. */
+        for (i = 1; i < run_count; i++) {
+            size_t j = i;
+
+            while (j > 0 && run[j - 1].score < run[j].score) {
+                size_t index = run[j - 1].index;
+                float score = run[j - 1].score;
+
+                run[j - 1].index = run[j].index;
+                run[j - 1].score = run[j].score;
+                run[j].index = index;
+                run[j].score = score;
+                j--;
+            }
+        }
+        for (i = 0; i < run_count && i < room; i++)
+            wanted[wanted_count++] = run[i].index;
+    }
+    if (wanted_count == 0) {
         hwr_gl_pshadow_set(NULL);
         return;
     }
@@ -386,11 +517,12 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
     /* The tile ledger: a light that stood last frame keeps its tile (its
      * contents are the whole cache), a tile whose light is gone is free, a
      * new light takes a free one and starts from nothing. */
-    for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++)
+    for (i = 0; i < budget; i++)
         g_tiles[i].seen = 0;
     memset(&out, 0, sizeof out);
     out.active = 1;
     out.resolution = HWR_PSM_RESOLUTION;
+    out.tiles = (int)budget;
     out.static_casters = statics;
     out.static_count = static_count;
     out.static_generation = static_stamp;
@@ -400,7 +532,7 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
         uint32_t stamp;
         int rebuild;
 
-        for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+        for (i = 0; i < budget; i++) {
             if (g_tiles[i].used && !g_tiles[i].seen &&
                 g_tiles[i].x == light->world_x &&
                 g_tiles[i].y == light->world_y &&
@@ -413,14 +545,14 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
         if (tile == NULL) {
             /* A free tile first; failing that, evict one whose light was not
              * seen this frame. Never one already claimed this frame. */
-            for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+            for (i = 0; i < budget; i++) {
                 if (!g_tiles[i].used) {
                     tile = &g_tiles[i];
                     break;
                 }
             }
             if (tile == NULL) {
-                for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+                for (i = 0; i < budget; i++) {
                     if (!g_tiles[i].seen) {
                         tile = &g_tiles[i];
                         break;
@@ -477,7 +609,7 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
     /* A tile whose light went away keeps its bytes but loses its claim, so
      * the same light coming back starts fresh rather than trusting a map
      * whose atlas rows may since have been painted by another. */
-    for (i = 0; i < HWR_PSM_MAX_LIGHTS; i++) {
+    for (i = 0; i < budget; i++) {
         if (g_tiles[i].used && !g_tiles[i].seen) {
             g_tiles[i].used = 0;
             g_tiles[i].stamp = 0;

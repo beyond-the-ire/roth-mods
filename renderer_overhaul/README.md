@@ -189,21 +189,33 @@ the map's own answer rather than a list: the game already marks the objects that
 darkened, and those are exactly the ones that are giving light. Nothing has to be listed for a map
 to work, custom maps included.
 
-**These lights cast no shadows** unless a game config asks for them, so one beside a doorway spills
-a little onto the far side of it and one behind a thin partition lights both faces. Three things
-keep that local: a light whose pool falls on nothing you can see is not there at all, a light cannot
-reach past its own room's floor and ceiling by more than `point_light_z_slack`, and its pool ends
-where `point_light_range` says rather than fading away for ever. What decides whether a light is
-there is always where its light FALLS and never whether you can see the lamp itself: step behind a
-pillar so the flame is hidden and the pool it casts is still on the wall in front of you. A light
-lighting something you CAN see goes on lighting it however far off you walk; how far away you are
-only stands it further down the queue for one of the slots.
+**The strongest few of them cast real shadows.** `point_light_shadows` says how many, and the ones
+that do are the ones lighting most of what you can see — so shadows arrive from the nearest and
+strongest outward as you walk, and a light joins or leaves the set with a rebuild of its own map
+rather than a flicker. A light past the count spills a little onto the far side of a doorway and
+lights both faces of a thin partition. Three things keep even that local: a light whose pool falls on
+nothing you can see is not there at all, a light cannot reach past its own room's floor and ceiling
+by more than `point_light_z_slack`, and its pool ends where `point_light_range` says rather than
+fading away for ever. What decides whether a light is there is always where its light FALLS and
+never whether you can see the lamp itself: step behind a pillar so the flame is hidden and the pool
+it casts is still on the wall in front of you. A light lighting something you CAN see goes on
+lighting it however far off you walk; how far away you are only stands it further down the queue for
+one of the slots.
 
 - `point_light`: whether they light anything at all. `point_light_objects` is where they come from;
   turning it off leaves the family on with nothing seeding it.
 - `point_light_max`: how many light the picture at once, from 1 through 16. What is dropped is
   always whatever is contributing least where you are standing, and it fades out over
   `point_light_fade` seconds rather than vanishing.
+- `point_light_shadows`: how many of those cast real shadows, from 0 through 64. Nought is none at
+  all; anything from `point_light_max` upward is every light that burns, so a big number here means
+  "all of them" whatever the row above is set to. The ones that get them are the ones worth most
+  where you are standing, and a light holding a shadow keeps it until another clearly outranks it,
+  so a shadow does not blink on and off at a boundary. Each shadowed light is six small renders of
+  its surroundings — taken again only when something within reach of it moves — plus one lookup per
+  lit pixel per frame. Measured over a whole lit map: at 1920x1080 four of them draw about a third
+  slower than none and eight about two thirds slower; at 3840x1600 it is nearer two fifths and four
+  fifths. A game config may pin one light's shadows on or refuse them whatever this says.
 - `point_light_intensity`, `point_light_range`: how bright one is, from 0 through 4, and where its
   pool ends in world units, from 100 through 2000. A fixed torch reads tighter than the light you
   carry.
@@ -377,15 +389,15 @@ Each entry says what the thing gives off, and each field stands on its own:
   here is written the way a person writes one; the bare six digits are accepted too.
 - **`strength`** — how bright, over the settings screen's own value.
 - **`reach`** — how far, in world units, over the settings screen's own value.
-- **`shadows`** — `true` asks for this light to cast real shadows: the walls, floors, doors and
-  things standing in its reach block it, with texture cut-outs honoured, instead of the light
-  passing through them. Nothing casts until an entry asks — a shadow map is rendered and kept per
-  shadowed light, so this is spent where it is worth spending: a handful of important, fixed
-  lights per map beats asking for every candle. At most four lights carry shadows at once; when
-  more ask, the ones contributing most to the picture get them. Decoded 3D props do not yet block
-  these lights, and glass dims none of them — a pane blocks only at its opaque paint. `false`
-  refuses one a broader entry granted. The advanced `point_shadows` setting refuses every such
-  request at once.
+- **`shadows`** — the last word about this one light, over the `point_light_shadows` count. Say
+  nothing and the light is one of the count's own candidates, which is the ordinary case. `true`
+  **pins** it: it takes a shadow ahead of the count's picks, wherever it stands in the ranking —
+  which is how a creator says *this* lamp is the one that matters in this room. It is not free, it
+  spends one of the count's own places. `false` refuses this light a shadow whatever the count says,
+  and refuses one a broader entry pinned. What a shadowed light is blocked by: the walls, floors,
+  doors and things standing in its reach, with texture cut-outs honoured. Decoded 3D props do not
+  yet block these lights, and glass dims none of them — a pane blocks only at its opaque paint.
+  Setting the count to nought turns every shadow off, pinned lights included.
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 
 The **most specific statement anybody made is the one in force**, and the tables compose **field by

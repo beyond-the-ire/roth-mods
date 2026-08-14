@@ -91,7 +91,7 @@
 #define HWR_POINT_HOPS_ROW "point_light_hops"
 #define HWR_POINT_Z_SLACK_ROW "point_light_z_slack"
 #define HWR_POINT_FADE_ROW "point_light_fade"
-#define HWR_POINT_SHADOWS_ROW "point_shadows"
+#define HWR_POINT_SHADOWS_ROW "point_light_shadows"
 
 /* What the map now loaded says about the brightness it was authored at: the
  * count of its lit sectors and three order statistics of their bytes. Zero
@@ -550,11 +550,13 @@ static void hwr_truecolor_points(const struct hwr_settings *settings,
                                              64.0f);
     points.fade_seconds = hwr_truecolor_row_float(HWR_POINT_FADE_ROW, settings,
                                                   0.25f);
-    /* The shadow prototype's file-only switch, spent here exactly as a class
-     * nobody asked for is: a refused request never reaches the seeding, let
-     * alone the shadow layer. */
-    points.shadows = mode == HWR_GL_SHADING_MODERN &&
-                     hwr_truecolor_row_bool(HWR_POINT_SHADOWS_ROW, settings, 1);
+    /* How many of them cast shadows, spent here exactly as a class nobody
+     * asked for is: under any law but the modern one the count is nought, so
+     * nothing is picked and no atlas stands. */
+    points.shadow_lights =
+        mode == HWR_GL_SHADING_MODERN
+            ? hwr_truecolor_row_u32(HWR_POINT_SHADOWS_ROW, settings, 4u)
+            : 0u;
     hwr_lights_set_settings(&points);
 }
 

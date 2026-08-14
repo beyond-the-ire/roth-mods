@@ -338,6 +338,15 @@ struct hwr_settings {
      * than a limit somebody should have to think about: what is dropped is
      * always the light contributing least where the eye is. */
     uint32_t point_light_max;
+    /* And how many of THOSE cast real shadows, worth-most first: nought is
+     * the whole feature off, and anything at or past the row above is every
+     * light that burns. It is bounded far above that row rather than by it on
+     * purpose -- somebody who wants all of them writes one big number and
+     * never has to come back when the row above moves.
+     *
+     * A game config may pin one light's shadows on, or refuse them, per
+     * light; this count is what every light it says nothing about follows. */
+    uint32_t point_light_shadows;
     /* The strength and the reach every one of them starts at, before the map's
      * own word about either. The reach is where the pool ENDS, not where it
      * becomes hard to see, so it also bounds how far a light with nothing to
@@ -365,12 +374,6 @@ struct hwr_settings {
     uint32_t point_light_hops;
     float point_light_z_slack;
     float point_light_fade;
-    /* The shadow PROTOTYPE's one switch: whether a light a game config marks
-     * "shadows": true gets its shadow maps at all. The feature itself is off
-     * until a config entry opts a light in -- this is the player's own way
-     * back out of a creator's choice, so it lives in the file rather than on
-     * the screen. */
-    int point_shadows;
 
     /* The sun and moon: one directional light per map, entering wherever the
      * map is open to the sky, gated per pixel by a light-space depth shadow

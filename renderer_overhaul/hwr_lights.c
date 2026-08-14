@@ -96,6 +96,22 @@ const struct hwr_lights_stats *hwr_lights_last_stats(void)
     return &g_stats;
 }
 
+/* WHAT A GAME CONFIG ENTRY SAID about one light casting shadows, in the three
+ * states the shadow layer reads: nothing said (the settings row's own count
+ * decides), always (pinned ahead of the count's picks), never (refused
+ * whatever the count says).
+ *
+ * ONE function, because all three seeding classes ask it and two copies of a
+ * three-state rule are two rules. The absent state is a real answer here and
+ * not a default -- which is exactly what the pair of fields in the entry is
+ * for -- so it is spelled out rather than left to a zero. */
+static int hwr_light_shadow_request(const struct hwr_look_light *named)
+{
+    if (named == NULL || !named->has_shadows)
+        return HWR_GL_SHADOW_FOLLOW;
+    return named->shadows ? HWR_GL_SHADOW_ALWAYS : HWR_GL_SHADOW_NEVER;
+}
+
 /* --------------------------------------------------------- colour off a sprite
  *
  * A light's colour is read off the thing that emits it, once, and kept. The
@@ -1468,6 +1484,16 @@ struct hwr_light_candidate {
     int16_t world_x;
     int16_t world_y;
     int16_t world_z;
+    /* What it is worth, and what it is worth FOR THE CHOOSING: the second
+     * carries the standing bonus that keeps a set of lights from churning,
+     * and the first is the plain number.
+     *
+     * They are kept apart because only one of them is a fact about the light.
+     * The bonus is a fact about the CHOICE this frame is making, and it is
+     * the plain worth that is published -- a published light that changed the
+     * frame after it arrived, for no reason but having arrived, would be a
+     * light that never settles. */
+    float worth;
     float score;
     float level;
     int stood;
@@ -1838,10 +1864,12 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_OBJECT;
     out->source_id = object->graphic_id;
     out->sector_index = object->sector_index;
-    /* No shadow map until the grant asks for one and the file-only switch
-     * lets it; minus one is the tile of every light no map stands for. */
-    out->light.shadow = g_settings.shadows && granted && named.has_shadows &&
-                        named.shadows;
+    /* WHAT THE GAME CONFIG SAID about this one casting shadows, carried as
+     * the three-state answer it is: nothing said leaves it to the settings
+     * row's own count, and true and false are a pin and a refusal that the
+     * count does not overrule. Minus one is the tile of every light no map
+     * stands for, which is every light until the shadow layer has picked. */
+    out->light.shadow_request = hwr_light_shadow_request(&named);
     out->light.shadow_tile = -1;
     /* WHAT NAMES THIS LIGHT ACROSS FRAMES is where the THING stands -- the
      * record's own three numbers -- and not where its light is emitted from.
@@ -2295,8 +2323,7 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_GLOW_FACE;
     out->source_id = face->source_id;
     out->sector_index = face->sector_index;
-    out->light.shadow = g_settings.shadows && face->light.has_shadows &&
-                        face->light.shadows;
+    out->light.shadow_request = hwr_light_shadow_request(&face->light);
     out->light.shadow_tile = -1;
     out->world_x = face->world_x;
     out->world_y = face->world_y;
@@ -2418,8 +2445,7 @@ static int hwr_light_from_placed(const struct hwr_lights_frame *frame,
      * seeder above for why they cannot be spent here. */
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)HWR_LIGHT_CLASS_PLACED;
-    out->light.shadow = g_settings.shadows && placed->light.has_shadows &&
-                        placed->light.shadows;
+    out->light.shadow_request = hwr_light_shadow_request(&placed->light);
     out->light.shadow_tile = -1;
     /* Nothing numbers a light that belongs to nothing, so what tells two of them
      * apart across frames is where each hangs -- which is exactly what the
@@ -2613,6 +2639,8 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
 
         candidates[i].level = held != NULL ? held->level : 0.0f;
         candidates[i].stood = held != NULL && held->stood;
+        candidates[i].worth = hwr_light_score(frame, &candidates[i].light,
+                                              1.0f, 0);
         candidates[i].score = hwr_light_score(frame, &candidates[i].light,
                                               1.0f, candidates[i].stood);
     }
@@ -2674,6 +2702,16 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
             continue;
         out[count] = candidate->light;
         out[count].intensity = candidate->light.intensity * level;
+        /* And what it is WORTH, which rides the light because the shadow
+         * layer ranks by it too: the tile a light holds is kept or lost by
+         * the same number the slot it stands in is, and one arithmetic
+         * published once is the only way the two orders cannot drift.
+         *
+         * The PLAIN worth, without the standing bonus the choosing above
+         * spends: the shadow layer keeps a hysteresis of its own, about
+         * holding a TILE, and a light already carrying one bonus into that
+         * comparison would be held twice for one reason. */
+        out[count].score = candidate->worth;
         count++;
     }
     if (next_count != 0)

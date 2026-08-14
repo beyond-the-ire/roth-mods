@@ -469,16 +469,29 @@ struct hwr_gl_point_light {
      * no vertex data -- it is what stops a torch lighting the room above it. */
     float z_lo;
     float z_hi;
-    /* Whether the game config asked this light to cast shadows -- the seeding
-     * carries the request; whether it is honoured is the shadow layer's call
-     * (the tile budget). Zero everywhere nothing asked, which is every light
-     * until a config entry says "shadows": true. */
-    int shadow;
+    /* What a game config SAID about this light casting shadows, which is a
+     * three-state answer and not a switch: nothing at all (follow the
+     * settings row -- the ordinary case, every light in an undescribed
+     * game), always (this one is worth a map whatever the row says), never
+     * (this one is not, whatever the row says). The seeding carries the
+     * word; who actually gets a tile is the shadow layer's own law. */
+    int shadow_request;
+    /* What this light is WORTH to the picture: the number the seeding ranked
+     * the frame's lights by, at full strength (see hwr_light_score). It rides
+     * the light because the shadow layer's own hysteresis is a comparison
+     * against it, and a second copy of the ranking arithmetic there would be
+     * a second law to drift. Zero from anything that did not rank. */
+    float score;
     /* Which atlas tile this light's shadow maps live in, or -1. Assigned by
      * the point-shadow layer after the frame's lights are chosen; -1 is what
-     * every light carries where the prototype is off. */
+     * every light carries where nothing casts. */
     int shadow_tile;
 };
+
+/* The three states of the answer above. */
+#define HWR_GL_SHADOW_FOLLOW 0   /* nothing said: the settings row decides */
+#define HWR_GL_SHADOW_ALWAYS 1   /* pinned: a tile before the row's own picks */
+#define HWR_GL_SHADOW_NEVER (-1) /* refused: no tile, whatever the row says */
 
 /* One caster vertex of the sun/moon light-space depth map.
  *
@@ -583,14 +596,19 @@ struct hwr_gl_sun {
     float bias_slope;
 };
 
-/* THE POINT-LIGHT SHADOW PROTOTYPE's execution side: one two-dimensional
- * R32F atlas of cube-topology face maps (three faces across, two down, one
- * such tile per shadowed light), rendered from the same caster vertex format
- * the sun uses, by the same caster program compiled once more under a
- * perspective define. The policy -- which lights, which tiles, when a tile
- * is stale -- lives in hwr_pshadow.c; this layer only executes it. The law
- * both sides compile is hwr_point_math.h. */
-#define HWR_GL_PSHADOW_MAX 4u
+/* THE POINT-LIGHT SHADOWS' execution side: one two-dimensional R32F atlas of
+ * cube-topology face maps (three faces across, two down, one such tile per
+ * shadowed light), rendered from the same caster vertex format the sun uses,
+ * by the same caster program compiled once more under a perspective define.
+ * The policy -- which lights, which tiles, when a tile is stale -- lives in
+ * hwr_pshadow.c; this layer only executes it. The law both sides compile is
+ * hwr_point_math.h.
+ *
+ * The number below is the CEILING the storage is built for, not the number of
+ * tiles that stand: the atlas is allocated to the `tiles` the policy
+ * publishes, which is what the settings row asks for held to how many lights
+ * there can be. */
+#define HWR_GL_PSHADOW_MAX 16u
 
 struct hwr_gl_pshadow_light {
     float world[3];
@@ -612,6 +630,13 @@ struct hwr_gl_pshadow {
     int active;
     /* One face's texels on a side; a change re-takes the atlas storage. */
     int resolution;
+    /* How many tiles the atlas is to hold -- the shadowed-light count in
+     * force, which is a settings row and therefore moves only where a
+     * settings change is safe. A change re-takes the storage exactly as a
+     * resolution change does, and every tile is stale afterwards: the policy
+     * layer asks each one back through the readiness ask, so no tile that
+     * was one light's can be read as another's. */
+    int tiles;
     /* The static caster slice every rebuilt tile draws -- the sun's own,
      * borrowed for the frame -- and the policy layer's generation stamp for
      * its CONTENT: the pointer can survive a rebuild, so equality of bytes

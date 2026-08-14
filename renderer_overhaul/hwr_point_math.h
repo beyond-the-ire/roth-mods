@@ -60,10 +60,16 @@
  * across and two down, face f at column f%3, row f/3, one tile per light. */
 #define HWR_PSM_FACES 6
 
-/* How many lights may carry a shadow map at once. A tile is six faces of
- * resolution^2 texels; four tiles at the default resolution is the whole
- * prototype budget, and the per-map allowance the measurements speak to. */
-#define HWR_PSM_MAX_LIGHTS 4
+/* The CEILING on how many lights may carry a shadow map at once: the storage
+ * the tile ledger and the atlas are built for, rather than the number in
+ * force.
+ *
+ * How many actually cast is a settings row, and the atlas is sized to it (see
+ * hwr_pshadow.c). The ceiling is the LIGHT ARRAY's own, because a light with
+ * no slot in the picture has nothing to cast into: there can never be more
+ * shadowed lights than there are lights, so the array's own maximum is the
+ * only ceiling here that is a fact rather than a budget somebody picked. */
+#define HWR_PSM_MAX_LIGHTS 16
 
 /* One face's texels on a side. */
 #define HWR_PSM_RESOLUTION 256

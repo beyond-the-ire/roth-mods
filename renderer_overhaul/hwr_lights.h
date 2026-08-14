@@ -77,10 +77,16 @@ struct hwr_lights_settings {
     unsigned hops;
     float z_slack;
     float fade_seconds;
-    /* Whether a light a game config marks "shadows": true may carry the
-     * request at all -- the prototype's file-only kill switch, spent here so
-     * a refused request never reaches the shadow layer. */
-    int shadows;
+    /* How many of the lights that stand cast real shadows, worth-most first.
+     * Nought is the whole feature off; a value at or past `max` is every
+     * light that stands, which is what makes the row uncapped upward.
+     *
+     * The seeding does nothing with it at all -- it is the shadow layer that
+     * picks and sizes its atlas to it (hwr_pshadow.c). It is carried here
+     * because one place works out what the rows ask for, and because a
+     * light's own word about shadows is read off its game config entry right
+     * beside the other three things an entry can say. */
+    unsigned shadow_lights;
 };
 
 /* Publishes what the rows ask for. Held whole rather than read per frame, for

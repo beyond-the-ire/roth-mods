@@ -1759,8 +1759,9 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Light from torches and candles",
         .help = "Lets the torches, candles and lit sigils a map places "
-                "actually light what is around them. They cast no shadows, so "
-                "one beside a doorway spills a little onto the far side of it."
+                "actually light what is around them. How many of them cast "
+                "shadows is a setting of its own below; one that casts none "
+                "spills a little onto the far side of a doorway."
     },
     {
         .key = "point_light_objects",
@@ -1827,6 +1828,45 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "What is dropped is always whatever is contributing least "
                 "where you are standing, and it fades out rather than "
                 "vanishing."
+    },
+    {
+        /* HOW MANY OF THOSE CAST SHADOWS, and a count rather than a switch
+         * because that is the only shape the question has an honest answer
+         * in: shadows from every torch in the place is what a person pictures
+         * when they ask for them, and the only thing standing in the way is
+         * cost. So the row says how much of it to spend, the spending goes to
+         * the lights lighting most of what is on the screen, and the ceiling
+         * sits far above the row it is actually held to -- a big number here
+         * means "all of them" and goes on meaning it when the row above
+         * moves. */
+        .key = "point_light_shadows",
+        .type = HWR_VT_U32,
+        .category = HWR_CAT_ENHANCEMENTS,
+        .exposure = HWR_EXP_CONSUMER,
+        .apply_kind = HWR_APPLY_HOOK,
+        .change_bit = HWR_CHANGE_TRUECOLOR,
+        .offset = offsetof(struct hwr_settings, point_light_shadows),
+        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
+                 HWR_SF_DEPENDS_ON_VALUE,
+        .def = { .u = 4u },
+        .original = { .u = 4u },
+        .min = { .u = 0u },
+        .max = { .u = 64u },
+        .step = { .u = 1u },
+        .page_step = { .u = 4u },
+        .depends_on = -1,
+        .depends_on_key = "shading_mode",
+        .depends_on_value = { .e = HWR_SHADING_MODERN },
+        .label = "How many cast shadows",
+        .help = "How many of them cast real shadows: walls, floors, doors and "
+                "the things standing about block their light instead of it "
+                "passing through. The ones that do are the ones lighting most "
+                "of what you can see, so shadows arrive from the nearest and "
+                "strongest outward. Nought is none at all, and anything from "
+                "the row above upward is every light that burns. They are not "
+                "free: over a whole lit map at 1920x1080, four of them draw "
+                "about a third slower than none and eight about two thirds "
+                "slower, and more again at larger sizes."
     },
     {
         .key = "point_light_intensity",
@@ -2019,28 +2059,24 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "disappears in a single frame."
     },
     {
-        /* The shadow prototype's one switch, file-only on purpose: nothing
-         * casts until a game config marks a light "shadows": true, so the
-         * feature has no screen presence to speak of -- but a creator's
-         * choice needs a player's way back out, and this is it. */
+        /* Retired: it was the one switch over a feature nothing used until a
+         * game config asked, and the count of shadowed lights is that switch
+         * and the whole dial besides -- nought there is exactly what turning
+         * this off did, and it is on the screen where a person can find it
+         * rather than in the file. The key is still accepted so an existing
+         * configuration file keeps loading whole. */
         .key = "point_shadows",
         .type = HWR_VT_BOOL,
         .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_ADVANCED,
-        .apply_kind = HWR_APPLY_HOOK,
-        .change_bit = HWR_CHANGE_TRUECOLOR,
-        .offset = offsetof(struct hwr_settings, point_shadows),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
-                 HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .b = 1 },
-        .original = { .b = 1 },
+        .exposure = HWR_EXP_RETIRED,
+        .apply_kind = HWR_APPLY_NONE,
+        .change_bit = 0,
+        .offset = HWR_SCHEMA_NO_FIELD,
+        .flags = 0,
         .depends_on = -1,
-        .depends_on_key = "shading_mode",
-        .depends_on_value = { .e = HWR_SHADING_MODERN },
         .label = "Shadows from marked lights",
-        .help = "Whether a light the game's own description marks as casting "
-                "shadows gets them. Nothing casts until a description asks; "
-                "turning this off refuses every such request."
+        .help = "how many lights cast shadows is a setting of its own now, "
+                "and nought there is what this off was"
     },
     /* The sun and moon: one directional light per map, entering wherever the
      * map is open to the sky and gated per pixel by a real shadow map
