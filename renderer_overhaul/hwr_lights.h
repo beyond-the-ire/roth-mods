@@ -118,8 +118,10 @@ struct hwr_lights_frame {
      * -- and the seeding takes no view of its own. */
     float sprite_vscale;
     /* The sectors the engine's own portal walk drew, and whether that answer
-     * is a real cull set at all. A light in a sector the walk did not reach is
-     * a light in a room that cannot be seen. */
+     * is a real cull set at all. A light that REACHES no sector the walk drew
+     * is a light nothing on the screen is lit by -- which is a question about
+     * where the light gets to and never about whether the thing giving it is
+     * itself in view, since a lamp behind a pillar still lights the wall. */
     const uint8_t *visible;
     size_t visible_count;
     int pvs_valid;
@@ -260,7 +262,7 @@ struct hwr_lights_stats {
     unsigned long no_sector;   /* nothing to belong to */
     unsigned long overlay;     /* a reflection-only artefact */
     unsigned long refused;     /* the look file says this is not a light */
-    unsigned long unseen;      /* the portal walk did not draw its room */
+    unsigned long unseen;      /* the walk drew no room this light reaches */
     unsigned long too_far;     /* past the hop cap */
     unsigned long capped;      /* more candidates than slots */
     unsigned long fading;      /* still going out from an earlier frame */

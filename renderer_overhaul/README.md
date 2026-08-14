@@ -189,12 +189,15 @@ the map's own answer rather than a list: the game already marks the objects that
 darkened, and those are exactly the ones that are giving light. Nothing has to be listed for a map
 to work, custom maps included.
 
-**These lights cast no shadows**, so one beside a doorway spills a little onto the far side of it
-and one behind a thin partition lights both faces. Three things keep that local: a light in a room
-you cannot see is not there at all, a light cannot reach past its own room's floor and ceiling by
-more than `point_light_z_slack`, and its pool ends where `point_light_range` says rather than
-fading away for ever. A light in a room you CAN see goes on lighting it however far off you walk;
-how far away you are only stands it further down the queue for one of the slots.
+**These lights cast no shadows** unless a game config asks for them, so one beside a doorway spills
+a little onto the far side of it and one behind a thin partition lights both faces. Three things
+keep that local: a light whose pool falls on nothing you can see is not there at all, a light cannot
+reach past its own room's floor and ceiling by more than `point_light_z_slack`, and its pool ends
+where `point_light_range` says rather than fading away for ever. What decides whether a light is
+there is always where its light FALLS and never whether you can see the lamp itself: step behind a
+pillar so the flame is hidden and the pool it casts is still on the wall in front of you. A light
+lighting something you CAN see goes on lighting it however far off you walk; how far away you are
+only stands it further down the queue for one of the slots.
 
 - `point_light`: whether they light anything at all. `point_light_objects` is where they come from;
   turning it off leaves the family on with nothing seeding it.

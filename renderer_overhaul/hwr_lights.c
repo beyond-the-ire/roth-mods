@@ -33,14 +33,18 @@
  * So these lights LEAK, and four containments are what is shipped instead of
  * occlusion. Each of them is cheap and each of them is absolute:
  *
- *   the portal walk   a light in a room the engine's own walk did not draw is
- *                     not seeded at all. This is free -- the walk has already
- *                     run -- and it removes the worst class outright: light
- *                     from a room that cannot be seen from here. It is also the
- *                     only one of the four that decides whether a light EXISTS,
- *                     which is a ruling rather than an implementation: a light
- *                     whose room is on the screen is lighting that room, however
- *                     far away the person looking at it happens to be standing.
+ *   the portal walk   a light that reaches nothing the engine's own walk drew
+ *                     is not seeded at all. This is nearly free -- the walk has
+ *                     already run -- and it removes the worst class outright:
+ *                     light from a room that cannot be seen from here. It is
+ *                     also the only one of the four that decides whether a light
+ *                     EXISTS, which is a ruling rather than an implementation: a
+ *                     light lighting a room that is on the screen is lighting
+ *                     that room, however far away the person looking at it
+ *                     happens to be standing AND WHEREVER THE THING GIVING IT
+ *                     HAPPENS TO BE HIDDEN. What is asked is where the light
+ *                     GETS TO, never where it comes from; the walk that answers
+ *                     it is written out at the containment itself.
  *   the hop cap       and where there is no drawn set at all -- the visibility
  *                     pass switched off, or a draw list that could not be read
  *                     -- a light more than so many doorways from the room the
@@ -1827,14 +1831,9 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
             return 0;
         }
     }
-    /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
-     * is a light in a room that cannot be seen from here. */
-    if (frame->pvs_valid && frame->visible != NULL &&
-        object->sector_index < frame->visible_count &&
-        !frame->visible[object->sector_index]) {
-        g_stats.unseen++;
-        return 0;
-    }
+    /* The containments are spent on the finished candidate rather than here:
+     * what the drawn set is asked about is the light's REACH, and how far this
+     * light carries is not settled until the lines below have run. */
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)HWR_LIGHT_CLASS_OBJECT;
     out->source_id = object->graphic_id;
@@ -1934,6 +1933,215 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
 
 /* ------------------------------------------------------------- the enumerator */
 
+/* CONTAINMENT: THE DRAWN SET, ASKED OF WHAT THE LIGHT REACHES.
+ *
+ * A light's life hangs on whether anything it REACHES is on the screen. It
+ * never hangs on whether the point it is emitted from is, and the difference
+ * between those two sentences is a bug somebody met while playing: stand behind
+ * a pillar so the lamp itself is hidden and the whole pool it casts goes out,
+ * while the wall it was lighting is still right there in front of you.
+ *
+ * The mechanism was the room a light is IN. A map's rooms are convex cells
+ * rather than rooms in the everyday sense, so the cell holding a light is
+ * routinely a sliver -- an alcove thirty-two units deep in the south wall of the
+ * hall it lights, which is exactly where the reported lamp hangs. That sliver
+ * leaves the engine's drawn set the moment its own opening is off the screen or
+ * behind a pillar, several times a turn, while the hall it opens onto is drawn
+ * the whole time. Asking whether the SLIVER was drawn therefore deleted a light
+ * standing twenty units from a fully drawn wall it was lighting.
+ *
+ * So the question asked here is the other one: IS ANY ROOM THIS LIGHT REACHES ON
+ * THE SCREEN. Its own room first, which is the common case and costs one array
+ * read; and where that room is not drawn, the light's own pool is followed out
+ * of it through the map's own openings.
+ *
+ * Three things bound that walk, and each of them is what keeps this a
+ * containment rather than the leak the containment was introduced to stop:
+ *
+ *   ONLY THROUGH OPENINGS  a wall with no room on the other side is not crossed.
+ *                     Light gets out of a room the way it really does, through
+ *                     the gaps, and never through the stone.
+ *   ONLY WITHIN THE REACH  an opening farther from the light than its own pool
+ *                     ENDS is not crossed. This is what stops the walk at
+ *                     arm's length: a light in a distant room the engine did
+ *                     not draw reaches no drawn room and dies exactly as it
+ *                     did before, which is the sigil leak this whole
+ *                     containment exists for.
+ *   ONLY INSIDE THE WINDOW  a room whose own floor and ceiling do not meet the
+ *                     light's world-Z window is not entered, because the
+ *                     fragment would fade the light to nothing there anyway. A
+ *                     torch still cannot light the storey above it.
+ *
+ * The first drawn room ends the walk, so the answer is reached at the first
+ * opening in the good case and the whole flood is only ever paid for by a light
+ * that is about to be refused.
+ *
+ * What this admits that the old rule did not is a light spilling out of a room
+ * that is off the screen onto a drawn surface WITHIN ITS OWN REACH, through a
+ * real opening. That is not a leak; that is the light, and refusing it was the
+ * complaint. */
+
+static uint32_t *g_reach_stamp;
+static uint32_t *g_reach_queue;
+static size_t g_reach_capacity;
+/* Which walk a stamp belongs to. A generation rather than a clear, so a light
+ * whose own room is drawn costs no pass over the map's rooms at all. */
+static uint32_t g_reach_generation;
+
+static int hwr_lights_reach_reserve(size_t sectors)
+{
+    if (sectors == 0u)
+        return 0;
+    if (g_reach_capacity < sectors) {
+        uint32_t *stamp = (uint32_t *)realloc(g_reach_stamp,
+                                              sectors * sizeof *stamp);
+        uint32_t *queue;
+
+        if (stamp == NULL)
+            return 0;
+        g_reach_stamp = stamp;
+        queue = (uint32_t *)realloc(g_reach_queue, sectors * sizeof *queue);
+        if (queue == NULL)
+            return 0;
+        g_reach_queue = queue;
+        /* Grown store, so every stamp in it is meaningless: cleared whole and
+         * the generation started again, which cannot be mistaken for a mark. */
+        memset(g_reach_stamp, 0, sectors * sizeof *g_reach_stamp);
+        g_reach_capacity = sectors;
+        g_reach_generation = 0u;
+    }
+    return 1;
+}
+
+/* Whether the drawn set says this room is on the screen.
+ *
+ * A set that does not answer for a room is NOT a set refusing it: the answer
+ * past its end is the same fail-open the per-candidate gate has always made, and
+ * the doorway count is what holds those rooms instead. */
+static int hwr_lights_room_drawn(const struct hwr_lights_frame *frame,
+                                 size_t sector)
+{
+    return sector >= frame->visible_count || frame->visible[sector] != 0;
+}
+
+/* How far a point is from an opening, in the plan, squared -- what is wanted is
+ * a comparison against a reach, and a square root would only be undone. The
+ * whole segment rather than its middle: an opening is wide, and light gets
+ * through the near end of it. */
+static float hwr_lights_wall_distance_sq(const struct hwr_world *world,
+                                         const struct hwr_wall *wall,
+                                         float at_x, float at_y)
+{
+    const struct hwr_vertex *a;
+    const struct hwr_vertex *b;
+    float ax;
+    float ay;
+    float dx;
+    float dy;
+    float len_sq;
+    float along;
+    float px;
+    float py;
+
+    if (wall->vertex_a_index >= world->vertex_count ||
+        wall->vertex_b_index >= world->vertex_count)
+        return -1.0f;               /* an opening with no corners: unmeasurable */
+    a = &world->vertices[wall->vertex_a_index];
+    b = &world->vertices[wall->vertex_b_index];
+    ax = (float)a->world_x;
+    ay = (float)a->world_y;
+    dx = (float)b->world_x - ax;
+    dy = (float)b->world_y - ay;
+    len_sq = dx * dx + dy * dy;
+    along = 0.0f;
+    if (len_sq > 0.0f) {
+        along = ((at_x - ax) * dx + (at_y - ay) * dy) / len_sq;
+        if (along < 0.0f)
+            along = 0.0f;
+        if (along > 1.0f)
+            along = 1.0f;
+    }
+    px = ax + along * dx;
+    py = ay + along * dy;
+    return (at_x - px) * (at_x - px) + (at_y - py) * (at_y - py);
+}
+
+static int hwr_lights_reach_drawn(const struct hwr_lights_frame *frame,
+                                  const struct hwr_light_candidate *candidate)
+{
+    const struct hwr_world *world = frame->world;
+    float reach_sq;
+    size_t head = 0;
+    size_t tail = 0;
+
+    /* No drawn set at all -- the visibility pass switched off, or a draw list
+     * that could not be read. Then every room is a room that might be on the
+     * screen and the doorway count is the whole containment. */
+    if (!frame->pvs_valid || frame->visible == NULL)
+        return 1;
+    /* Its own room, which is the answer nearly every frame and the whole reason
+     * this costs nothing to ask. */
+    if (hwr_lights_room_drawn(frame, candidate->sector_index))
+        return 1;
+    if (!(candidate->light.range > 0.0f) ||
+        !hwr_lights_reach_reserve(world->sector_count))
+        return 0;
+    reach_sq = candidate->light.range * candidate->light.range;
+    if (++g_reach_generation == 0u) {
+        memset(g_reach_stamp, 0, g_reach_capacity * sizeof *g_reach_stamp);
+        g_reach_generation = 1u;
+    }
+    g_reach_stamp[candidate->sector_index] = g_reach_generation;
+    g_reach_queue[tail++] = candidate->sector_index;
+    while (head < tail) {
+        uint32_t index = g_reach_queue[head++];
+        const struct hwr_sector *sector = &world->sectors[index];
+        size_t w;
+
+        if (sector->first_wall > world->wall_count ||
+            sector->wall_count > world->wall_count - sector->first_wall)
+            continue;
+        for (w = 0; w < sector->wall_count; w++) {
+            const struct hwr_wall *wall = &world->walls[sector->first_wall + w];
+            size_t next = wall->neighbor_sector_index;
+            const struct hwr_sector *neighbor;
+            float low;
+            float high;
+            float distance_sq;
+
+            /* Stone. Light does not cross it, and neither does this. */
+            if (next == SIZE_MAX || next >= world->sector_count)
+                continue;
+            if (g_reach_stamp[next] == g_reach_generation)
+                continue;
+            neighbor = &world->sectors[next];
+            low = (float)neighbor->floor_z;
+            high = (float)neighbor->ceiling_z;
+            if (low > high) {
+                float swap = low;
+
+                low = high;
+                high = swap;
+            }
+            /* The world-Z window, which is the same window the fragment fades
+             * across: a room the light could only reach outside it is a room the
+             * light does not reach. */
+            if (high < candidate->light.z_lo || low > candidate->light.z_hi)
+                continue;
+            distance_sq = hwr_lights_wall_distance_sq(
+                world, wall, candidate->light.world_x,
+                candidate->light.world_y);
+            if (distance_sq < 0.0f || distance_sq > reach_sq)
+                continue;
+            if (hwr_lights_room_drawn(frame, next))
+                return 1;
+            g_reach_stamp[next] = g_reach_generation;
+            g_reach_queue[tail++] = (uint32_t)next;
+        }
+    }
+    return 0;
+}
+
 /* CONTAINMENT: the hop cap, worked out once for the frame rather than per
  * candidate -- AND ONLY WHERE THERE IS NO DRAWN SET TO CONTAIN BY.
  *
@@ -1978,6 +2186,28 @@ static const uint8_t *hwr_lights_hop_containment(
         hop = hwr_lights_hop_map(frame->world, frame->camera_sector,
                                  g_settings.hops);
     return hop;
+}
+
+/* BOTH OF THEM, ONCE, over a finished candidate.
+ *
+ * It is asked here rather than inside each class's own seeder for two reasons.
+ * A containment that meant one thing for a torch and another for a lit floor
+ * would not be a containment -- and the drawn set is now asked of the light's
+ * REACH, which is not known until the map, the rows and the game config have all
+ * had their say about how far this particular light carries. */
+static int hwr_lights_contained(const struct hwr_lights_frame *frame,
+                                const struct hwr_light_candidate *candidate,
+                                const uint8_t *hop)
+{
+    if (!hwr_lights_reach_drawn(frame, candidate)) {
+        g_stats.unseen++;
+        return 0;
+    }
+    if (hop != NULL && hop[candidate->sector_index] == 0xffu) {
+        g_stats.too_far++;
+        return 0;
+    }
+    return 1;
 }
 
 static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
@@ -2030,10 +2260,8 @@ static size_t hwr_lights_seed_objects(const struct hwr_lights_frame *frame,
 
         if (!hwr_light_from_object(frame, object, &candidate))
             continue;
-        if (hop != NULL && hop[candidate.sector_index] == 0xffu) {
-            g_stats.too_far++;
+        if (!hwr_lights_contained(frame, &candidate, hop))
             continue;
-        }
         candidates[count++] = candidate;
     }
     return count;
@@ -2061,14 +2289,8 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     if (face->sector_index >= world->sector_count)
         return 0;
     sector = &world->sectors[face->sector_index];
-    /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
-     * is a light in a room that cannot be seen from here. */
-    if (frame->pvs_valid && frame->visible != NULL &&
-        face->sector_index < frame->visible_count &&
-        !frame->visible[face->sector_index]) {
-        g_stats.unseen++;
-        return 0;
-    }
+    /* The containments are spent on the finished candidate; see the object
+     * seeder above for why they cannot be spent here. */
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)HWR_LIGHT_CLASS_GLOW_FACE;
     out->source_id = face->source_id;
@@ -2165,10 +2387,8 @@ static size_t hwr_lights_seed_glow_faces(const struct hwr_lights_frame *frame,
 
         if (!hwr_light_from_glow_face(frame, &g_glow_faces[i], &candidate))
             continue;
-        if (hop != NULL && hop[candidate.sector_index] == 0xffu) {
-            g_stats.too_far++;
+        if (!hwr_lights_contained(frame, &candidate, hop))
             continue;
-        }
         candidates[count++] = candidate;
     }
     return count;
@@ -2194,14 +2414,8 @@ static int hwr_light_from_placed(const struct hwr_lights_frame *frame,
     if (placed->sector_index >= world->sector_count)
         return 0;
     sector = &world->sectors[placed->sector_index];
-    /* CONTAINMENT: the portal walk. A light whose room the engine did not draw
-     * is a light in a room that cannot be seen from here. */
-    if (frame->pvs_valid && frame->visible != NULL &&
-        placed->sector_index < frame->visible_count &&
-        !frame->visible[placed->sector_index]) {
-        g_stats.unseen++;
-        return 0;
-    }
+    /* The containments are spent on the finished candidate; see the object
+     * seeder above for why they cannot be spent here. */
     memset(out, 0, sizeof *out);
     out->source = (uint8_t)HWR_LIGHT_CLASS_PLACED;
     out->light.shadow = g_settings.shadows && placed->light.has_shadows &&
@@ -2282,10 +2496,8 @@ static size_t hwr_lights_seed_placed(const struct hwr_lights_frame *frame,
 
         if (!hwr_light_from_placed(frame, &g_placed[i], &candidate))
             continue;
-        if (hop != NULL && hop[candidate.sector_index] == 0xffu) {
-            g_stats.too_far++;
+        if (!hwr_lights_contained(frame, &candidate, hop))
             continue;
-        }
         candidates[count++] = candidate;
     }
     return count;
