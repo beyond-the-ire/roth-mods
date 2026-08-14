@@ -476,6 +476,23 @@ struct hwr_gl_point_light {
      * (this one is not, whatever the row says). The seeding carries the
      * word; who actually gets a tile is the shadow layer's own law. */
     int shadow_request;
+    /* WHICH THING'S OWN PICTURE THIS LIGHT IS, as the map's own object number
+     * -- the number the community map editor shows as "Object: N" -- or
+     * HWR_GL_LIGHT_NO_SOURCE where no drawn thing is the source of it.
+     *
+     * It rides the light for one reason: a thing that gives light stands a
+     * unit or two off whatever it is mounted on while its light is pushed
+     * clear of that same surface, so the thing's own card is BETWEEN its light
+     * and its mounting -- and a card that shadows the surface it decorates is
+     * the sigil putting itself out. The shadow layer therefore leaves a
+     * light's own card out of that light's own map, and it can only know which
+     * card that is if the light says so. Nothing else reads it.
+     *
+     * A number rather than a pointer or an array index, because it names the
+     * same thing across frames and across a rebuild of the object list: what
+     * the seeding read and what the shadow layer walks are one map's own
+     * numbering. */
+    uint32_t source_object;
     /* What this light is WORTH to the picture: the number the seeding ranked
      * the frame's lights by, at full strength (see hwr_light_score). It rides
      * the light because the shadow layer's own hysteresis is a comparison
@@ -487,6 +504,13 @@ struct hwr_gl_point_light {
      * every light carries where nothing casts. */
     int shadow_tile;
 };
+
+/* A light no drawn thing is the source of: one a game config hangs at three
+ * numbers of its own, one a granted surface glows with, the one at the eye.
+ * The same value the object list carries for a thing no map numbers, which is
+ * asserted where both headers are in scope (hwr_pshadow.c) rather than left to
+ * agree by eye. */
+#define HWR_GL_LIGHT_NO_SOURCE 0xffffffffu
 
 /* The three states of the answer above. */
 #define HWR_GL_SHADOW_FOLLOW 0   /* nothing said: the settings row decides */

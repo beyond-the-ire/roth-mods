@@ -67,10 +67,33 @@
  * plus the light's neighbourhood of object CARDS, each faced to this light.
  * What does not, stated rather than omitted: decoded 3D mesh props (the open
  * edge here; their emitter is the sun's and has not been aimed at a point
- * yet), and the light's OWN source object unless it is wall art
- * -- a free-standing emitter's card contains its own light and could only
- * shadow the whole room, while wall art stands clear of its light by the
- * wall-clearance law and its bracket's shadow is honest. */
+ * yet), and A LIGHT'S OWN SOURCE CARD, never, in this light's own tile.
+ *
+ * NOTHING SHADOWS ITSELF. A thing that gives light is drawn a unit or two off
+ * whatever it is mounted on, and its light is pushed clear of that same
+ * surface by the wall-clearance law -- so the CARD stands between the light
+ * and the mounting, and a card that casts there paints a shadow of itself
+ * across the very door it decorates. That is the whole of the rule: the
+ * light's own card is left out of the light's own map, under every
+ * circumstance and whatever the thing is mounted on.
+ *
+ * IN THAT TILE ALONE. The same card casts in every OTHER light's tile, which
+ * is the other half of the rule and the reason it is spelled by identity
+ * rather than by "wall art does not cast": a lit sigil is a thing standing in
+ * the room, and a lamp across the hall throws its silhouette exactly as it
+ * throws a candlestick's. Every other caster in a light's own tile -- the
+ * geometry, the other things' cards, the props -- is untouched.
+ *
+ * The three classes that seed lights answer it in their own terms, and only
+ * one of them has a self at all:
+ *
+ *   an OBJECT's light   it IS a thing the map numbers, so it names that
+ *                       number and its card is the one left out.
+ *   a PLACED light      three numbers in a game config, drawn by nothing:
+ *                       no source, and so nothing to leave out.
+ *   a GLOW FACE's light a painted surface rather than a thing. It has no
+ *                       source object, and a surface is not a card in any
+ *                       tile to begin with -- the card slice is objects. */
 
 /* One frame's whole shadow policy: reads the count in force and each light's
  * own word off the built array, picks who casts, assigns tiles, keeps them

@@ -1871,6 +1871,13 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
      * stands for, which is every light until the shadow layer has picked. */
     out->light.shadow_request = hwr_light_shadow_request(&named);
     out->light.shadow_tile = -1;
+    /* AND WHICH THING THIS LIGHT IS THE LIGHT OF, by the map's own object
+     * number. The shadow layer leaves a light's own card out of its own map --
+     * a ward on a door stands between its light and the door -- and this is
+     * how it knows which card. A thing no map numbers (a particle, the flying
+     * pickup) carries the object list's own sentinel, which is the same
+     * "nothing to leave out" every other class says. */
+    out->light.source_object = object->map_index;
     /* WHAT NAMES THIS LIGHT ACROSS FRAMES is where the THING stands -- the
      * record's own three numbers -- and not where its light is emitted from.
      * The two are different on purpose (see the emit point below), and a name
@@ -2325,6 +2332,10 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     out->sector_index = face->sector_index;
     out->light.shadow_request = hwr_light_shadow_request(&face->light);
     out->light.shadow_tile = -1;
+    /* A PAINTED SURFACE IS NOT A THING THE MAP NUMBERS, so there is no card of
+     * its own to leave out of its own map -- and a granted face's light has
+     * none by construction, since the card slice is objects and nothing else. */
+    out->light.source_object = HWR_GL_LIGHT_NO_SOURCE;
     out->world_x = face->world_x;
     out->world_y = face->world_y;
     out->world_z = face->world_z;
@@ -2453,6 +2464,9 @@ static int hwr_light_from_placed(const struct hwr_lights_frame *frame,
      * rather than invented, and the CLASS is what keeps it from colliding with a
      * torch of graphic nought standing in the same place. */
     out->source_id = 0u;
+    /* And for the same reason it has no card of its own to leave out of its
+     * own map: a light somebody hung at three numbers is drawn by nothing. */
+    out->light.source_object = HWR_GL_LIGHT_NO_SOURCE;
     out->sector_index = placed->sector_index;
     out->world_x = placed->world_x;
     out->world_y = placed->world_y;

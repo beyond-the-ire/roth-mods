@@ -16,7 +16,14 @@ struct roth_api_v1;
  * There is one array of lights and one falloff law; a class is a way of finding
  * lights in a map, not a second kind of light. That is what lets a later class
  * arrive as a seeder alone, with nothing said to the shader -- and it is why the
- * classes are named here even where nothing seeds them yet. */
+ * classes are named here even where nothing seeds them yet.
+ *
+ * WHAT EVERY SEEDER OWES THE LIGHT IT MAKES, whichever class it is: the thing
+ * the light is the light OF (hwr_gl_point_light's source_object), which is a
+ * map's own object number or HWR_GL_LIGHT_NO_SOURCE where nothing drawn is
+ * behind it. It has to be SAID rather than left at what a clearing leaves,
+ * because nought is a real object of every map: a class that forgot it would
+ * quietly take some other thing's card out of its shadow map. */
 enum hwr_light_class {
     /* An object the map's own author marked as giving light rather than taking
      * it: a torch, a candle, a lit sigil. The mark is the composed shade byte

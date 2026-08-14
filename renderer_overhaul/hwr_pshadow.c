@@ -26,6 +26,10 @@ _Static_assert((unsigned)HWR_PSM_MAX_LIGHTS ==
                    (unsigned)HWR_GL_POINT_LIGHT_MAX,
                "the tile ceiling is the light array's own: a light with no "
                "slot in the picture has nothing to cast into");
+_Static_assert((uint32_t)HWR_GL_LIGHT_NO_SOURCE ==
+                   (uint32_t)HWR_OBJECT_NO_INDEX,
+               "a light with no source and a thing no map numbers say the "
+               "same word: the card walk compares one against the other");
 
 /* THE MARGIN a challenger must beat the light holding a tile by, which is the
  * light array's own quarter (hwr_light_score's standing bonus) rather than a
@@ -191,7 +195,8 @@ static struct hwr_gl_sun_vertex *hwr_ps_grow(struct hwr_ps_tile *tile,
 }
 
 /* The card slice of one shadowed light: every object within its reach, one
- * upright quad each, faced to THIS light.
+ * upright quad each, faced to THIS light -- EXCEPT the one thing this light is
+ * the light OF, which never stands in its own map (see the header).
  *
  * The sizing arithmetic below is the billboard emitter's own law, the same
  * lines the sun's card emitter carries (hwr_sun.c documents each term); what
@@ -203,7 +208,8 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
                                const struct hwr_scene *scene,
                                const struct hwr_objects *objects,
                                const struct roth_api_v1 *api,
-                               const struct hwr_gl_camera *camera)
+                               const struct hwr_gl_camera *camera,
+                               uint32_t source_object)
 {
     const struct hwr_billboards *bb = &scene->billboards;
     double xscale;
@@ -253,6 +259,18 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
         if (object->sector_index == (uint16_t)HWR_OBJECT_NO_SECTOR)
             continue;
         if ((object->flags & HWR_OBJECT_FLAG_REFLECTION_ONLY) != 0)
+            continue;
+        /* THIS LIGHT'S OWN THING, WHICH NEVER CASTS INTO THIS LIGHT'S OWN
+         * MAP. Under any circumstance, wall art included: the emit point
+         * stands clear of whatever the thing is mounted on while the thing
+         * itself stands a unit or two off it, so its card is BETWEEN its own
+         * light and its mounting and would shadow the very surface it
+         * decorates -- a ward on a door putting its own door out. It is left
+         * out HERE, in this light's slice alone, so the same card still casts
+         * in every other light's map: a sigil is a thing in the room, and a
+         * lamp across the hall throws its silhouette like anything else's. */
+        if (source_object != (uint32_t)HWR_OBJECT_NO_INDEX &&
+            object->map_index == source_object)
             continue;
         /* Reach cull, with a margin for the card's own width: a caster
          * wholly outside the light's pool shadows nothing the pool lights. */
@@ -383,9 +401,9 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
         wall_art = (object->flags9 & 0x80u) != 0;
         if (wall_art) {
             /* Pinned to its wall in the world: the authored axis, exactly
-             * the sun's rule -- and its own light stands CLEAR of the card
-             * by the wall-clearance law, so the bracket's shadow behind the
-             * flame is honest rather than a self-eclipse. */
+             * the sun's rule. It is drawn flat on its wall for every light
+             * that sees it, and the only light it does not cast for at all
+             * is its own, which was refused above. */
             uint32_t phi = 2u * (uint32_t)object->facing + 0x80u;
 
             axis[0] = (float)hwr_ps_sincos(api, phi) / 16384.0f;
@@ -394,9 +412,10 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
             /* Faced to THIS light -- the billboard law with the light
              * standing in for the eye, per object. An object standing (in
              * plan) on the light has no honest facing, and an object whose
-             * card would CONTAIN the light is the light's own emitter (or a
-             * co-located one): either could only shadow the whole room, and
-             * both are skipped. */
+             * card would CONTAIN the light could only shadow the whole room:
+             * both are skipped. That is a geometric refusal about ANY card,
+             * a co-located second thing included, and not a stand-in for the
+             * identity rule above -- which is why the two are kept apart. */
             if (!hwr_psm_card_axis(tile->x, tile->y,
                                    (float)object->world_x,
                                    (float)object->world_y, axis))
@@ -573,7 +592,8 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
          * within reach, a few quads -- because its BYTES are part of the
          * stamp: an animated torch stepping a frame moves them and refreshes
          * exactly this tile, and a still room hashes to what it was. */
-        hwr_ps_build_cards(tile, scene, objects, api, camera);
+        hwr_ps_build_cards(tile, scene, objects, api, camera,
+                           light->source_object);
         stamp = static_stamp;
         stamp = hwr_ps_mix(stamp, &tile->x, sizeof tile->x);
         stamp = hwr_ps_mix(stamp, &tile->y, sizeof tile->y);
