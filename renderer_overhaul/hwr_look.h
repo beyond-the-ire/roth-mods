@@ -231,6 +231,22 @@ struct hwr_look_light {
      * beneath), which is why the pair. */
     int has_shadows;
     int shadows;
+    /* Whether the THING this grant makes a light is itself DRAWN lit, the way
+     * the map's own lights are. True is what a grant has always done -- a
+     * torch that lights the room and is drawn as a dark sprite reads as a
+     * halo with nothing in the middle -- and false keeps the ordinary shading
+     * law on the sprite while the light it gives is untouched: a thing lit by
+     * the room, its own glow included, rather than a thing painted bright.
+     * Absent composes from beneath and means true where nothing says
+     * otherwise.
+     *
+     * A field of the OBJECT tables alone -- `sprites` and `objects` -- since
+     * only a thing drawn with a sprite has a drawing to speak about: textures
+     * and faces grant surfaces, and a placed light is drawn by nothing. And
+     * it speaks about the PROMOTION only: a thing the map itself marks lit is
+     * the map's own statement, which this field does not unmark. */
+    int has_lit;
+    int lit;
 };
 
 /* One grant laid over another, FIELD by field, with `off` left to the caller

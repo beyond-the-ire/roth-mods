@@ -204,9 +204,11 @@ one of the slots.
 
 - `point_light`: whether they light anything at all. `point_light_objects` is where they come from;
   turning it off leaves the family on with nothing seeding it.
-- `point_light_max`: how many light the picture at once, from 1 through 16. What is dropped is
-  always whatever is contributing least where you are standing, and it fades out over
-  `point_light_fade` seconds rather than vanishing.
+- `point_light_max`: the ceiling on `point_light_shadows` below, from 1 through 16. Every torch
+  that burns lights the picture — up to the sixteen the picture can carry at once, worth-most
+  first, so a hall of torches shows every pool across the room rather than the nearest few. A
+  light entering the set comes up over `point_light_fade` seconds; only past the sixteenth does
+  the least contributing one stand down.
 - `point_light_shadows`: how many of those cast real shadows, from 0 through 64. Nought is none at
   all; anything from `point_light_max` upward is every light that burns, so a big number here means
   "all of them" whatever the row above is set to. The ones that get them are the ones worth most
@@ -354,7 +356,8 @@ That is the whole of it. Select a thing in the editor: if `Lighting` is 0 the ga
 room with it and a grant is *tuning*; if it is anything else the game draws it as an ordinary object,
 and naming it in a grant is what turns it into a light. A thing made a light that way is also **drawn
 undarkened**, exactly as the map's own lights are, so it looks like the thing lighting the room rather
-than a dark sprite with a halo round it.
+than a dark sprite with a halo round it. Where that is not wanted — a thing that should give light and
+still sit in the room's own shading — the entry says `"lit": false` (see the field below).
 
 **The colour is optional wherever there is a picture to read it off.** A thing is drawn with a
 picture and a surface is painted with one, so leaving `colour` out takes the colour from that picture:
@@ -398,6 +401,14 @@ Each entry says what the thing gives off, and each field stands on its own:
   doors and things standing in its reach, with texture cut-outs honoured. Decoded 3D props do not
   yet block these lights, and glass dims none of them — a pane blocks only at its opaque paint.
   Setting the count to nought turns every shadow off, pinned lights included.
+- **`lit`** — whether the **thing itself is drawn lit**, the way the map's own lights are. Say
+  nothing and it is: that is what a grant has always done, and what stops a torch reading as a dark
+  sprite with a halo round it. `"lit": false` keeps the ordinary shading law on the sprite while the
+  light it gives is untouched — the thing is then lit by the lights around it, its own among them,
+  so it glows with its own light rather than being painted bright. A field of `sprites` and
+  `objects` alone: textures and faces grant surfaces, and a placed light is drawn by nothing, so
+  there is no sprite for it to speak about there. On a thing the map itself marks (`Lighting` 0)
+  the mark is the map's own statement and this field does not unmark it.
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 
 The **most specific statement anybody made is the one in force**, and the tables compose **field by

@@ -3,6 +3,7 @@
 #include "hwr_das.h"
 #include "hwr_look.h"
 #include "hwr_objects.h"
+#include "hwr_point_math.h"
 #include "hwr_sprite_span.h"
 #include "hwr_sprites.h"
 #include "hwr_world.h"
@@ -600,6 +601,14 @@ static uint64_t g_last_ns;
  * -- clear of the surface, and too little to carry a light through anything
  * thicker than a pane. */
 #define HWR_GLOW_FACE_OFFSET 16
+/* The shadow lookup's grazing floor stands on this clearance: every mounted
+ * light is exactly one clearance off its own wall, and that is the plane
+ * distance below which the lookup declines to shadow (hwr_point_math.h states
+ * why). The tie is asserted rather than left to agree by eye. */
+_Static_assert(HWR_GLOW_FACE_OFFSET == HWR_PSM_GRAZE_NEAR_WORLD,
+               "the grazing floor is the emit law's own wall clearance: a "
+               "mounted light stands one clearance off its wall, and that is "
+               "the plane the lookup must decline");
 /* Where a map's own archive stops holding the pictures its SURFACES are painted
  * with and starts holding the ones its OBJECTS are drawn with. Nothing is ever
  * painted with a number at or above the first, so a texture grant written on one
@@ -1625,7 +1634,13 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
     if (!hwr_look_object_grant(object->map_index, object->object_id,
                                object->graphic_id, &named))
         return 0;
-    return !named.off;
+    if (named.off)
+        return 0;
+    /* The entry's own word on the drawing, composed like every field: absent
+     * means true -- what a grant has always done -- and false keeps the
+     * ordinary shading law on the sprite while the light it gives stands.
+     * The light is then its own nearest light, which is what lights it. */
+    return named.has_lit == 0 || named.lit != 0;
 }
 
 /* ------------------------------------------------- where a thing's light is
@@ -2563,20 +2578,29 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
         hwr_lights_reset();
         return 0;
     }
-    /* Two caps, and the difference between them is where a light goes out.
+    /* THE CAP IS THE PASS'S OWN CARRYING BOUND, and nothing tighter.
      *
-     * The first is how many lights are CHOSEN, which is the quality row. The
-     * second is how many the pass can carry at all. A light that loses its
-     * place among the chosen goes out over a moment rather than in one frame,
-     * and it spends that moment in the room between the two -- so the row keeps
-     * meaning "how many light this scene" while nothing ever vanishes mid-step.
-     * At the highest quality setting the two are the same number and there is
-     * no such room, which is stated rather than worked around: somebody asking
-     * for every slot to be a chosen light has asked for exactly that. */
+     * It used to be the quality row, and the row's cap is what a torch-filled
+     * hall turned out to look like: a room with seventeen marked torches
+     * showed eight pools and nine dark ones, each popping alight as the eye
+     * walked toward it. A light's pool is what it is wherever the eye stands
+     * -- the picture is drawn in world space -- so a burning torch whose pool
+     * is in view and unlit is not a quality trade, it is a wrong picture.
+     * Every candidate the array can carry is therefore published, worth-most
+     * first, and what the row still governs is the SHADOW spending
+     * (hwr_pshadow.c reads it as the ceiling on the shadowed count), which is
+     * where the real per-light cost lives.
+     *
+     * What crossing the ceiling costs is stated rather than hidden: with the
+     * whole array chosen there is no spare slot for a light on its way out,
+     * so in a scene holding more candidates than the array the one that loses
+     * the last place goes out in a frame rather than over a moment. That
+     * light is by construction the least contributing of sixteen -- the old
+     * law popped the ninth-of-seventeen, which is the report this replaces --
+     * and the standing bonus below keeps the boundary from trading places on
+     * a whim. A light entering the set still comes up its ramp. */
     hard = max < HWR_GL_POINT_LIGHT_MAX ? max : HWR_GL_POINT_LIGHT_MAX;
-    cap = g_settings.max;
-    if (cap > hard)
-        cap = hard;
+    cap = hard;
     for (class_index = 0; class_index < (unsigned)HWR_LIGHT_CLASS_COUNT;
          class_index++) {
         if ((g_settings.classes & (1u << class_index)) == 0u)

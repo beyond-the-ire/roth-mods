@@ -1823,11 +1823,11 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How many burn at once",
-        .help = "How many of them may light the picture at the same time. "
-                "What is dropped is always whatever is contributing least "
-                "where you are standing, and it fades out rather than "
-                "vanishing."
+        .label = "How many may cast shadows",
+        .help = "The ceiling on the shadow row below. Every torch that burns "
+                "lights the picture -- a pool in view is never left dark for "
+                "a budget -- so what this bounds is how many of them may be "
+                "asked to cast real shadows, which is where the cost lives."
     },
     {
         /* HOW MANY OF THOSE CAST SHADOWS, and a count rather than a switch

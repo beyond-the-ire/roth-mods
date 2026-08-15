@@ -845,6 +845,10 @@ void hwr_look_light_over(struct hwr_look_light *into,
         into->has_shadows = 1;
         into->shadows = from->shadows;
     }
+    if (from->has_lit) {
+        into->has_lit = 1;
+        into->lit = from->lit;
+    }
 }
 
 /* One scope's keyed entries over another's. `from_map` says whether this is the
@@ -1157,13 +1161,18 @@ static int hwr_look_grant_off(const struct hwr_json_doc *doc, int node,
  * absent, and absent means saying nothing about it rather than answering
  * nought.
  *
- * Answers 0 for a name that is none of these three, so a table with names of
+ * Answers 0 for a name that is none of these, so a table with names of
  * its own -- where a thing stands, which graphic it should be -- answers for
- * those and lets this answer for the rest. The three fields are then spelled
- * once for both tables and cannot drift into two spellings. */
+ * those and lets this answer for the rest. The fields are then spelled
+ * once for every table and cannot drift into two spellings.
+ *
+ * `object_grant` is whether this table grants OBJECTS their light -- `sprites`
+ * and `objects` -- which is what scopes `lit`: only a thing drawn with a
+ * sprite has a drawing for that field to speak about, so the tables that
+ * grant surfaces and the placed lights refuse it with the reason. */
 static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
-                                struct hwr_look_light *into, const char *where,
-                                int report)
+                                struct hwr_look_light *into, int object_grant,
+                                const char *where, int report)
 {
     const char *field = hwr_json_name(doc, child);
     double number = 0.0;
@@ -1208,6 +1217,25 @@ static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
         }
         into->has_shadows = 1;
         into->shadows = shadows;
+        return 1;
+    }
+    if (strcmp(field, "lit") == 0) {
+        int lit = 0;
+
+        if (!object_grant) {
+            hwr_look_note(report, where, "'lit' says how the THING a grant "
+                                         "lights is drawn, so it belongs to "
+                                         "'sprites' and 'objects': a surface "
+                                         "or a free-standing light has no "
+                                         "sprite to draw");
+            return 1;
+        }
+        if (!hwr_json_as_bool(doc, child, &lit)) {
+            hwr_look_note(report, where, "'lit' is true or false");
+            return 1;
+        }
+        into->has_lit = 1;
+        into->lit = lit;
         return 1;
     }
     return 0;
@@ -1519,7 +1547,8 @@ static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
         if (field == NULL || hwr_look_is_notes(field) ||
             strcmp(field, "off") == 0)
             continue;
-        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light, by_pair,
+                                   inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }
@@ -1684,7 +1713,8 @@ static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
             strcmp(field, "index") == 0 || strcmp(field, "id") == 0 ||
             strcmp(field, "off") == 0)
             continue;
-        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light, 1,
+                                   inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }
@@ -1786,7 +1816,8 @@ static void hwr_look_read_face(const struct hwr_json_doc *doc, int node,
             strcmp(field, "index") == 0 || strcmp(field, "id") == 0 ||
             strcmp(field, "off") == 0)
             continue;
-        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light, 0,
+                                   inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }
@@ -1860,7 +1891,8 @@ static void hwr_look_read_placed(const struct hwr_json_doc *doc, int node,
          * nobody knows: an entry that exists only because somebody wrote it is
          * got rid of by deleting it, and a switch for turning off a thing that
          * would not be there without you is a switch for nothing. */
-        if (!hwr_look_grant_field(doc, child, &entry->light, inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light, 0,
+                                   inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }

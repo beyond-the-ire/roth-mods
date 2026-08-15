@@ -100,6 +100,48 @@
  * the store is world distance over range; callers divide by range. */
 #define HWR_PSM_BIAS_CEILING_WORLD 6.0f
 
+/* THE GRAZING FLOOR: how far a light must stand off a receiver's PLANE for
+ * that plane to take this light's shadows at all.
+ *
+ * A plane the light nearly stands in collapses, in the light's own cube map,
+ * to a curve a texel or two wide: a wall sixteen units off its own light
+ * spans, past a couple of hundred units along it, ONE texel row of the faces
+ * it grazes, so a single texel's footprint covers tens of units of wall
+ * together with every joint, jamb and frame edge that stretch of wall meets.
+ * Whichever surface wins such a texel stands in for all of them, the carried
+ * reference extrapolates the receiver's plane past joints the texel cannot
+ * see, and the compare turns the junction lines into rows of evenly spaced
+ * shadow dashes marching down the wall. No bias mends it: at that incidence
+ * the honest tolerances are larger than the distances between the surfaces.
+ *
+ * So the lookup DECLINES: below one wall clearance (the emit law stands every
+ * mounted light exactly this far off its wall -- hwr_lights.c asserts the
+ * tie) the map has nothing trustworthy to say about the plane and the answer
+ * is unshadowed; by two clearances the plane subtends texels again and the
+ * law above is untouched; between them one smooth ramp, the z-window's own
+ * shape. What it costs is stated: a caster hugging a grazed wall loses its
+ * long shadow ALONG that wall for that light alone -- a shadow the map could
+ * only have drawn as the dashes above -- while the same caster keeps its
+ * shadow in every other light's map and on every squarely-lit surface. The
+ * fade rides the same dot product the light itself is dying on there: a
+ * receiver this rule touches is lit at grazing incidence to begin with. */
+#define HWR_PSM_GRAZE_NEAR_WORLD 16
+#define HWR_PSM_GRAZE_FAR_WORLD 32
+
+/* The weight above, 0 at one clearance and 1 at two: plain smoothstep, worked
+ * here so the renderer's GLSL and the offline twin compile one ramp. */
+static inline float hwr_psm_graze_weight(float plane_distance)
+{
+    float t = (fabsf(plane_distance) - (float)HWR_PSM_GRAZE_NEAR_WORLD) /
+              (float)(HWR_PSM_GRAZE_FAR_WORLD - HWR_PSM_GRAZE_NEAR_WORLD);
+
+    if (t < 0.0f)
+        t = 0.0f;
+    if (t > 1.0f)
+        t = 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+
 /* The face a direction from the light leaves through: its major axis. */
 static inline int hwr_psm_face(float dx, float dy, float dz)
 {

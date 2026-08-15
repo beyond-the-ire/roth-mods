@@ -2090,6 +2090,7 @@ static const char g_geometry_fragment_body[] =
     "uniform float u_ps_guard;\n"          /* the read window's share of a face */
     "uniform float u_ps_floor;\n"          /* bias floor, world units */
     "uniform float u_ps_ceiling;\n"        /* bias ceiling, world units */
+    "uniform vec2 u_ps_graze;\n"           /* the grazing floor's two clearances */
     /* World position and atlas tile of each light in the array below; the
      * tile is -1 everywhere no shadow map stands for it. World rather than
      * view space on purpose: the maps are rendered in world space, which
@@ -2152,6 +2153,15 @@ static const char g_geometry_fragment_body[] =
     "  vec2 uv=vec2(dot(d,uu),dot(d,vv))/major*u_ps_guard*0.5+0.5;\n"
     "  vec3 n=v_normal_world;\n"
     "  bool planar=n!=vec3(0.0);\n"
+    /* THE GRAZING FLOOR (hwr_point_math.h): a plane the light stands within
+     * one wall clearance of collapses to a texel-wide curve in this light's
+     * own map, and nothing a texel that wide stores is honest about it --
+     * the lookup declines, fading back in by two clearances. */
+    "  float graze=1.0;\n"
+    "  if (planar) {\n"
+    "    graze=smoothstep(u_ps_graze.x,u_ps_graze.y,abs(dot(n,p-L)));\n"
+    "    if (graze<=0.0) return 1.0;\n"
+    "  }\n"
     "  float band=(planar?2.0*u_ps_floor:2.0*u_ps_ceiling)+u_ps_floor;\n"
     /* The fragment's own texel, carried to its centre; a band-refused own
      * retakes uncarried at the fragment itself -- the honest local question,
@@ -2187,7 +2197,7 @@ static const char g_geometry_fragment_body[] =
     "  float s10=ps_tap(tile,f,b+ivec2(1,0),L,R,p,n,planar,od,own,band);\n"
     "  float s01=ps_tap(tile,f,b+ivec2(0,1),L,R,p,n,planar,od,own,band);\n"
     "  float s11=ps_tap(tile,f,b+ivec2(1,1),L,R,p,n,planar,od,own,band);\n"
-    "  return mix(mix(s00,s10,fr.x),mix(s01,s11,fr.x),fr.y);\n"
+    "  return mix(1.0,mix(mix(s00,s10,fr.x),mix(s01,s11,fr.x),fr.y),graze);\n"
     "}\n"
     /* The lights that are NOT at the eye: a torch on a wall, a candle on a
      * table, a lit window. One array, whatever seeded them, so a class added
@@ -6609,6 +6619,9 @@ static int hwr_gl_render_view(const struct hwr_gl_scene_view *view,
             hwr_uniform_1f(program, "u_ps_floor", HWR_PSM_BIAS_FLOOR_WORLD);
             hwr_uniform_1f(program, "u_ps_ceiling",
                            HWR_PSM_BIAS_CEILING_WORLD);
+            hwr_uniform_2f(program, "u_ps_graze",
+                           (GLfloat)HWR_PSM_GRAZE_NEAR_WORLD,
+                           (GLfloat)HWR_PSM_GRAZE_FAR_WORLD);
             g_gl.active_texture(GL_TEXTURE0 + 13);
             g_gl.bind_texture(GL_TEXTURE_2D, g_ps_atlas_texture);
             g_gl.active_texture(GL_TEXTURE0);
