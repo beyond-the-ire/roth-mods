@@ -172,6 +172,9 @@ struct hwr_gl_functions {
     PFNGLBINDBUFFERPROC bind_buffer;
     PFNGLBUFFERDATAPROC buffer_data;
     PFNGLBUFFERSUBDATAPROC buffer_sub_data;
+    PFNGLBINDBUFFERBASEPROC bind_buffer_base;
+    PFNGLGETUNIFORMBLOCKINDEXPROC get_uniform_block_index;
+    PFNGLUNIFORMBLOCKBINDINGPROC uniform_block_binding;
     PFNGLTEXBUFFERPROC tex_buffer;
     PFNGLCREATESHADERPROC create_shader;
     PFNGLSHADERSOURCEPROC shader_source;
@@ -224,6 +227,9 @@ struct hwr_gl_functions {
 
 static struct hwr_gl_functions g_gl;
 static GLuint g_fbo;
+/* The point-light table's uniform buffer (u_point_block); zero until the
+ * first frame that carries a light. */
+static GLuint g_point_ubo;
 static GLuint g_color_buffer;
 static GLuint g_index_fbo;
 static int g_void_persist = -1;
@@ -882,6 +888,11 @@ static int hwr_load_gl_functions(void)
     HWR_LOAD_GL(bind_buffer, PFNGLBINDBUFFERPROC, "glBindBuffer");
     HWR_LOAD_GL(buffer_data, PFNGLBUFFERDATAPROC, "glBufferData");
     HWR_LOAD_GL(buffer_sub_data, PFNGLBUFFERSUBDATAPROC, "glBufferSubData");
+    HWR_LOAD_GL(bind_buffer_base, PFNGLBINDBUFFERBASEPROC, "glBindBufferBase");
+    HWR_LOAD_GL(get_uniform_block_index, PFNGLGETUNIFORMBLOCKINDEXPROC,
+                "glGetUniformBlockIndex");
+    HWR_LOAD_GL(uniform_block_binding, PFNGLUNIFORMBLOCKBINDINGPROC,
+                "glUniformBlockBinding");
     HWR_LOAD_GL(tex_buffer, PFNGLTEXBUFFERPROC, "glTexBuffer");
     HWR_LOAD_GL(create_shader, PFNGLCREATESHADERPROC, "glCreateShader");
     HWR_LOAD_GL(shader_source, PFNGLSHADERSOURCEPROC, "glShaderSource");
@@ -2091,11 +2102,24 @@ static const char g_geometry_fragment_body[] =
     "uniform float u_ps_floor;\n"          /* bias floor, world units */
     "uniform float u_ps_ceiling;\n"        /* bias ceiling, world units */
     "uniform vec2 u_ps_graze;\n"           /* the grazing floor's two clearances */
-    /* World position and atlas tile of each light in the array below; the
-     * tile is -1 everywhere no shadow map stands for it. World rather than
-     * view space on purpose: the maps are rendered in world space, which
-     * every view shares -- the same reason the sun's lookup stays there. */
-    "uniform vec4 u_point_w[16];\n"
+    /* THE LIGHT TABLE, one std140 block for the whole array: view position
+     * and reach, colour and energy, the world-Z window, and the world
+     * position with the atlas tile riding the fourth component (minus one
+     * everywhere no shadow map stands). A uniform BLOCK rather than plain
+     * uniform arrays because the ceiling outgrew the register budget: at
+     * sixty-four lights these rows are 4 KB against the 16 KB block every
+     * GL 3.3 driver guarantees, where the register spelling had already
+     * spent most of the guaranteed 1024 components at sixteen. The values
+     * and every line reading them are unchanged to the bit -- the block is
+     * storage, not law. The world side stays world-space on purpose: the
+     * maps are rendered in world space, which every view shares -- the
+     * same reason the sun's lookup stays there. */
+    "layout(std140) uniform u_point_block {\n"
+    "  vec4 u_point_a[64];\n"        /* view position.xyz, where it ends */
+    "  vec4 u_point_b[64];\n"        /* colour.rgb, energy */
+    "  vec4 u_point_z[64];\n"        /* .xy the world-Z window it stays in */
+    "  vec4 u_point_w[64];\n"        /* world position.xyz, atlas tile */
+    "};\n"
     "void ps_basis(int f, out vec3 a, out vec3 uu, out vec3 vv) {\n"
     "  if (f==0){a=vec3(1,0,0);uu=vec3(0,1,0);vv=vec3(0,0,1);}\n"
     "  else if (f==1){a=vec3(-1,0,0);uu=vec3(0,-1,0);vv=vec3(0,0,1);}\n"
@@ -2116,11 +2140,18 @@ static const char g_geometry_fragment_body[] =
     "                    (tile*2+f/3)*u_ps_res+t.y),0).r;\n"
     "}\n"
     /* One texel's compare: the reference carried along the receiver's plane
-     * to the texel centre's own ray (clamped by the ceiling so a degenerate
-     * plane cannot carry it somewhere dishonest), the floor for arithmetic,
-     * and the band rule on every lit answer -- a lit texel whose stored
-     * caster stands past the receiver's band crossed unmodelled ground, and
-     * the fragment's own answer stands in. */
+     * to the texel centre's own ray -- EXACT and UNCLAMPED, because the
+     * intersection is two dot products of honest floats and its error is
+     * float rounding, not distance. (A ceiling clamp stood here once and
+     * was the wall banding: at moderate obliqueness the honest carry
+     * between neighbouring texel columns exceeds any constant, and a
+     * truncated reference reads the plane's own stored distance as a
+     * nearer caster -- dark stripes at exactly one-texel period. The
+     * degenerate cases the clamp was for never reach this line: no plane
+     * and a grazing ray both fall to the flat ceiling below.) The floor
+     * pays for arithmetic, and the band rule on every lit answer -- a lit
+     * texel whose stored caster stands past the receiver's band crossed
+     * unmodelled ground, and the fragment's own answer stands in. */
     "float ps_tap(int tile,int f,ivec2 t,vec3 L,float R,vec3 p,vec3 n,\n"
     "             bool planar,float od,float own,float band) {\n"
     "  vec2 c=(vec2(t)+0.5)/float(u_ps_res);\n"
@@ -2132,8 +2163,7 @@ static const char g_geometry_fragment_body[] =
     "    if (abs(denom)>1e-6) {\n"
     "      float tt=dot(n,p-L)/denom;\n"
     "      if (tt>0.0)\n"
-    "        ref=od+clamp(tt*length(dc)-od,-u_ps_ceiling,u_ps_ceiling)\n"
-    "            -u_ps_floor;\n"
+    "        ref=tt*length(dc)-u_ps_floor;\n"
     "    }\n"
     "  }\n"
     "  float stored=ps_fetch(tile,f,t)*R;\n"
@@ -2177,8 +2207,7 @@ static const char g_geometry_fragment_body[] =
     "      if (abs(denom)>1e-6) {\n"
     "        float tt=dot(n,p-L)/denom;\n"
     "        if (tt>0.0)\n"
-    "          ref=od+clamp(tt*length(dc)-od,-u_ps_ceiling,u_ps_ceiling)\n"
-    "              -u_ps_floor;\n"
+    "          ref=tt*length(dc)-u_ps_floor;\n"
     "      }\n"
     "    }\n"
     "    float stored=ps_fetch(tile,f,ot)*R;\n"
@@ -2208,9 +2237,9 @@ static const char g_geometry_fragment_body[] =
      *
      * How many are live is a uniform, and it is zero where nothing seeded one:
      * a map with no torch in view costs this exactly one comparison. */
-    "uniform vec4 u_point_a[16];\n"         /* position.xyz, where it ends */
-    "uniform vec4 u_point_b[16];\n"         /* colour.rgb, energy */
-    "uniform vec2 u_point_z[16];\n"         /* the world-Z window it stays in */
+    /* The table itself is the std140 block beside the shadow machinery
+     * above; how many rows of it are live is the one loose uniform here,
+     * and it is zero where nothing seeded one. */
     "uniform int u_point_count;\n"
     /* How softly that window's two edges fade, in world units. */
     "uniform float u_point_z_edge;\n"
@@ -4125,6 +4154,33 @@ void hwr_gl_pshadow_set(const struct hwr_gl_pshadow *ps)
         g_pshadow.count = (size_t)g_pshadow.tiles;
 }
 
+/* How many tiles one atlas can actually stand at this resolution: the
+ * compile ceiling, held to the driver's own largest texture dimension --
+ * the tiles are a single column of 2*resolution-texel rows, so the column
+ * is what the dimension bounds. Sixty-four tiles at the shipping 256 face
+ * is 32768 texels, the dimension the mainstream drivers ship; a smaller
+ * driver stands fewer and the policy budgets within it. Answers the
+ * compile ceiling where no context is up yet. */
+int hwr_gl_pshadow_tile_ceiling(int resolution)
+{
+    /* The driver's dimension is a constant of the context: asked once. */
+    static GLint max_dim;
+    int fit;
+
+    if (resolution <= 0)
+        return 0;
+    if (!g_initialized || g_gl.get_integer_v == NULL)
+        return (int)HWR_GL_PSHADOW_MAX;
+    if (max_dim <= 0)
+        g_gl.get_integer_v(GL_MAX_TEXTURE_SIZE, &max_dim);
+    if (max_dim <= 0)
+        return (int)HWR_GL_PSHADOW_MAX;
+    fit = (int)(max_dim / (2 * resolution));
+    if (fit > (int)HWR_GL_PSHADOW_MAX)
+        fit = (int)HWR_GL_PSHADOW_MAX;
+    return fit;
+}
+
 /* Brings the atlas machinery up: the two perspective caster programs (the
  * sun's own sources under one more define), the two array objects, the R32F
  * atlas and its ordering depth buffer. A failure stands the whole machinery
@@ -4140,6 +4196,17 @@ static int hwr_pshadow_ensure_objects(void)
         return 0;
     if (tiles < 1 || tiles > (int)HWR_GL_PSHADOW_MAX)
         return 0;
+    /* The driver's own dimension, a second time and defensively: the policy
+     * already budgets within the ceiling above, so this clamp firing means
+     * a policy bug -- but an atlas taller than the driver's dimension would
+     * fail allocation outright, and a clamped one merely leaves the topmost
+     * tiles unreadable to lights that were never given them. */
+    {
+        int fit = hwr_gl_pshadow_tile_ceiling(resolution);
+
+        if (fit >= 1 && tiles > fit)
+            tiles = fit;
+    }
     if (g_ps_program == 0 || g_ps_line_program == 0) {
         static const char version[] = "#version 330 core\n";
         static const char ps_define[] = "#define PSHADOW 1\n";
@@ -4208,8 +4275,9 @@ static int hwr_pshadow_ensure_objects(void)
          * storage follows it: at the shipping 256-texel face, a tile is
          * 3*256 by 2*256 texels of R32F (1.5 MB) and its share of the
          * ordering depth buffer (1.1 MB at 24 bits), so about 2.6 MB each --
-         * 10.5 MB at the count that ships, and 42 MB at the ceiling, which is
-         * every light the picture can carry. */
+         * 10.5 MB at the count that ships, and about 170 MB at the
+         * sixty-four ceiling, which is every light the picture can carry:
+         * the dial states its cost and the choice is the player's. */
         g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R32F, atlas_w, atlas_h, 0,
                           GL_RED, GL_FLOAT, NULL);
         g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -4489,10 +4557,13 @@ static void hwr_destroy_scene_objects(void)
         g_gl.delete_buffers(1, &g_scene_vbo);
     if (g_texture_buffer != 0)
         g_gl.delete_buffers(1, &g_texture_buffer);
+    if (g_point_ubo != 0)
+        g_gl.delete_buffers(1, &g_point_ubo);
     g_scene_vao = 0;
     g_resolve_vao = 0;
     g_scene_vbo = 0;
     g_texture_buffer = 0;
+    g_point_ubo = 0;
     hwr_delete_texture(&g_texture_buffer_texture);
     hwr_delete_texture(&g_colormap_texture);
     hwr_delete_texture(&g_tint_texture);
@@ -5155,10 +5226,12 @@ void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
 /* The lights that are not at the eye, as the frame about to be drawn found
  * them. Nothing is kept from one frame to the next: the set is what this frame
  * seeded, so a light whose source has gone is gone with it rather than held by
- * this array. The shader declares the arrays at sixteen and this is what fills
- * them, so the two are held together here rather than by reading. */
-_Static_assert(HWR_GL_POINT_LIGHT_MAX == 16u,
-               "the world shader declares the light arrays at sixteen");
+ * this array. The shader declares the block's arrays at sixty-four and this
+ * is what fills them, so the two are held together here rather than by
+ * reading. */
+_Static_assert(HWR_GL_POINT_LIGHT_MAX == 64u,
+               "the world shader declares the light block's arrays at "
+               "sixty-four");
 
 static struct hwr_gl_point_light g_point_lights[HWR_GL_POINT_LIGHT_MAX];
 static size_t g_point_light_count;
@@ -6024,20 +6097,33 @@ static void hwr_point_light_view(const struct hwr_gl_camera *camera,
 
 /* The frame's lights, in this view's own space. The vertical window stays in
  * world units: the fragment reconstructs its own world height from the position
- * above, so the window is the same window in every view. */
+ * above, so the window is the same window in every view.
+ *
+ * The rows travel in ONE uniform block now (u_point_block, std140): four
+ * vec4 arrays at the light ceiling, 16 bytes an element in either spelling,
+ * so the buffer is the register image byte for byte and the shader reads the
+ * same floats it always read -- the block is storage, not law. It exists
+ * because the ceiling outgrew the register budget: sixty-four lights in
+ * plain uniform arrays would spend the whole 1024-component guarantee, where
+ * the 16 KB block guarantee holds them four times over. */
+#define HWR_GL_POINT_BLOCK_BINDING 0
+
 static void hwr_bind_point_lights(GLuint program,
                                   const struct hwr_gl_camera *camera)
 {
-    GLfloat position_range[HWR_GL_POINT_LIGHT_MAX * 4];
-    GLfloat color_energy[HWR_GL_POINT_LIGHT_MAX * 4];
-    GLfloat window[HWR_GL_POINT_LIGHT_MAX * 2];
-    GLfloat world_tile[HWR_GL_POINT_LIGHT_MAX * 4];
-    GLint location;
+    /* The block image: a, b, z, w arrays back to back, vec4 stride. */
+    GLfloat block[HWR_GL_POINT_LIGHT_MAX * 4u * 4u];
+    GLfloat *position_range = block;
+    GLfloat *color_energy = block + HWR_GL_POINT_LIGHT_MAX * 4u;
+    GLfloat *window = block + HWR_GL_POINT_LIGHT_MAX * 8u;
+    GLfloat *world_tile = block + HWR_GL_POINT_LIGHT_MAX * 12u;
+    GLuint index;
     size_t i;
 
     hwr_uniform_1i(program, "u_point_count", (GLint)g_point_light_count);
     if (g_point_light_count == 0)
         return;
+    memset(block, 0, sizeof block);
     for (i = 0; i < g_point_light_count; i++) {
         const struct hwr_gl_point_light *light = &g_point_lights[i];
         float view[3];
@@ -6052,8 +6138,8 @@ static void hwr_bind_point_lights(GLuint program,
         color_energy[i * 4u + 1u] = light->color[1];
         color_energy[i * 4u + 2u] = light->color[2];
         color_energy[i * 4u + 3u] = light->intensity;
-        window[i * 2u + 0u] = light->z_lo;
-        window[i * 2u + 1u] = light->z_hi;
+        window[i * 4u + 0u] = light->z_lo;
+        window[i * 4u + 1u] = light->z_hi;
         /* The world side of the same light, for the shadow lookup, which
          * runs in world space exactly as the sun's does. The tile rides the
          * fourth component; minus one is every light no map stands for. */
@@ -6062,19 +6148,17 @@ static void hwr_bind_point_lights(GLuint program,
         world_tile[i * 4u + 2u] = light->world_z;
         world_tile[i * 4u + 3u] = (GLfloat)light->shadow_tile;
     }
-    location = g_gl.get_uniform_location(program, "u_point_a");
-    if (location >= 0)
-        g_gl.uniform_4fv(location, (GLsizei)g_point_light_count,
-                         position_range);
-    location = g_gl.get_uniform_location(program, "u_point_b");
-    if (location >= 0)
-        g_gl.uniform_4fv(location, (GLsizei)g_point_light_count, color_energy);
-    location = g_gl.get_uniform_location(program, "u_point_z");
-    if (location >= 0)
-        g_gl.uniform_2fv(location, (GLsizei)g_point_light_count, window);
-    location = g_gl.get_uniform_location(program, "u_point_w");
-    if (location >= 0)
-        g_gl.uniform_4fv(location, (GLsizei)g_point_light_count, world_tile);
+    if (g_point_ubo == 0)
+        g_gl.gen_buffers(1, &g_point_ubo);
+    g_gl.bind_buffer(GL_UNIFORM_BUFFER, g_point_ubo);
+    g_gl.buffer_data(GL_UNIFORM_BUFFER, (GLsizeiptr)sizeof block, block,
+                     GL_STREAM_DRAW);
+    g_gl.bind_buffer_base(GL_UNIFORM_BUFFER, HWR_GL_POINT_BLOCK_BINDING,
+                          g_point_ubo);
+    index = g_gl.get_uniform_block_index(program, "u_point_block");
+    if (index != GL_INVALID_INDEX)
+        g_gl.uniform_block_binding(program, index,
+                                   HWR_GL_POINT_BLOCK_BINDING);
 }
 
 /* Verifies the uploaded lookup data three ways: the texture store bytes read

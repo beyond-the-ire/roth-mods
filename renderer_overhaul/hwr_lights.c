@@ -1508,11 +1508,13 @@ struct hwr_light_candidate {
     int stood;
 };
 
-/* Room for every candidate the cap could ever have to choose between. A map
- * with more lights in view than this keeps the first of them, in the map's own
- * order, which is stable from frame to frame -- so an overflow is a set that is
- * smaller than it might be, never a set that churns. */
-#define HWR_LIGHT_CANDIDATE_MAX 64u
+/* Room for every candidate the cap could ever have to choose between: twice
+ * the light array's own ceiling, so the ranking still chooses even where a
+ * map offers more than the picture carries. A map with more lights in view
+ * than this keeps the first of them, in the map's own order, which is stable
+ * from frame to frame -- so an overflow is a set that is smaller than it
+ * might be, never a set that churns. */
+#define HWR_LIGHT_CANDIDATE_MAX (HWR_GL_POINT_LIGHT_MAX * 2u)
 
 static float hwr_light_wrap16(int32_t value)
 {
@@ -2578,29 +2580,34 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
         hwr_lights_reset();
         return 0;
     }
-    /* THE CAP IS THE PASS'S OWN CARRYING BOUND, and nothing tighter.
+    /* THE CAP IS THE BURN DIAL, held to the pass's own carrying bound.
      *
-     * It used to be the quality row, and the row's cap is what a torch-filled
-     * hall turned out to look like: a room with seventeen marked torches
-     * showed eight pools and nine dark ones, each popping alight as the eye
-     * walked toward it. A light's pool is what it is wherever the eye stands
-     * -- the picture is drawn in world space -- so a burning torch whose pool
-     * is in view and unlit is not a quality trade, it is a wrong picture.
-     * Every candidate the array can carry is therefore published, worth-most
-     * first, and what the row still governs is the SHADOW spending
-     * (hwr_pshadow.c reads it as the ceiling on the shadowed count), which is
-     * where the real per-light cost lives.
+     * The dial ("how many burn at once") is the player's, by the director's
+     * ruling: the limits of the machine are the player's to spend, so the
+     * row runs to the array's own honest ceiling and the DEFAULT is set
+     * where a torch-filled hall burns whole -- the sixteen the old hard
+     * ceiling allowed, which is the number that ended the popping-pools
+     * report (a room with seventeen marked torches once showed eight pools
+     * and nine dark ones under an eight-row cap; a burning torch whose pool
+     * is in view and unlit is not a quality trade, it is a wrong picture).
+     * Within the dial every candidate is published worth-most first, and
+     * the SHADOW spending is the row below, which the shadow layer holds to
+     * this dial in turn -- a shadow count past the burning count names
+     * nothing.
      *
-     * What crossing the ceiling costs is stated rather than hidden: with the
-     * whole array chosen there is no spare slot for a light on its way out,
-     * so in a scene holding more candidates than the array the one that loses
-     * the last place goes out in a frame rather than over a moment. That
-     * light is by construction the least contributing of sixteen -- the old
-     * law popped the ninth-of-seventeen, which is the report this replaces --
-     * and the standing bonus below keeps the boundary from trading places on
-     * a whim. A light entering the set still comes up its ramp. */
+     * What crossing the dial costs is stated rather than hidden: with the
+     * whole allowance chosen there is no spare slot for a light on its way
+     * out, so in a scene holding more candidates than the dial the one that
+     * loses the last place goes out in a frame rather than over a moment.
+     * That light is by construction the least contributing of the set, and
+     * the standing bonus below keeps the boundary from trading places on a
+     * whim. A light entering the set still comes up its ramp. A dial of
+     * nought is no dial at all -- an offline rig that published no rows --
+     * and reads as the carrying bound, because the row's own floor is one. */
     hard = max < HWR_GL_POINT_LIGHT_MAX ? max : HWR_GL_POINT_LIGHT_MAX;
     cap = hard;
+    if (g_settings.max != 0u && (size_t)g_settings.max < cap)
+        cap = (size_t)g_settings.max;
     for (class_index = 0; class_index < (unsigned)HWR_LIGHT_CLASS_COUNT;
          class_index++) {
         if ((g_settings.classes & (1u << class_index)) == 0u)

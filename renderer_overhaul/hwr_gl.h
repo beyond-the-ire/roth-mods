@@ -436,12 +436,20 @@ struct hwr_gl_light {
     float point_z_edge;
 };
 
-/* How many lights that are NOT at the eye the world pass carries at once. Two
- * four-component slots and one two-component slot each, which is 160 uniform
- * components against the 1024 the oldest driver the mod supports guarantees. A
- * buffer-backed block is the road to hundreds and is not taken for sixteen: it
- * would add a binding-point contract to a program that has none. */
-#define HWR_GL_POINT_LIGHT_MAX 16u
+/* How many lights that are NOT at the eye the world pass carries at once.
+ *
+ * The array rides a uniform BLOCK now rather than uniform registers: four
+ * four-component slots a light, 4 KB at this ceiling, against the 16 KB
+ * block every GL 3.3 driver guarantees -- the plain-uniform arithmetic
+ * that once capped this at sixteen (1024 components, most of them spent
+ * here) died with the restructure. What still bounds it is the SHADOW
+ * side: the six-face shadow tiles stand in one texture column at 512
+ * texels a tile, and sixty-four of them is the 32768-texel dimension the
+ * mainstream drivers ship (a smaller driver stands fewer tiles and says
+ * so at run time, never fewer lights). The family keeps ONE ceiling for
+ * both rows because a shadow count past the light count names nothing --
+ * so the ceiling is the atlas's own, stated here once. */
+#define HWR_GL_POINT_LIGHT_MAX 64u
 
 /* One light in the world, as a seeding class handed it over.
  *
@@ -632,7 +640,7 @@ struct hwr_gl_sun {
  * tiles that stand: the atlas is allocated to the `tiles` the policy
  * publishes, which is what the settings row asks for held to how many lights
  * there can be. */
-#define HWR_GL_PSHADOW_MAX 16u
+#define HWR_GL_PSHADOW_MAX 64u
 
 struct hwr_gl_pshadow_light {
     float world[3];
@@ -686,6 +694,12 @@ int hwr_gl_pshadow_map_valid(void);
  * stood down for (no context yet, another shading law) and a lost context:
  * a stamp alone would call the tile current and never render it. */
 int hwr_gl_pshadow_tile_ready(int tile);
+/* How many tiles one atlas can stand at this face resolution: the compile
+ * ceiling held to the driver's own largest texture dimension. The policy
+ * budgets within it, so a driver that stands fewer tiles sheds shadow
+ * maps and never lights. Answers the compile ceiling before a context is
+ * up. */
+int hwr_gl_pshadow_tile_ceiling(int resolution);
 
 /* Publishes the frame's sun. NULL or active==0 stands the whole machinery
  * down; the key uniforms then keep the zero rest they have always had. */

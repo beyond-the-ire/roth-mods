@@ -1814,20 +1814,25 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, point_light_max),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .u = 8u },
-        .original = { .u = 8u },
+        .def = { .u = 16u },
+        .original = { .u = 16u },
         .min = { .u = 1u },
-        .max = { .u = 16u },
+        .max = { .u = 64u },
         .step = { .u = 1u },
-        .page_step = { .u = 4u },
+        .page_step = { .u = 8u },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How many may cast shadows",
-        .help = "The ceiling on the shadow row below. Every torch that burns "
-                "lights the picture -- a pool in view is never left dark for "
-                "a budget -- so what this bounds is how many of them may be "
-                "asked to cast real shadows, which is where the cost lives."
+        .label = "How many burn at once",
+        .help = "How many of those lights may be giving light at the same "
+                "time, nearest and strongest first. The default covers the "
+                "game's fullest torch halls; the top of the dial is the "
+                "renderer's own table, sixty-four lights in one drawing "
+                "pass, which is also where the shadow storage below tops "
+                "out -- a real bound, not a chosen one. Each burning light "
+                "is a little arithmetic on every pixel: a hall with all "
+                "sixty-four alight draws about a quarter slower than one "
+                "with sixteen, whatever the window size."
     },
     {
         /* HOW MANY OF THOSE CAST SHADOWS, and a count rather than a switch
@@ -1835,10 +1840,13 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
          * in: shadows from every torch in the place is what a person pictures
          * when they ask for them, and the only thing standing in the way is
          * cost. So the row says how much of it to spend, the spending goes to
-         * the lights lighting most of what is on the screen, and the ceiling
-         * sits far above the row it is actually held to -- a big number here
-         * means "all of them" and goes on meaning it when the row above
-         * moves. */
+         * the lights lighting most of what is on the screen, and the row is
+         * held to the burn dial above -- a shadow count past the burning
+         * count names nothing -- so a big number here means "all of them"
+         * and goes on meaning it when the row above moves. Both rows share
+         * one sixty-four ceiling, which is the shadow atlas's own: the
+         * six-face tiles stand in one texture column, and sixty-four of
+         * them is the largest dimension the mainstream drivers give. */
         .key = "point_light_shadows",
         .type = HWR_VT_U32,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -1864,9 +1872,14 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "of what you can see, so shadows arrive from the nearest and "
                 "strongest outward. Nought is none at all, and anything from "
                 "the row above upward is every light that burns. They are not "
-                "free: over a whole lit map at 1920x1080, four of them draw "
-                "about a third slower than none and eight about two thirds "
-                "slower, and more again at larger sizes."
+                "free, in time or in memory: in a crowded hall at 3840x1600, "
+                "eight of them draw about a quarter slower than none and "
+                "sixteen about two fifths slower, less at smaller sizes and "
+                "more where big pools overlap; and each one keeps a six-face "
+                "map, about two and a half megabytes, so all sixty-four hold "
+                "about 170 megabytes of card memory. A smaller graphics card "
+                "may stand fewer maps than the dial asks and says so when it "
+                "does."
     },
     {
         .key = "point_light_intensity",

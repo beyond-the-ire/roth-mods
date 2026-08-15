@@ -7,6 +7,7 @@
 #include "hwr_sun.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -114,15 +115,17 @@ void hwr_pshadow_reset(void)
 }
 
 /* HOW MANY LIGHTS CAST, this frame: what the settings row asks for, held to
- * how many lights the picture carries at all. A row above the light limit is
- * "all of them" rather than a number -- there is nothing for a tile past the
- * last light to be about -- and that is what makes the row uncapped upward
- * without the storage being. */
+ * how many lights may burn at all (the burn dial -- a shadow count past the
+ * light count names nothing), and to the tiles one atlas can stand on this
+ * driver. A row at or past the burn dial is "all of them" rather than a
+ * number, and that is what makes the row uncapped upward without the
+ * storage being. */
 static size_t hwr_pshadow_budget(void)
 {
     const struct hwr_lights_settings *settings = hwr_lights_get_settings();
     size_t want;
     size_t cap;
+    int fit;
 
     if (settings == NULL)
         return 0;
@@ -130,6 +133,21 @@ static size_t hwr_pshadow_budget(void)
     cap = (size_t)settings->max;
     if (cap > HWR_PSM_MAX_LIGHTS)
         cap = HWR_PSM_MAX_LIGHTS;
+    fit = hwr_gl_pshadow_tile_ceiling(HWR_PSM_RESOLUTION);
+    if (fit >= 0 && cap > (size_t)fit) {
+        /* The driver stands fewer tiles than the dial may ask: said once,
+         * because the help text promises it is said at all. */
+        static int said;
+
+        if (!said && want > (size_t)fit) {
+            fprintf(stderr,
+                    "[renderer_overhaul] point shadows: this driver's "
+                    "texture size stands %d shadow maps at most; the row "
+                    "is held there\n", fit);
+            said = 1;
+        }
+        cap = (size_t)fit;
+    }
     return want < cap ? want : cap;
 }
 

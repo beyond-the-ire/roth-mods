@@ -69,7 +69,7 @@
  * no slot in the picture has nothing to cast into: there can never be more
  * shadowed lights than there are lights, so the array's own maximum is the
  * only ceiling here that is a fact rather than a budget somebody picked. */
-#define HWR_PSM_MAX_LIGHTS 16
+#define HWR_PSM_MAX_LIGHTS 64
 
 /* One face's texels on a side. */
 #define HWR_PSM_RESOLUTION 256
@@ -95,9 +95,17 @@
 #define HWR_PSM_BIAS_FLOOR_WORLD 0.25f
 
 /* The lookup bias CEILING, in world units: the flat constant the plane-less
- * and degenerate classes read, and the clamp on every carried reference --
- * the same three jobs the sun's ceiling kept. Stated in world units because
- * the store is world distance over range; callers divide by range. */
+ * and degenerate classes read -- two jobs, not the sun's three. The sun's
+ * ceiling also clamped every carried reference, and carrying that clamp
+ * here was the wall banding: the sun's carry is a linearized gradient and
+ * bounding it is honest, but this lookup's carry is the EXACT ray-plane
+ * distance, whose honest change between neighbouring texel columns grows
+ * with obliqueness past any constant -- a truncated reference then reads
+ * the receiver's own stored plane as a nearer caster, dark stripes at
+ * exactly one-texel period. The carried reference is therefore never
+ * clamped; the degenerate cases fall to this flat constant instead.
+ * Stated in world units because the store is world distance over range;
+ * callers divide by range. */
 #define HWR_PSM_BIAS_CEILING_WORLD 6.0f
 
 /* THE GRAZING FLOOR: how far a light must stand off a receiver's PLANE for

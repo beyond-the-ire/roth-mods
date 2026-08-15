@@ -533,7 +533,7 @@ static void hwr_truecolor_points(const struct hwr_settings *settings,
     if (mode == HWR_GL_SHADING_MODERN &&
         hwr_truecolor_row_bool(HWR_POINT_ROW, settings, 1))
         points.classes |= 1u << HWR_LIGHT_CLASS_PLACED;
-    points.max = hwr_truecolor_row_u32(HWR_POINT_MAX_ROW, settings, 8u);
+    points.max = hwr_truecolor_row_u32(HWR_POINT_MAX_ROW, settings, 16u);
     points.intensity = hwr_truecolor_row_float(HWR_POINT_INTENSITY_ROW,
                                                settings, 1.0f);
     points.range = hwr_truecolor_row_float(HWR_POINT_RANGE_ROW, settings,
