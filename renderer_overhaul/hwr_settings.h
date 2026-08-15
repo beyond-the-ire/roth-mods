@@ -106,19 +106,6 @@ enum hwr_room_anchor {
     HWR_ROOM_ANCHOR_MANUAL
 };
 
-/* Where the colour of a light that is not at the eye comes from.
- *
- * A torch is fire and a sigil is not, and the sprite the map drew for each of
- * them already says which: reading the colour off the thing that emits it makes
- * a derived light look like it belongs to its own source rather than pasted on.
- * The other value is one colour for every such light, which is less true and
- * more controllable -- and is what a map wants where its own art is not the
- * colour of what it is meant to be giving off. */
-enum hwr_point_color_source {
-    HWR_POINT_COLOR_SPRITE = 0,
-    HWR_POINT_COLOR_FIXED
-};
-
 /* The quality tier of the sun and moon light's shadow map: how finely it
  * resolves and what the soft edge may cost. Low is the depth map at its
  * small size with hard edges; Medium is the size where window bars resolve;
@@ -353,8 +340,16 @@ struct hwr_settings {
      * stop it can spill. */
     float point_light_intensity;
     float point_light_range;
-    enum hwr_point_color_source point_light_color_source;
-    uint32_t point_light_color;
+    /* WHAT COLOUR THEY THROW IS NOT A SETTING and has no field here. Every one
+     * of them takes its colour off the thing that gives the light -- a torch
+     * off its own flame, a granted surface off its own picture -- and a
+     * particular thing is recoloured by naming it in a game config, which is a
+     * statement about that thing rather than about all of them. Two rows used
+     * to sit here: one colour for every light, and a file-only switch that
+     * chose between it and the reading. The reading is the law, so the switch
+     * chose nothing anybody wanted and the visible colour under it moved
+     * nothing anybody could see -- a settings row that reads as broken. Both
+     * are gone, keys and all. */
     /* How much of the map's own candle word these take, exactly as the light
      * the player carries takes it: at nothing the two rows above are the whole
      * answer, at one the map's word is read whole. */

@@ -73,6 +73,17 @@
 
 /* ------------------------------------------------------------- what is asked */
 
+/* THE COLOUR A LIGHT IS LEFT WITH WHERE THE THING THAT GIVES IT HAS NONE TO
+ * GIVE: a sprite cut entirely away, or one drawn in nothing but the palette's
+ * own black. It is a fallback and not a setting -- a light nobody can read a
+ * colour off is a rare mistake in the art rather than a taste anybody holds --
+ * and a light of no colour at all would be a black light, which is worse than
+ * a warm one. The number is the one the colour row that used to sit in the
+ * settings shipped at, so nothing that was ever lit by it changes colour. */
+#define HWR_LIGHT_UNREADABLE_R (255.0f / 255.0f)
+#define HWR_LIGHT_UNREADABLE_G (180.0f / 255.0f)
+#define HWR_LIGHT_UNREADABLE_B (110.0f / 255.0f)
+
 static struct hwr_lights_settings g_settings;
 static struct hwr_lights_stats g_stats;
 
@@ -1924,22 +1935,26 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
                         &glow_intensity, &glow_range);
     out->light.intensity = g_settings.intensity * glow_intensity;
     out->light.range = g_settings.range * glow_range;
-    out->light.color[0] = g_settings.color[0];
-    out->light.color[1] = g_settings.color[1];
-    out->light.color[2] = g_settings.color[2];
-    /* THE COLOUR OFF THE SPRITE -- ONE LAW, FOR EVERY THING THAT GIVES LIGHT.
+    /* THE COLOUR OFF THE SPRITE -- ONE LAW, FOR EVERY THING THAT GIVES LIGHT,
+     * AND THE ONLY ONE.
+     *
      * A sprite is drawn as a cut-out, so an average over what is not cut away is
      * the colour of the thing itself: a torch answers with its flame and a cold
      * sigil with its own light. That is as true of a thing a game config made a
      * light as of one the map marked, so the reading is the same reading and the
-     * promoted case is not a case here at all. Where the rows ask for the one
-     * colour beside them instead, that is what both get. */
-    if (g_settings.color_from_sprite) {
+     * promoted case is not a case here at all. There is no row to turn it off
+     * with: one colour for every light in the game is a picture nobody asked
+     * for, and a thing that wants a colour of its own is NAMED in a game
+     * config, where the statement is about that thing. */
+    {
         float sprite_color[3];
 
         /* A sprite that has no colour to give -- one cut entirely away, or one
-         * drawn in the palette's own black -- leaves the chosen colour
-         * standing rather than turning the light black. */
+         * drawn in the palette's own black -- leaves the fallback standing
+         * rather than turning the light black. */
+        out->light.color[0] = HWR_LIGHT_UNREADABLE_R;
+        out->light.color[1] = HWR_LIGHT_UNREADABLE_G;
+        out->light.color[2] = HWR_LIGHT_UNREADABLE_B;
         if (resolved && hwr_light_sprite_color(frame, &lookup, sprite_color)) {
             out->light.color[0] = sprite_color[0];
             out->light.color[1] = sprite_color[1];

@@ -72,8 +72,10 @@ struct hwr_lights_settings {
      * look file's word about that particular graphic. */
     float intensity;
     float range;
-    int color_from_sprite;
-    float color[3];
+    /* THE COLOUR IS NOT ASKED FOR, because there is nothing to ask: every light
+     * takes its colour off the thing that gives it, and where a game config
+     * names one for a particular thing that name is the last word. Neither is
+     * a choice the rows can make, so neither is a field here. */
     /* How much of the map's own candle word the two above take. */
     float glow_scale;
     /* The containments. Doorways from the eye's own room a light may still be

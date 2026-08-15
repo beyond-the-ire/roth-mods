@@ -190,6 +190,13 @@ the map's own answer rather than a list: the game already marks the objects that
 darkened, and those are exactly the ones that are giving light. Nothing has to be listed for a map
 to work, custom maps included.
 
+**Each of them throws the colour of the thing that gives it**, and there is no setting for it:
+a torch is drawn as a flame and throws its flame's colour, a cold ward throws its own cold light,
+and a wall of lava throws the colour of its ember rather than of the rock the ember is set in. One
+colour for every light in the game would be a picture nobody asked for; a particular thing that
+should throw a colour of its own is named in a game config, where the statement is about that
+thing and not about all of them.
+
 **The strongest few of them cast real shadows.** `point_light_shadows` says how many, and the ones
 that do are the ones lighting most of what you can see — so shadows arrive from the nearest and
 strongest outward as you walk, and a light joins or leaves the set with a rebuild of its own map
@@ -226,9 +233,6 @@ one of the slots.
 - `point_light_intensity`, `point_light_range`: how bright one is, from 0 through 4, and where its
   pool ends in world units, from 100 through 2000. A light fixed in the world reads tighter than
   the light you carry.
-- `point_light_color_source`, `point_light_color`: `sprite` reads the colour off the thing itself,
-  so fire throws fire-coloured light and a cold sigil throws cold light; `fixed` uses the one
-  colour beside it, as six bare hexadecimal digits.
 - `point_light_glow_scale`: how much of the map's own word about its lantern these take, from 0
   through 2, exactly as the light you carry takes it.
 - `point_light_z_slack`: the vertical containment above, from 0 through 512 world units.

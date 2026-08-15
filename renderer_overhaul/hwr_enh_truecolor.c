@@ -85,8 +85,6 @@
 #define HWR_POINT_MAX_ROW "point_light_max"
 #define HWR_POINT_INTENSITY_ROW "point_light_intensity"
 #define HWR_POINT_RANGE_ROW "point_light_range"
-#define HWR_POINT_COLOR_SOURCE_ROW "point_light_color_source"
-#define HWR_POINT_COLOR_ROW "point_light_color"
 #define HWR_POINT_GLOW_ROW "point_light_glow_scale"
 #define HWR_POINT_HOPS_ROW "point_light_hops"
 #define HWR_POINT_Z_SLACK_ROW "point_light_z_slack"
@@ -507,7 +505,6 @@ static void hwr_truecolor_points(const struct hwr_settings *settings,
                                  enum hwr_gl_shading_mode mode)
 {
     struct hwr_lights_settings points;
-    uint32_t rgb;
 
     memset(&points, 0, sizeof points);
     if (mode == HWR_GL_SHADING_MODERN &&
@@ -538,11 +535,9 @@ static void hwr_truecolor_points(const struct hwr_settings *settings,
                                                settings, 1.0f);
     points.range = hwr_truecolor_row_float(HWR_POINT_RANGE_ROW, settings,
                                            450.0f);
-    points.color_from_sprite =
-        hwr_truecolor_row_enum(HWR_POINT_COLOR_SOURCE_ROW, settings,
-                               HWR_POINT_COLOR_SPRITE) == HWR_POINT_COLOR_SPRITE;
-    rgb = 0x00ffb46eu;
-    hwr_truecolor_row_color(HWR_POINT_COLOR_ROW, settings, rgb, points.color);
+    /* WHAT COLOUR THEY THROW IS NOT ASKED FOR HERE, because it is not a
+     * setting: every one of them takes its colour off the thing that gives the
+     * light, and the seeding does that for itself. */
     points.glow_scale = hwr_truecolor_row_float(HWR_POINT_GLOW_ROW, settings,
                                                 0.0f);
     points.hops = hwr_truecolor_row_u32(HWR_POINT_HOPS_ROW, settings, 1u);

@@ -58,8 +58,6 @@ struct hwr_config_state {
      * come from the watcher carries no expectation. */
     int reload_expects_hash;
     uint64_t reload_hash;
-    /* One note per retired key per session, by table position. */
-    struct hwr_row_set retired_noted;
     /* Whether the last load found no file at all, which is not the same answer
      * as a file with errors in it. */
     int first_run;
@@ -122,36 +120,17 @@ static char *hwr_trim(char *text)
  * -1 unknown key. Every bound, token, and transform comes from the table, so
  * the file and the settings overlay can only ever agree. */
 static int hwr_apply_config_value(struct hwr_settings *settings,
-                                  const char *key, const char *value,
-                                  const struct hwr_setting_desc **matched)
+                                  const char *key, const char *value)
 {
     const struct hwr_setting_desc *desc = hwr_schema_find(key);
     union hwr_value parsed;
 
-    if (matched != NULL)
-        *matched = desc;
     if (desc == NULL)
         return -1;
     if (!hwr_schema_parse(desc, value, &parsed, NULL, 0))
         return 0;
-    /* A retired key is parsed for its file's sake and then discarded. */
-    if (desc->exposure != HWR_EXP_RETIRED)
-        hwr_schema_set(settings, desc, parsed);
+    hwr_schema_set(settings, desc, parsed);
     return 1;
-}
-
-/* A retired key costs its owner one line of explanation, once. */
-static void hwr_note_retired(const struct hwr_setting_desc *desc,
-                             unsigned int line_number)
-{
-    int index = hwr_schema_index_of(desc);
-
-    if (index < 0 || hwr_row_set_has(&g_config.retired_noted, index))
-        return;
-    hwr_row_set_add(&g_config.retired_noted, index);
-    fprintf(stderr,
-            "[renderer_overhaul] %s:%u: '%s' is retired and has no effect; %s\n",
-            g_config.path, line_number, desc->key, desc->help);
 }
 
 static uint64_t hwr_config_hash_bytes(
@@ -185,7 +164,6 @@ static int hwr_config_read(struct hwr_settings *settings,
         char *equals;
         char *key;
         char *value;
-        const struct hwr_setting_desc *desc;
         int result;
         size_t length;
 
@@ -225,10 +203,8 @@ static int hwr_config_read(struct hwr_settings *settings,
         *equals = 0;
         value = hwr_trim(equals + 1);
         key = hwr_trim(key);
-        result = hwr_apply_config_value(settings, key, value, &desc);
-        if (result > 0 && desc->exposure == HWR_EXP_RETIRED && report_errors) {
-            hwr_note_retired(desc, line_number);
-        } else if (result == 0) {
+        result = hwr_apply_config_value(settings, key, value);
+        if (result == 0) {
             if (report_errors)
                 fprintf(stderr,
                         "[renderer_overhaul] %s:%u: invalid value for '%s'\n",

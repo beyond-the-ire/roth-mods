@@ -29,11 +29,17 @@ enum hwr_category {
     HWR_CAT_SYSTEM
 };
 
+/* THERE IS NO RETIRED EXPOSURE, and that is a ruling rather than an omission.
+ * A row that goes on being parsed so that a file written for an earlier build
+ * keeps loading is a compatibility shim, and nothing has shipped yet for
+ * anything to be compatible WITH: a key that is gone is gone, and a settings
+ * file naming one takes the unknown-key line every unrecognised key takes --
+ * which is error handling and not compatibility. Do not add one back before
+ * the mod is released. */
 enum hwr_exposure {
     HWR_EXP_CONSUMER = 0, /* parsed, written, shown in the settings overlay */
     HWR_EXP_ADVANCED,     /* parsed, written only when already present */
     HWR_EXP_ALIAS,        /* parsed through a transform onto another row */
-    HWR_EXP_RETIRED,      /* parsed, value discarded, never written */
     HWR_EXP_READONLY      /* no cfg key; reported state only */
 };
 

@@ -78,11 +78,6 @@ static const struct hwr_enum_value HWR_LIGHT_SCOPE_VALUES[] = {
     { "all",    HWR_LIGHT_SCOPE_ALL,    "Everywhere" }
 };
 
-static const struct hwr_enum_value HWR_POINT_COLOR_VALUES[] = {
-    { "sprite", HWR_POINT_COLOR_SPRITE, "The colour of the thing itself" },
-    { "fixed",  HWR_POINT_COLOR_FIXED,  "One colour for all of them" }
-};
-
 static const struct hwr_enum_value HWR_SHADING_DITHER_VALUES[] = {
     { "auto", HWR_SHADING_DITHER_AUTO, "Follow the shading" },
     { "off",  HWR_SHADING_DITHER_OFF,  "Off" },
@@ -93,21 +88,6 @@ static const struct hwr_enum_value HWR_SUN_QUALITY_VALUES[] = {
     { "low",    HWR_SUN_QUALITY_LOW,    "Low" },
     { "medium", HWR_SUN_QUALITY_MEDIUM, "Medium" },
     { "high",   HWR_SUN_QUALITY_HIGH,   "High" }
-};
-
-/* Retired, and kept only so that a configuration file written for an earlier
- * build still parses: texture cut-outs are the only casting law now, so
- * neither token reaches a field. */
-static const struct hwr_enum_value HWR_SUN_TEXELS_VALUES[] = {
-    { "solid",  0, "Solid shapes" },
-    { "cutout", 1, "Texture cut-outs" }
-};
-
-/* Retired, and kept only so that a configuration file written for an earlier
- * build still parses. Neither token reaches a field. */
-static const struct hwr_enum_value HWR_RENDER_MODE_VALUES[] = {
-    { "authentic", 0, "Authentic" },
-    { "enhanced",  1, "Enhanced" }
 };
 
 /* Set-1 make scancodes, spelled the way the other first-party mods spell them
@@ -418,43 +398,6 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .widget = HWR_WIDGET_KEY_CAPTURE,
         .label = "Settings overlay key",
         .help = "Key that opens the renderer settings overlay."
-    },
-    {
-        /* Retired: authentic rendering is what every enhancement being off
-         * produces, so there is no whole-renderer mode to select. The key is
-         * still accepted, and a retired row's help is the clause the note
-         * about it carries. */
-        .key = "render_mode",
-        .type = HWR_VT_ENUM,
-        .category = HWR_CAT_RENDERING,
-        .exposure = HWR_EXP_RETIRED,
-        .apply_kind = HWR_APPLY_NONE,
-        .change_bit = 0,
-        .offset = HWR_SCHEMA_NO_FIELD,
-        .flags = 0,
-        .values = HWR_RENDER_MODE_VALUES,
-        .value_count = HWR_COUNT_OF(HWR_RENDER_MODE_VALUES),
-        .depends_on = -1,
-        .label = "Render mode",
-        .help = "enhancements are individual settings, each with its own key"
-    },
-    {
-        /* Retired: there is no manufactured world frame to colour any more.
-         * The key is still accepted so an existing configuration file keeps
-         * loading as a whole. */
-        .key = "solid_color",
-        .type = HWR_VT_COLOR,
-        .category = HWR_CAT_RENDERING,
-        .exposure = HWR_EXP_RETIRED,
-        .apply_kind = HWR_APPLY_NONE,
-        .change_bit = 0,
-        .offset = HWR_SCHEMA_NO_FIELD,
-        .flags = 0,
-        .min = { .rgb = 0x00000000u },
-        .max = { .rgb = 0x00ffffffu },
-        .depends_on = -1,
-        .label = "Solid color",
-        .help = "the world frame it coloured is drawn from the map itself now"
     },
     {
         /* The true-colour foundation is derived state, not a choice: it is
@@ -1943,51 +1886,6 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "where it should not."
     },
     {
-        .key = "point_light_color_source",
-        .type = HWR_VT_ENUM,
-        .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_ADVANCED,
-        .apply_kind = HWR_APPLY_HOOK,
-        .change_bit = HWR_CHANGE_TRUECOLOR,
-        .offset = offsetof(struct hwr_settings, point_light_color_source),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
-                 HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .e = HWR_POINT_COLOR_SPRITE },
-        .original = { .e = HWR_POINT_COLOR_SPRITE },
-        .values = HWR_POINT_COLOR_VALUES,
-        .value_count = HWR_COUNT_OF(HWR_POINT_COLOR_VALUES),
-        .depends_on = -1,
-        .depends_on_key = "shading_mode",
-        .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "What colour a light source throws",
-        .help = "Reading it from the thing itself means fire throws "
-                "fire-coloured light and a cold sigil throws cold light. One "
-                "chosen colour is more uniform and more controllable."
-    },
-    {
-        .key = "point_light_color",
-        .type = HWR_VT_COLOR,
-        .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_CONSUMER,
-        .apply_kind = HWR_APPLY_HOOK,
-        .change_bit = HWR_CHANGE_TRUECOLOR,
-        .offset = offsetof(struct hwr_settings, point_light_color),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
-                 HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .rgb = 0x00ffb46eu },
-        .original = { .rgb = 0x00ffb46eu },
-        .min = { .rgb = 0x00000000u },
-        .max = { .rgb = 0x00ffffffu },
-        .depends_on = -1,
-        .depends_on_key = "shading_mode",
-        .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Light source colour",
-        .help = "The colour one of them throws, unless a game config has "
-                "named one for that particular thing. Warmer than the light "
-                "you carry, because most of what a map fixes to its walls is "
-                "fire and a carried lamp is not."
-    },
-    {
         .key = "point_light_glow_scale",
         .type = HWR_VT_F32,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -2084,26 +1982,6 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .help = "How long, in seconds, a light takes to come up or go out "
                 "when there is no longer room for it. Nothing appears or "
                 "disappears in a single frame."
-    },
-    {
-        /* Retired: it was the one switch over a feature nothing used until a
-         * game config asked, and the count of shadowed lights is that switch
-         * and the whole dial besides -- nought there is exactly what turning
-         * this off did, and it is on the screen where a person can find it
-         * rather than in the file. The key is still accepted so an existing
-         * configuration file keeps loading whole. */
-        .key = "point_shadows",
-        .type = HWR_VT_BOOL,
-        .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_RETIRED,
-        .apply_kind = HWR_APPLY_NONE,
-        .change_bit = 0,
-        .offset = HWR_SCHEMA_NO_FIELD,
-        .flags = 0,
-        .depends_on = -1,
-        .label = "Shadows from marked lights",
-        .help = "how many lights cast shadows is a setting of its own now, "
-                "and nought there is what this off was"
     },
     /* The sun and moon: one directional light per map, entering wherever the
      * map is open to the sky and gated per pixel by a real shadow map
@@ -2258,25 +2136,6 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "floor; Low trades fineness and the soft edge for speed; "
                 "High doubles the detail again and widens the softness "
                 "range."
-    },
-    {
-        /* Retired: texture cut-outs are the only casting law -- a grate's
-         * holes pass light and a translucent pane filters the beam by the
-         * map's own per-texel rule, at every quality tier. The key is still
-         * accepted so an existing configuration file keeps loading whole. */
-        .key = "sun_shadow_texels",
-        .type = HWR_VT_ENUM,
-        .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_RETIRED,
-        .apply_kind = HWR_APPLY_NONE,
-        .change_bit = 0,
-        .offset = HWR_SCHEMA_NO_FIELD,
-        .flags = 0,
-        .values = HWR_SUN_TEXELS_VALUES,
-        .value_count = HWR_COUNT_OF(HWR_SUN_TEXELS_VALUES),
-        .depends_on = -1,
-        .label = "Shadows from textures",
-        .help = "texture cut-outs are the only law the shadows follow now"
     },
     {
         .key = "sun_object_shadows",
