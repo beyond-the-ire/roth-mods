@@ -196,8 +196,8 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
  *
  * ONE LIGHT PER ROOM PER TEXTURE, at the centroid of that room's granted faces
  * and pushed off each face along its own normal. A lava lake is hundreds of
- * faces sharing one texture; one light each would fill a sixteen-slot array
- * with near-identical lights and starve every torch in the room.
+ * faces sharing one texture; one light each would fill the whole array with
+ * near-identical lights and starve every other light in the room.
  *
  * Called with the world a map load has just snapshotted, and with the two
  * archives its pictures live in: a grant that states no colour takes one off the

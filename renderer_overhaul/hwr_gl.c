@@ -1092,6 +1092,12 @@ static const char g_geometry_vertex_body[] =
 static const char g_glsl_version[] = "#version 330 core\n";
 static const char g_truecolor_define[] = "#define HWR_TRUECOLOR 1\n";
 
+/* HOW MANY LIGHTS THE LIGHT BLOCK'S ARRAYS ARE DECLARED AT, as the shader
+ * spells it. Written once and pasted into all four rows, so they cannot
+ * drift from one another, and held to HWR_GL_POINT_LIGHT_MAX by the
+ * assertion beside the C-side array that fills them. */
+#define HWR_GL_POINT_BLOCK_TEXT "256"
+
 static const char g_geometry_fragment_body[] =
     "layout(location=0) out uint out_index;\n"
     "layout(location=1) out uint out_floor_id;\n"
@@ -2106,19 +2112,28 @@ static const char g_geometry_fragment_body[] =
      * and reach, colour and energy, the world-Z window, and the world
      * position with the atlas tile riding the fourth component (minus one
      * everywhere no shadow map stands). A uniform BLOCK rather than plain
-     * uniform arrays because the ceiling outgrew the register budget: at
-     * sixty-four lights these rows are 4 KB against the 16 KB block every
-     * GL 3.3 driver guarantees, where the register spelling had already
-     * spent most of the guaranteed 1024 components at sixteen. The values
-     * and every line reading them are unchanged to the bit -- the block is
-     * storage, not law. The world side stays world-space on purpose: the
-     * maps are rendered in world space, which every view shares -- the
-     * same reason the sun's lookup stays there. */
+     * uniform arrays because the ceiling outgrew the register budget: the
+     * register spelling had already spent most of the guaranteed 1024
+     * components at sixteen lights, where these four rows at the ceiling
+     * are 16 KB -- exactly the block size every GL 3.3 driver guarantees,
+     * which is what the ceiling is derived from. The values and every line
+     * reading them are unchanged to the bit -- the block is storage, not
+     * law. The world side stays world-space on purpose: the maps are
+     * rendered in world space, which every view shares -- the same reason
+     * the sun's lookup stays there.
+     *
+     * The declared count is spelled ONCE (below), so the four rows cannot
+     * drift from each other, and it is held to the C-side ceiling by the
+     * assertion beside the array that fills them. */
     "layout(std140) uniform u_point_block {\n"
-    "  vec4 u_point_a[64];\n"        /* view position.xyz, where it ends */
-    "  vec4 u_point_b[64];\n"        /* colour.rgb, energy */
-    "  vec4 u_point_z[64];\n"        /* .xy the world-Z window it stays in */
-    "  vec4 u_point_w[64];\n"        /* world position.xyz, atlas tile */
+    /* view position.xyz, where it ends */
+    "  vec4 u_point_a[" HWR_GL_POINT_BLOCK_TEXT "];\n"
+    /* colour.rgb, energy */
+    "  vec4 u_point_b[" HWR_GL_POINT_BLOCK_TEXT "];\n"
+    /* .xy the world-Z window it stays in */
+    "  vec4 u_point_z[" HWR_GL_POINT_BLOCK_TEXT "];\n"
+    /* world position.xyz, atlas tile */
+    "  vec4 u_point_w[" HWR_GL_POINT_BLOCK_TEXT "];\n"
     "};\n"
     "void ps_basis(int f, out vec3 a, out vec3 uu, out vec3 vv) {\n"
     "  if (f==0){a=vec3(1,0,0);uu=vec3(0,1,0);vv=vec3(0,0,1);}\n"
@@ -4276,8 +4291,10 @@ static int hwr_pshadow_ensure_objects(void)
          * 3*256 by 2*256 texels of R32F (1.5 MB) and its share of the
          * ordering depth buffer (1.1 MB at 24 bits), so about 2.6 MB each --
          * 10.5 MB at the count that ships, and about 170 MB at the
-         * sixty-four ceiling, which is every light the picture can carry:
-         * the dial states its cost and the choice is the player's. */
+         * sixty-four ceiling, which is the ATLAS's own ceiling and not the
+         * light array's: the shadow row stops there while the light row
+         * runs far past it. The dial states its cost and the choice is the
+         * player's. */
         g_gl.tex_image_2d(GL_TEXTURE_2D, 0, GL_R32F, atlas_w, atlas_h, 0,
                           GL_RED, GL_FLOAT, NULL);
         g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -5226,12 +5243,12 @@ void hwr_gl_lamp_advance(uint16_t candle_glow, uint16_t world_clock,
 /* The lights that are not at the eye, as the frame about to be drawn found
  * them. Nothing is kept from one frame to the next: the set is what this frame
  * seeded, so a light whose source has gone is gone with it rather than held by
- * this array. The shader declares the block's arrays at sixty-four and this
- * is what fills them, so the two are held together here rather than by
- * reading. */
-_Static_assert(HWR_GL_POINT_LIGHT_MAX == 64u,
-               "the world shader declares the light block's arrays at "
-               "sixty-four");
+ * this array. The shader declares the block's arrays at one number
+ * (HWR_GL_POINT_BLOCK_TEXT) and this is what fills them, so the two are held
+ * together here rather than by reading. */
+_Static_assert(HWR_GL_POINT_LIGHT_MAX == 256u,
+               "the world shader declares the light block's arrays at two "
+               "hundred and fifty-six (HWR_GL_POINT_BLOCK_TEXT)");
 
 static struct hwr_gl_point_light g_point_lights[HWR_GL_POINT_LIGHT_MAX];
 static size_t g_point_light_count;
@@ -6099,13 +6116,16 @@ static void hwr_point_light_view(const struct hwr_gl_camera *camera,
  * world units: the fragment reconstructs its own world height from the position
  * above, so the window is the same window in every view.
  *
- * The rows travel in ONE uniform block now (u_point_block, std140): four
- * vec4 arrays at the light ceiling, 16 bytes an element in either spelling,
- * so the buffer is the register image byte for byte and the shader reads the
+ * The rows travel in ONE uniform block (u_point_block, std140): four vec4
+ * arrays at the light ceiling, 16 bytes an element in either spelling, so
+ * the buffer is the register image byte for byte and the shader reads the
  * same floats it always read -- the block is storage, not law. It exists
- * because the ceiling outgrew the register budget: sixty-four lights in
+ * because the ceiling outgrew the register budget: even sixty-four lights in
  * plain uniform arrays would spend the whole 1024-component guarantee, where
- * the 16 KB block guarantee holds them four times over. */
+ * the block guarantee stands four times that many. The upload is the whole
+ * block every time, zeros past the count in force, which is 16 KB at the
+ * ceiling -- one stream-draw of the guaranteed block size, and what makes
+ * a frame's cost the LIT rows rather than the declared ones. */
 #define HWR_GL_POINT_BLOCK_BINDING 0
 
 static void hwr_bind_point_lights(GLuint program,

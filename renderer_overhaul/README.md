@@ -39,7 +39,7 @@ it.
 
 The **Enhancements** section is long, so its settings are gathered under headings — **Game
 config**, **Shading and picture**, **Room light**, **The light you carry**, **Items and figures**,
-**Torches and candles** and **Sun and moon** — and each heading opens and closes. `Enter` or a
+**Light sources** and **Sun and moon** — and each heading opens and closes. `Enter` or a
 click on a heading opens or closes it, and the arrow keys do the same: left folds it away, right
 opens it. A heading shows `+` when it is closed and `-` when it is open.
 
@@ -184,7 +184,8 @@ every save, so a look tuned on that response goes on working. Under `engine` a m
 values are also no longer counted or scaled when it loads: the value each room carries means the
 same thing on every map, so there is nothing to fit.
 
-Torches, candles and lit sigils give light of their own under `modern`. Which things those are is
+The light sources a map places — torches, candles, lit sigils, glowing surfaces — give light of
+their own under `modern`. Which things those are is
 the map's own answer rather than a list: the game already marks the objects that are never to be
 darkened, and those are exactly the ones that are giving light. Nothing has to be listed for a map
 to work, custom maps included.
@@ -204,13 +205,17 @@ one of the slots.
 
 - `point_light`: whether they light anything at all. `point_light_objects` is where they come from;
   turning it off leaves the family on with nothing seeding it.
-- `point_light_max`: the ceiling on `point_light_shadows` below, from 1 through 16. Every torch
-  that burns lights the picture — up to the sixteen the picture can carry at once, worth-most
-  first, so a hall of torches shows every pool across the room rather than the nearest few. A
-  light entering the set comes up over `point_light_fade` seconds; only past the sixteenth does
-  the least contributing one stand down.
-- `point_light_shadows`: how many of those cast real shadows, from 0 through 64. Nought is none at
-  all; anything from `point_light_max` upward is every light that burns, so a big number here means
+- `point_light_max`: how many light sources may be lighting the picture at once, from 1 through
+  256, worth-most first, so a hall full of them shows every pool across the room rather than the
+  nearest few. It ships at 32. The top of the dial is the renderer's own light table: each light
+  is four rows of a uniform block, and 256 of them is exactly the 16 kilobytes every graphics
+  driver of this generation guarantees. A light entering the set comes up over `point_light_fade`
+  seconds; only once the dial is full does the least contributing one stand down. It also holds
+  `point_light_shadows` below, which stops sooner for a reason of its own storage.
+- `point_light_shadows`: how many of those cast real shadows, from 0 through 64 — a ceiling of its
+  own, the shadow atlas's rather than the light table's, because the six-face maps stand in one
+  texture column. Nought is none at
+  all; anything from `point_light_max` upward is every light there is, so a big number here means
   "all of them" whatever the row above is set to. The ones that get them are the ones worth most
   where you are standing, and a light holding a shadow keeps it until another clearly outranks it,
   so a shadow does not blink on and off at a boundary. Each shadowed light is six small renders of
@@ -219,8 +224,8 @@ one of the slots.
   slower than none and eight about two thirds slower; at 3840x1600 it is nearer two fifths and four
   fifths. A game config may pin one light's shadows on or refuse them whatever this says.
 - `point_light_intensity`, `point_light_range`: how bright one is, from 0 through 4, and where its
-  pool ends in world units, from 100 through 2000. A fixed torch reads tighter than the light you
-  carry.
+  pool ends in world units, from 100 through 2000. A light fixed in the world reads tighter than
+  the light you carry.
 - `point_light_color_source`, `point_light_color`: `sprite` reads the colour off the thing itself,
   so fire throws fire-coloured light and a cold sigil throws cold light; `fixed` uses the one
   colour beside it, as six bare hexadecimal digits.

@@ -65,10 +65,18 @@
  * force.
  *
  * How many actually cast is a settings row, and the atlas is sized to it (see
- * hwr_pshadow.c). The ceiling is the LIGHT ARRAY's own, because a light with
- * no slot in the picture has nothing to cast into: there can never be more
- * shadowed lights than there are lights, so the array's own maximum is the
- * only ceiling here that is a fact rather than a budget somebody picked. */
+ * hwr_pshadow.c). The ceiling is the ATLAS's own: the tiles stand one above
+ * another in a single texture column (three faces across, two down, per
+ * tile), so at the resolution below sixty-four of them is 32768 texels --
+ * the largest dimension the mainstream drivers ship. It is a fact about a
+ * texture rather than a budget somebody picked, which is why it stays where
+ * it is while the light array's own ceiling stands far above it; more tiles
+ * than this would need a grid layout and a different lookup, not a bigger
+ * number here.
+ *
+ * It can never stand ABOVE the light array's ceiling -- a light with no slot
+ * in the picture has nothing to cast into -- and that inequality is asserted
+ * in hwr_pshadow.c, where both headers are in scope. */
 #define HWR_PSM_MAX_LIGHTS 64
 
 /* One face's texels on a side. */

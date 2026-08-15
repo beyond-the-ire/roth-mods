@@ -12,11 +12,11 @@
  *
  * ============================= WHO CASTS ==================================
  *
- * A COUNT, not a list. The settings row says how many of the lights burning
+ * A COUNT, not a list. The settings row says how many of the lights standing
  * in the picture cast real shadows, and the ones that do are the ones worth
  * most where the player is standing -- the same ranking that decides which
- * lights burn at all, so shadows join the picture outward from the strongest
- * and leave outward from the weakest. Nought is the off position for the
+ * lights are in the picture at all, so shadows join it outward from the
+ * strongest and leave outward from the weakest. Nought is the off position for the
  * whole feature; a count at or past the light limit means every light the
  * frame publishes casts, which is how "all of them" is spelled.
  *

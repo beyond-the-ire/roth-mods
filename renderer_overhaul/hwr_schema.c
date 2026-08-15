@@ -1757,11 +1757,12 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Light from torches and candles",
-        .help = "Lets the torches, candles and lit sigils a map places "
-                "actually light what is around them. How many of them cast "
-                "shadows is a setting of its own below; one that casts none "
-                "spills a little onto the far side of a doorway."
+        .label = "Light from light sources",
+        .help = "Lets the light sources a map places -- torches, candles, lit "
+                "sigils, glowing surfaces -- actually light what is around "
+                "them. How many of them cast shadows is a setting of its own "
+                "below; one that casts none spills a little onto the far side "
+                "of a doorway."
     },
     {
         .key = "point_light_objects",
@@ -1814,39 +1815,52 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .offset = offsetof(struct hwr_settings, point_light_max),
         .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
                  HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .u = 16u },
-        .original = { .u = 16u },
+        /* THE DEFAULT is thirty-two: the sixteen it shipped at was the old
+         * hard ceiling wearing a default's clothes, and a fuller hall is
+         * what a person who turns this family on is asking for. Its Original
+         * follows the default, as every row of this family's does -- the
+         * whole family is inert under the Original picture. */
+        .def = { .u = 32u },
+        .original = { .u = 32u },
         .min = { .u = 1u },
-        .max = { .u = 64u },
+        .max = { .u = 256u },
         .step = { .u = 1u },
-        .page_step = { .u = 8u },
+        .page_step = { .u = 16u },
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How many burn at once",
+        .label = "How many light sources at once",
         .help = "How many of those lights may be giving light at the same "
-                "time, nearest and strongest first. The default covers the "
-                "game's fullest torch halls; the top of the dial is the "
-                "renderer's own table, sixty-four lights in one drawing "
-                "pass, which is also where the shadow storage below tops "
-                "out -- a real bound, not a chosen one. Each burning light "
-                "is a little arithmetic on every pixel: a hall with all "
-                "sixty-four alight draws about a quarter slower than one "
-                "with sixteen, whatever the window size."
+                "time, nearest and strongest first. The default lights the "
+                "game's fullest halls whole; the top of the dial is the "
+                "renderer's own table, two hundred and fifty-six lights in "
+                "one drawing pass -- four rows of a uniform block each, "
+                "sixteen kilobytes altogether, which is exactly the block "
+                "size every graphics driver of this generation guarantees, "
+                "so it is a real bound and not a chosen one. The shadow row "
+                "below stops sooner, at sixty-four, which is its own "
+                "storage's bound rather than this one. Each light in force "
+                "is a little arithmetic on every pixel: a hall with sixty-"
+                "four of them lit draws about a tenth slower than one with "
+                "thirty-two, and one with all two hundred and fifty-six "
+                "takes about twice as long, a little more of both at the "
+                "largest window sizes."
     },
     {
         /* HOW MANY OF THOSE CAST SHADOWS, and a count rather than a switch
          * because that is the only shape the question has an honest answer
-         * in: shadows from every torch in the place is what a person pictures
+         * in: shadows from every light in the place is what a person pictures
          * when they ask for them, and the only thing standing in the way is
          * cost. So the row says how much of it to spend, the spending goes to
          * the lights lighting most of what is on the screen, and the row is
-         * held to the burn dial above -- a shadow count past the burning
-         * count names nothing -- so a big number here means "all of them"
-         * and goes on meaning it when the row above moves. Both rows share
-         * one sixty-four ceiling, which is the shadow atlas's own: the
-         * six-face tiles stand in one texture column, and sixty-four of
-         * them is the largest dimension the mainstream drivers give. */
+         * held to the count above -- a shadow count past the number of
+         * lights names nothing -- so a big number here means "all of them"
+         * and goes on meaning it when the row above moves. The two rows no
+         * longer share a ceiling: this one stops at the shadow atlas's own
+         * sixty-four -- the six-face tiles stand in one texture column, and
+         * sixty-four of them is the largest dimension the mainstream drivers
+         * give -- while the row above runs to the light table's own two
+         * hundred and fifty-six. */
         .key = "point_light_shadows",
         .type = HWR_VT_U32,
         .category = HWR_CAT_ENHANCEMENTS,
@@ -1871,7 +1885,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "passing through. The ones that do are the ones lighting most "
                 "of what you can see, so shadows arrive from the nearest and "
                 "strongest outward. Nought is none at all, and anything from "
-                "the row above upward is every light that burns. They are not "
+                "the row above upward is every light there is. They are not "
                 "free, in time or in memory: in a crowded hall at 3840x1600, "
                 "eight of them draw about a quarter slower than none and "
                 "sixteen about two fifths slower, less at smaller sizes and "
@@ -1900,7 +1914,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How bright a torch is",
+        .label = "How bright a light source is",
         .help = "How much light one of them gives off."
     },
     {
@@ -1922,11 +1936,11 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How far a torch reaches",
+        .label = "How far a light source reaches",
         .help = "Where the pool around one of them ends, in world units. A "
-                "fixed torch reads tighter than the light you carry, and a "
-                "shorter reach is also less of it spilling where it should "
-                "not."
+                "light fixed in the world reads tighter than the light you "
+                "carry, and a shorter reach is also less of it spilling "
+                "where it should not."
     },
     {
         .key = "point_light_color_source",
@@ -1945,7 +1959,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "What colour a torch throws",
+        .label = "What colour a light source throws",
         .help = "Reading it from the thing itself means fire throws "
                 "fire-coloured light and a cold sigil throws cold light. One "
                 "chosen colour is more uniform and more controllable."
@@ -1967,11 +1981,11 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .depends_on = -1,
         .depends_on_key = "shading_mode",
         .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "Torch colour",
-        .help = "The colour a torch throws, unless a game config has named "
-                "one for that particular thing. Warmer than the light you "
-                "carry, because a wall torch is fire and a carried lamp is "
-                "not."
+        .label = "Light source colour",
+        .help = "The colour one of them throws, unless a game config has "
+                "named one for that particular thing. Warmer than the light "
+                "you carry, because most of what a map fixes to its walls is "
+                "fire and a carried lamp is not."
     },
     {
         .key = "point_light_glow_scale",
@@ -2045,7 +2059,7 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
         .label = "How far above and below a room",
         .help = "How far past its own room's floor and ceiling a light may "
                 "still reach, in world units, before it fades out. It is what "
-                "stops a torch lighting the storey above it."
+                "stops a light on one floor lighting the storey above it."
     },
     {
         .key = "point_light_fade",

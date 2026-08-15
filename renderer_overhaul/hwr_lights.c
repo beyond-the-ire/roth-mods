@@ -575,9 +575,9 @@ static uint64_t g_last_ns;
  * that leaves behind is in a room being drawn.
  *
  * The merge is stated rather than discovered. A lava lake is hundreds of faces
- * sharing one texture, and one light per face would fill a sixteen-slot array
- * with sixteen near-identical lights a foot apart and starve every torch in the
- * room -- while looking, from the middle of the lake, exactly like one light. */
+ * sharing one texture, and one light per face would fill the whole array with
+ * near-identical lights a foot apart and starve every other light in the room
+ * -- while looking, from the middle of the lake, exactly like one light. */
 
 /* How many surfaces one map may have granted at once. The look layer's own
  * table is this size, so this is the whole of what it can hand over. */
@@ -2563,8 +2563,14 @@ static size_t hwr_lights_seed_placed(const struct hwr_lights_frame *frame,
 size_t hwr_lights_build(const struct hwr_lights_frame *frame,
                         struct hwr_gl_point_light *out, size_t max)
 {
-    struct hwr_light_candidate candidates[HWR_LIGHT_CANDIDATE_MAX];
-    struct hwr_light_retained next[HWR_LIGHT_RETAIN_MAX];
+    /* Both scratch arrays are FILE STATICS rather than locals, which is what
+     * they became when the ceiling grew: together they are a hundred and
+     * twenty kilobytes, and a stack frame that size in a plugin loaded into
+     * somebody else's thread is a thing to be asked for rather than assumed.
+     * The builder is not re-entrant and never was, and every entry either one
+     * is read at is one this call wrote. */
+    static struct hwr_light_candidate candidates[HWR_LIGHT_CANDIDATE_MAX];
+    static struct hwr_light_retained next[HWR_LIGHT_RETAIN_MAX];
     size_t next_count = 0;
     size_t candidate_count = 0;
     size_t count = 0;
@@ -2580,20 +2586,22 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
         hwr_lights_reset();
         return 0;
     }
-    /* THE CAP IS THE BURN DIAL, held to the pass's own carrying bound.
+    /* THE CAP IS THE LIGHT-COUNT DIAL, held to the pass's own carrying bound.
      *
-     * The dial ("how many burn at once") is the player's, by the director's
-     * ruling: the limits of the machine are the player's to spend, so the
-     * row runs to the array's own honest ceiling and the DEFAULT is set
-     * where a torch-filled hall burns whole -- the sixteen the old hard
-     * ceiling allowed, which is the number that ended the popping-pools
-     * report (a room with seventeen marked torches once showed eight pools
-     * and nine dark ones under an eight-row cap; a burning torch whose pool
-     * is in view and unlit is not a quality trade, it is a wrong picture).
-     * Within the dial every candidate is published worth-most first, and
-     * the SHADOW spending is the row below, which the shadow layer holds to
-     * this dial in turn -- a shadow count past the burning count names
-     * nothing.
+     * The dial ("how many light sources at once") is the player's, by the
+     * director's ruling: the limits of the machine are the player's to
+     * spend, so the row runs to the array's own honest ceiling -- the
+     * uniform block's, two hundred and fifty-six -- and the DEFAULT is set
+     * where a light-filled hall stands whole. It was the sixteen the old
+     * hard ceiling allowed, which is the number that ended the popping-pools
+     * report (a room with seventeen marked lights once showed eight pools
+     * and nine dark ones under an eight-row cap; a light whose pool is in
+     * view and unlit is not a quality trade, it is a wrong picture); it is
+     * thirty-two now, because sixteen was the old ceiling wearing a
+     * default's clothes rather than a number anybody chose. Within the dial every candidate is
+     * published worth-most first, and the SHADOW spending is the row below,
+     * which the shadow layer holds to this dial in turn -- a shadow count
+     * past the light count names nothing.
      *
      * What crossing the dial costs is stated rather than hidden: with the
      * whole allowance chosen there is no spare slot for a light on its way

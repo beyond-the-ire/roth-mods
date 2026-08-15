@@ -23,10 +23,11 @@
 
 _Static_assert((unsigned)HWR_PSM_MAX_LIGHTS == (unsigned)HWR_GL_PSHADOW_MAX,
                "the policy and execution tile ceilings must agree");
-_Static_assert((unsigned)HWR_PSM_MAX_LIGHTS ==
+_Static_assert((unsigned)HWR_PSM_MAX_LIGHTS <=
                    (unsigned)HWR_GL_POINT_LIGHT_MAX,
-               "the tile ceiling is the light array's own: a light with no "
-               "slot in the picture has nothing to cast into");
+               "the tile ceiling can never stand above the light array's "
+               "own: a light with no slot in the picture has nothing to "
+               "cast into");
 _Static_assert((uint32_t)HWR_GL_LIGHT_NO_SOURCE ==
                    (uint32_t)HWR_OBJECT_NO_INDEX,
                "a light with no source and a thing no map numbers say the "
@@ -115,11 +116,11 @@ void hwr_pshadow_reset(void)
 }
 
 /* HOW MANY LIGHTS CAST, this frame: what the settings row asks for, held to
- * how many lights may burn at all (the burn dial -- a shadow count past the
- * light count names nothing), and to the tiles one atlas can stand on this
- * driver. A row at or past the burn dial is "all of them" rather than a
- * number, and that is what makes the row uncapped upward without the
- * storage being. */
+ * how many lights there may be at all (the light-count row -- a shadow count
+ * past the light count names nothing), and to the tiles one atlas can stand
+ * on this driver. A row at or past the light-count row is "all of them"
+ * rather than a number, and that is what makes the row uncapped upward
+ * without the storage being. */
 static size_t hwr_pshadow_budget(void)
 {
     const struct hwr_lights_settings *settings = hwr_lights_get_settings();

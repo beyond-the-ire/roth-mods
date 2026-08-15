@@ -340,9 +340,9 @@ struct hwr_settings {
     uint32_t point_light_max;
     /* And how many of THOSE cast real shadows, worth-most first: nought is
      * the whole feature off, and anything at or past the row above is every
-     * light that burns. It is bounded far above that row rather than by it on
-     * purpose -- somebody who wants all of them writes one big number and
-     * never has to come back when the row above moves.
+     * light there is. It is bounded by its own storage rather than by that
+     * row on purpose -- somebody who wants all of them writes one big number
+     * and never has to come back when the row above moves.
      *
      * A game config may pin one light's shadows on, or refuse them, per
      * light; this count is what every light it says nothing about follows. */

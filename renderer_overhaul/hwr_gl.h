@@ -438,18 +438,24 @@ struct hwr_gl_light {
 
 /* How many lights that are NOT at the eye the world pass carries at once.
  *
- * The array rides a uniform BLOCK now rather than uniform registers: four
- * four-component slots a light, 4 KB at this ceiling, against the 16 KB
- * block every GL 3.3 driver guarantees -- the plain-uniform arithmetic
- * that once capped this at sixteen (1024 components, most of them spent
- * here) died with the restructure. What still bounds it is the SHADOW
- * side: the six-face shadow tiles stand in one texture column at 512
- * texels a tile, and sixty-four of them is the 32768-texel dimension the
- * mainstream drivers ship (a smaller driver stands fewer tiles and says
- * so at run time, never fewer lights). The family keeps ONE ceiling for
- * both rows because a shadow count past the light count names nothing --
- * so the ceiling is the atlas's own, stated here once. */
-#define HWR_GL_POINT_LIGHT_MAX 64u
+ * The array rides a uniform BLOCK rather than uniform registers: four
+ * four-component slots a light, sixteen bytes each, so at this ceiling the
+ * block is exactly 16 KB -- the block size every GL 3.3 driver guarantees.
+ * That is what makes the number an honest bound rather than a chosen one:
+ * one more light would ask a driver for storage the standard does not
+ * promise it has. (The plain-uniform arithmetic that once capped this at
+ * sixteen -- 1024 components, most of them spent here -- died with the
+ * block restructure.)
+ *
+ * IT IS NOT THE SHADOW CEILING, and the two were one number only while the
+ * smaller of them bound both. The shadow tiles are bounded by the atlas
+ * they stand in (HWR_GL_PSHADOW_MAX, below), which is a fact about a
+ * texture dimension and has nothing to do with how many lights a pass can
+ * carry. The only relationship left between them is an inequality -- a
+ * light with no slot in the picture has nothing to cast into, so the tile
+ * ceiling can never stand above this one -- and it is asserted where both
+ * headers are in scope (hwr_pshadow.c) rather than left to agree by eye. */
+#define HWR_GL_POINT_LIGHT_MAX 256u
 
 /* One light in the world, as a seeding class handed it over.
  *
@@ -639,7 +645,17 @@ struct hwr_gl_sun {
  * The number below is the CEILING the storage is built for, not the number of
  * tiles that stand: the atlas is allocated to the `tiles` the policy
  * publishes, which is what the settings row asks for held to how many lights
- * there can be. */
+ * there can be.
+ *
+ * WHY IT STAYS AT SIXTY-FOUR while the light ceiling above it rises past it:
+ * the six-face tiles stand in ONE texture column, 512 texels a tile at the
+ * shipping face, and sixty-four of them is 32768 texels -- the largest
+ * texture dimension the mainstream drivers ship. Standing more would mean
+ * laying the tiles out in a GRID rather than a column: a different atlas, a
+ * different lookup arithmetic, and every banked shadow picture to re-take.
+ * That is a proposal and not a thing that is built. A driver that stands
+ * fewer than sixty-four says so at run time and sheds shadow maps, never
+ * lights. */
 #define HWR_GL_PSHADOW_MAX 64u
 
 struct hwr_gl_pshadow_light {
