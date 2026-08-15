@@ -1517,6 +1517,17 @@ struct hwr_light_candidate {
     float score;
     float level;
     int stood;
+    /* Whether this light is one the scene WANTS burning this frame.
+     *
+     * It is not the same question as whether it is a light: a light whose room
+     * has just been switched off is still every bit the light it was, and the
+     * only thing that changed is that it should not be standing. That is why it
+     * is a field of the candidate rather than a refusal in the class seeder --
+     * a refusal would take the candidate out of the array, and a light that is
+     * not in the array cannot walk its ramp down. An unwanted candidate is
+     * carried, ranked LAST, never chosen, and therefore taken down the one fade
+     * every other light uses. */
+    int wanted;
 };
 
 /* Room for every candidate the cap could ever have to choose between: twice
@@ -1617,6 +1628,61 @@ static int hwr_light_object_marked(const struct hwr_world *world,
         object->sector_index < world->sector_count)
         sector_light = world->sectors[object->sector_index].light;
     return hwr_object_composed_light(object->seed, sector_light) == 0;
+}
+
+/* WHETHER ONE ROOM'S OWN FIXTURES ARE LIT RIGHT NOW.
+ *
+ * THE ENGINE'S OWN WORD, and there is exactly one: bit 2 of the sector's flags
+ * byte -- the byte at +0x0a of a geometry record, which is what
+ * `hwr_parse_sector` reads into `flags` and what every refresh re-reads. CLEAR
+ * is lit; SET is the candle-tinted class, which is the engine's way of saying
+ * this room's own fixtures are out and what is in the player's hand is what
+ * lights it.
+ *
+ * WHY IT IS A LATCH RATHER THAN A THRESHOLD ON THE BRIGHTNESS BYTE. A light
+ * switch in a map is a command record the engine ramps: `tick_light_switch`
+ * pushes a signed step into every driven sector's BRIGHTNESS byte (+0x0b) each
+ * frame through `apply_light_delta_to_record_list`, and when the ramp is spent
+ * it stamps this FLAG through `apply_flag_mask_to_record_list` -- setting bit 2
+ * where the ramp was going down and clearing it where it was going up. The
+ * brightness byte alone cannot answer the question: the authored step is a
+ * dozen or two out of two hundred and fifty-five and it differs per switch, so
+ * the same byte value is a lit room in one place and an unlit one in the next,
+ * and there is nothing written down anywhere that says where a given room's
+ * swing began. The flag is the engine's own answer to exactly the question
+ * being asked, it is stamped by the same handler, and every light switch in
+ * this game carries the finalize bit that stamps it -- so the latch is never
+ * skipped.
+ *
+ * It is the same bit the room's own shading reads, which is the whole point: a
+ * light that follows it goes out exactly when the room the mod would otherwise
+ * have drawn dark goes dark.
+ *
+ * A room nothing ever switches simply answers the same thing for ever, and a
+ * light in one either always burns or never does. Both are honest: a room the
+ * map authored candle-lit is a room whose fixtures ARE out. */
+#define HWR_LIGHT_SECTOR_FIXTURES_OUT 0x02u
+
+static int hwr_light_sector_lit(const struct hwr_world *world,
+                                size_t sector_index)
+{
+    if (world == NULL || sector_index >= world->sector_count)
+        return 1;
+    return (world->sectors[sector_index].flags &
+            HWR_LIGHT_SECTOR_FIXTURES_OUT) == 0;
+}
+
+/* And what one grant's word about that comes to, over the room's own state:
+ * a grant that says nothing burns always, which is what every light did before
+ * the field existed. Written once so the three classes cannot grow three
+ * readings of one field. */
+static int hwr_light_wanted(const struct hwr_world *world,
+                            size_t sector_index,
+                            const struct hwr_look_light *named)
+{
+    if (named == NULL || !named->has_only_when_lit || !named->only_when_lit)
+        return 1;
+    return hwr_light_sector_lit(world, sector_index);
 }
 
 /* AND WHETHER A GAME CONFIG MADE ONE, which is the same question asked of the
@@ -1892,6 +1958,9 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_OBJECT;
     out->source_id = object->graphic_id;
     out->sector_index = object->sector_index;
+    /* WHETHER THE ROOM WANTS IT BURNING. A thing stands in its own room, so
+     * that room's live word is the one it follows. */
+    out->wanted = hwr_light_wanted(world, object->sector_index, &named);
     /* WHAT THE GAME CONFIG SAID about this one casting shadows, carried as
      * the three-state answer it is: nothing said leaves it to the settings
      * row's own count, and true and false are a pin and a refusal that the
@@ -2266,6 +2335,21 @@ static int hwr_lights_contained(const struct hwr_lights_frame *frame,
                                 const struct hwr_light_candidate *candidate,
                                 const uint8_t *hop)
 {
+    /* THE ROOM'S OWN SWITCH, asked first because it is the cheapest and the
+     * most fundamental: a light whose room has its fixtures out is not a light
+     * that is anywhere, so there is nothing to ask the drawn set about.
+     *
+     * It is a DROP only once the light is fully out. While anything is still
+     * held for it the candidate is carried -- unwanted, ranked last, never
+     * chosen -- so that the ramp below can walk it down. Dropping it the frame
+     * the switch flipped would take it out of the array, and a light that is
+     * not in the array cannot fade: it would pop. Once the ramp is spent
+     * nothing is held for it any more, and from then on it costs a slot in
+     * nobody's array and a place in nobody's ranking. */
+    if (!candidate->wanted && hwr_light_find_retained(candidate) == NULL) {
+        g_stats.unlit++;
+        return 0;
+    }
     if (!hwr_lights_reach_drawn(frame, candidate)) {
         g_stats.unseen++;
         return 0;
@@ -2362,6 +2446,10 @@ static int hwr_light_from_glow_face(const struct hwr_lights_frame *frame,
     out->source = (uint8_t)HWR_LIGHT_CLASS_GLOW_FACE;
     out->source_id = face->source_id;
     out->sector_index = face->sector_index;
+    /* WHETHER THE ROOM WANTS IT BURNING. A granted surface's light is one per
+     * ROOM per texture and was gathered out of that room's own faces, so it has
+     * a governing room as plainly as a torch does. */
+    out->wanted = hwr_light_wanted(world, face->sector_index, &face->light);
     out->light.shadow_request = hwr_light_shadow_request(&face->light);
     out->light.shadow_tile = -1;
     /* A PAINTED SURFACE IS NOT A THING THE MAP NUMBERS, so there is no card of
@@ -2500,6 +2588,10 @@ static int hwr_light_from_placed(const struct hwr_lights_frame *frame,
      * own map: a light somebody hung at three numbers is drawn by nothing. */
     out->light.source_object = HWR_GL_LIGHT_NO_SOURCE;
     out->sector_index = placed->sector_index;
+    /* WHETHER THE ROOM WANTS IT BURNING. The room a free-standing light hangs
+     * in was worked out when the map was staged; its LIVE state is read here,
+     * every frame, because that is the thing a switch moves. */
+    out->wanted = hwr_light_wanted(world, placed->sector_index, &placed->light);
     out->world_x = placed->world_x;
     out->world_y = placed->world_y;
     out->world_z = placed->world_z;
@@ -2588,6 +2680,7 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
     static struct hwr_light_retained next[HWR_LIGHT_RETAIN_MAX];
     size_t next_count = 0;
     size_t candidate_count = 0;
+    size_t wanted_count = 0;
     size_t count = 0;
     size_t cap;
     size_t hard;
@@ -2709,8 +2802,19 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
         candidates[i].stood = held != NULL && held->stood;
         candidates[i].worth = hwr_light_score(frame, &candidates[i].light,
                                               1.0f, 0);
-        candidates[i].score = hwr_light_score(frame, &candidates[i].light,
-                                              1.0f, candidates[i].stood);
+        /* AND WHAT IT IS WORTH FOR THE CHOOSING: nothing at all where the room
+         * does not want it burning. Every candidate the room DOES want scores
+         * above nothing -- a light with no reach or no strength was refused
+         * before it got here -- so an unwanted one sorts strictly below all of
+         * them and can never take a place from a light that is standing. What
+         * is left of it is the way out: it is carried, it is not chosen, and it
+         * walks down the ramp below. Its plain worth is untouched, because that
+         * is a fact about the light rather than about this frame's choice. */
+        candidates[i].score = candidates[i].wanted
+                            ? hwr_light_score(frame, &candidates[i].light,
+                                              1.0f, candidates[i].stood)
+                            : 0.0f;
+        wanted_count += (size_t)(candidates[i].wanted != 0);
     }
     /* Sorted by what each is worth, and STABLY: the map's own order breaks a
      * tie, and that order does not move between frames. An unstable sort here
@@ -2726,13 +2830,15 @@ size_t hwr_lights_build(const struct hwr_lights_frame *frame,
         }
         candidates[j] = item;
     }
-    if (candidate_count > cap)
-        g_stats.capped = (unsigned long)(candidate_count - cap);
+    /* What the cap DROPPED, counted over the candidates that were asking for a
+     * place. One on its way out is not asking: it is already going. */
+    if (wanted_count > cap)
+        g_stats.capped = (unsigned long)(wanted_count - cap);
 
     for (i = 0; i < candidate_count && next_count < HWR_LIGHT_RETAIN_MAX; i++) {
         struct hwr_light_candidate *candidate = &candidates[i];
         struct hwr_light_retained *held = &next[next_count];
-        int chosen = i < cap;
+        int chosen = candidate->wanted && i < cap;
         float level = candidate->level;
 
         /* Toward one where it is chosen and toward nothing where it is not.

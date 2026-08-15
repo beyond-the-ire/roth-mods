@@ -438,6 +438,19 @@ Each entry says what the thing gives off, and each field stands on its own:
   `objects` alone: textures and faces grant surfaces, and a placed light is drawn by nothing, so
   there is no sprite for it to speak about there. On a thing the map itself marks (`Lighting` 0)
   the mark is the map's own statement and this field does not unmark it.
+- **`only_when_sector_lit`** — whether this light burns **only while the room it stands in counts as
+  lit**. Say nothing and it burns whatever the room says, which is what every light did before this
+  field existed. `true` ties it to the engine's own live word about whether that room's fixtures are
+  on — the word a **light switch on the wall** rewrites — so a light hung in a switched room goes out
+  when the switch goes off and comes back when it goes on, over the same fade every other light uses.
+  A room nothing ever switches answers the same thing for ever, and a light in one either always
+  burns or never does. It is legal on **all five tables**, because every light this mod makes stands
+  in exactly one of the map's rooms: a thing stands in its own, a granted surface's light stands in
+  the room its faces were gathered from, and a placed light stands in the room its point is inside.
+  It speaks about the **light** and not about the drawing, which is `lit` above — so a candelabra
+  written `"only_when_sector_lit": true, "lit": false` has its light follow the switch *and* is drawn
+  by the room's own shading, which the same switch moves. See
+  [Re-lighting a switched room](#re-lighting-a-switched-room), which is what it is for.
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 
 The **most specific statement anybody made is the one in force**, and the tables compose **field by
@@ -696,6 +709,61 @@ three numbers in another map are a different corner of a different building. **L
 **Light from glowing textures** do not reach these — a light you wrote down is not a kind of thing the
 game has, so there is no separate switch for it — but **Light from torches and candles** turns them
 off with everything else.
+
+### Re-lighting a switched room
+
+Some rooms in this game have their lighting turned on and off by a **switch on the wall**, and there
+is no lamp behind it. The switch does not light a lamp: it rewrites the **room's own** brightness, and
+the room simply gets brighter or darker all over. That is the look this mod exists to replace — so the
+moment you kill a room's own glow and hang real lights in it, you have taken away the only thing that
+switch had to move, and the switch stops doing anything.
+
+`only_when_sector_lit` gives it something to move again. The pair is:
+
+```json
+"maps": {
+  "STUDY1": {
+    "settings": { "room_light_gain": 0 },
+    "lights": {
+      "placed": [
+        { "notes": "the ceiling fixture of the small switched room",
+          "at": [-896, 1164, 280], "colour": "#ffd7a0",
+          "strength": 1.6, "reach": 420,
+          "only_when_sector_lit": true }
+      ]
+    }
+  }
+}
+```
+
+- **`room_light_gain: 0`** takes the room's own flat glow out of the picture, so what you see is the
+  light you hang and nothing else.
+- **`only_when_sector_lit: true`** ties the light you hung to the switch. Flip the switch off and it
+  fades out; flip it on and it comes back up.
+
+That example is a real place: on the map the game opens on, a small room with a single fixture on its
+ceiling and a switch on the wall outside its door. The three numbers under `at` are the game's own,
+taken from that fixture's own position with the light hung a little under the ceiling. Run it, find
+the switch, and the room has a lamp in it that answers to it.
+
+**What "counts as lit" means.** The engine keeps a live mark on every room saying whether that room's
+own fixtures are on, and a light switch is what sets and clears it. That mark is what the field reads
+— the same one the room's own shading reads — so a light following it goes out at exactly the moment
+the room would otherwise have gone dark. It is not the room's brightness number: a switch moves that
+by a step the map's author chose, differing from switch to switch, so there is no brightness anybody
+could name that means "on" everywhere.
+
+**Rooms that never switch.** Most rooms don't. A room whose fixtures the map authors as **on** always
+answers lit, so a light in one written with the field burns exactly as it would without it. A room
+the map authors as **candle-lit** — a cellar, a crypt, anywhere the game means you to be carrying
+your own light — answers *not* lit for ever, so a light written with the field there never burns at
+all. If a light you hung is dark and you did not expect it, that is the first thing to check: take
+the field off, or hang it in the room next door.
+
+**The thing that gives the light.** If you are tying a *thing* rather than a hung light to a switch —
+a candelabra, a wall sconce — write `"lit": false` beside it. The light then follows the switch and
+the sprite is drawn by the room's own shading, which the same switch moves, so it goes dark with the
+room instead of staying painted bright.
 
 ### The sky's own light: `environment_lighting`
 

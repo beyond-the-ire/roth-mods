@@ -318,6 +318,36 @@ struct hwr_look_light {
      * the map's own statement, which this field does not unmark. */
     int has_lit;
     int lit;
+    /* Whether this light burns ONLY WHILE THE ROOM IT STANDS IN COUNTS AS LIT.
+     *
+     * Some rooms of this game have their lighting turned on and off by a switch
+     * on the wall, and there is no lamp behind it: the switch rewrites the
+     * ROOM's own lighting metadata and the room simply becomes brighter or
+     * darker. A room re-lit by hand -- its map glow killed with
+     * `room_light_gain` and real lights hung in it instead -- has nothing left
+     * for that switch to move, so the switch stops working. This is what gives
+     * it something to move: a light that says so exists only while the engine's
+     * own live word says its room's fixtures are on, and goes out when it says
+     * they are off.
+     *
+     * Absent means false, which is what every light did before the field
+     * existed: it burns whatever its room says. A field of EVERY table, because
+     * every light in the mod stands in exactly one room -- an object stands in
+     * its own, a granted surface's light stands in the room its faces were
+     * gathered from, and a free-standing light stands in the room the point is
+     * inside.
+     *
+     * IT SPEAKS ABOUT THE LIGHT AND NOT ABOUT THE DRAWING, which is `lit`
+     * above. The two compose: a candelabra written
+     * `"only_when_sector_lit": true, "lit": false` has its light follow the
+     * switch AND is drawn by the room's own shading, which the same switch
+     * moves -- so it goes dark with the room rather than staying painted
+     * bright. Written alone it puts the light out and leaves the drawing
+     * whatever it was, which is the only honest answer available for a thing
+     * the MAP itself marks fullbright: that mark is the map's statement and
+     * this field does not unmake it. */
+    int has_only_when_lit;
+    int only_when_lit;
 };
 
 /* One grant laid over another, FIELD by field, with `off` left to the caller

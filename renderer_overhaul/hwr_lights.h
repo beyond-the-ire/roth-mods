@@ -281,6 +281,12 @@ struct hwr_lights_stats {
     unsigned long too_far;     /* past the hop cap */
     unsigned long capped;      /* more candidates than slots */
     unsigned long fading;      /* still going out from an earlier frame */
+    /* A light that asked to follow its room's own switch, in a room whose
+     * fixtures are out and which has finished going out. Counted apart from
+     * every other refusal because it is the only one that is not about the
+     * light: the light is exactly where it was and exactly what it was, and
+     * the room turned it off. */
+    unsigned long unlit;
     /* A thing the map does NOT mark that a game config named, and thereby made
      * a light. Counted apart from the marked ones because the two answer
      * different questions: one is what the map itself says, the other is what

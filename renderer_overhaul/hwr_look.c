@@ -872,6 +872,10 @@ void hwr_look_light_over(struct hwr_look_light *into,
         into->has_lit = 1;
         into->lit = from->lit;
     }
+    if (from->has_only_when_lit) {
+        into->has_only_when_lit = 1;
+        into->only_when_lit = from->only_when_lit;
+    }
 }
 
 /* One scope's keyed entries over another's. `from_map` says whether this is the
@@ -1351,6 +1355,28 @@ static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
         }
         into->has_lit = 1;
         into->lit = lit;
+        return 1;
+    }
+    /* THE ONE FIELD THAT IS NOT ABOUT THE LIGHT AT ALL, but about WHEN it is
+     * there. It is legal on every table, `textures` and `faces` included, and
+     * that is a decision rather than an oversight: every light this mod makes
+     * stands in exactly one of the map's rooms -- a surface grant's light is
+     * one per room per texture and already carries that room -- so the question
+     * "is this light's room lit" has the same one honest answer wherever it is
+     * asked. A lava lake would be absurd to hang off a switch and nobody will;
+     * a lit sign, a rune over a doorway or a glowing panel in a room with a
+     * switch on the wall is exactly the case, and refusing it there would be
+     * refusing something cheap, well-defined and asked for. */
+    if (strcmp(field, "only_when_sector_lit") == 0) {
+        int only = 0;
+
+        if (!hwr_json_as_bool(doc, child, &only)) {
+            hwr_look_note(report, where,
+                          "'only_when_sector_lit' is true or false");
+            return 1;
+        }
+        into->has_only_when_lit = 1;
+        into->only_when_lit = only;
         return 1;
     }
     return 0;
