@@ -23,6 +23,12 @@
  * paid for whether or not a file uses it; raising it is worth doing when the
  * tables are grown to fit the file rather than declared to fit the cap. */
 #define HWR_LOOK_MAX_MAPS 64u
+/* And how many DAS FILES one file may describe. A game keeps a handful of them
+ * -- this one keeps six, one shared and five the maps are dealt out of -- and
+ * a map pack that brings its own brings one or two, so this is room for many
+ * times what either has. A section here is cheaper than a map's: only the two
+ * tables keyed by a picture may be written in one, so that is all it carries. */
+#define HWR_LOOK_MAX_DAS 32u
 #define HWR_LOOK_NAME 64u
 /* How many entries one keyed grant table may hold in one scope -- the sprites
  * a place says something about, and the textures it says something about, which
@@ -62,10 +68,11 @@
  * with no settings file of its own starts on. */
 #define HWR_LOOK_FOLDER "game_configs"
 #define HWR_LOOK_EXTENSION ".json"
+/* What the game's own picture files are called, for the one question this
+ * layer asks of the folder they live in: whether a section names one of
+ * them. */
+#define HWR_LOOK_DAS_EXTENSION ".DAS"
 #define HWR_LOOK_SHIPPED "roth"
-/* The file the layer read before the folder did, kept only to say that it is
- * no longer read. */
-#define HWR_LOOK_RETIRED "renderer_look.cfg"
 /* How long a place in the file may be named. Deep enough for every chain the
  * shape has and short enough to say in one line. */
 #define HWR_LOOK_WHERE 256u
@@ -277,10 +284,31 @@ struct hwr_look_map {
     struct hwr_look_scope scope;
 };
 
+/* WHAT ONE DAS FILE'S PICTURES GIVE OFF, wherever they are drawn.
+ *
+ * The scope between the game and the map, and the one the game's own shape
+ * asks for: a map's pictures are read out of a file it shares with the other
+ * maps of its part of the game, so a torch described once here is described
+ * for every one of them. It is keyed by the file's own name, reduced by the
+ * same law a map name is.
+ *
+ * It carries the two BLANKET tables and nothing else, because those are the
+ * two keyed by a picture. An object's number, a face's number and a position
+ * are numbers in one map's own lists; the dials and the sky's own light
+ * describe a place. Neither kind means anything to a file of pictures, so
+ * neither is read here. */
+struct hwr_look_das {
+    char name[HWR_LOOK_NAME];
+    struct hwr_look_lights sprites;
+    struct hwr_look_lights textures;
+};
+
 struct hwr_look_file {
     /* What the file calls the game it describes, which is its title. */
     char title[HWR_LOOK_NAME];
     struct hwr_look_scope everywhere;
+    struct hwr_look_das das[HWR_LOOK_MAX_DAS];
+    size_t das_count;
     struct hwr_look_map maps[HWR_LOOK_MAX_MAPS];
     size_t map_count;
 };
@@ -331,6 +359,23 @@ static unsigned char g_sprite_matched[HWR_LOOK_MAX_LIGHTS];
 static unsigned char g_sprite_told[HWR_LOOK_MAX_LIGHTS];
 static int g_objects_settled;
 static char g_look_map[HWR_LOOK_NAME];
+/* WHICH DAS FILES THE MAP IN FORCE READS ITS PICTURES OUT OF -- its own, and
+ * the shared one every map loads -- reduced to what they are matched on. They
+ * are facts about the map being drawn, so they are held beside its name and
+ * survive a re-read of the file exactly as it does. */
+static char g_look_das[HWR_LOOK_NAME];
+static char g_look_shared_das[HWR_LOOK_NAME];
+/* And where the game keeps those files, which is the only place a section
+ * naming no DAS file at all can be caught: the file itself cannot know what
+ * the game holds, and the folder can be listed. */
+static char g_look_das_dir[2048];
+/* What has been said about each DAS section of the file in force: whether the
+ * game was found to hold a file of that name, and -- for the section naming
+ * the SHARED file -- whether the keys in it that name the map's own pictures
+ * have been reported. Both are once per section per reading of the file, so
+ * they are cleared wherever one is read. */
+static unsigned char g_das_told[HWR_LOOK_MAX_DAS];
+static unsigned char g_das_scope_told[HWR_LOOK_MAX_DAS];
 static uint64_t g_look_hash;
 static uint64_t g_look_candidate_hash;
 static uint32_t g_look_candidate_polls;
@@ -570,27 +615,6 @@ static int hwr_look_selected_is_missing(void)
     return g_slot_missing[slot] != 0;
 }
 
-/* One line for the file this layer used to read, said once and only where one
- * is actually still sitting beside the plugin. */
-static void hwr_look_note_retired_file(void)
-{
-    static int said;
-    char path[2600];
-    FILE *stream;
-
-    if (said || g_look_dir[0] == 0)
-        return;
-    snprintf(path, sizeof path, "%s/%s", g_look_dir, HWR_LOOK_RETIRED);
-    stream = fopen(path, "rb");
-    if (stream == NULL)
-        return;
-    fclose(stream);
-    said = 1;
-    fprintf(stderr, "[renderer_overhaul] %s is no longer read; per-map looks "
-                    "now live in the %s folder\n",
-            HWR_LOOK_RETIRED, HWR_LOOK_FOLDER);
-}
-
 void hwr_look_scan(const char *plugin_dir, const char *keep)
 {
     char names[HWR_LOOK_MAX_CONFIGS][HWR_LOOK_TOKEN];
@@ -695,7 +719,6 @@ void hwr_look_scan(const char *plugin_dir, const char *keep)
     hwr_look_publish_slots();
     slot = hwr_look_slot_of(keep_token);
     hwr_settings_set_game_config(slot > 0 ? (int32_t)slot : 0);
-    hwr_look_note_retired_file();
 }
 
 size_t hwr_look_config_count(void)
@@ -974,6 +997,98 @@ static const struct hwr_look_map *hwr_look_find_map(
             return &file->maps[i];
     }
     return NULL;
+}
+
+/* The same question about a DAS FILE, answered by the same law: the names on
+ * both sides are reduced before they are compared, so a section written
+ * DEMO1, demo1 or M\DEMO1.DAS answers for the file the engine calls
+ * DEMO1.DAS. Nothing found is nothing said, which is what every map that
+ * loads a file nobody described gets. */
+static const struct hwr_look_das *hwr_look_find_das(
+    const struct hwr_look_file *file, const char *name)
+{
+    size_t i;
+
+    if (name == NULL || name[0] == 0)
+        return NULL;
+    for (i = 0; i < file->das_count; i++) {
+        if (hwr_ascii_equal_ci(file->das[i].name, name))
+            return &file->das[i];
+    }
+    return NULL;
+}
+
+/* Whether a folded sprite key names a picture of the SHARED file rather than of
+ * the map's own. The key carries the editor's texture source in its high byte,
+ * and the sources are the four ranges the reader folds: 0 and 1 are the map's
+ * own file, everything above is not. */
+static int hwr_look_sprite_is_shared(uint16_t graphic_id)
+{
+    return (graphic_id >> 8) > 1u;
+}
+
+/* A DAS SECTION NAMING A FILE THE GAME DOES NOT HOLD, said once.
+ *
+ * A section is silent on the maps that load a different file, and that silence
+ * is the point of the scope -- so "this named nothing on this map" is never a
+ * complaint. The one thing that IS worth saying is that a name matches no file
+ * the game holds at all, because such a section can never do anything on any
+ * map, and the natural mistake -- writing a MAP's name where the file's was
+ * wanted -- looks exactly like a line quietly doing nothing.
+ *
+ * Asked of the folder the game keeps those files in, which is the only place
+ * the answer actually lives: the description cannot know what a game holds. A
+ * folder that cannot be listed says nothing at all, because an accusation is
+ * worth making only where the answer is known. Said once per section per
+ * reading of the file, so an edited file asks again. */
+static void hwr_look_check_das_names(void)
+{
+    unsigned char found[HWR_LOOK_MAX_DAS];
+    const struct dirent *entry;
+    size_t suffix = strlen(HWR_LOOK_DAS_EXTENSION);
+    size_t pending = 0;
+    size_t count;
+    DIR *listing;
+    size_t i;
+
+    if (!g_look_present || g_look_das_dir[0] == 0)
+        return;
+    count = g_look.das_count < HWR_LOOK_MAX_DAS ? g_look.das_count
+                                                : HWR_LOOK_MAX_DAS;
+    for (i = 0; i < count; i++)
+        pending += g_das_told[i] == 0u ? 1u : 0u;
+    if (pending == 0)
+        return;
+    listing = opendir(g_look_das_dir);
+    if (listing == NULL)
+        return;
+    memset(found, 0, sizeof found);
+    while ((entry = readdir(listing)) != NULL) {
+        char reduced[HWR_LOOK_NAME];
+        size_t length = strlen(entry->d_name);
+
+        if (length <= suffix ||
+            !hwr_ascii_equal_ci(entry->d_name + length - suffix,
+                                HWR_LOOK_DAS_EXTENSION))
+            continue;
+        hwr_look_map_name(reduced, HWR_LOOK_NAME, entry->d_name);
+        for (i = 0; i < count; i++) {
+            if (hwr_ascii_equal_ci(g_look.das[i].name, reduced))
+                found[i] = 1u;
+        }
+    }
+    closedir(listing);
+    for (i = 0; i < count; i++) {
+        if (g_das_told[i])
+            continue;
+        g_das_told[i] = 1u;
+        if (found[i])
+            continue;
+        fprintf(stderr, "[renderer_overhaul] %s: das %s: %s holds no DAS file "
+                        "of that name, so nothing written under it can light "
+                        "anything on any map\n",
+                g_look_path, g_look.das[i].name, g_look_das_dir);
+    }
 }
 
 /* ---------------------------------------------------- reading the file --- */
@@ -1919,13 +2034,85 @@ static void hwr_look_read_placed_lights(const struct hwr_json_doc *doc,
         hwr_look_read_placed(doc, child, into, index++, where, report);
 }
 
-/* `placed` says whether this scope may address something that only exists in one
- * map -- an object of it, or a position inside it. Only a map's own scope may:
- * an object number is a number in ONE map's list, and the same three numbers
- * elsewhere are a different corner of a different building. */
+/* THE TWO BLANKET TABLES, which are the two keyed by a PICTURE rather than by a
+ * number out of one map's own lists -- and therefore the two every scope may
+ * hold, the file of pictures included. Answers 0 for a name that is neither, so
+ * each scope says for itself what it makes of the rest.
+ *
+ * Written once for the three scopes: two readers would be two places for the
+ * same two tables to be spelled and one place for them to drift. */
+static int hwr_look_read_blanket(const struct hwr_json_doc *doc, int child,
+                                 const char *name,
+                                 struct hwr_look_lights *sprites,
+                                 struct hwr_look_lights *textures,
+                                 const char *where, int report)
+{
+    char inside[HWR_LOOK_WHERE];
+    int entry;
+
+    if (strcmp(name, "sprites") == 0) {
+        /* A BLANKET over every object drawn with one sprite, keyed by the
+         * texture and source pair the editor's object panel shows. Read in
+         * every scope: a sprite is the same sprite wherever it is drawn. */
+        hwr_look_where(inside, where, "sprites");
+        if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
+            hwr_look_note(report, inside, "the sprites are a block keyed by "
+                                          "the texture and source numbers the "
+                                          "editor shows for an object, written "
+                                          "\"34/0\", or by the single picture "
+                                          "number it shows when you pick one");
+            return 1;
+        }
+        for (entry = hwr_json_first(doc, child); entry >= 0;
+             entry = hwr_json_next(doc, entry)) {
+            if (hwr_look_is_notes(hwr_json_name(doc, entry)))
+                continue;
+            hwr_look_read_light(doc, entry, sprites, inside, report, "sprite",
+                                1);
+        }
+        return 1;
+    }
+    if (strcmp(name, "textures") == 0) {
+        /* And a BLANKET over the map's own geometry: every wall band and every
+         * floor and ceiling painted with one texture -- lava, a rune, a lit
+         * sigil. Read in every scope for the same reason: a texture is the same
+         * texture wherever it is painted, and a game whose lava glows wants it
+         * to glow everywhere. */
+        hwr_look_where(inside, where, "textures");
+        if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
+            hwr_look_note(report, inside, "the textures are a block keyed by "
+                                          "the number of a texture the map "
+                                          "paints with");
+            return 1;
+        }
+        for (entry = hwr_json_first(doc, child); entry >= 0;
+             entry = hwr_json_next(doc, entry)) {
+            if (hwr_look_is_notes(hwr_json_name(doc, entry)))
+                continue;
+            hwr_look_read_light(doc, entry, textures, inside, report, "texture",
+                                0);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* What things give off, in whichever scope is asking.
+ *
+ * `not_here` is what this scope is CALLED where it may not address something
+ * that exists only inside one map -- an object of it, a face of it, a position
+ * in it. NULL is a map's own scope, where all three are read. An object number
+ * is a number in ONE map's list, and the same three numbers elsewhere are a
+ * different corner of a different building, so everywhere else the three are
+ * refused with the place they belong named. */
 static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
-                                 struct hwr_look_scope *into,
-                                 const char *where, int report, int placed)
+                                 struct hwr_look_lights *sprites,
+                                 struct hwr_look_lights *textures,
+                                 struct hwr_look_objects *objects,
+                                 struct hwr_look_faces *faces,
+                                 struct hwr_look_placed *placed,
+                                 const char *not_here,
+                                 const char *where, int report)
 {
     char inside[HWR_LOOK_WHERE];
     int child;
@@ -1941,85 +2128,42 @@ static void hwr_look_read_lights(const struct hwr_json_doc *doc, int object,
 
         if (name == NULL || hwr_look_is_notes(name))
             continue;
-        if (strcmp(name, "sprites") == 0) {
-            int light;
-
-            /* A BLANKET over every object drawn with one sprite, keyed by the
-             * texture and source pair the editor's object panel shows. Read in
-             * every scope: a sprite is the same sprite wherever it is drawn. */
-            hwr_look_where(inside, where, "sprites");
-            if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
-                hwr_look_note(report, inside, "the sprites are a block keyed "
-                                              "by the texture and source "
-                                              "numbers the editor shows for an "
-                                              "object, written \"34/0\", or by "
-                                              "the single picture number it "
-                                              "shows when you pick one");
-                continue;
-            }
-            for (light = hwr_json_first(doc, child); light >= 0;
-                 light = hwr_json_next(doc, light)) {
-                if (hwr_look_is_notes(hwr_json_name(doc, light)))
-                    continue;
-                hwr_look_read_light(doc, light, &into->sprites, inside, report,
-                                    "sprite", 1);
-            }
-        } else if (strcmp(name, "textures") == 0) {
-            int texture;
-
-            /* And a BLANKET over the map's own geometry: every wall band and
-             * every floor and ceiling painted with one texture -- lava, a rune,
-             * a lit sigil. Read in every scope for the same reason: a texture
-             * is the same texture wherever it is painted, and a game whose lava
-             * glows wants it to glow everywhere. */
-            hwr_look_where(inside, where, "textures");
-            if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
-                hwr_look_note(report, inside, "the textures are a block keyed "
-                                              "by the number of a texture the "
-                                              "map paints with");
-                continue;
-            }
-            for (texture = hwr_json_first(doc, child); texture >= 0;
-                 texture = hwr_json_next(doc, texture)) {
-                if (hwr_look_is_notes(hwr_json_name(doc, texture)))
-                    continue;
-                hwr_look_read_light(doc, texture, &into->textures, inside,
-                                    report, "texture", 0);
-            }
-        } else if (strcmp(name, "objects") == 0) {
+        if (hwr_look_read_blanket(doc, child, name, sprites, textures, where,
+                                  report))
+            continue;
+        if (strcmp(name, "objects") == 0) {
             hwr_look_where(inside, where, "objects");
-            if (!placed) {
+            if (not_here != NULL) {
                 hwr_look_note(report, inside, "an object's number and its ID "
                                               "belong to ONE map, so an object "
                                               "is described under a map rather "
-                                              "than everywhere");
+                                              "than %s", not_here);
                 continue;
             }
-            hwr_look_read_objects(doc, child, &into->objects, inside, report);
+            hwr_look_read_objects(doc, child, objects, inside, report);
         } else if (strcmp(name, "faces") == 0) {
             hwr_look_where(inside, where, "faces");
-            if (!placed) {
+            if (not_here != NULL) {
                 hwr_look_note(report, inside, "a face's number and its ID "
                                               "belong to ONE map, so a face is "
                                               "described under a map rather "
-                                              "than everywhere");
+                                              "than %s", not_here);
                 continue;
             }
-            hwr_look_read_faces(doc, child, &into->faces, inside, report);
+            hwr_look_read_faces(doc, child, faces, inside, report);
         } else if (strcmp(name, "placed") == 0) {
             /* The lights that belong to no object at all. Under a map only, for
              * the same reason: three numbers elsewhere are a different corner of
              * a different building. */
             hwr_look_where(inside, where, "placed");
-            if (!placed) {
+            if (not_here != NULL) {
                 hwr_look_note(report, inside, "a position is a position in ONE "
                                               "map, so a free-standing light is "
-                                              "hung under a map rather than "
-                                              "everywhere");
+                                              "hung under a map rather than %s",
+                              not_here);
                 continue;
             }
-            hwr_look_read_placed_lights(doc, child, &into->placed, inside,
-                                        report);
+            hwr_look_read_placed_lights(doc, child, placed, inside, report);
         } else {
             hwr_look_note(report, where, "'%s' is not something this build "
                                          "reads", name);
@@ -2050,14 +2194,61 @@ static void hwr_look_read_scope(const struct hwr_json_doc *doc, int object,
             hwr_look_read_settings(doc, child, into, inside, report);
         } else if (strcmp(name, "lights") == 0) {
             hwr_look_where(inside, where, "lights");
-            hwr_look_read_lights(doc, child, into, inside, report, placed);
+            hwr_look_read_lights(doc, child, &into->sprites, &into->textures,
+                                 &into->objects, &into->faces, &into->placed,
+                                 placed ? NULL : "everywhere", inside, report);
         } else if (strcmp(name, "environment_lighting") == 0) {
-            /* Read in EVERY scope: the sky is the same sky over a whole game,
-             * and what changes per map is which way its openings face -- which
-             * is exactly the field a map writes and the game-wide answer
-             * mostly does not. */
+            /* Read in BOTH the scopes that describe a place: the sky is the
+             * same sky over a whole game, and what changes per map is which way
+             * its openings face -- which is exactly the field a map writes and
+             * the game-wide answer mostly does not. */
             hwr_look_where(inside, where, "environment_lighting");
             hwr_look_read_env(doc, child, into, inside, report);
+        } else {
+            hwr_look_note(report, where, "'%s' is not something this build "
+                                         "reads", name);
+        }
+    }
+}
+
+/* WHAT ONE DAS FILE'S PICTURES GIVE OFF. The two blanket tables and nothing
+ * else, because a file of pictures is not a place: the dials and the sky's own
+ * light describe how somewhere is lit, and an object's number, a face's number
+ * and a position are numbers inside one map. Each of those costs its own key
+ * and is told where it belongs, rather than being read somewhere it would mean
+ * something different from what it says. */
+static void hwr_look_read_das_scope(const struct hwr_json_doc *doc, int object,
+                                    struct hwr_look_das *into,
+                                    const char *where, int report)
+{
+    char inside[HWR_LOOK_WHERE];
+    int child;
+
+    if (hwr_json_type(doc, object) != HWR_JSON_OBJECT) {
+        hwr_look_note(report, where, "a DAS file is described by a block");
+        return;
+    }
+    for (child = hwr_json_first(doc, object); child >= 0;
+         child = hwr_json_next(doc, child)) {
+        const char *name = hwr_json_name(doc, child);
+
+        if (name == NULL || hwr_look_is_notes(name))
+            continue;
+        if (strcmp(name, "lights") == 0) {
+            hwr_look_where(inside, where, "lights");
+            hwr_look_read_lights(doc, child, &into->sprites, &into->textures,
+                                 NULL, NULL, NULL, "under a DAS file", inside,
+                                 report);
+        } else if (strcmp(name, "settings") == 0) {
+            hwr_look_note(report, where, "the dials say how a PLACE is lit "
+                                         "rather than what a picture gives "
+                                         "off, so they are written everywhere "
+                                         "or under a map");
+        } else if (strcmp(name, "environment_lighting") == 0) {
+            hwr_look_note(report, where, "the sky's own light belongs to a "
+                                         "place rather than to a file of "
+                                         "pictures, so it is written everywhere "
+                                         "or under a map");
         } else {
             hwr_look_note(report, where, "'%s' is not something this build "
                                          "reads", name);
@@ -2110,6 +2301,52 @@ static int hwr_look_build(struct hwr_look_file *file,
         } else if (strcmp(name, "everywhere") == 0) {
             hwr_look_read_scope(doc, child, &file->everywhere, "everywhere",
                                 report, 0);
+        } else if (strcmp(name, "das") == 0) {
+            int entry;
+
+            if (hwr_json_type(doc, child) != HWR_JSON_OBJECT) {
+                hwr_look_note(report, "das", "the DAS files are a block keyed "
+                                             "by the name of one");
+                continue;
+            }
+            for (entry = hwr_json_first(doc, child); entry >= 0;
+                 entry = hwr_json_next(doc, entry)) {
+                const char *written = hwr_json_name(doc, entry);
+                const struct hwr_look_das *found;
+                char reduced[HWR_LOOK_NAME];
+                char where[HWR_LOOK_WHERE];
+
+                if (written == NULL || hwr_look_is_notes(written))
+                    continue;
+                /* Reduced by the law a map name is reduced by, on both sides:
+                 * the name written here and the name the game hands over are
+                 * the same file however either spells it. */
+                hwr_look_map_name(reduced, HWR_LOOK_NAME, written);
+                hwr_look_where(where, "das", written);
+                if (reduced[0] == 0) {
+                    hwr_look_note(report, where, "that is not the name of a "
+                                                 "DAS file");
+                    continue;
+                }
+                /* Two spellings of one name are one file, so the second is laid
+                 * over the first rather than losing it. */
+                found = hwr_look_find_das(file, reduced);
+                if (found == NULL) {
+                    if (file->das_count >= HWR_LOOK_MAX_DAS) {
+                        hwr_look_note(report, where, "that is more DAS files "
+                                                     "than one file may "
+                                                     "describe");
+                        continue;
+                    }
+                    found = &file->das[file->das_count];
+                    snprintf(file->das[file->das_count].name, HWR_LOOK_NAME,
+                             "%s", reduced);
+                    file->das_count++;
+                }
+                hwr_look_read_das_scope(doc, entry,
+                                        &file->das[(size_t)(found - file->das)],
+                                        where, report);
+            }
         } else if (strcmp(name, "maps") == 0) {
             int entry;
 
@@ -2297,9 +2534,61 @@ static int hwr_look_read(struct hwr_look_file *file, uint64_t *content_hash,
 
 /* ---------------------------------------------------- what is in force --- */
 
+/* ONE DAS FILE'S GRANTS, laid over what is in force beneath them.
+ *
+ * `own` is whether this is the file THIS MAP's own pictures are read out of.
+ * Where it is not -- the section names the SHARED file, which every map loads
+ * and which is therefore in force everywhere -- the only pictures it can
+ * honestly speak about are that file's own: a sprite key whose source is 0 or
+ * 1, and every texture key, name a slot in the MAP's own file instead, which
+ * is a different picture on every map that loads a different one. Those are
+ * left out here and said once, because a line that means something different
+ * on every map is not the line anybody wrote.
+ *
+ * Under a map's OWN DAS section the shared file's pictures are kept: the
+ * shared file is loaded on those maps too, so such a line is that picture
+ * scoped to the maps this file is dealt to, which is a thing somebody may
+ * well want. */
+static void hwr_look_das_over(struct hwr_look_lights *out_sprites,
+                              struct hwr_look_lights *out_textures,
+                              const struct hwr_look_das *das, int own,
+                              size_t index)
+{
+    struct hwr_look_lights kept;
+    size_t left_out = 0;
+    size_t i;
+
+    if (own) {
+        hwr_look_lights_merge(out_sprites, &das->sprites, 0);
+        hwr_look_lights_merge(out_textures, &das->textures, 0);
+        return;
+    }
+    memset(&kept, 0, sizeof kept);
+    for (i = 0; i < das->sprites.count; i++) {
+        if (!hwr_look_sprite_is_shared(das->sprites.items[i].id)) {
+            left_out++;
+            continue;
+        }
+        kept.items[kept.count++] = das->sprites.items[i];
+    }
+    hwr_look_lights_merge(out_sprites, &kept, 0);
+    left_out += das->textures.count;
+    if (left_out == 0 || index >= HWR_LOOK_MAX_DAS || g_das_scope_told[index])
+        return;
+    g_das_scope_told[index] = 1u;
+    fprintf(stderr, "[renderer_overhaul] %s: das %s is the file every map "
+                    "loads, so %u grant(s) in it that name a picture of the "
+                    "map's OWN file -- a sprite of source 0 or 1, or a texture "
+                    "-- name a different picture on every map and are left out; "
+                    "write those under the map's own DAS file, under the map, "
+                    "or under everywhere\n",
+            g_look_path, das->name, (unsigned)left_out);
+}
+
 /* The overrides in force for one map, lowest precedence first. */
 static void hwr_look_compose(const struct hwr_look_file *file,
-                             const char *map_name,
+                             const char *map_name, const char *map_das,
+                             const char *shared_das,
                              struct hwr_look_values *out,
                              struct hwr_look_lights *out_sprites,
                              struct hwr_look_lights *out_textures,
@@ -2308,6 +2597,8 @@ static void hwr_look_compose(const struct hwr_look_file *file,
                              struct hwr_look_placed *out_placed,
                              struct hwr_look_env *out_env)
 {
+    const struct hwr_look_das *shared;
+    const struct hwr_look_das *own;
     const struct hwr_look_map *map;
 
     memset(out, 0, sizeof *out);
@@ -2323,6 +2614,18 @@ static void hwr_look_compose(const struct hwr_look_file *file,
     hwr_look_lights_merge(out_sprites, &file->everywhere.sprites, 0);
     hwr_look_lights_merge(out_textures, &file->everywhere.textures, 0);
     hwr_look_env_over(out_env, &file->everywhere.env);
+    /* AND THE FILES THIS MAP'S PICTURES COME OUT OF, between the game and the
+     * map: the shared one first, because it is the one every map loads and is
+     * therefore the less particular statement, then the map's own. A file that
+     * is both is merged once, as the map's own. */
+    shared = hwr_look_find_das(file, shared_das);
+    own = hwr_look_find_das(file, map_das);
+    if (shared != NULL && shared != own)
+        hwr_look_das_over(out_sprites, out_textures, shared, 0,
+                          (size_t)(shared - file->das));
+    if (own != NULL)
+        hwr_look_das_over(out_sprites, out_textures, own, 1,
+                          (size_t)(own - file->das));
     map = hwr_look_find_map(file, map_name);
     if (map != NULL) {
         hwr_look_merge(out, &map->scope.values);
@@ -2469,14 +2772,22 @@ static void hwr_look_publish_nothing(void)
 
 static void hwr_look_say_what_was_read(const struct hwr_look_file *file)
 {
+    char das[64];
+
+    /* The DAS files only where there are any, so the ordinary line stays the
+     * one sentence it has always been. */
+    das[0] = 0;
+    if (file->das_count != 0u)
+        snprintf(das, sizeof das, ", %u DAS file(s)",
+                 (unsigned)file->das_count);
     if (file->title[0] != 0)
         fprintf(stderr, "[renderer_overhaul] game config %s (%s): %u map(s) "
-                        "described\n",
-                g_look_path, file->title, (unsigned)file->map_count);
+                        "described%s\n",
+                g_look_path, file->title, (unsigned)file->map_count, das);
     else
         fprintf(stderr, "[renderer_overhaul] game config %s: %u map(s) "
-                        "described\n",
-                g_look_path, (unsigned)file->map_count);
+                        "described%s\n",
+                g_look_path, (unsigned)file->map_count, das);
 }
 
 /* Nothing is in force, and why. This is not an error in any of its three
@@ -2490,6 +2801,8 @@ static void hwr_look_stand_down(int report)
     const char *token = hwr_look_selected_token();
 
     memset(&g_look, 0, sizeof g_look);
+    memset(g_das_told, 0, sizeof g_das_told);
+    memset(g_das_scope_told, 0, sizeof g_das_scope_told);
     g_look_present = 0;
     g_look_hash = 0;
     g_look_candidate_hash = 0;
@@ -2571,8 +2884,15 @@ static void hwr_look_take_selection(int report, const uint64_t *expect)
     g_look_present = 1;
     g_look_hash = hash;
     g_look_candidate_polls = 0;
+    /* A new file is a new conversation about its DAS sections: what has been
+     * said about one is about the sections that were read, and those have just
+     * been read again. */
+    memset(g_das_told, 0, sizeof g_das_told);
+    memset(g_das_scope_told, 0, sizeof g_das_scope_told);
     if (report)
         hwr_look_say_what_was_read(&g_look);
+    if (report)
+        hwr_look_check_das_names();
     hwr_look_select_map(g_look_map[0] != 0 ? g_look_map : NULL);
     /* THE COMPLETE REAPPLY. A reload is a person asking for what the file
      * says NOW, and half of what it says about a map was worked out against
@@ -2595,7 +2915,6 @@ void hwr_look_load(const char *plugin_dir)
 {
     if (plugin_dir != NULL)
         snprintf(g_look_dir, sizeof g_look_dir, "%s", plugin_dir);
-    hwr_look_note_retired_file();
     g_look_map[0] = 0;
     hwr_look_take_selection(1, NULL);
 }
@@ -2711,7 +3030,11 @@ void hwr_look_drain_request(void)
     hwr_look_take_selection(1, expects ? &expected : NULL);
 }
 
-void hwr_look_select_map(const char *map_name)
+/* What the place in force is worth, worked out again and published. Written
+ * once because TWO things decide it -- which map is being drawn, and which
+ * files that map's pictures are read out of -- and either may be stated
+ * without the other. */
+static void hwr_look_recompose(void)
 {
     struct hwr_look_values next;
     struct hwr_look_lights next_sprites;
@@ -2720,6 +3043,16 @@ void hwr_look_select_map(const char *map_name)
     struct hwr_look_faces next_faces;
     struct hwr_look_placed next_placed;
     struct hwr_look_env next_env;
+
+    hwr_look_compose(&g_look, g_look_map, g_look_das, g_look_shared_das, &next,
+                     &next_sprites, &next_textures, &next_objects, &next_faces,
+                     &next_placed, &next_env);
+    hwr_look_publish(&next, &next_sprites, &next_textures, &next_objects,
+                     &next_faces, &next_placed, &next_env);
+}
+
+void hwr_look_select_map(const char *map_name)
+{
     char reduced[HWR_LOOK_NAME];
 
     /* Reduced into a buffer of its own FIRST: the reload path passes the
@@ -2731,10 +3064,27 @@ void hwr_look_select_map(const char *map_name)
      * had written. That was the wipe. */
     hwr_look_map_name(reduced, HWR_LOOK_NAME, map_name);
     memcpy(g_look_map, reduced, HWR_LOOK_NAME);
-    hwr_look_compose(&g_look, g_look_map, &next, &next_sprites, &next_textures,
-                     &next_objects, &next_faces, &next_placed, &next_env);
-    hwr_look_publish(&next, &next_sprites, &next_textures, &next_objects,
-                     &next_faces, &next_placed, &next_env);
+    hwr_look_recompose();
+}
+
+void hwr_look_select_das(const char *folder, const char *map_das,
+                         const char *shared_das)
+{
+    char reduced_map[HWR_LOOK_NAME];
+    char reduced_shared[HWR_LOOK_NAME];
+
+    /* Both reduced into buffers of their own before either is written, for the
+     * same reason the map's name is: the reducer writes its output's first byte
+     * before it reads its input, and what is handed in here is what is already
+     * held. */
+    hwr_look_map_name(reduced_map, HWR_LOOK_NAME, map_das);
+    hwr_look_map_name(reduced_shared, HWR_LOOK_NAME, shared_das);
+    memcpy(g_look_das, reduced_map, HWR_LOOK_NAME);
+    memcpy(g_look_shared_das, reduced_shared, HWR_LOOK_NAME);
+    if (folder != NULL && folder != g_look_das_dir)
+        snprintf(g_look_das_dir, sizeof g_look_das_dir, "%s", folder);
+    hwr_look_check_das_names();
+    hwr_look_recompose();
 }
 
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,
@@ -3147,11 +3497,16 @@ void hwr_look_clear(void)
     memset(g_object_hidden, 0, sizeof g_object_hidden);
     memset(g_sprite_matched, 0, sizeof g_sprite_matched);
     memset(g_sprite_told, 0, sizeof g_sprite_told);
+    memset(g_das_told, 0, sizeof g_das_told);
+    memset(g_das_scope_told, 0, sizeof g_das_scope_told);
     g_objects_settled = 0;
     g_look_present = 0;
     g_look_path[0] = 0;
     g_look_dir[0] = 0;
     g_look_map[0] = 0;
+    g_look_das[0] = 0;
+    g_look_shared_das[0] = 0;
+    g_look_das_dir[0] = 0;
     g_look_hash = 0;
     g_look_candidate_hash = 0;
     g_look_candidate_polls = 0;

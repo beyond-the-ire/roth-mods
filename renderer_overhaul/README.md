@@ -301,6 +301,16 @@ falls back to the settings alone, and putting the file back puts the selection b
     }
   },
 
+  "das": {
+    "DEMO1": {
+      "notes": "The fifteen water-and-cathedral maps are dealt out of this one.",
+      "lights": {
+        "sprites": { "34/0": { "strength": 1.8, "colour": "#ffb46e" } },
+        "textures": { "2609": { "strength": 1.2, "reach": 640 } }
+      }
+    }
+  },
+
   "maps": {
     "STUDY1": {
       "notes": "Lamplit and enclosed; its own candles carry it.",
@@ -337,8 +347,17 @@ described it.
 
 A map is keyed by the name of its **own file**, without the folder and without the extension —
 `STUDY1`, `CRYPT1` — matched whatever its case and with or without an extension either side, so
-`study1` and `STUDY1.RAW` name one map. Maps that share a texture archive are still different maps
-here.
+`study1` and `STUDY1.RAW` name one map. Maps that share a DAS file are still different maps here.
+
+`das` is the **third scope**, and it sits between the other two: it is keyed by the name of a **DAS
+file** — the file a map's pictures are actually read out of — and what is written under one reaches
+every map that loads it. It has [a section of its own](#one-line-for-a-whole-part-of-the-game-das)
+below. The three compose least specific first, field by field, exactly as the two always have:
+
+> `everywhere` → the shared DAS file → the map's own DAS file → the map
+
+so a map's own line beats what its DAS file says, which beats what every place gets, and `off`
+comes whole from the most specific scope that names a thing.
 
 `settings` holds settings-screen keys, spelled exactly as the settings file spells them and read by
 exactly the same rules, so every bound and every message comes from the settings screen itself and
@@ -429,10 +448,10 @@ the colour its kind already carries:
 `off` follows the same ranking, whole: turning one object off leaves every other object of its kind
 and its group alight, and naming one object out of a kind that is `off` makes that one a light again.
 
-`objects`, `faces` and `placed` are written **under a map** and never under `everywhere` — a number
-in one map's own list, and three numbers inside one building, name nothing anywhere else. `sprites`
-and `textures` may be written in either: a sprite is the same sprite and a texture the same texture
-wherever the game draws it.
+`objects`, `faces` and `placed` are written **under a map** and never under `everywhere` or under a
+DAS file — a number in one map's own list, and three numbers inside one building, name nothing
+anywhere else. `sprites` and `textures` may be written in any of the three: a sprite is the same
+sprite and a texture the same texture wherever the game draws it.
 
 #### Naming things: `sprites` and `objects`
 
@@ -443,9 +462,9 @@ light, and `"93/0"` the empty candelabra that is plainly not a light at all. It 
 object of that kind in the game.
 
 **The same picture has a second number, and both are accepted.** The editor's picture-picking window
-shows one number per picture rather than a pair: that number is the picture's own place in the archive
-it lives in. A map's own archive holds its object pictures from **4096**; the shared archive holds its
-own from **0**. So
+shows one number per picture rather than a pair: that number is the picture's own place in the DAS
+file it lives in. A map's own DAS file holds its object pictures from **4096**; the shared DAS file
+holds its own from **0**. So
 
 | Texture Source | picture number |
 |---|---|
@@ -455,11 +474,17 @@ own from **0**. So
 | 3 | `256 + Texture Index` |
 
 and `"112/0"` and `"4208"` are one key naming one picture. Write whichever number is in front of you.
-A picture number in `4096`–`4607` belongs to **the map's own archive**, so which picture it is depends
-on the map you are looking at — exactly as the pair does, since the pair is read against the same
-archive. Numbers in `0`–`511` are the shared archive's and mean the same picture on every map of the
-game. Anything between the two ranges is a *world texture* rather than an object's picture and is
-refused with a note.
+Anything between the two ranges is a *world texture* rather than an object's picture and is refused
+with a note.
+
+**A key is a slot in a file of pictures, and that is worth knowing before you write one under
+`everywhere`.** Numbers in `0`–`511` — Texture Source 2 and 3 — are the **shared** DAS file's, which
+every map loads, so a game-wide line naming one is exactly what it looks like: that picture,
+everywhere. Numbers in `4096`–`4607` — Sources 0 and 1 — and **every texture number** are slots in
+**the map's own DAS file**, and the maps of this game are dealt out of five different ones, so a
+game-wide line naming one grants *whatever occupies that slot on each map* rather than one picture.
+Where that is not what you meant, [`das`](#one-line-for-a-whole-part-of-the-game-das) is the tool: it
+names the file, so the slot is a picture again.
 
 `objects` names one of them, or a group, the way the editor names it. Two ways, and an entry uses
 exactly one:
@@ -564,13 +589,77 @@ notes go:
 - a `textures` key written **under a map** that no face or flat of that map is painted with;
 - a `textures` key that is really a sprite — a pair, or a picture number — with the table it belongs
   in named;
+- a `das` section naming no DAS file the game holds — *"`M` holds no DAS file of that name"* — said
+  once per reading of the file rather than once per map, because it is true everywhere;
 - and a member of a block **given more than once**, naming it: *"'sprites' is given more than once
   here; only the last one counts, and everything the earlier one said is thrown away"*. JSON keeps the
   last of two members of one name, which is the right answer and a silent one — pasting four blocks
   together and losing two of them looks exactly like a file that was never written.
 
-A `sprites` or `textures` key written in `everywhere` stays quiet on maps that do not use it, because
-a game-wide entry is meant to name nothing on most of a game's maps.
+A `sprites` or `textures` key written in `everywhere` — or under a **DAS file** — stays quiet on maps
+that do not use it, because an entry written once for many maps is meant to name nothing on most of
+them.
+
+### One line for a whole part of the game: `das`
+
+A map's pictures are not its own. Every map reads them out of a **DAS file** it shares with the
+other maps of its part of the game, and this game keeps five of those plus one shared file that
+every map loads. So the torch that hangs in the water halls hangs in fifteen maps, and describing it
+under each of them is fifteen lines that have to be kept in step by hand.
+
+`das` is that one line. It sits beside `everywhere` and `maps`, keyed by the name of a DAS file:
+
+```json
+"das": {
+  "DEMO1": {
+    "notes": "The fifteen water-and-cathedral maps are dealt out of this one.",
+    "lights": {
+      "sprites": { "34/0": { "strength": 1.8, "colour": "#ffb46e" } },
+      "textures": { "2609": { "strength": 1.2, "reach": 640 } }
+    }
+  }
+}
+```
+
+That entry is in force on every map whose pictures come out of `DEMO1.DAS` and on no other map. The
+name is matched exactly as a map's is — **whatever its case, with or without the folder and with or
+without the extension** — so `DEMO1`, `demo1` and `M\DEMO1.DAS` are one file.
+
+**This game's own files**, which is the table to write against:
+
+| DAS file | the maps dealt out of it |
+|---|---|
+| `DEMO` | `CAVERNS`, `OPTEMP1`, `STUDY1`, `STUDY2`, `STUDY3`, `STUDY4`, `TEMPLE1` |
+| `DEMO1` | `AQUA1`, `AQUA2`, `CHURCH1`, `ELOHIM1`, `LRINTH`, `LRINTH1`, `RAQUIA1`–`RAQUIA5`, `SOULST2`, `SOULST3`, `VICAR`, `VICAR1` |
+| `DEMO2` | `ANUBIS`, `GNARL1`, `TGATE1F`–`TGATE1I`, `TOWER1` |
+| `DEMO3` | `ABAGATE2`, `DOMINION`, `DOPPLE`, `SALVAT` |
+| `DEMO4` | `AELF`, `CAVERNS2`, `CAVERNS3`, `GRAVE`, `MAS3`, `MAS4`, `MAS6`, `MAS7`, `MAUSO1EA`, `MAUSO1EB`, `MAZE` |
+| `ADEMO` | **every map**: it is the shared file, and naming it is how to say *everywhere* and mean it |
+
+**Only the two tables keyed by a picture may be written in one:** `sprites` and `textures`. A file of
+pictures is not a place and it is not a map, so `objects`, `faces` and `placed` — numbers in one
+map's own lists — belong under a map, and `settings` and `environment_lighting` — how somewhere is
+lit — belong under `everywhere` or under a map. Each of them written here costs its own key, names
+where it belongs, and leaves the rest of the section standing. `notes` is documentation here as it is
+anywhere else.
+
+**Which pictures a section may speak about is what the scope means.** A section names a file, so its
+keys are that file's own slots:
+
+- Under a **map's own** DAS file, everything is at home: Texture Source 0 and 1 and every texture
+  number are that file's slots, and a **shared** picture (`"68/2"`, or `0`–`511`) is kept too — the
+  shared file is loaded on those maps as well, so such a line is that picture *scoped to the maps
+  this file is dealt to*, which is a useful thing to be able to say.
+- Under the **shared** file — `ADEMO` — only the shared file's own pictures mean anything. A key
+  naming one of the map's own slots (Source 0 or 1, or any texture) names a different picture on
+  every map that loads a different file, so it is left out and the game says so once, naming how
+  many. Write those under the map's own DAS file, under the map, or — if *whatever occupies that
+  slot* really is what you meant — under `everywhere`.
+
+**A section naming no DAS file the game holds says so, once**, rather than sitting there quietly
+doing nothing: the game looks in the folder it keeps them in, and *"`M` holds no DAS file of that
+name"* is what a map name written here by mistake gets. A section naming a real file that this
+particular map does not load stays **silent**, because that is the whole point of the scope.
 
 ### Lights the map never had: `placed`
 
@@ -601,8 +690,8 @@ Each light is placed in whichever of the map's rooms contains the point — the 
 editor asks when you drop an object into a room — and is then held by exactly the containments every
 other light is held by. A light hung outside every room lights nothing and says so.
 
-A `placed` list is written **under a map** and never under `everywhere`: the same three numbers in
-another map are a different corner of a different building. **Light from things the map marks** and
+A `placed` list is written **under a map** and never under `everywhere` or under a DAS file: the same
+three numbers in another map are a different corner of a different building. **Light from things the map marks** and
 **Light from glowing textures** do not reach these — a light you wrote down is not a kind of thing the
 game has, so there is no separate switch for it — but **Light from torches and candles** turns them
 off with everything else.

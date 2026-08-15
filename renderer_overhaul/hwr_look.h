@@ -19,6 +19,7 @@
  *     "for": "Realms of the Haunting",
  *     "notes": "How this game's places are lit.",
  *     "everywhere": { ...one place... },
+ *     "das": { "DEMO1": { ...what its pictures give off... } },
  *     "maps": { "STUDY1": { ...one place... } }
  *   }
  *
@@ -31,8 +32,45 @@
  *
  * A map is matched on the name of the map's own file -- STUDY1, STUDY2 --
  * case-insensitively, with any directory and any extension stripped from both
- * sides. Maps sharing a texture archive are still different maps here, which
- * is what makes a description a map's own.
+ * sides. Maps sharing a DAS file are still different maps here, which is what
+ * makes a description a map's own.
+ *
+ * `das` IS THE THIRD SCOPE, and it is keyed by the name of a DAS FILE rather
+ * than of a map: the file a map's pictures are actually read out of. It is
+ * matched by the same law a map name is -- case-insensitively, with any folder
+ * and any extension stripped from both sides, so DEMO1, demo1 and M\DEMO1.DAS
+ * are one file. A section applies on exactly the maps whose own pictures come
+ * out of the file it names, so a torch described once under DEMO1 is described
+ * for every map that loads DEMO1, and the SHARED file every map loads -- ADEMO
+ * in this game -- is the section that applies everywhere by naming what is
+ * actually true of it.
+ *
+ * ONLY THE TWO BLANKET TABLES may be written in one: `sprites` and `textures`,
+ * which are keyed by a PICTURE and are therefore the only two whose keys mean
+ * anything to a file of pictures. `objects`, `faces` and `placed` are numbers
+ * in one map's own lists and are written under a map; `settings` and
+ * `environment_lighting` describe a PLACE and are written everywhere or under
+ * a map. Each of those in a `das` section costs its own key and says where it
+ * belongs.
+ *
+ * THE THREE SCOPES COMPOSE LEAST SPECIFIC FIRST, field by field, by the one
+ * rule everything here composes by:
+ *
+ *     everywhere  ->  the shared DAS  ->  the map's own DAS  ->  the map
+ *
+ * so a map's own line beats what its DAS file says, which beats what every
+ * place gets, and `off` is taken whole from the most specific scope naming a
+ * thing exactly as it is between the tables of one scope.
+ *
+ * A GRANT UNDER A DAS FILE NAMES A PICTURE IN THAT FILE, and that is what the
+ * scope is for. The shared file's own section can therefore speak only about
+ * the shared file's own pictures: a key naming one of the MAP's own pictures --
+ * a sprite whose source is 0 or 1, or any texture, since a surface is painted
+ * out of the map's own DAS -- names a different picture on every map, so it is
+ * left out of that section and said once. Written under a map's OWN DAS
+ * section, a key naming a SHARED picture is a different thing and is kept: the
+ * shared file is loaded on those maps too, so it is that picture scoped to the
+ * maps that load this DAS.
  *
  * One place says three kinds of thing:
  *
@@ -72,8 +110,23 @@
  *                          the ones HWR_OBJ_DUMP prints.
  *
  *               The last three are written under a map and never under
- *               `everywhere`: a number in one map's own list, and three
- *               numbers inside one building, name nothing anywhere else.
+ *               `everywhere` or under a DAS file: a number in one map's own
+ *               list, and three numbers inside one building, name nothing
+ *               anywhere else.
+ *
+ *               AND WHAT A NUMBER MEANS UNDER `everywhere` IS WORTH SAYING
+ *               PLAINLY, because it is the one thing about the blankets that
+ *               can be believed wrongly. A key is a SLOT in a file of
+ *               pictures. The shared file's slots -- a sprite whose source is
+ *               2 or 3 -- hold the same picture on every map of the game, so a
+ *               game-wide line naming one is exactly what it looks like. The
+ *               MAP's own slots -- sources 0 and 1, and every texture -- hold
+ *               whatever that map's own DAS file put there, which is a
+ *               different picture on maps that load a different file, so a
+ *               game-wide line naming one grants that slot's picture per map
+ *               rather than one picture. Where that is not what was meant, the
+ *               `das` scope is the tool: it names the file, so the slot is a
+ *               picture again.
  *
  *   "environment_lighting"
  *               THE SKY'S OWN LIGHT -- the sun, or the moon -- which is the
@@ -192,6 +245,24 @@ void hwr_look_drain_request(void);
  * the game-wide answer standing. Raises the change bits of every row whose
  * effective value moved, so the next pump applies them. */
 void hwr_look_select_map(const char *map_name);
+/* And which DAS FILES the map being drawn reads its pictures out of: its own,
+ * and the shared one every map loads. Both are matched by the same law a map
+ * name is, so either may be handed in with its folder and its extension on it.
+ * NULL for both is a map whose files are not known, and leaves the `das`
+ * sections out of the answer rather than guessing at one.
+ *
+ * `folder` is where the game keeps those files, which is what lets a section
+ * naming no DAS file the game holds be said once rather than sitting there
+ * quietly doing nothing. NULL keeps whatever folder was last stated, and a
+ * folder nothing can be listed out of says nothing at all -- an accusation is
+ * worth making only where the answer is actually known.
+ *
+ * Stated before the map is chosen, because the engine settles the picture
+ * files before it settles the map -- but this publishes what is in force by
+ * itself, so the two may be stated in either order and neither is a
+ * precondition of the other. */
+void hwr_look_select_das(const char *folder, const char *map_das,
+                         const char *shared_das);
 /* The value a row is worth right now: its override where the current map has
  * one, and the store's own value everywhere else. */
 union hwr_value hwr_look_effective(const struct hwr_setting_desc *desc,

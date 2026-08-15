@@ -52,11 +52,12 @@
 #define VA_G_MAP_DAS_NAME              0x7023cu
 #define VA_G_SHARED_DAS_NAME           0x702dcu
 /* The map's own file name, which is the only thing that says which map is
- * loaded: one texture archive serves as many as twenty-nine maps, so the
- * archive name cannot stand in for it. The engine writes the incoming map's
- * name here before the geometry it names is read, hands this very buffer to the
- * loader as the file to open, and builds the map's own state file from the same
- * string. */
+ * loaded: one DAS file serves as many as fifteen maps, so the DAS name cannot
+ * stand in for it -- what that one says is which part of the game a map
+ * belongs to, which is a question of its own and the one the look file's `das`
+ * sections answer. The engine writes the incoming map's name here before the
+ * geometry it names is read, hands this very buffer to the loader as the file
+ * to open, and builds the map's own state file from the same string. */
 #define VA_G_MAP_RAW_NAME              0x701ecu
 #define VA_G_GDV_PALETTE_MODE          0x91de6u
 #define VA_G_MOUSE_X                   0x707b3u
@@ -487,6 +488,22 @@ static int hwr_find_archive_path(const char *root, const char *name,
                                  char *path, size_t capacity)
 {
     return hwr_find_game_file(root, "M", name, path, capacity);
+}
+
+/* The folder those files live in, named on its own: the look layer asks it
+ * whether a `das` section names a file the game actually holds, and that is a
+ * question about the folder rather than about any one file in it. Answers -1
+ * before the plugin knows where it is standing. */
+static int hwr_das_folder(char *path, size_t capacity)
+{
+    char root[2600];
+
+    if (g_plugin_dir[0] == 0)
+        return -1;
+    snprintf(root, sizeof root, "%s", g_plugin_dir);
+    if (hwr_parent_path(root) != 0 || hwr_parent_path(root) != 0)
+        return -1;
+    return hwr_path_join(path, capacity, root, "M");
 }
 
 static void hwr_gl_settings_apply(uint32_t mask,
@@ -2187,16 +2204,32 @@ static void hwr_reload_map_data(const struct roth_api_v1 *api, uint32_t generati
     if (hwr_read_basename(api, VA_G_MAP_DAS_NAME, map_name) != 0 ||
         hwr_read_basename(api, VA_G_SHARED_DAS_NAME, shared_name) != 0) {
         snprintf(failure, sizeof failure, "DAS name is unavailable");
+        hwr_look_select_das(NULL, NULL, NULL);
         hwr_look_select_map(NULL);
         hwr_settings_apply_pending();
         goto failed;
     }
+    /* WHICH FILES THIS MAP'S PICTURES COME OUT OF, which is what the look
+     * file's `das` sections are scoped by: a torch described once under the
+     * file a part of the game is dealt out of is described for every map that
+     * loads it. The names come from the engine's own two buffers, and the
+     * folder is where the game keeps them -- the one thing that lets a section
+     * naming no such file be said rather than sitting there quietly doing
+     * nothing. */
+    {
+        char das_folder[2600];
+
+        hwr_look_select_das(hwr_das_folder(das_folder, sizeof das_folder) == 0
+                                ? das_folder : NULL,
+                            map_name, shared_name);
+    }
     /* The map-change safe point is where the look file's per-map overrides come
      * into force, so a previous map's overrides can never survive into the next
      * one: the layer is recomposed from scratch for the map being loaded. The
-     * map is named by its own file, never by the archive it shares with as many
-     * as twenty-eight others. Where that name cannot be trusted the global look
-     * stands alone, which is what an unlisted map gets anyway. */
+     * map is named by its own file, never by the DAS file it shares with as
+     * many as fourteen others. Where that name cannot be trusted the game-wide
+     * answer and the DAS files' own stand alone, which is what an unlisted map
+     * gets anyway. */
     if (hwr_read_map_basename(api, look_name) == 0) {
         hwr_look_select_map(look_name);
     } else {
