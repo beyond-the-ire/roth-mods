@@ -15,11 +15,15 @@
  * What this file holds is who casts -- the count in force, each light's own
  * word over it, and the hysteresis that keeps a tile where it is -- the tile
  * ledger (which light owns which atlas tile and what STAMP its contents were
- * rendered at), and the per-light card emitter, which is the sun's own card
- * law aimed at a point: the sizing arithmetic is the billboard emitter's, the
- * geometry is hwr_sunm_card out of the shared header, and the axis is the
+ * rendered at), and the per-light moving emitter, which is the sun's own law
+ * aimed at a point: the card sizing arithmetic is the billboard emitter's, the
+ * card geometry is hwr_sunm_card out of the shared header, and the axis is the
  * horizontal perpendicular of the line from THIS light to the object
- * (hwr_psm_card_axis) rather than one direction for the whole sky. */
+ * (hwr_psm_card_axis) rather than one direction for the whole sky. A decoded
+ * 3D prop is aimed at nothing -- it is real geometry, and the same triangles
+ * serve every light that sees them -- so it goes through the shared prop
+ * emitter unchanged; what is decided here about a prop is only whether it is
+ * near enough to this light to matter. */
 
 _Static_assert((unsigned)HWR_PSM_MAX_LIGHTS == (unsigned)HWR_GL_PSHADOW_MAX,
                "the policy and execution tile ceilings must agree");
@@ -109,9 +113,14 @@ static void hwr_ps_forget_tiles(void)
     g_budget = 0;
 }
 
+/* The frame's prop arena, released with the ledger: its storage outlives a
+ * frame but its contents never do, and a torn-down renderer keeps neither. */
+static void hwr_ps_forget_props(void);
+
 void hwr_pshadow_reset(void)
 {
     hwr_ps_forget_tiles();
+    hwr_ps_forget_props();
     hwr_gl_pshadow_set(NULL);
 }
 
@@ -189,6 +198,11 @@ static int32_t hwr_ps_sincos(const struct roth_api_v1 *api, uint32_t angle)
                                        (angle & 0x1ffu) * 2u);
 }
 
+/* THE CARD-WIDTH MARGIN of the reach cull: a thing whose ANCHOR stands just
+ * outside the pool can still put its picture inside it, so the cull is given
+ * the width of the widest card the emitter below builds. */
+#define HWR_PS_CARD_MARGIN 512.0f
+
 static struct hwr_gl_sun_vertex *hwr_ps_grow(struct hwr_ps_tile *tile,
                                              size_t extra)
 {
@@ -213,9 +227,255 @@ static struct hwr_gl_sun_vertex *hwr_ps_grow(struct hwr_ps_tile *tile,
     return slot;
 }
 
-/* The card slice of one shadowed light: every object within its reach, one
- * upright quad each, faced to THIS light -- EXCEPT the one thing this light is
- * the light OF, which never stands in its own map (see the header).
+/* ======================= THE FRAME'S 3D PROPS ============================
+ *
+ * ONE PROP IS ONE PIECE OF GEOMETRY, whichever light is looking at it: unlike
+ * a card, which is an upright quad turned to face the light it casts for,
+ * a tree is a tree from every side. So the frame's props are emitted ONCE --
+ * here, before any tile is filled -- and every tile within reach of one takes
+ * a COPY of the bytes it already has. What that saves is not the copy: it is
+ * the emission (four tiles turning the same trunk by the same facing and
+ * working out the same face planes four times) and the HASH (the stamp folding
+ * the same hundred kilobytes four times). On the game's own thickest outdoor
+ * map at the shipping shadow count, that is most of what props cost.
+ *
+ * The currency story is unchanged in substance: what a tile's stamp folds for
+ * a prop is a hash OF THE PROP'S OWN BYTES, taken once here rather than four
+ * times there -- so a prop that moves, turns, or steps a texture frame still
+ * moves the stamp of exactly the tiles that can see it.
+ *
+ * The arena lives across frames so its storage is taken once; what it holds is
+ * this frame's, and nothing reads it after the frame that filled it. */
+struct hwr_ps_prop {
+    /* Which thing this is, by the map's own number: the identity refusal is
+     * spent per tile, because a prop is left out of ITS OWN light's map and
+     * stands in every other. */
+    uint32_t map_index;
+    /* Where it stands, and how far its own placed geometry carries from
+     * there: a broad tree just outside a pool still hangs branches into it,
+     * so the cull is given each prop's own reach rather than one number for
+     * every prop of the map. */
+    float x;
+    float y;
+    float reach;
+    size_t first;
+    size_t count;
+    uint32_t digest;
+};
+
+static struct hwr_gl_sun_vertex *g_prop_vertices;
+static size_t g_prop_vertex_count;
+static size_t g_prop_vertex_capacity;
+static struct hwr_ps_prop *g_props;
+static size_t g_prop_count;
+static size_t g_prop_capacity;
+
+static struct hwr_gl_sun_vertex *hwr_ps_prop_reserve(void *context,
+                                                     size_t count)
+{
+    struct hwr_gl_sun_vertex *slot;
+
+    (void)context;
+    if (g_prop_vertex_count + count > g_prop_vertex_capacity) {
+        size_t next = g_prop_vertex_capacity != 0 ? g_prop_vertex_capacity * 2u
+                                                  : 1024u;
+        struct hwr_gl_sun_vertex *grown;
+
+        while (next < g_prop_vertex_count + count)
+            next *= 2u;
+        grown = (struct hwr_gl_sun_vertex *)realloc(g_prop_vertices,
+                                                    next * sizeof *grown);
+        if (grown == NULL)
+            return NULL;
+        g_prop_vertices = grown;
+        g_prop_vertex_capacity = next;
+    }
+    slot = g_prop_vertices + g_prop_vertex_count;
+    g_prop_vertex_count += count;
+    return slot;
+}
+
+static void hwr_ps_forget_props(void)
+{
+    free(g_prop_vertices);
+    free(g_props);
+    g_prop_vertices = NULL;
+    g_props = NULL;
+    g_prop_vertex_count = 0;
+    g_prop_vertex_capacity = 0;
+    g_prop_count = 0;
+    g_prop_capacity = 0;
+}
+
+/* HOW FAR PAST ITS OWN ANCHOR THE WIDEST PROP OF THIS MAP REACHES, which is
+ * what the build's own cull must allow a prop before it may refuse one: how
+ * far a prop carries is not known until it has been placed, so the coarse
+ * test that decides whether to place it at all is given the widest prop the
+ * pack holds. Read off the pack's own local vertices -- every prop's geometry
+ * is in that one array -- as a radius, which the facing rotation cannot
+ * change, and held until the pack is rebuilt (a map change, a DAS change).
+ * Zero where the map has no props at all, which is most maps. */
+static float hwr_ps_pack_reach(const struct hwr_meshes *meshes)
+{
+    static const struct hwr_mesh_local_vertex *seen;
+    static size_t seen_count;
+    static float reach;
+    double furthest = 0.0;
+    size_t i;
+
+    if (meshes == NULL || meshes->vertices == NULL ||
+        meshes->vertex_count == 0)
+        return 0.0f;
+    if (meshes->vertices == seen && meshes->vertex_count == seen_count)
+        return reach;
+    for (i = 0; i < meshes->vertex_count; i++) {
+        double x = (double)meshes->vertices[i].x;
+        double y = (double)meshes->vertices[i].y;
+        double square = x * x + y * y;
+
+        if (square > furthest)
+            furthest = square;
+    }
+    seen = meshes->vertices;
+    seen_count = meshes->vertex_count;
+    reach = (float)sqrt(furthest);
+    return reach;
+}
+
+/* This frame's props: every thing NO SHADOWED LIGHT COULD SEE left where it
+ * stands, and every other emitted through the shared law with its own bytes
+ * hashed and its own reach measured. Nothing here is aimed at any light --
+ * which is the point -- but a map's far corners are still not walked for
+ * lamps that cannot reach them. */
+static void hwr_ps_build_props(const struct hwr_scene *scene,
+                               const struct hwr_objects *objects,
+                               const struct roth_api_v1 *api,
+                               const struct hwr_gl_camera *camera,
+                               const struct hwr_gl_point_light *lights,
+                               const size_t *wanted, size_t wanted_count)
+{
+    float bound;
+    size_t i;
+
+    g_prop_vertex_count = 0;
+    g_prop_count = 0;
+    /* A map whose pack holds no prop geometry at all -- which is most maps --
+     * is not walked: there is nothing here for the walk to find. */
+    if (objects == NULL || !objects->valid || api == NULL ||
+        api->game_ram == NULL || !scene->object_meshes.built ||
+        scene->object_meshes.vertex_count == 0)
+        return;
+    bound = hwr_ps_pack_reach(&scene->object_meshes);
+    for (i = 0; i < objects->count; i++) {
+        const struct hwr_object *object = &objects->items[i];
+        struct hwr_sprite_lookup lookup;
+        struct hwr_ps_prop *prop;
+        size_t first = g_prop_vertex_count;
+        double furthest = 0.0;
+        uint32_t digest;
+        int wanted_by = 0;
+        size_t v;
+
+        if (object->sector_index == (uint16_t)HWR_OBJECT_NO_SECTOR)
+            continue;
+        if ((object->flags & HWR_OBJECT_FLAG_REFLECTION_ONLY) != 0)
+            continue;
+        for (v = 0; v < wanted_count && !wanted_by; v++) {
+            const struct hwr_gl_point_light *light = &lights[wanted[v]];
+            float dx = (float)object->world_x - light->world_x;
+            float dy = (float)object->world_y - light->world_y;
+
+            wanted_by = sqrtf(dx * dx + dy * dy) <= light->range + bound;
+        }
+        if (!wanted_by)
+            continue;
+        if (hwr_sprites_resolve(api, scene->map_archive,
+                                scene->shared_archive, object->graphic_id,
+                                object->facing, camera->yaw, 0,
+                                object->backref, &lookup) != 0)
+            continue;
+        if (lookup.archive == NULL ||
+            lookup.entry_id >= lookup.archive->entry_count)
+            continue;
+        if (hwr_sun_emit_mesh_caster(scene, object, lookup.archive,
+                                     lookup.entry_id, api,
+                                     hwr_ps_prop_reserve, NULL) <= 0 ||
+            g_prop_vertex_count == first)
+            continue;
+        if (g_prop_count + 1u > g_prop_capacity) {
+            size_t next = g_prop_capacity != 0 ? g_prop_capacity * 2u : 32u;
+            struct hwr_ps_prop *grown = (struct hwr_ps_prop *)realloc(
+                g_props, next * sizeof *grown);
+
+            if (grown == NULL) {
+                g_prop_vertex_count = first;
+                return;
+            }
+            g_props = grown;
+            g_prop_capacity = next;
+        }
+        /* Its own reach, off the bytes just written: the furthest its placed
+         * geometry stands from the thing's own anchor. */
+        for (v = first; v < g_prop_vertex_count; v++) {
+            double dx = (double)g_prop_vertices[v].x - (double)object->world_x;
+            double dy = (double)g_prop_vertices[v].y - (double)object->world_y;
+            double square = dx * dx + dy * dy;
+
+            if (square > furthest)
+                furthest = square;
+        }
+        digest = hwr_ps_mix(2166136261u, g_prop_vertices + first,
+                            (g_prop_vertex_count - first) *
+                                sizeof *g_prop_vertices);
+        prop = &g_props[g_prop_count++];
+        prop->map_index = object->map_index;
+        prop->x = (float)object->world_x;
+        prop->y = (float)object->world_y;
+        prop->reach = (float)sqrt(furthest);
+        prop->first = first;
+        prop->count = g_prop_vertex_count - first;
+        prop->digest = digest;
+    }
+}
+
+/* The props of one tile: every one of the frame's within this light's reach,
+ * copied in beside its cards -- EXCEPT the one thing this light is the light
+ * OF, by the same identity rule its card is refused under. Answers the hash
+ * of what was taken, which is what the tile's stamp folds for them. */
+static uint32_t hwr_ps_take_props(struct hwr_ps_tile *tile,
+                                  uint32_t source_object)
+{
+    uint32_t taken = 2166136261u;
+    size_t i;
+
+    for (i = 0; i < g_prop_count; i++) {
+        const struct hwr_ps_prop *prop = &g_props[i];
+        float dx = prop->x - tile->x;
+        float dy = prop->y - tile->y;
+        struct hwr_gl_sun_vertex *out;
+
+        if (source_object != (uint32_t)HWR_OBJECT_NO_INDEX &&
+            prop->map_index == source_object)
+            continue;
+        if (sqrtf(dx * dx + dy * dy) > tile->range + prop->reach)
+            continue;
+        out = hwr_ps_grow(tile, prop->count);
+        if (out == NULL)
+            break;
+        memcpy(out, g_prop_vertices + prop->first,
+               prop->count * sizeof *out);
+        taken = hwr_ps_mix(taken, &prop->digest, sizeof prop->digest);
+    }
+    return taken;
+}
+
+/* The moving slice of one shadowed light: every object within its reach --
+ * an ordinary thing as one upright quad faced to THIS light, a decoded 3D prop
+ * as its own geometry through the shared emitter -- EXCEPT the one thing this
+ * light is the light OF, which never stands in its own map (see the header).
+ * The identity refusal is spent before the class is even asked, so it holds
+ * for a prop exactly as it holds for a card: a lit statue does not shadow
+ * itself out of its own pool.
  *
  * The sizing arithmetic below is the billboard emitter's own law, the same
  * lines the sun's card emitter carries (hwr_sun.c documents each term); what
@@ -239,7 +499,7 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
 
     tile->card_count = 0;
     if (objects == NULL || !objects->valid || api == NULL ||
-        api->game_ram == NULL || !bb->built)
+        api->game_ram == NULL)
         return;
     xscale = (double)(int32_t)api->game_ram->u32(VA_G_VIEW_PARAMS_XSCALE);
     pscale = (double)(int32_t)api->game_ram->u32(VA_G_PERSPECTIVE_SCALE);
@@ -291,12 +551,14 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
         if (source_object != (uint32_t)HWR_OBJECT_NO_INDEX &&
             object->map_index == source_object)
             continue;
-        /* Reach cull, with a margin for the card's own width: a caster
-         * wholly outside the light's pool shadows nothing the pool lights. */
+        /* Reach cull, with a margin for the card's own width: a caster wholly
+         * outside the light's pool shadows nothing the pool lights. (A prop
+         * is culled by its OWN reach where the props are taken, since a card's
+         * width says nothing about a tree's.) */
         dx = (float)object->world_x - tile->x;
         dy = (float)object->world_y - tile->y;
         flat = sqrtf(dx * dx + dy * dy);
-        if (flat > tile->range + 512.0f)
+        if (flat > tile->range + HWR_PS_CARD_MARGIN)
             continue;
         if (hwr_sprites_resolve(api, scene->map_archive,
                                 scene->shared_archive, object->graphic_id,
@@ -312,8 +574,10 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
             if (live >= 0)
                 lookup.frame_index = (uint16_t)live;
         }
-        /* Decoded 3D props are the stated open edge here: their emitter is
-         * the sun's and has not been aimed at a point yet. */
+        /* A DECODED 3D PROP IS NOT A CARD and is not built here: it casts its
+         * own geometry, the same for every light, and the frame emitted it
+         * once before any tile was filled. This tile takes its copy after the
+         * cards are done. */
         if ((lookup.archive->entries[lookup.entry_id].payload_flags &
              0xff00u) == HWR_PS_MESH_FLAG)
             continue;
@@ -322,6 +586,12 @@ static void hwr_ps_build_cards(struct hwr_ps_tile *tile,
         if ((frame.flags & (uint16_t)HWR_PS_MESH_FLAG) != 0)
             continue;
         if ((frame.flags & (uint16_t)HWR_PS_DRAW_NOTHING_FLAG) != 0)
+            continue;
+        /* From here the thing is a sprite and its card is cut from the atlas,
+         * so a frame with no atlas packed has no cards -- exactly where the
+         * sun's own walk asks the same question, and after the props, which
+         * are cut from nothing. */
+        if (!bb->built)
             continue;
         if (lookup.archive == bb->map_archive &&
             lookup.entry_id < bb->map_dir_count)
@@ -552,6 +822,11 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
         hwr_gl_pshadow_set(NULL);
         return;
     }
+    /* THE FRAME'S PROPS, once, before any tile is filled: they are the same
+     * geometry for every light, so what differs per tile is only which of them
+     * are near enough (and the one a light is the light of). */
+    hwr_ps_build_props(scene, objects, api, camera, lights, wanted,
+                       wanted_count);
     /* The tile ledger: a light that stood last frame keeps its tile (its
      * contents are the whole cache), a tile whose light is gone is free, a
      * new light takes a free one and starts from nothing. */
@@ -568,6 +843,8 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
         struct hwr_gl_point_light *light = &lights[wanted[k]];
         struct hwr_ps_tile *tile = NULL;
         uint32_t stamp;
+        uint32_t props;
+        size_t cards;
         int rebuild;
 
         for (i = 0; i < budget; i++) {
@@ -613,14 +890,20 @@ void hwr_pshadow_frame(struct hwr_scene *scene, const struct hwr_world *world,
          * exactly this tile, and a still room hashes to what it was. */
         hwr_ps_build_cards(tile, scene, objects, api, camera,
                            light->source_object);
+        cards = tile->card_count;
+        /* Then this light's share of the frame's props, appended: their bytes
+         * go to the execution layer with the cards, and what the stamp folds
+         * for them is the hash of the hashes taken when they were emitted. */
+        props = hwr_ps_take_props(tile, light->source_object);
         stamp = static_stamp;
         stamp = hwr_ps_mix(stamp, &tile->x, sizeof tile->x);
         stamp = hwr_ps_mix(stamp, &tile->y, sizeof tile->y);
         stamp = hwr_ps_mix(stamp, &tile->z, sizeof tile->z);
         stamp = hwr_ps_mix(stamp, &tile->range, sizeof tile->range);
-        if (tile->card_count != 0)
+        if (cards != 0)
             stamp = hwr_ps_mix(stamp, tile->cards,
-                               tile->card_count * sizeof tile->cards[0]);
+                               cards * sizeof tile->cards[0]);
+        stamp = hwr_ps_mix(stamp, &props, sizeof props);
         if (stamp == 0u)
             stamp = 1u;
         /* Stale by stamp, never rendered, or the measurement switch: the

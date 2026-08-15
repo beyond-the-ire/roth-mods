@@ -426,8 +426,9 @@ Each entry says what the thing gives off, and each field stands on its own:
   which is how a creator says *this* lamp is the one that matters in this room. It is not free, it
   spends one of the count's own places. `false` refuses this light a shadow whatever the count says,
   and refuses one a broader entry pinned. What a shadowed light is blocked by: the walls, floors,
-  doors and things standing in its reach, with texture cut-outs honoured. Decoded 3D props do not
-  yet block these lights, and glass dims none of them — a pane blocks only at its opaque paint.
+  doors and things standing in its reach, 3D objects included — a tree throws its leaves' own ragged
+  shadow from a lamp exactly as it does from the moon — with texture cut-outs honoured. Glass dims
+  none of them: a pane blocks only at its opaque paint.
   Setting the count to nought turns every shadow off, pinned lights included.
 - **`lit`** — whether the **thing itself is drawn lit**, the way the map's own lights are. Say
   nothing and it is: that is what a grant has always done, and what stops a torch reading as a dark

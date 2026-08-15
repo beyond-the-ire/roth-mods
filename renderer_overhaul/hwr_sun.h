@@ -67,4 +67,33 @@ int hwr_sun_acquire_static(const struct hwr_scene *scene,
                            const struct hwr_gl_sun_vertex **out,
                            size_t *count, uint32_t *stamp);
 
+/* Where one prop's caster triangles are to be written: hands back room for
+ * `count` vertices, or NULL where there is none. The two callers differ in
+ * nothing else -- the sun grows its single dynamic slice, a point light grows
+ * the tile it is filling -- which is why the geometry itself is written once. */
+typedef struct hwr_gl_sun_vertex *(*hwr_sun_caster_reserve)(void *context,
+                                                            size_t count);
+
+/* ONE DECODED 3D PROP AS CASTER GEOMETRY, for anything that shadows: the same
+ * class law for every light, because a tree blocks a lamp exactly as it blocks
+ * the moon. Takes a thing and the DAS block its graphic RESOLVED to; answers
+ * whether that block is a 3D prop at all, and where it is, writes its faces
+ * through `reserve`.
+ *
+ * The class law, stated once and compiled by both callers: a face carrying the
+ * DAS transparency flag casts its texture, whose index-0 texels are holes in
+ * the shadow exactly as a sprite card's are (a tree's leaves); a face without
+ * it casts solid (a trunk); a textured face the eye never draws casts nothing;
+ * pins are camera-facing decorations and cast nothing.
+ *
+ * Returns 1 where the thing IS a 3D prop -- emitted, or the pack holding no
+ * geometry for it, and either way the caller's card path must not also draw it
+ * -- 0 where it is an ordinary sprite the caller should card, and -1 where the
+ * reserve refused. */
+int hwr_sun_emit_mesh_caster(const struct hwr_scene *scene,
+                             const struct hwr_object *object,
+                             struct hwr_das_archive *archive, size_t entry_id,
+                             const struct roth_api_v1 *api,
+                             hwr_sun_caster_reserve reserve, void *context);
+
 #endif

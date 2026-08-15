@@ -684,18 +684,31 @@ static uint16_t hwr_sun_light_yaw(const struct hwr_gl_camera *camera)
     return (uint16_t)(((long)lround((double)camera->yaw + delta)) & 0x1ff);
 }
 
-/* One decoded 3D prop into the dynamic slice, as its real geometry: the mesh
- * emitter's own placement law (facing rotation in the engine's table, the
- * modular position add), and the eye emitter's own texel law -- a masked
- * face (the DAS transparency flag) carries its texture into the caster
- * program, where its index-0 texels are holes in the shadow exactly as the
- * sprite cards' are; a face without it casts solid, which is a trunk's
- * honest shadow. Faces the eye never draws (the visibility flag clear) cast
- * nothing; pins are camera-facing decorations and are skipped. */
+/* ONE DECODED 3D PROP AS CASTER GEOMETRY -- the law, in the one place both
+ * lights compile it.
+ *
+ * Its real geometry rather than a card: the mesh emitter's own placement law
+ * (facing rotation in the engine's table, the modular position add), and the
+ * eye emitter's own texel law -- a masked face (the DAS transparency flag)
+ * carries its texture into the caster program, where its index-0 texels are
+ * holes in the shadow exactly as the sprite cards' are; a face without it
+ * casts solid, which is a trunk's honest shadow. Faces the eye never draws
+ * (the visibility flag clear) cast nothing; pins are camera-facing
+ * decorations and are skipped.
+ *
+ * A tree is the same tree whichever light looks at it, so the vertices this
+ * writes are the same for the sun's one slice and for every point light's
+ * tile: what differs is WHERE they are written, which is the caller's
+ * `reserve`, and WHICH props are worth writing at all, which is the caller's
+ * own reach. The exported entry below is this function plus the directory
+ * walk that finds a resolved thing's resource.
+ *
+ * Returns 0, or -1 where the reserve refused. */
 static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
                              const struct hwr_object *object,
                              const struct hwr_mesh_resource *resource,
-                             const struct roth_api_v1 *api)
+                             const struct roth_api_v1 *api,
+                             hwr_sun_caster_reserve reserve, void *context)
 {
     const struct hwr_meshes *meshes = &scene->object_meshes;
     int32_t facing_sin = hwr_sun_sincos(api, 2u * object->facing);
@@ -761,8 +774,7 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
                                            (uint16_t)local->vertical);
         }
         triangles = corner_count - 2u;
-        out = hwr_sun_grow(&g_dynamic, &g_dynamic_count, &g_dynamic_capacity,
-                           triangles * 3u);
+        out = reserve(context, triangles * 3u);
         if (out == NULL)
             return -1;
         {
@@ -817,6 +829,54 @@ static int hwr_sun_emit_mesh(const struct hwr_scene *scene,
         }
     }
     return 0;
+}
+
+/* THE RESOLVED THING'S OWN 3D PROP, if it is one: the class test on the
+ * resolved DAS block and the directory walk that finds its geometry, then the
+ * faces. Written once here because the point-light tiles cast the same props
+ * the sun does -- a tree blocks a lamp exactly as it blocks the moon -- and a
+ * second copy of the class law is a second law.
+ *
+ * Returns 1 where the thing IS a 3D prop (emitted, or nothing to emit because
+ * the pack holds no geometry for it -- either way the caller's card path must
+ * not also draw it), 0 where it is an ordinary sprite, and -1 where the
+ * reserve refused. */
+int hwr_sun_emit_mesh_caster(const struct hwr_scene *scene,
+                             const struct hwr_object *object,
+                             struct hwr_das_archive *archive, size_t entry_id,
+                             const struct roth_api_v1 *api,
+                             hwr_sun_caster_reserve reserve, void *context)
+{
+    const struct hwr_meshes *meshes;
+    const struct hwr_mesh_resource *resource = NULL;
+
+    if (scene == NULL || object == NULL || api == NULL || reserve == NULL ||
+        archive == NULL || entry_id >= archive->entry_count)
+        return 0;
+    if ((archive->entries[entry_id].payload_flags & 0xff00u) !=
+        HWR_SUN_MESH_FLAG)
+        return 0;
+    meshes = &scene->object_meshes;
+    if (archive == meshes->map_archive && entry_id < meshes->map_dir_count &&
+        meshes->map_dir[entry_id].present)
+        resource = &meshes->map_dir[entry_id];
+    else if (archive == meshes->shared_archive &&
+             entry_id < meshes->shared_dir_count &&
+             meshes->shared_dir[entry_id].present)
+        resource = &meshes->shared_dir[entry_id];
+    if (resource == NULL)
+        return 1;
+    return hwr_sun_emit_mesh(scene, object, resource, api, reserve,
+                             context) != 0 ? -1 : 1;
+}
+
+/* The sun's own sink: the one dynamic slice, grown. */
+static struct hwr_gl_sun_vertex *hwr_sun_dynamic_reserve(void *context,
+                                                         size_t count)
+{
+    (void)context;
+    return hwr_sun_grow(&g_dynamic, &g_dynamic_count, &g_dynamic_capacity,
+                        count);
 }
 
 /* The object cards: the full object table -- a tree behind the player still
@@ -900,23 +960,15 @@ static void hwr_sun_build_dynamic(const struct hwr_scene *scene,
             if (live >= 0)
                 lookup.frame_index = (uint16_t)live;
         }
-        if ((lookup.archive->entries[lookup.entry_id].payload_flags &
-             0xff00u) == HWR_SUN_MESH_FLAG) {
-            const struct hwr_mesh_resource *resource = NULL;
+        {
+            int mesh = hwr_sun_emit_mesh_caster(scene, object, lookup.archive,
+                                                lookup.entry_id, api,
+                                                hwr_sun_dynamic_reserve, NULL);
 
-            if (lookup.archive == scene->object_meshes.map_archive &&
-                lookup.entry_id < scene->object_meshes.map_dir_count &&
-                scene->object_meshes.map_dir[lookup.entry_id].present)
-                resource = &scene->object_meshes.map_dir[lookup.entry_id];
-            else if (lookup.archive == scene->object_meshes.shared_archive &&
-                     lookup.entry_id < scene->object_meshes.shared_dir_count &&
-                     scene->object_meshes.shared_dir[lookup.entry_id].present)
-                resource =
-                    &scene->object_meshes.shared_dir[lookup.entry_id];
-            if (resource != NULL &&
-                hwr_sun_emit_mesh(scene, object, resource, api) != 0)
+            if (mesh < 0)
                 return;
-            continue;
+            if (mesh != 0)
+                continue;
         }
         if (hwr_sprites_frame(&lookup, &frame) != 0)
             continue;

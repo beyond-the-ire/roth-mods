@@ -56,18 +56,34 @@
  *
  * The caching story, which is most of the point: a tile is rendered when its
  * STAMP moves -- the static slice's own content stamp, folded with the
- * light's position and reach and with the bytes of its card slice -- and at
- * no other time. A static scene therefore renders its maps once per map (or
- * per door/lift change, which moves the slice stamp exactly as the sun's
- * rebuild does) and pays per frame for the lookups alone; an animated torch
- * near a shadowed light moves the card bytes and refreshes just that tile.
+ * light's position and reach, with the bytes of its card slice, and with the
+ * hash of each 3D prop it took a copy of -- and at no other time. A static
+ * scene therefore renders its maps once per map (or per door/lift change,
+ * which moves the slice stamp exactly as the sun's rebuild does) and pays per
+ * frame for the lookups alone; an animated torch near a shadowed light moves
+ * the card bytes and refreshes just that tile, and a tree that sways, turns or
+ * steps a texture frame moves its own hash and refreshes exactly the tiles
+ * that can see it.
  *
  * What casts here: the sun's own static slice, whole -- every wall, flat,
  * slab and door, the masked cut-out and translucent-paint laws included --
- * plus the light's neighbourhood of object CARDS, each faced to this light.
- * What does not, stated rather than omitted: decoded 3D mesh props (the open
- * edge here; their emitter is the sun's and has not been aimed at a point
- * yet), and A LIGHT'S OWN SOURCE CARD, never, in this light's own tile.
+ * plus the light's neighbourhood of things: an ordinary one as a CARD faced to
+ * this light, a decoded 3D PROP as its own geometry, by the sun's own class
+ * law out of the one shared emitter (a tree's leaves cut the same holes in a
+ * lamp's shadow that they cut in the moon's, and its trunk blocks whole).
+ *
+ * A card is BUILT for its light and a prop is not -- a tree is a tree from
+ * every side -- so the frame's props are emitted ONCE, before any tile is
+ * filled, and each tile takes a copy of the ones within its reach. That is
+ * worth having rather than tidy: four tiles turning the same trunk and hashing
+ * the same hundred kilobytes four times is most of what props cost on a
+ * thickly-planted map. Each prop's reach is its OWN, measured off the geometry
+ * as placed, so a broad tree just outside a pool still hangs its branches into
+ * it while a candlestick is refused at the pool's edge.
+ *
+ * What does not cast, stated rather than omitted: A LIGHT'S OWN SOURCE, never,
+ * in this light's own tile -- whichever class the thing is, since the refusal
+ * is spent by object number before the class is asked.
  *
  * NOTHING SHADOWS ITSELF. A thing that gives light is drawn a unit or two off
  * whatever it is mounted on, and its light is pushed clear of that same
@@ -88,7 +104,12 @@
  * one of them has a self at all:
  *
  *   an OBJECT's light   it IS a thing the map numbers, so it names that
- *                       number and its card is the one left out.
+ *                       number and what that thing draws -- its card, or its
+ *                       geometry where the thing is a 3D prop -- is what is
+ *                       left out. Nothing about the seeding asks what class a
+ *                       thing's picture is, so a lit statue is as much a
+ *                       light's source as a lit sigil, and the refusal covers
+ *                       it without knowing which it was.
  *   a PLACED light      three numbers in a game config, drawn by nothing:
  *                       no source, and so nothing to leave out.
  *   a GLOW FACE's light a painted surface rather than a thing. It has no
