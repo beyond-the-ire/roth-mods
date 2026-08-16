@@ -60,6 +60,16 @@ struct debug_state_view {
     uint16_t cursor_face_texture_bottom;
     uint16_t cursor_face_texture_middle;
     uint16_t cursor_face_texture_top;
+    /* The placed object under the cursor, when the engine's own result is an
+     * object surface and the record it points at validates against the loaded
+     * map's own object lists. `cursor_object_index` is the number the community
+     * map editor shows as "Object: N"; `cursor_object_graphic` is that record's
+     * texture index / texture source word, which is the object's OWN picture and
+     * is a different number from the DAS entry the cursor sampled. */
+    int cursor_object_valid;
+    uint32_t cursor_object_index;
+    uint16_t cursor_object_graphic;
+    uint16_t cursor_object_id;
 };
 
 void debug_state_reset(void);

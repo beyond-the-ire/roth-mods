@@ -42,6 +42,18 @@ current material. `TEXEL U/V` are texture-local coordinates at the cursor's
 selected point. A face index is reported only when the cursor result is a wall
 surface and its record offset validates against the loaded map's face array.
 
+`CURSOR OBJECT` is the placed object under the cursor: its 0-based map number,
+its own picture, and the ID tag on its record. It is reported only when the
+cursor result is an object surface and the record the engine was drawing from
+validates against the loaded map's own object lists; otherwise it reads `N/A`.
+
+The picture is printed in both numbers a map editor shows for one -- the single
+picking-window number and the texture index / texture source pair, as
+`4115 (19/0)`. **It is a different number from `DAS FAT INDEX` on the line
+below it.** For a 3D object the DAS entry is the material of the mesh face under
+the cursor; the object's own picture is on the `CURSOR OBJECT` line. The two
+agree only for an object drawn as a plain sprite.
+
 ## Controls
 
 - **F11** cycles `PERFORMANCE` → `INSPECTOR` → `DETAILED` → `ALL` → `OFF`.

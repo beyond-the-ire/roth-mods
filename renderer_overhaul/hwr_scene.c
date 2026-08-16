@@ -6259,6 +6259,10 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         if (hwr_sprite_scales(api, (double)camera.source_focal_x,
                               (double)camera.source_focal_y, &hscale, &vscale))
             frame.sprite_vscale = (float)vscale;
+        /* And the pack the 3D props are drawn from, for the same reason: a
+         * prop has no sprite to be sized against, and its own vertical extent
+         * is where its light comes from. */
+        frame.meshes = &scene->object_meshes;
         /* The primary view's own visibility, which is the frame's: one light
          * set serves every view, so what a mirror shows is lit by the lights of
          * the rooms the player can see rather than by a second walk of its own.

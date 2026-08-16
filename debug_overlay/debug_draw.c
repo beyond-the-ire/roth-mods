@@ -164,6 +164,34 @@ static void debug_format_fat_index(char *output, size_t size, uint16_t index)
         snprintf(output, size, "%u(0x%04X)", index, index);
 }
 
+/* THE PICTURE ONE PLACED OBJECT IS DRAWN WITH, in both the numbers the
+ * community map editor prints for it.
+ *
+ * Its object panel shows a PAIR -- texture index and texture source -- which is
+ * the record's own word read straight across. Its picking window shows ONE
+ * number for the same picture, which is that picture's place in the file it
+ * lives in: a map's own file holds its object pictures from 4096 (source 0) and
+ * from 4352 (source 1), and the shared file holds its own from 0 (source 2) and
+ * from 256 (source 3). A source outside those four names no single number, and
+ * then only the pair is printed rather than a number that would be wrong. */
+static void debug_format_picture(char *output, size_t size, uint16_t graphic)
+{
+    unsigned index = (unsigned)(graphic & 0xffu);
+    unsigned source = (unsigned)(graphic >> 8);
+    unsigned single;
+
+    switch (source) {
+    case 0: single = 4096u + index; break;
+    case 1: single = 4352u + index; break;
+    case 2: single = index; break;
+    case 3: single = 256u + index; break;
+    default:
+        snprintf(output, size, "%u/%u", index, source);
+        return;
+    }
+    snprintf(output, size, "%u (%u/%u)", single, index, source);
+}
+
 static const char *debug_window_mode(uint32_t mode)
 {
     switch (mode) {
@@ -367,9 +395,25 @@ static void debug_build_inspector_lines(
             debug_add_line(lines, count, "");
     }
     if (config->show_cursor) {
+        char picture[32];
+
         debug_add_line(lines, count, "CURSOR CLASS RAW %u", state->cursor_type);
         debug_add_line(lines, count, "CURSOR SURFACE KIND RAW %u",
                        state->cursor_surface_kind);
+        /* The object's OWN picture, and the entry the cursor sampled, on two
+         * lines next to each other: for a 3D object those are different
+         * numbers -- the entry below is the material of the mesh face under
+         * the cursor, and the picture here is the object itself. */
+        if (state->cursor_object_valid) {
+            debug_format_picture(picture, sizeof(picture),
+                                 state->cursor_object_graphic);
+            debug_add_line(lines, count,
+                           "CURSOR OBJECT %u  PICTURE %s  ID %u",
+                           state->cursor_object_index, picture,
+                           state->cursor_object_id);
+        } else {
+            debug_add_line(lines, count, "CURSOR OBJECT N/A");
+        }
         debug_add_line(lines, count, "CURSOR DAS FAT INDEX %u (0x%04X)",
                        state->cursor_das_entry, state->cursor_das_entry);
         debug_add_line(lines, count, "CURSOR TEXEL U %u  V %u",

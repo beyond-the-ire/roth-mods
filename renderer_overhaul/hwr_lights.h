@@ -6,6 +6,7 @@
 #include <stddef.h>
 
 struct hwr_das_archive;
+struct hwr_meshes;
 struct hwr_object;
 struct hwr_objects;
 struct hwr_world;
@@ -132,6 +133,17 @@ struct hwr_lights_frame {
      * the engine's own perspective scale against the canvas the mod draws into
      * -- and the seeding takes no view of its own. */
     float sprite_vscale;
+    /* AND THE PACKED GEOMETRY OF THE THINGS THAT ARE NOT DRAWN AS SPRITES AT
+     * ALL. A 3D prop -- a chandelier, a candelabrum, a brazier -- has no sprite
+     * frame to be sized against, so the height law above answers nothing about
+     * one and its light would stand at the map's own anchor. For a thing HUNG
+     * from a ceiling that anchor is IN the ceiling, which is the one place a
+     * light may not be (see the emit point below). The pack is where the
+     * thing's own vertical extent is written down, so it is handed over for the
+     * same reason the sprite scale is: the seeding takes no geometry of its own.
+     * Absent -- an older caller, a map with no props -- leaves such a light at
+     * its anchor, which is where it stood before this existed. */
+    const struct hwr_meshes *meshes;
     /* The sectors the engine's own portal walk drew, and whether that answer
      * is a real cull set at all. A light that REACHES no sector the walk drew
      * is a light nothing on the screen is lit by -- which is a question about

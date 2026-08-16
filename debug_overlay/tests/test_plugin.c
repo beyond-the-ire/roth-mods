@@ -12,6 +12,7 @@
 
 static uint8_t test_ram[TEST_RAM_SIZE];
 static uint8_t test_geometry[0x10000];
+static uint8_t test_objects[0x10000];
 
 static uint8_t test_u8(uint32_t offset)
 {
@@ -90,6 +91,12 @@ static void test_geometry_put_u16(uint16_t offset, uint16_t value)
 {
     test_geometry[offset] = (uint8_t)value;
     test_geometry[(uint16_t)(offset + 1u)] = (uint8_t)(value >> 8);
+}
+
+static void test_objects_put_u16(uint16_t offset, uint16_t value)
+{
+    test_objects[offset] = (uint8_t)value;
+    test_objects[(uint16_t)(offset + 1u)] = (uint8_t)(value >> 8);
 }
 
 static void test_present(const struct roth_plugin_info_v1 *plugin,
@@ -193,6 +200,7 @@ int main(void)
     memcpy(test_ram + 0x701ecu, "STUDY1.RAW", sizeof("STUDY1.RAW"));
     memcpy(test_ram + 0x7023cu, "M/DEMO.DAS", sizeof("M/DEMO.DAS"));
     test_put_u32(0x90aa8u, (uint32_t)(uintptr_t)test_geometry);
+    test_put_u32(0x90aa4u, (uint32_t)(uintptr_t)test_objects);
     test_put_u16(0x90c12u, 0x0168);
     test_put_u32(0x91df8u, 10);
     test_put_u32(0x91dfcu, 0x0100);
@@ -266,6 +274,47 @@ int main(void)
     assert(sampled.cursor_face_texture_middle == 30);
     assert(sampled.cursor_face_texture_top == 31);
     assert(sampled.cursor_face_texture_bottom == 32);
+    /* A wall result names no object, and the object block says so rather than
+     * reading a record out of a pointer that was never an object's. */
+    assert(!sampled.cursor_object_valid);
+
+    /* THE PLACED OBJECT UNDER THE CURSOR. Two sectors carry object lists: the
+     * first holds two records and the second three, so the record staged in the
+     * second is the map's own object number 3 -- the fourth record of the walk
+     * -- and a fixture that only ever numbered one list could not tell that
+     * from 0. The picture word 0x0013 is texture index 19 of source 0, which
+     * the same editor's picking window prints as 4115. */
+    test_objects_put_u16(2u, 0x0040);                 /* sector 0's list */
+    test_objects_put_u16(4u, 0x0100);                 /* sector 1's list */
+    test_objects[0x0040] = 2;                         /* two records */
+    test_objects[0x0100] = 3;                         /* three records */
+    test_objects_put_u16(0x0112u + 0x04u, 0x0013);    /* picture 19/0 = 4115 */
+    test_objects_put_u16(0x0112u + 0x0eu, 36);        /* the record's ID tag */
+    test_ram[0x90a49u] = 4;                           /* an object result */
+    test_put_u32(0x90a56u, (uint32_t)(uintptr_t)(test_objects + 0x0112u));
+    debug_state_sample(&api, &sampled);
+    assert(sampled.cursor_object_valid);
+    assert(sampled.cursor_object_index == 3);
+    assert(sampled.cursor_object_graphic == 0x0013);
+    assert(sampled.cursor_object_id == 36);
+    /* And the face block is silent, because a face is not what was picked. */
+    assert(!sampled.cursor_face_index_valid);
+
+    /* An address inside the section that lands between records names nothing,
+     * and nothing is what is reported. */
+    test_put_u32(0x90a56u, (uint32_t)(uintptr_t)(test_objects + 0x0118u));
+    debug_state_sample(&api, &sampled);
+    assert(!sampled.cursor_object_valid);
+
+    /* Nor does a record of the right shape under a result kind that was never
+     * written for one. */
+    test_ram[0x90a49u] = 3;
+    test_put_u32(0x90a56u, (uint32_t)(uintptr_t)(test_objects + 0x0112u));
+    debug_state_sample(&api, &sampled);
+    assert(!sampled.cursor_object_valid);
+    /* Left standing on the object for the drawing passes below, so the line
+     * that prints it is one the layouts really compose. */
+    test_ram[0x90a49u] = 4;
 
     plugin->on_load(&api);
     assert(debug_input_mode() == DEBUG_LAYOUT_PERFORMANCE);

@@ -1,5 +1,6 @@
 #include "hwr_meshes.h"
 
+#include "hwr_lights.h"
 #include "hwr_projection.h"
 #include "hwr_sprites.h"
 #include "hwr_util.h"
@@ -822,18 +823,38 @@ static void hwr_mesh_step_animations(struct hwr_meshes *meshes,
 static uint8_t hwr_mesh_light(uint8_t shade_seed,
                               const struct hwr_object *object,
                               const struct hwr_world *world,
+                              int promoted,
                               uint8_t *sector_flags)
 {
     uint8_t light = 0;
+    uint8_t composed;
     *sector_flags = 0;
     if (object->sector_index != HWR_OBJECT_NO_SECTOR &&
         object->sector_index < world->sector_count) {
         light = world->sectors[object->sector_index].light;
         *sector_flags = world->sectors[object->sector_index].flags;
     }
-    return shade_seed != 0 && light != 0
-         ? (uint8_t)((uint8_t)(shade_seed - 0x80u) + light)
-         : shade_seed;
+    composed = shade_seed != 0 && light != 0
+             ? (uint8_t)((uint8_t)(shade_seed - 0x80u) + light)
+             : shade_seed;
+    /* AND WHAT A GAME CONFIG MADE A LIGHT LOOKS LIKE, which for a 3D prop is
+     * the same sentence the sprite emitter says about a card.
+     *
+     * Nought is the engine's own unshaded class -- the byte the map's author
+     * writes on a thing that is never to be darkened -- so a thing a game
+     * config makes a light is drawn at nought exactly as a torch the map marks
+     * is. Without this a granted chandelier lights the room around it and is
+     * itself drawn in the room's own gloom: a halo with a dark thing in the
+     * middle of it, which is the one shape a light source never has.
+     *
+     * The question is the SEEDING'S -- one authority, asked once per object by
+     * the caller and handed down -- so the thing that is drawn lit is exactly
+     * the thing that lights, and a grant that says "lit": false keeps the
+     * ordinary shading on the prop while the light it gives stands. The
+     * seeding answers no wherever the object class is not being seeded at all,
+     * which is every shading law but the modern one, so this line cannot move
+     * a pixel of the other two. */
+    return promoted && composed != 0u ? (uint8_t)0u : composed;
 }
 
 static void hwr_mesh_finish_vertex(struct hwr_gl_vertex *vertex,
@@ -980,6 +1001,7 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
                               const struct hwr_world *world,
                               const struct hwr_gl_camera *camera,
                               int32_t facing_sin, int32_t facing_cos,
+                              int promoted,
                               const struct hwr_sector_xspan *clip,
                               struct hwr_mesh_pending **pending,
                               size_t *pending_count,
@@ -1017,7 +1039,8 @@ static int hwr_mesh_emit_face(struct hwr_meshes *meshes,
         meshes->stat_culled++;
         return 0;
     }
-    light = hwr_mesh_light(face->shade_seed, object, world, &sector_flags);
+    light = hwr_mesh_light(face->shade_seed, object, world, promoted,
+                           &sector_flags);
     if ((face->flags & 0x1000u) != 0) {
         for (i = 0; i < count; i++) {
             s[i] = (float)(((uint16_t)(face->packed_control[i] & 0x80u)
@@ -1125,7 +1148,7 @@ static int hwr_mesh_emit_pin(struct hwr_meshes *meshes,
                              const struct hwr_world *world,
                              const struct hwr_gl_camera *camera,
                              int32_t facing_sin, int32_t facing_cos,
-                             double hscale, double vscale,
+                             int promoted, double hscale, double vscale,
                              const struct hwr_sector_xspan *clip)
 {
     const struct hwr_mesh_material *material;
@@ -1190,7 +1213,8 @@ static int hwr_mesh_emit_pin(struct hwr_meshes *meshes,
          (double)camera->yaw_cos / 16384.0;
     rx = half_w * camera->yaw_sin / 16384.0;
     ry = half_w * camera->yaw_cos / 16384.0;
-    light = hwr_mesh_light(face->shade_seed, object, world, &sector_flags);
+    light = hwr_mesh_light(face->shade_seed, object, world, promoted,
+                           &sector_flags);
     memset(&tl, 0, sizeof tl);
     tl.x = hwr_mesh_clamp_i16((int32_t)(cx - rx));
     tl.y = hwr_mesh_clamp_i16((int32_t)(cy - ry));
@@ -1292,6 +1316,7 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
         double center_depth;
         int32_t correction;
         int32_t facing_sin, facing_cos;
+        int promoted;
         const struct hwr_sector_xspan *clip =
             spans != NULL && i < span_count ? &spans[i] : NULL;
         size_t face_index;
@@ -1329,6 +1354,10 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
         meshes->stat_objects++;
         facing_sin = hwr_mesh_sincos(api, 2u * object->facing);
         facing_cos = hwr_mesh_sincos(api, 2u * object->facing + 0x80u);
+        /* ONCE PER THING, not once per face: whether a game config made this
+         * one a light is a fact about the object, and a prop is dozens of
+         * faces. Asked here so a hall of chandeliers costs one answer each. */
+        promoted = hwr_lights_object_promoted(world, object);
         for (face_index = 0; face_index < resource->face_count; face_index++) {
             const struct hwr_mesh_face *face =
                 &meshes->faces[resource->first_face + face_index];
@@ -1338,11 +1367,11 @@ int hwr_meshes_emit(struct hwr_meshes *meshes,
                     continue;
                 result = hwr_mesh_emit_pin(meshes, resource, face, object,
                                            world, camera, facing_sin, facing_cos,
-                                           hscale, vscale, clip);
+                                           promoted, hscale, vscale, clip);
             } else {
                 result = hwr_mesh_emit_face(meshes, resource, face, object,
                                             world, camera, facing_sin, facing_cos,
-                                            clip,
+                                            promoted, clip,
                                             &pending, &pending_count,
                                             &pending_capacity);
             }

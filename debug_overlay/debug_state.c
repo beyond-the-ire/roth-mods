@@ -18,12 +18,27 @@
 #define DEBUG_VA_PLAYER_Z             0x90a92u
 #define DEBUG_VA_PLAYER_Y             0x90a96u
 #define DEBUG_VA_PLAYER_SECTOR        0x90c12u
+#define DEBUG_VA_MAP_OBJECTS_BUFFER   0x90aa4u
 #define DEBUG_VA_MAP_GEOMETRY_BUFFER  0x90aa8u
 #define DEBUG_VA_SECTOR_COUNT         0x91df8u
 #define DEBUG_VA_SECTOR_SECTION       0x91dfcu
 #define DEBUG_SECTOR_STRIDE           0x1au
 #define DEBUG_FACE_STRIDE             0x0cu
+#define DEBUG_OBJECT_STRIDE           0x10u
 #define DEBUG_GEOMETRY_EXTENT         0x10000u
+#define DEBUG_OBJECT_EXTENT           0x10000u
+
+/* The engine's own result kinds in the cursor record's type byte: 3 is a wall
+ * or sector face, 4 is a placed object. The blocks below are gated on these
+ * exactly as the interaction code itself is; nothing is reported off a kind the
+ * record was not written for. */
+#define DEBUG_CURSOR_KIND_FACE        3u
+#define DEBUG_CURSOR_KIND_OBJECT      4u
+
+/* Fields of one placed-object record, which is the same sixteen-byte record the
+ * map file holds and the engine renders from. */
+#define DEBUG_OBJECT_OFF_GRAPHIC      0x04u
+#define DEBUG_OBJECT_OFF_ID           0x0eu
 
 static struct roth_video_event_v1 debug_video;
 static int debug_have_video;
@@ -119,6 +134,91 @@ static void debug_sample_cursor(const struct roth_api_v1 *api,
     view->cursor_render_record_ref = debug_read_u32(reference + 6);
 }
 
+static const uint8_t *debug_objects_base(const struct roth_api_v1 *api)
+{
+    uintptr_t stored =
+        (uintptr_t)api->game_ram->u32(DEBUG_VA_MAP_OBJECTS_BUFFER);
+
+    return stored >= 0x1000u ? (const uint8_t *)stored : NULL;
+}
+
+static int debug_objects_fit(uint32_t offset, uint32_t size)
+{
+    return offset <= DEBUG_OBJECT_EXTENT &&
+           size <= DEBUG_OBJECT_EXTENT - offset;
+}
+
+/* WHICH PLACED OBJECT THE CURSOR RESULT POINTS AT.
+ *
+ * The engine's cursor record carries, for an object result, the address of the
+ * record it was rendering from. That address alone names nothing a person can
+ * type, so it is resolved against the loaded map's OWN object lists: the walk
+ * below is the map's per-sector lists flattened with the sectors in ascending
+ * order, which is the enumeration the community map editor prints as
+ * "Object: N", and the record is only reported when its address lands exactly on
+ * one of those records. An address that does not is left unreported -- the mod
+ * does not identify objects from guesses.
+ *
+ * The running number counts EVERY record the map holds, hidden ones included:
+ * what numbers an object is the map's own list, not this walk's willingness to
+ * draw it.
+ *
+ * The record's own texture index and texture source live at +4 as one word, and
+ * that pair is the object's OWN picture -- a different number from the DAS entry
+ * the cursor sampled, which for a 3D object is the material of the mesh face
+ * under the cursor and not the object at all. */
+static void debug_sample_object(const struct roth_api_v1 *api,
+                                struct debug_state_view *view,
+                                uint32_t sector_count)
+{
+    const uint8_t *section = debug_objects_base(api);
+    uintptr_t want = (uintptr_t)view->cursor_render_record_ref;
+    uint32_t number = 0;
+    uint32_t target;
+    uint32_t sector;
+
+    if (view->cursor_surface_kind != DEBUG_CURSOR_KIND_OBJECT ||
+        section == NULL || want < (uintptr_t)section)
+        return;
+    if ((uintptr_t)(want - (uintptr_t)section) >= DEBUG_OBJECT_EXTENT)
+        return;
+    target = (uint32_t)(want - (uintptr_t)section);
+    for (sector = 0; sector < sector_count; sector++) {
+        uint32_t directory = 2u + sector * 2u;
+        uint32_t list;
+        uint32_t record;
+        uint32_t count;
+        uint32_t i;
+
+        if (!debug_objects_fit(directory, 2u))
+            break;                           /* the directory only grows */
+        list = (uint32_t)debug_read_u16(section + directory);
+        if (list < 2u || !debug_objects_fit(list, 1u))
+            continue;
+        count = section[list];
+        if (count == 0u)
+            continue;
+        if (!debug_objects_fit(list + 2u, count * DEBUG_OBJECT_STRIDE)) {
+            number += count;                 /* still numbered by the map */
+            continue;
+        }
+        record = list + 2u;
+        for (i = 0; i < count; i++, record += DEBUG_OBJECT_STRIDE) {
+            if (record != target) {
+                number++;
+                continue;
+            }
+            view->cursor_object_valid = 1;
+            view->cursor_object_index = number;
+            view->cursor_object_graphic =
+                debug_read_u16(section + record + DEBUG_OBJECT_OFF_GRAPHIC);
+            view->cursor_object_id =
+                debug_read_u16(section + record + DEBUG_OBJECT_OFF_ID);
+            return;
+        }
+    }
+}
+
 static int debug_sector_index(uint16_t offset, uint32_t first,
                               uint32_t count, uint32_t *index)
 {
@@ -179,7 +279,7 @@ static void debug_sample_geometry(const struct roth_api_v1 *api,
         }
     }
 
-    if (view->cursor_surface_kind != 3 ||
+    if (view->cursor_surface_kind != DEBUG_CURSOR_KIND_FACE ||
         debug_geometry_read(geometry, 6, header, sizeof(header)) != 0)
         return;
     first_face = debug_read_u16(header);
@@ -253,6 +353,7 @@ void debug_state_sample(const struct roth_api_v1 *api,
     view->cursor_type = api->game_ram->u8(DEBUG_VA_CURSOR_TYPE);
     debug_sample_cursor(api, view);
     debug_sample_geometry(api, view, sector_section, sector_count);
+    debug_sample_object(api, view, sector_count);
 
     if (debug_have_video) {
         view->video_valid = 1;

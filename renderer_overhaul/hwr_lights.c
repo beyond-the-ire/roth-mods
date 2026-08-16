@@ -2,6 +2,7 @@
 
 #include "hwr_das.h"
 #include "hwr_look.h"
+#include "hwr_meshes.h"
 #include "hwr_objects.h"
 #include "hwr_point_math.h"
 #include "hwr_sprite_span.h"
@@ -1772,6 +1773,90 @@ static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
     return 1;
 }
 
+/* AND THE MIDDLE OF A 3D PROP, WHICH IS THE SAME SENTENCE ABOUT A THING THAT
+ * IS NOT DRAWN AS A SPRITE AT ALL.
+ *
+ * A chandelier, a candelabrum or a brazier is real geometry rather than a
+ * cut-out, so the sprite law above cannot answer for it: the frame reader
+ * refuses a mesh block outright (there is no picture in one), the height comes
+ * back as nothing, and the light is left standing at the map's own anchor.
+ *
+ * THAT ANCHOR IS THE CEILING. A hung prop is authored with its origin where it
+ * is FIXED and its geometry hanging below -- the study's chandeliers are
+ * anchored at z 384 in a room whose ceiling is z 384, with their own vertices
+ * from -80 to 0 of that -- so a light at the anchor sits exactly IN the ceiling
+ * plane. Every ray of that light's shadow map then leaves through a ceiling
+ * triangle at no distance at all: the whole room reads occluded, with the
+ * ceiling's own triangulation seams passing light in slivers, which is a room
+ * full of shadow spokes thrown by nothing. Measured before it was fixed: at the
+ * anchor, every one of the forty-five floor probes of the chandelier's room
+ * read blocked; one unit below it, none of them did.
+ *
+ * So a prop's light comes from the MIDDLE OF ITS OWN VERTICAL EXTENT, which is
+ * the mesh's reading of the same sentence the sprite law states -- the middle
+ * of the thing rather than the point it is hung by -- and it is read off the
+ * PACK the prop is really drawn from rather than from a number typed here. For
+ * the study's chandelier that is forty units below its anchor; the eight candle
+ * flames it carries (its pin faces) stand at forty-four. The law lands the
+ * light in the flames without being told anything about chandeliers.
+ *
+ * The extent's MIDDLE, not the vertices' average: a mesh's corners are wherever
+ * its author put them, and an average would follow the density of the geometry
+ * rather than the shape of it -- the same reason the sprite law takes the
+ * middle of the drawn span rather than the middle of the painted texels.
+ *
+ * Only the height moves. Where the thing stands is the map's own answer and a
+ * horizontal middle taken off a lopsided prop would walk its light toward a
+ * wall for no reason anybody could state.
+ *
+ * Answers 0 for anything that is not a packed 3D prop, and then the sprite law
+ * above has its say. */
+#define HWR_LIGHT_MESH_FLAG 0x8000u
+
+static int hwr_light_mesh_middle(const struct hwr_lights_frame *frame,
+                                 const struct hwr_sprite_lookup *lookup,
+                                 const struct hwr_object *object,
+                                 float *out_z)
+{
+    const struct hwr_meshes *meshes = frame->meshes;
+    const struct hwr_mesh_resource *resource = NULL;
+    int32_t low;
+    int32_t high;
+    size_t v;
+
+    if (meshes == NULL || !meshes->built || meshes->vertices == NULL ||
+        lookup->archive == NULL ||
+        lookup->entry_id >= lookup->archive->entry_count)
+        return 0;
+    if ((lookup->archive->entries[lookup->entry_id].payload_flags & 0xff00u) !=
+        HWR_LIGHT_MESH_FLAG)
+        return 0;
+    if (lookup->archive == meshes->map_archive &&
+        lookup->entry_id < meshes->map_dir_count &&
+        meshes->map_dir[lookup->entry_id].present)
+        resource = &meshes->map_dir[lookup->entry_id];
+    else if (lookup->archive == meshes->shared_archive &&
+             lookup->entry_id < meshes->shared_dir_count &&
+             meshes->shared_dir[lookup->entry_id].present)
+        resource = &meshes->shared_dir[lookup->entry_id];
+    if (resource == NULL || resource->vertex_count == 0u ||
+        resource->first_vertex + resource->vertex_count > meshes->vertex_count)
+        return 0;
+    low = meshes->vertices[resource->first_vertex].vertical;
+    high = low;
+    for (v = 1u; v < resource->vertex_count; v++) {
+        int32_t at = meshes->vertices[resource->first_vertex + v].vertical;
+
+        if (at < low)
+            low = at;
+        if (at > high)
+            high = at;
+    }
+    *out_z = (float)((double)object->world_z +
+                     ((double)low + (double)high) * 0.5);
+    return 1;
+}
+
 /* AND CLEAR OF THE SURFACE IT IS MOUNTED ON.
  *
  * A sconce, a bracket torch or a lit sigil is drawn FLAT ON A WALL -- the
@@ -1992,7 +2077,11 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->light.world_x = (float)object->world_x;
     out->light.world_y = (float)object->world_y;
     out->light.world_z = (float)object->world_z;
-    if (resolved)
+    /* A 3D prop first, because a prop has no sprite frame for the sprite law to
+     * read and the two are asking one question. Neither answering leaves the
+     * anchor, which is where every light stood before either existed. */
+    if (resolved &&
+        !hwr_light_mesh_middle(frame, &lookup, object, &out->light.world_z))
         (void)hwr_light_sprite_middle(frame, &lookup, object,
                                       &out->light.world_z);
     (void)hwr_light_wall_clearance(world, object, &out->light.world_x,
