@@ -2258,9 +2258,6 @@ static const char g_geometry_fragment_body[] =
     "uniform int u_point_count;\n"
     /* How softly that window's two edges fade, in world units. */
     "uniform float u_point_z_edge;\n"
-    /* And how much of its own size a light hung inside something is given, as a
-     * share of the radius its own seeding published. Nought is a point. */
-    "uniform float u_point_body;\n"
     /* The three classes the modern law must not touch, and why each one would be
      * a disaster if it did.
      *
@@ -2458,9 +2455,11 @@ static const char g_geometry_fragment_body[] =
      *
      * It only ever ADDS: a surface facing the light square on takes the same
      * one it took before, so what moves is the terminator. And the radius is
-     * nought for every light not hung inside anything and for a row set to
-     * nothing, which is the point law again, operation for operation. */
-    "  float body=u_point_z[i].z*u_point_body;\n"
+     * nought for every light not hung inside anything, which is the point law
+     * again, operation for operation. It is the thing's own size and there is
+     * no dial on it: a fixture is as big as it is, and a share of its size is
+     * not a taste anybody holds. */
+    "  float body=u_point_z[i].z;\n"
     "  if (body>0.0 && r<body) {\n"
     "    float w=r>0.0 ? min(body/r-1.0,1.0) : 1.0;\n"
     "    ndl=(ndl+w)/(1.0+w);\n"
@@ -6103,10 +6102,6 @@ static void hwr_bind_light_uniforms(GLuint program,
      * held inside. The window travels with each light; this is one row, so it
      * is one uniform beside the rig rather than a third component per light. */
     hwr_uniform_1f(program, "u_point_z_edge", light->point_z_edge);
-    /* And how much of its own size such a light is given, for the same reason
-     * in the same place: the radius belongs to the light and travels with it,
-     * while how much of it counts is one row for the whole picture. */
-    hwr_uniform_1f(program, "u_point_body", light->point_body);
 }
 
 /* The geometry stage's own world-to-view transform, in C, for a position that is

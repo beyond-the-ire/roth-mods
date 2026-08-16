@@ -6251,6 +6251,12 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
         frame.map_archive = scene->map_archive;
         frame.shared_archive = scene->shared_archive;
         frame.view_yaw = api->game_ram->u16(VA_G_SKY_YAW);
+        /* The across axis the emitter spans a camera-facing card with, handed
+         * over rather than read again: a sideways nudge on a billboard is a
+         * nudge across the card as it is drawn, and a second reading of the
+         * camera could drift from the one the quad was built with. */
+        frame.view_yaw_sin = camera.yaw_sin;
+        frame.view_yaw_cos = camera.yaw_cos;
         /* How tall a sprite stands in the world, in the one number the seeding
          * needs of it: a thing's light comes from the middle of the sprite it is
          * drawn as, and that middle is the emitter's own sizing law rather than

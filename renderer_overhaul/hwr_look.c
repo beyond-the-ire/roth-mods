@@ -876,6 +876,20 @@ void hwr_look_light_over(struct hwr_look_light *into,
         into->has_only_when_lit = 1;
         into->only_when_lit = from->only_when_lit;
     }
+    /* The two that place the light rather than describe it, composed exactly
+     * like the rest and separately from each other: a DAS file may say that
+     * every sconce of its own art burns at the top of its card while one map
+     * nudges one of them sideways, and neither statement has to restate the
+     * other. */
+    if (from->has_anchor) {
+        into->has_anchor = 1;
+        into->anchor = from->anchor;
+    }
+    if (from->has_offset) {
+        into->has_offset = 1;
+        into->offset[0] = from->offset[0];
+        into->offset[1] = from->offset[1];
+    }
 }
 
 /* One scope's keyed entries over another's. `from_map` says whether this is the
@@ -1276,6 +1290,44 @@ static int hwr_look_grant_off(const struct hwr_json_doc *doc, int node,
     return off;
 }
 
+/* WHICH OF THE FIVE TABLES a grant was written in.
+ *
+ * Two fields are not legal everywhere, and each is refused with the reason
+ * rather than with a shrug: `lit` speaks about a DRAWING, which only a thing
+ * drawn with a sprite has, and the two placing fields speak about a thing's own
+ * HEIGHT, which a light hung at three numbers does not have. A table code says
+ * which is which in one word, so neither scope has to be guessed from a pair of
+ * flags at four call sites. */
+enum hwr_look_table {
+    HWR_LOOK_TABLE_SPRITES,
+    HWR_LOOK_TABLE_OBJECTS,
+    HWR_LOOK_TABLE_TEXTURES,
+    HWR_LOOK_TABLE_FACES,
+    HWR_LOOK_TABLE_PLACED
+};
+
+/* WHERE ALONG A THING'S HEIGHT ITS LIGHT SITS, in the three words a person
+ * writes. Three and no more: a second spelling of any of them is a second thing
+ * to document, to gate and to keep, for a word nobody would have to look up. */
+static int hwr_look_anchor_word(const char *text, int *out)
+{
+    if (text == NULL)
+        return 0;
+    if (strcmp(text, "bottom") == 0) {
+        *out = HWR_LOOK_ANCHOR_BOTTOM;
+        return 1;
+    }
+    if (strcmp(text, "center") == 0) {
+        *out = HWR_LOOK_ANCHOR_CENTER;
+        return 1;
+    }
+    if (strcmp(text, "top") == 0) {
+        *out = HWR_LOOK_ANCHOR_TOP;
+        return 1;
+    }
+    return 0;
+}
+
 /* One field of what a grant gives off. Every field is separately present or
  * absent, and absent means saying nothing about it rather than answering
  * nought.
@@ -1283,17 +1335,14 @@ static int hwr_look_grant_off(const struct hwr_json_doc *doc, int node,
  * Answers 0 for a name that is none of these, so a table with names of
  * its own -- where a thing stands, which graphic it should be -- answers for
  * those and lets this answer for the rest. The fields are then spelled
- * once for every table and cannot drift into two spellings.
- *
- * `object_grant` is whether this table grants OBJECTS their light -- `sprites`
- * and `objects` -- which is what scopes `lit`: only a thing drawn with a
- * sprite has a drawing for that field to speak about, so the tables that
- * grant surfaces and the placed lights refuse it with the reason. */
+ * once for every table and cannot drift into two spellings. */
 static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
-                                struct hwr_look_light *into, int object_grant,
+                                struct hwr_look_light *into, int table,
                                 const char *where, int report)
 {
     const char *field = hwr_json_name(doc, child);
+    int object_grant = table == HWR_LOOK_TABLE_SPRITES ||
+                       table == HWR_LOOK_TABLE_OBJECTS;
     double number = 0.0;
     uint32_t rgb = 0;
 
@@ -1377,6 +1426,92 @@ static int hwr_look_grant_field(const struct hwr_json_doc *doc, int child,
         }
         into->has_only_when_lit = 1;
         into->only_when_lit = only;
+        return 1;
+    }
+    /* AND THE TWO THAT PLACE THE LIGHT RATHER THAN DESCRIBE IT.
+     *
+     * The emit laws put a light in the middle of the thing that gives it, which
+     * is right for a torch and wrong for the art whose flame is not in the
+     * middle of its own picture. `anchor` names one of the three points of the
+     * thing's own height and `offset` nudges from there, and between them they
+     * are how somebody standing in the room says where the flame is without the
+     * mod having to guess it from texels.
+     *
+     * Both are refused on `placed` with the reason: a free-standing light has
+     * no thing and no height, and `at` already IS its position. Both are legal
+     * on `textures`, which reaches a map's FLATS as well as its faces -- a
+     * floor has no height to sit along either, and that is said where the flat
+     * is found rather than here, because one texture is painted on walls and
+     * floors both and the key cannot know which. */
+    if (strcmp(field, "anchor") == 0) {
+        int anchor = HWR_LOOK_ANCHOR_CENTER;
+
+        if (table == HWR_LOOK_TABLE_PLACED) {
+            hwr_look_note(report, where, "'anchor' says where along a thing's "
+                                         "own height its light sits, and a "
+                                         "free-standing light has no thing to "
+                                         "measure: 'at' IS where it hangs");
+            return 1;
+        }
+        if (!hwr_look_anchor_word(hwr_json_as_text(doc, child), &anchor)) {
+            hwr_look_note(report, where, "'anchor' is \"bottom\", \"center\" "
+                                         "or \"top\" -- where along the "
+                                         "thing's own height its light sits");
+            return 1;
+        }
+        into->has_anchor = 1;
+        into->anchor = anchor;
+        return 1;
+    }
+    if (strcmp(field, "offset") == 0) {
+        double xy[2];
+        size_t read = 0;
+        int at;
+
+        if (table == HWR_LOOK_TABLE_PLACED) {
+            hwr_look_note(report, where, "'offset' nudges a light from where "
+                                         "the thing that gives it stands, and "
+                                         "a free-standing light stands where "
+                                         "you put it: write it into 'at'");
+            return 1;
+        }
+        if (hwr_json_type(doc, child) != HWR_JSON_ARRAY) {
+            hwr_look_note(report, where, "'offset' is two numbers of world "
+                                         "units, written [x, y]: x sideways "
+                                         "across the thing, y up");
+            return 1;
+        }
+        for (at = hwr_json_first(doc, child); at >= 0;
+             at = hwr_json_next(doc, at)) {
+            double value = 0.0;
+
+            if (read >= 2u || !hwr_json_as_number(doc, at, &value)) {
+                hwr_look_note(report, where, "'offset' is two numbers: x "
+                                             "sideways across the thing and y "
+                                             "up");
+                return 1;
+            }
+            xy[read++] = value;
+        }
+        if (read != 2u) {
+            hwr_look_note(report, where, "'offset' is two numbers: x sideways "
+                                         "across the thing and y up");
+            return 1;
+        }
+        /* Held to the space the map itself is authored in, for the reason
+         * `at` is: a nudge that will not fit in one is a nudge to somewhere
+         * outside the building, and saying so turns a mistyped number into a
+         * complaint rather than into a light nobody ever finds. */
+        if (xy[0] < -32768.0 || xy[0] > 32767.0 ||
+            xy[1] < -32768.0 || xy[1] > 32767.0) {
+            hwr_look_note(report, where, "a nudge is a whole room at most: "
+                                         "between -32768 and 32767 world "
+                                         "units");
+            return 1;
+        }
+        into->has_offset = 1;
+        into->offset[0] = (float)xy[0];
+        into->offset[1] = (float)xy[1];
         return 1;
     }
     return 0;
@@ -1688,7 +1823,9 @@ static void hwr_look_read_light(const struct hwr_json_doc *doc, int node,
         if (field == NULL || hwr_look_is_notes(field) ||
             strcmp(field, "off") == 0)
             continue;
-        if (!hwr_look_grant_field(doc, child, &entry->light, by_pair,
+        if (!hwr_look_grant_field(doc, child, &entry->light,
+                                   by_pair ? HWR_LOOK_TABLE_SPRITES
+                                           : HWR_LOOK_TABLE_TEXTURES,
                                    inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
@@ -1854,8 +1991,8 @@ static void hwr_look_read_object(const struct hwr_json_doc *doc, int node,
             strcmp(field, "index") == 0 || strcmp(field, "id") == 0 ||
             strcmp(field, "off") == 0)
             continue;
-        if (!hwr_look_grant_field(doc, child, &entry->light, 1,
-                                   inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light,
+                                   HWR_LOOK_TABLE_OBJECTS, inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }
@@ -1957,8 +2094,8 @@ static void hwr_look_read_face(const struct hwr_json_doc *doc, int node,
             strcmp(field, "index") == 0 || strcmp(field, "id") == 0 ||
             strcmp(field, "off") == 0)
             continue;
-        if (!hwr_look_grant_field(doc, child, &entry->light, 0,
-                                   inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light,
+                                   HWR_LOOK_TABLE_FACES, inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }
@@ -2032,8 +2169,8 @@ static void hwr_look_read_placed(const struct hwr_json_doc *doc, int node,
          * nobody knows: an entry that exists only because somebody wrote it is
          * got rid of by deleting it, and a switch for turning off a thing that
          * would not be there without you is a switch for nothing. */
-        if (!hwr_look_grant_field(doc, child, &entry->light, 0,
-                                   inside, report))
+        if (!hwr_look_grant_field(doc, child, &entry->light,
+                                   HWR_LOOK_TABLE_PLACED, inside, report))
             hwr_look_note(report, inside, "'%s' is not something a light gives "
                                           "off", field);
     }

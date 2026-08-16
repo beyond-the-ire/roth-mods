@@ -123,6 +123,17 @@ struct hwr_lights_frame {
     struct hwr_das_archive *map_archive;
     struct hwr_das_archive *shared_archive;
     uint16_t view_yaw;
+    /* AND THE VIEW'S OWN ACROSS AXIS, which is the frame a camera-facing card
+     * is drawn in: the engine's own (sin, cos) at 16384, exactly the pair the
+     * emitter spans such a card with (hwr_billboards.c). A game config's
+     * sideways nudge on a thing drawn as a billboard is spent along it, since
+     * "across the card" is a statement about the card and a card that turns to
+     * face the eye turns its across axis with it. Both nought is no view staged
+     * at all, and then a sideways nudge on a billboard has no frame to be in
+     * and is not spent -- the same fallback the height law takes when no
+     * projection is staged. */
+    int16_t view_yaw_sin;
+    int16_t view_yaw_cos;
     /* The VERTICAL half of the sprite-sizing law's projection match
      * (hwr_sprite_span.h), which is what turns a sprite's texels into the
      * height it stands in the world. The seeding needs it because a thing's

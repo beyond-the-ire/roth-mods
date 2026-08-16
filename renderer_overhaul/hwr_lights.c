@@ -125,6 +125,98 @@ static int hwr_light_shadow_request(const struct hwr_look_light *named)
     return named->shadows ? HWR_GL_SHADOW_ALWAYS : HWR_GL_SHADOW_NEVER;
 }
 
+/* The engine's own sine table, which is where every frame in this section comes
+ * from: 16384*sin(2*pi*k/512) at a nine-bit index, exactly as the emitter and
+ * the mesh builder read it. */
+#ifndef VA_G_SINCOS_TABLE
+#define VA_G_SINCOS_TABLE 0x72080u
+#endif
+
+static int32_t hwr_light_sincos(const struct roth_api_v1 *api, uint32_t k)
+{
+    if (api == NULL || api->game_ram == NULL)
+        return 0;
+    return (int16_t)api->game_ram->u16(VA_G_SINCOS_TABLE + (k & 0x1ffu) * 2u);
+}
+
+/* WHAT A GRANT SAYS about where along a thing's height its light sits, and how
+ * far it is nudged from there. Absent is the middle and no nudge, which is
+ * every light before either field existed -- so a map that says nothing seeds
+ * exactly the stream it seeded before, to the bit. */
+static int hwr_light_anchor_of(const struct hwr_look_light *named)
+{
+    if (named == NULL || !named->has_anchor)
+        return HWR_LOOK_ANCHOR_CENTER;
+    return named->anchor;
+}
+
+static void hwr_light_offset_of(const struct hwr_look_light *named,
+                                double *out_x, double *out_y)
+{
+    *out_x = 0.0;
+    *out_y = 0.0;
+    if (named == NULL || !named->has_offset)
+        return;
+    *out_x = (double)named->offset[0];
+    *out_y = (double)named->offset[1];
+}
+
+/* ONE OF THE THREE POINTS OF A SPAN, by the anchor's own word. Written once
+ * because three laws ask it of three different spans -- a card's drawn height,
+ * a face's floor-to-ceiling band, a prop's vertical extent -- and three copies
+ * of a three-way choice is three chances for one of them to mean something
+ * else. */
+static double hwr_light_along(double low, double high, int anchor)
+{
+    if (anchor == HWR_LOOK_ANCHOR_BOTTOM)
+        return low;
+    if (anchor == HWR_LOOK_ANCHOR_TOP)
+        return high;
+    return (low + high) * 0.5;
+}
+
+/* THE FRAME A SIDEWAYS NUDGE ON A DRAWN CARD IS SPENT IN: the card's own across
+ * axis, which is the axis the EMITTER spans the quad along and not a second
+ * opinion about it (hwr_billboards.c:1417-1437).
+ *
+ * A card mounted flat on a wall -- the engine's rotated path, record +9 bit
+ * 0x80 -- lies along the world axis its own facing sets: the engine builds its
+ * edges in view space at 2*(facing+0x40) - yaw, and undoing the camera rotation
+ * cancels the yaw and the ninety degrees to 2*facing + 0x80, which is
+ * independent of where anybody is standing. That is the case the field is for:
+ * a sconce whose flame is painted off to one side of its own picture is off to
+ * one side of the WALL, and stays there as the player walks round.
+ *
+ * A card that is not mounted turns to face the eye, so its across axis is the
+ * camera's own -- (sin, cos) at 16384 -- and a point a few units to the right on
+ * such a card genuinely travels as the view moves, because the card does. That
+ * is the honest reading of "across the card" and not a defect of it.
+ *
+ * Answers 0 where there is no frame to be in: no engine to read the table from
+ * for a mounted card, no view staged for a billboard. A nudge with no frame is
+ * not spent, exactly as a height with no projection is not taken. */
+static int hwr_light_card_across(const struct hwr_lights_frame *frame,
+                                 const struct hwr_object *object,
+                                 double *out_x, double *out_y)
+{
+    if ((object->flags9 & HWR_OBJECT_FLAGS9_ROTATED) != 0) {
+        uint32_t phi = 2u * (uint32_t)object->facing + 0x80u;
+        int32_t ax = hwr_light_sincos(frame->api, phi);
+        int32_t ay = hwr_light_sincos(frame->api, phi + 0x80u);
+
+        if (ax == 0 && ay == 0)
+            return 0;
+        *out_x = (double)ax / 16384.0;
+        *out_y = (double)ay / 16384.0;
+        return 1;
+    }
+    if (frame->view_yaw_sin == 0 && frame->view_yaw_cos == 0)
+        return 0;
+    *out_x = (double)frame->view_yaw_sin / 16384.0;
+    *out_y = (double)frame->view_yaw_cos / 16384.0;
+    return 1;
+}
+
 /* --------------------------------------------------------- colour off a sprite
  *
  * A light's colour is read off the thing that emits it, once, and kept. The
@@ -947,17 +1039,32 @@ static int hwr_glow_sector_centroid(const struct hwr_world *world,
  * at every eye allowed to see the face, which is the interior of the room that
  * owns it. Taking the other one would put every wall light inside the wall.
  *
+ * AND WHAT THE GRANT SAYS ABOUT WHERE ON THE FACE IT IS. A face's own height is
+ * the band its room runs between, so `anchor` names its FLOOR edge, its CEILING
+ * edge or the height between them, which is what a face's light took before the
+ * field existed and what one that says nothing still takes. `offset` nudges
+ * from there: `y` up, and `x` ALONG THE FACE -- its own direction, from its
+ * first corner toward its second, which is the one axis a flat face has. A lit
+ * sigil painted at one end of a long wall is lit from that end.
+ *
+ * The push off the wall is not one of them and is not touched by either: it is
+ * a clearance rather than a placement, and it is perpendicular to both, so
+ * along-the-wall and off-the-wall never fight over the same unit.
+ *
  * Written once and used twice -- by the texture blanket, which accumulates
  * these into one light per room, and by a face somebody named, which keeps its
  * own -- so the two cannot place a light by different laws. Returns 0 where the
  * face has no geometry to stand on. */
 static int hwr_glow_face_point(const struct hwr_world *world,
                                const struct hwr_sector *sector,
-                               const struct hwr_wall *wall, int16_t *out_x,
-                               int16_t *out_y, int16_t *out_z)
+                               const struct hwr_wall *wall,
+                               const struct hwr_look_light *named,
+                               int16_t *out_x, int16_t *out_y, int16_t *out_z)
 {
     const struct hwr_vertex *a;
     const struct hwr_vertex *b;
+    double off_x = 0.0;
+    double off_y = 0.0;
     int32_t dx;
     int32_t dy;
     double length;
@@ -972,15 +1079,62 @@ static int hwr_glow_face_point(const struct hwr_world *world,
     length = sqrt((double)dx * dx + (double)dy * dy);
     if (!(length > 0.0))
         return 0;
+    hwr_light_offset_of(named, &off_x, &off_y);
     *out_x = hwr_glow_wrap16(
         (int32_t)a->world_x + dx / 2 +
-        (int32_t)lround((double)dy / length * HWR_GLOW_FACE_OFFSET));
+        (int32_t)lround((double)dy / length * HWR_GLOW_FACE_OFFSET +
+                        (double)dx / length * off_x));
     *out_y = hwr_glow_wrap16(
         (int32_t)a->world_y + dy / 2 +
-        (int32_t)lround((double)-dx / length * HWR_GLOW_FACE_OFFSET));
-    *out_z = (int16_t)(((int32_t)sector->floor_z +
-                        (int32_t)sector->ceiling_z) / 2);
+        (int32_t)lround((double)-dx / length * HWR_GLOW_FACE_OFFSET +
+                        (double)dy / length * off_x));
+    /* The height, in the whole numbers the map is authored in and by the
+     * SAME division the band's middle was always taken with: the anchor picks
+     * one of the band's three points and the nudge is added to it, so a face
+     * that says nothing answers the integer it answered before, to the unit,
+     * on a room whose floor and ceiling do not sum evenly as much as on one
+     * that does. */
+    {
+        int anchor = hwr_light_anchor_of(named);
+        int32_t band;
+
+        if (anchor == HWR_LOOK_ANCHOR_BOTTOM)
+            band = (int32_t)sector->floor_z;
+        else if (anchor == HWR_LOOK_ANCHOR_TOP)
+            band = (int32_t)sector->ceiling_z;
+        else
+            band = ((int32_t)sector->floor_z +
+                    (int32_t)sector->ceiling_z) / 2;
+        *out_z = hwr_glow_clamp16(band + (int32_t)lround(off_y));
+    }
     return 1;
+}
+
+/* AND WHAT A FLOOR OR A CEILING HAS TO SAY TO THE SAME TWO WORDS: nothing, and
+ * that is worth one sentence rather than silence.
+ *
+ * A grant is keyed by a TEXTURE, and one texture is painted on a map's walls
+ * and on its floors both. So a person who writes `anchor` for the sigil on the
+ * wall has written it for the same picture underfoot, where there is no height
+ * to sit along and no direction to run along either -- the surface IS the
+ * anchor. The words are ignored there and kept where they mean something, and
+ * the reader is told once per reading of the file rather than once per map, so
+ * that walking a game does not turn one piece of news into forty. */
+static uint32_t g_glow_flat_told;
+
+static void hwr_glow_flat_note(const struct hwr_glow_grant *grant)
+{
+    if (!grant->light.has_anchor && !grant->light.has_offset)
+        return;
+    if (g_glow_flat_told == g_glow_face_generation)
+        return;
+    g_glow_flat_told = g_glow_face_generation;
+    fprintf(stderr, "[renderer_overhaul] the texture %u is painted on a floor "
+                    "or a ceiling here as well, and a flat has no height for a "
+                    "light to sit along: its light stays over the middle of "
+                    "the room it floors, and the 'anchor' and 'offset' written "
+                    "for it reach the faces painted with it alone\n",
+            (unsigned)grant->texture_id);
 }
 
 void hwr_lights_stage_glow_faces(const struct hwr_world *world,
@@ -1113,6 +1267,7 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
                                   (int32_t)sector->ceiling_flat_id);
         if (grant >= 0) {
             g_glow_grants[grant].found = 1u;
+            hwr_glow_flat_note(&g_glow_grants[grant]);
             hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                 hwr_glow_clamp16((int32_t)sector->ceiling_z -
                                                  HWR_GLOW_FACE_OFFSET));
@@ -1121,6 +1276,7 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
                                   (int32_t)sector->floor_flat_id);
         if (grant >= 0) {
             g_glow_grants[grant].found = 1u;
+            hwr_glow_flat_note(&g_glow_grants[grant]);
             hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                 hwr_glow_clamp16((int32_t)sector->floor_z +
                                                  HWR_GLOW_FACE_OFFSET));
@@ -1134,6 +1290,7 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
                                       (int32_t)(int16_t)slab->lower_surface_id);
             if (grant >= 0) {
                 g_glow_grants[grant].found = 1u;
+                hwr_glow_flat_note(&g_glow_grants[grant]);
                 hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                     hwr_glow_clamp16((int32_t)slab->lower_z -
                                                      HWR_GLOW_FACE_OFFSET));
@@ -1142,6 +1299,7 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
                                       (int32_t)(int16_t)slab->upper_surface_id);
             if (grant >= 0) {
                 g_glow_grants[grant].found = 1u;
+                hwr_glow_flat_note(&g_glow_grants[grant]);
                 hwr_glow_accumulate(accum, &used, grant, centre_x, centre_y,
                                     hwr_glow_clamp16((int32_t)slab->upper_z +
                                                      HWR_GLOW_FACE_OFFSET));
@@ -1194,15 +1352,23 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
             if (!is_named) {
                 if (blanket < 0)
                     continue;
-                if (!hwr_glow_face_point(world, sector, wall, &push_x, &push_y,
-                                         &push_z))
-                    continue;
+                /* The point is worked out per GRANTED BAND rather than once for
+                 * the face, because where along the face a light sits is now
+                 * something a grant may say and two bands of one wall may be
+                 * granted by two entries that say different things. A face
+                 * whose bands say nothing answers the same point three times,
+                 * which is what it always answered. */
                 for (k = 0; k < 3u; k++) {
                     grant = hwr_glow_grant_of(world, g_glow_grants,
                                               g_glow_grant_count, ids[k]);
-                    if (grant >= 0)
-                        hwr_glow_accumulate(accum, &used, grant, push_x,
-                                            push_y, push_z);
+                    if (grant < 0)
+                        continue;
+                    if (!hwr_glow_face_point(world, sector, wall,
+                                             &g_glow_grants[grant].light,
+                                             &push_x, &push_y, &push_z))
+                        continue;
+                    hwr_glow_accumulate(accum, &used, grant, push_x,
+                                        push_y, push_z);
                 }
                 continue;
             }
@@ -1268,8 +1434,8 @@ void hwr_lights_stage_glow_faces(const struct hwr_world *world,
                     }
                     continue;
                 }
-                if (!hwr_glow_face_point(world, sector, wall, &push_x, &push_y,
-                                         &push_z))
+                if (!hwr_glow_face_point(world, sector, wall, &light,
+                                         &push_x, &push_y, &push_z))
                     continue;
                 if (g_glow_face_count >= HWR_GLOW_FACE_MAX) {
                     if (!said_full) {
@@ -1754,9 +1920,28 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
  * light has to come from where that sprite is rather than from the point the
  * map happens to hang it by. Two things follow from that, and they are the
  * whole of this section.
+ *
+ * AND ONE THING A FILE MAY SAY OVER ALL OF IT. The laws below put a light in
+ * the MIDDLE of the thing, because that is right for a torch, a rune and a
+ * chandelier alike; it is wrong wherever the art itself puts the flame
+ * somewhere else -- a sconce whose flame burns at the top of its own card, a
+ * brazier painted low in its picture. A game config's `anchor` picks one of the
+ * three points of the thing's own height and its `offset` nudges from there,
+ * and both are spent HERE, beside the law each belongs to, rather than as a
+ * correction applied to a finished answer: the height a card is drawn at, the
+ * span a face runs between and the extent a prop occupies are three different
+ * measurements, and one of them is what each word is about.
+ *
+ * The automatic clearance off a mounting surface is NOT one of them and is
+ * untouched by either: it comes after, it is a fact about the map rather than
+ * about the art, and a sconce nudged along its wall is still a sconce that may
+ * not sit inside it. The three-point choice itself, the two words that make it
+ * and the frame a card's own sideways nudge is spent in are written at the top
+ * of this file, beside the other things the whole seeding shares.
  */
 
-/* THE MIDDLE OF THE SPRITE, up its own height from the anchor.
+/* WHERE ALONG THE SPRITE ITS LIGHT SITS, which is its middle unless somebody
+ * with the picture in front of them says otherwise.
  *
  * A map record's z is where the sprite is HUNG -- its feet for a thing standing
  * on the floor, its head for one hung from a bracket -- so a light at that
@@ -1770,6 +1955,13 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
  * worked out from a transcription would leave the light out of the sprite the
  * first time either copy moved.
  *
+ * AND THE THREE POINTS THE `anchor` FIELD NAMES ARE THAT SPAN'S OWN: the bottom
+ * is the card's base -- the map's anchor for a thing standing on the floor --
+ * the top is a card's height above it, and the middle is what every light took
+ * before the field existed and what one that says nothing still takes. It is
+ * the DRAWN card that is measured, so the half-size block modifier halves the
+ * distance between them exactly as it halves the card.
+ *
  * It is taken at the frame the light's COLOUR is taken at, and for the same
  * reason: a height that crawled with an animation would be a light nobody
  * wrote. Answers 0 where the frame carries no projection to size against or the
@@ -1778,7 +1970,7 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
 static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
                                    const struct hwr_sprite_lookup *lookup,
                                    const struct hwr_object *object,
-                                   float *out_z)
+                                   int anchor, float *out_z)
 {
     struct hwr_sprite_frame sprite;
     int16_t origin_x = 0;
@@ -1794,7 +1986,7 @@ static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
     hwr_sprite_vertical_span((int32_t)object->world_z, object->flags9,
                              sprite.flags, sprite.width, origin_y,
                              (double)frame->sprite_vscale, &z_top, &z_bottom);
-    *out_z = (float)(((double)z_top + (double)z_bottom) * 0.5);
+    *out_z = (float)hwr_light_along((double)z_bottom, (double)z_top, anchor);
     return 1;
 }
 
@@ -1849,6 +2041,7 @@ static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
 static int hwr_light_mesh_middle(const struct hwr_lights_frame *frame,
                                  const struct hwr_sprite_lookup *lookup,
                                  const struct hwr_object *object,
+                                 int anchor, double off_x, double off_y,
                                  float *out_z, float *out_body)
 {
     const struct hwr_meshes *meshes = frame->meshes;
@@ -1887,24 +2080,43 @@ static int hwr_light_mesh_middle(const struct hwr_lights_frame *frame,
         if (at > high)
             high = at;
     }
-    middle = ((double)low + (double)high) * 0.5;
+    /* THE POINT ITSELF, in the pack's own local coordinates, with everything a
+     * game config said folded in before anything is measured about it.
+     *
+     * The vertical is the anchor's own word about the extent -- its bottom, its
+     * middle or its top -- and the `offset` is added to that. The SIDEWAYS
+     * nudge is a local x and nothing more, and that is exact rather than
+     * convenient: the pack's local +x axis is turned into the world by the mesh
+     * builder as (cos, -sin) of twice the facing (hwr_meshes.c:593-596), which
+     * IS the object's own right-vector -- the same axis the emitter lays a
+     * mounted card along. So a nudge of n units along the prop's right is a
+     * local (n, 0), and the caller spends the world half of it by that same
+     * vector. Nothing here has to know which way the thing is turned. */
+    middle = hwr_light_along((double)low, (double)high, anchor) + off_y;
     *out_z = (float)((double)object->world_z + middle);
-    /* AND HOW BIG THE THING IS, about that same point: the far corner of the
+    /* AND HOW BIG THE THING IS, ABOUT THAT SAME POINT: the far corner of the
      * prop's own geometry, which is the radius of the body the flame is inside
-     * (hwr_gl.h, `body`). Taken off the pack the middle above came from and in
-     * the pack's own local coordinates, which needs no facing: a radius about
-     * a point on the axis is the same radius however the thing is turned.
+     * (hwr_gl.h, `body`). Taken off the pack the point above came from and in
+     * the pack's own local coordinates, which needs no facing: a radius about a
+     * point ON the axis is the same radius however the thing is turned, and a
+     * point moved OFF the axis is moved in the same local frame the corners are
+     * written in, so the measurement stays a measurement.
+     *
+     * It is measured about the emit point rather than about the extent's middle
+     * on purpose: what the radius is for is the wrap between the flame and the
+     * arms around it, and a flame moved up into the crown of a candelabrum has
+     * different arms near it than one in the middle.
      *
      * The FARTHEST corner rather than an average or a half-height: what the
      * radius has to cover is the thing's own arms, since it is the arms that a
      * point law leaves dark, and they are exactly the corners furthest from
-     * the middle. */
+     * the point. */
     for (v = 0; v < resource->vertex_count; v++) {
         const struct hwr_mesh_local_vertex *at =
             &meshes->vertices[resource->first_vertex + v];
+        double dx = (double)at->x - off_x;
         double dz = (double)at->vertical - middle;
-        double squared = (double)at->x * (double)at->x +
-                         (double)at->y * (double)at->y + dz * dz;
+        double squared = dx * dx + (double)at->y * (double)at->y + dz * dz;
 
         if (squared > far_squared)
             far_squared = squared;
@@ -2134,20 +2346,74 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->light.world_x = (float)object->world_x;
     out->light.world_y = (float)object->world_y;
     out->light.world_z = (float)object->world_z;
-    /* A 3D prop first, because a prop has no sprite frame for the sprite law to
-     * read and the two are asking one question. Neither answering leaves the
-     * anchor, which is where every light stood before either existed.
-     *
-     * The prop is also the one class that answers the OTHER question the emit
-     * point raises -- how big the thing the flame is inside is -- and it comes
-     * back from the same read for the same reason: a size worked out anywhere
-     * but beside the middle it is measured about could drift from it. A card
-     * leaves it at nought and is the point light it always was. */
-    if (resolved &&
-        !hwr_light_mesh_middle(frame, &lookup, object, &out->light.world_z,
-                               &out->light.body))
-        (void)hwr_light_sprite_middle(frame, &lookup, object,
-                                      &out->light.world_z);
+    /* WHAT THE GAME CONFIG SAID ABOUT WHERE ALONG THE THING THE FLAME IS, taken
+     * once and handed to whichever law answers: both fields are about the
+     * thing's own height and its own drawn frame, and both are absent on every
+     * map that says nothing, which is the middle and no nudge. */
+    {
+        double off_x = 0.0;
+        double off_y = 0.0;
+        int anchor = hwr_light_anchor_of(&named);
+
+        hwr_light_offset_of(&named, &off_x, &off_y);
+        /* A 3D prop first, because a prop has no sprite frame for the sprite
+         * law to read and the two are asking one question. Neither answering
+         * leaves the anchor, which is where every light stood before either
+         * existed.
+         *
+         * The prop is also the one class that answers the OTHER question the
+         * emit point raises -- how big the thing the flame is inside is -- and
+         * it comes back from the same read for the same reason: a size worked
+         * out anywhere but beside the point it is measured about could drift
+         * from it. A card leaves it at nought and is the point light it always
+         * was. */
+        if (resolved &&
+            hwr_light_mesh_middle(frame, &lookup, object, anchor, off_x, off_y,
+                                  &out->light.world_z, &out->light.body)) {
+            /* THE PROP'S SIDEWAYS HALF, along the object's own right-vector --
+             * the world image of the local +x the size above was measured in,
+             * so the two halves of one nudge cannot disagree. */
+            if (off_x != 0.0) {
+                uint32_t phi = 2u * (uint32_t)object->facing;
+                double rx = (double)hwr_light_sincos(frame->api, phi + 0x80u);
+                double ry = -(double)hwr_light_sincos(frame->api, phi);
+
+                if (rx != 0.0 || ry != 0.0) {
+                    out->light.world_x =
+                        (float)((double)out->light.world_x +
+                                off_x * rx / 16384.0);
+                    out->light.world_y =
+                        (float)((double)out->light.world_y +
+                                off_x * ry / 16384.0);
+                }
+            }
+        } else {
+            /* A CARD. Its height is the drawn card's, and its sideways nudge is
+             * across that card in the frame the emitter draws it in -- along
+             * the wall for one mounted flat on one, across the eye's view for
+             * one that turns to face it. The vertical nudge needs no frame at
+             * all: up is up. */
+            if (resolved)
+                (void)hwr_light_sprite_middle(frame, &lookup, object, anchor,
+                                              &out->light.world_z);
+            out->light.world_z = (float)((double)out->light.world_z + off_y);
+            if (off_x != 0.0) {
+                double ax = 0.0;
+                double ay = 0.0;
+
+                if (hwr_light_card_across(frame, object, &ax, &ay)) {
+                    out->light.world_x =
+                        (float)((double)out->light.world_x + off_x * ax);
+                    out->light.world_y =
+                        (float)((double)out->light.world_y + off_x * ay);
+                }
+            }
+        }
+    }
+    /* AND CLEAR OF WHATEVER IT IS MOUNTED ON, last and over everything above:
+     * the clearance is a fact about the map rather than about the art, so it is
+     * not a thing a game config nudges into or out of. A sconce moved along its
+     * own wall is still a sconce that may not sit inside it. */
     (void)hwr_light_wall_clearance(world, object, &out->light.world_x,
                                    &out->light.world_y);
     /* The map's own candle word, through exactly the recipe the light the

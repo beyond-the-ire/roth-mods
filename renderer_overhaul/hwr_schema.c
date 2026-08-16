@@ -1983,36 +1983,6 @@ static struct hwr_setting_desc HWR_SCHEMA[] = {
                 "when there is no longer room for it. Nothing appears or "
                 "disappears in a single frame."
     },
-    {
-        .key = "point_light_body",
-        .type = HWR_VT_F32,
-        .category = HWR_CAT_ENHANCEMENTS,
-        .exposure = HWR_EXP_ADVANCED,
-        .apply_kind = HWR_APPLY_HOOK,
-        .change_bit = HWR_CHANGE_TRUECOLOR,
-        .offset = offsetof(struct hwr_settings, point_light_body),
-        .flags = HWR_SF_MAP_OVERRIDE | HWR_SF_RESTART_FREE |
-                 HWR_SF_DEPENDS_ON_VALUE,
-        .def = { .f = 1.0f },
-        .original = { .f = 1.0f },
-        .min = { .f = 0.0f },
-        .max = { .f = 4.0f },
-        .step = { .f = 0.05f },
-        .page_step = { .f = 0.25f },
-        .depends_on = -1,
-        .depends_on_key = "shading_mode",
-        .depends_on_value = { .e = HWR_SHADING_MODERN },
-        .label = "How big a light source itself is",
-        .help = "A light hung inside a chandelier or a candelabrum is a flame "
-                "with that thing's own arms right beside it rather than a "
-                "point out in the room, so it lights the thing it burns in. "
-                "This is how much of the fixture's own size the flame is "
-                "given: one is the thing's own size, and nothing at all makes "
-                "the light a point again, which leaves a fixture hanging dark "
-                "in the middle of the pool it casts. It reaches the fixture "
-                "and nothing else -- outside that, every light is the point it "
-                "always was."
-    },
     /* The sun and moon: one directional light per map, entering wherever the
      * map is open to the sky and gated per pixel by a real shadow map
      * rendered from the light. The family sits under the Modern shading law

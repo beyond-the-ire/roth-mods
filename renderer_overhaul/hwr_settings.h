@@ -369,11 +369,6 @@ struct hwr_settings {
     uint32_t point_light_hops;
     float point_light_z_slack;
     float point_light_fade;
-    /* And how big one of them is, as a share of the size of whatever it is hung
-     * inside: a flame in a chandelier lights that chandelier's own arms, which
-     * a point in the middle of them can never do. Nought is a point, which is
-     * what every light was before this row. */
-    float point_light_body;
 
     /* The sun and moon: one directional light per map, entering wherever the
      * map is open to the sky, gated per pixel by a light-space depth shadow

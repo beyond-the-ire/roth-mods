@@ -434,11 +434,6 @@ struct hwr_gl_light {
      * edges, and it is the same softness for all of them because it is one
      * row. Zero is a hard edge. */
     float point_z_edge;
-    /* How much of its own size a light hung INSIDE something is given (see
-     * `body` on the light itself). One is the thing's own size; zero is a
-     * point, which is what every light was before this row and is inert to the
-     * bit, because the term it scales is then nought. */
-    float point_body;
 };
 
 /* How many lights that are NOT at the eye the world pass carries at once.

@@ -351,6 +351,44 @@ struct hwr_look_light {
      * over it and takes none away. */
     int has_only_when_lit;
     int only_when_lit;
+    /* WHERE ALONG THE THING'S OWN HEIGHT THE LIGHT SITS, and how far it is
+     * nudged from there.
+     *
+     * The emit laws put a light in the middle of the thing that gives it --
+     * the middle of the drawn card, the middle of a face's own wall band, the
+     * middle of a prop's vertical extent -- because that is right for a torch,
+     * a rune and a chandelier alike. It is not right for the art where the
+     * flame is not in the middle: a sconce whose flame sits at the top of its
+     * card, a brazier painted low in its own picture. These two fields are how
+     * somebody with the place in front of them says so.
+     *
+     * `anchor` names one of the three points of the thing's own HEIGHT and
+     * `offset` nudges from there in world units -- `y` up, `x` sideways in the
+     * frame the thing is drawn in, which is the card's own across axis for a
+     * sprite, the wall's own direction for a face and the prop's own right for
+     * a mesh (hwr_lights.c, where each is spent beside the law it belongs to).
+     *
+     * Absent is the middle and no nudge, which is every light before these
+     * existed. Legal on the four tables that name something with a height --
+     * `sprites`, `objects`, `textures`, `faces` -- and refused on `placed`,
+     * where `at` IS the position. A floor or a ceiling has no height to sit
+     * along and takes neither, which is said where the flat is found rather
+     * than where the key is read, because one texture may be painted on a wall
+     * and a floor both. */
+    int has_anchor;
+    int anchor;                         /* enum hwr_look_anchor */
+    int has_offset;
+    float offset[2];                    /* x sideways, y up, in world units */
+};
+
+/* The three points of a thing's own height a light may sit at. The middle is
+ * what every emit law already answered, so it is what an absent `anchor`
+ * means and what the value nought has to be: a cleared grant is a grant that
+ * says nothing, and a grant that says nothing must not move a light. */
+enum hwr_look_anchor {
+    HWR_LOOK_ANCHOR_CENTER = 0,
+    HWR_LOOK_ANCHOR_BOTTOM,
+    HWR_LOOK_ANCHOR_TOP
 };
 
 /* One grant laid over another, FIELD by field, with `off` left to the caller

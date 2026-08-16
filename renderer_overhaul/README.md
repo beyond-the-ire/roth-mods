@@ -197,6 +197,13 @@ colour for every light in the game would be a picture nobody asked for; a partic
 should throw a colour of its own is named in a game config, where the statement is about that
 thing and not about all of them.
 
+**A light hung inside something lights that thing.** A flame in a chandelier or a candelabrum has
+that fixture's own arms right beside it rather than a room's width away, so within the fixture's own
+size the light reaches those arms instead of lying in their plane and leaving them black — which is
+what left a chandelier hanging dark in the middle of the pool it cast. It is the fixture's own size
+and there is nothing to set: outside that size every light is the point it always was, and the
+room's picture is unchanged.
+
 **The strongest few of them cast real shadows.** `point_light_shadows` says how many, and the ones
 that do are the ones lighting most of what you can see — so shadows arrive from the nearest and
 strongest outward as you walk, and a light joins or leaves the set with a rebuild of its own map
@@ -236,13 +243,6 @@ one of the slots.
 - `point_light_glow_scale`: how much of the map's own word about its lantern these take, from 0
   through 2, exactly as the light you carry takes it.
 - `point_light_z_slack`: the vertical containment above, from 0 through 512 world units.
-- `point_light_body`: how big a light source itself is, from 0 through 4 of the size of whatever it
-  hangs inside. A flame in a chandelier or a candelabrum has that fixture's own arms right beside
-  it rather than a room's width away, so it lights the thing it burns in; at nought the light is a
-  point in the middle of those arms, lies in the plane of every one of them, and leaves the fixture
-  hanging dark in the middle of the pool it casts. It ships at 1, which is the fixture's own size,
-  and it reaches the fixture and nothing else: outside it every light is the point it always was,
-  and the room's picture is unchanged.
 - `point_light_hops`: how many doorways from the room you are in a light may still be lighting it,
   from 0 through 3. A light normally goes on lighting its own room for as long as that room is on
   screen whatever this says; it is the limit that comes into force only when the renderer cannot
@@ -330,7 +330,9 @@ falls back to the settings alone, and putting the file back puts the selection b
             "index": 70,
             "colour": "#ffb46e", "strength": 1.4, "reach": 420 },
           { "notes": "every arcane ward its author gave one ID",
-            "id": 36, "reach": 300 }
+            "id": 36, "reach": 300 },
+          { "notes": "a sconce whose flame is painted high and off to one side",
+            "index": 88, "anchor": "top", "offset": [-6, -4] }
         ],
         "faces": [
           { "notes": "the sigil wall in the north room",
@@ -408,6 +410,9 @@ the ceiling and the far wall lit up — so a mounted thing's light stands clear 
 mounted on, and the wall behind it is lit like any other surface. A thing standing out in the room is
 lit from where it stands and is not moved at all.
 
+Where the art disagrees — a sconce whose flame burns at the top of its plate, a brazier painted low
+in its own picture — `anchor` and `offset` below say so.
+
 #### `lights` — five tables
 
 `lights` holds five tables. Two are **blankets** over a whole game, three name **particular things in
@@ -459,6 +464,26 @@ Each entry says what the thing gives off, and each field stands on its own:
   as long as it is out, whatever `lit` says — a fixture painted bright in a room whose fixtures are
   off is a flame somebody forgot to blow out. The map's own mark (`Lighting` 0) is untouched. See
   [Re-lighting a switched room](#re-lighting-a-switched-room), which is what it is for.
+- **`anchor`** — where along the thing's own **height** its light sits: `"bottom"`, `"center"` or
+  `"top"`. Say nothing and it is the middle, which is where every light sits. What the height is
+  depends on what the thing is: for a thing drawn as a **sprite** it is the drawn card — `bottom` is
+  the card's base, which is the point the map hangs a thing standing on the floor by, and `top` is a
+  card's height above it; for a **wall texture** or a **face** it is the band its room runs between,
+  so `bottom` is the floor edge and `top` the ceiling edge; for a **3D object** it is the model's own
+  vertical extent. This is for art whose flame is not in the middle of its own picture.
+  A **floor or a ceiling** has no height to sit along, so a texture painted on one ignores it there —
+  the surface is the anchor — and says so once; the same entry still anchors every **face** painted
+  with it. Not a field of `placed`: `at` is already where a free-standing light hangs.
+- **`offset`** — `[x, y]` in world units, applied **after** the anchor. `y` is up, negative down.
+  `x` is sideways **across the thing as it is drawn**: along the wall for a wall texture or a face,
+  from the face's first corner toward its second; across the card for a sprite — which for a torch,
+  sconce or ward **mounted flat on a wall** is along that wall and stays there as you walk round it,
+  and for a thing that turns to face you is across your own view, because the card turns too; and for
+  a **3D object** it is the object's own right. Say nothing and it is `[0, 0]`. Ignored on floors and
+  ceilings along with the anchor, and not a field of `placed`, for the same reasons.
+  The **clearance off a mounting surface stays automatic** and neither field touches it: a sconce
+  nudged along its own wall is still held clear of that wall, because how far a light must stand off
+  a surface is a fact about the map rather than about the art.
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 
 The **most specific statement anybody made is the one in force**, and the tables compose **field by
