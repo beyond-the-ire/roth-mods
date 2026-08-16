@@ -236,6 +236,13 @@ one of the slots.
 - `point_light_glow_scale`: how much of the map's own word about its lantern these take, from 0
   through 2, exactly as the light you carry takes it.
 - `point_light_z_slack`: the vertical containment above, from 0 through 512 world units.
+- `point_light_body`: how big a light source itself is, from 0 through 4 of the size of whatever it
+  hangs inside. A flame in a chandelier or a candelabrum has that fixture's own arms right beside
+  it rather than a room's width away, so it lights the thing it burns in; at nought the light is a
+  point in the middle of those arms, lies in the plane of every one of them, and leaves the fixture
+  hanging dark in the middle of the pool it casts. It ships at 1, which is the fixture's own size,
+  and it reaches the fixture and nothing else: outside it every light is the point it always was,
+  and the room's picture is unchanged.
 - `point_light_hops`: how many doorways from the room you are in a light may still be lighting it,
   from 0 through 3. A light normally goes on lighting its own room for as long as that room is on
   screen whatever this says; it is the limit that comes into force only when the renderer cannot
@@ -437,7 +444,8 @@ Each entry says what the thing gives off, and each field stands on its own:
   so it glows with its own light rather than being painted bright. A field of `sprites` and
   `objects` alone: textures and faces grant surfaces, and a placed light is drawn by nothing, so
   there is no sprite for it to speak about there. On a thing the map itself marks (`Lighting` 0)
-  the mark is the map's own statement and this field does not unmark it.
+  the mark is the map's own statement and this field does not unmark it. A thing that also carries
+  `only_when_sector_lit` is drawn lit only while it burns: see the field below.
 - **`only_when_sector_lit`** — whether this light burns **only while the room it stands in counts as
   lit**. Say nothing and it burns whatever the room says, which is what every light did before this
   field existed. `true` ties it to the engine's own live word about whether that room's fixtures are
@@ -447,9 +455,9 @@ Each entry says what the thing gives off, and each field stands on its own:
   burns or never does. It is legal on **all five tables**, because every light this mod makes stands
   in exactly one of the map's rooms: a thing stands in its own, a granted surface's light stands in
   the room its faces were gathered from, and a placed light stands in the room its point is inside.
-  It speaks about the **light** and not about the drawing, which is `lit` above — so a candelabra
-  written `"only_when_sector_lit": true, "lit": false` has its light follow the switch *and* is drawn
-  by the room's own shading, which the same switch moves. See
+  It carries the **drawing** with it: a thing it puts out is drawn by the ordinary shading law for
+  as long as it is out, whatever `lit` says — a fixture painted bright in a room whose fixtures are
+  off is a flame somebody forgot to blow out. The map's own mark (`Lighting` 0) is untouched. See
   [Re-lighting a switched room](#re-lighting-a-switched-room), which is what it is for.
 - **`off`** — the whole entry rather than a field: this is not a light, whatever anything else said.
 

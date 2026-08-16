@@ -337,15 +337,18 @@ struct hwr_look_light {
      * gathered from, and a free-standing light stands in the room the point is
      * inside.
      *
-     * IT SPEAKS ABOUT THE LIGHT AND NOT ABOUT THE DRAWING, which is `lit`
-     * above. The two compose: a candelabra written
-     * `"only_when_sector_lit": true, "lit": false` has its light follow the
-     * switch AND is drawn by the room's own shading, which the same switch
-     * moves -- so it goes dark with the room rather than staying painted
-     * bright. Written alone it puts the light out and leaves the drawing
-     * whatever it was, which is the only honest answer available for a thing
-     * the MAP itself marks fullbright: that mark is the map's statement and
-     * this field does not unmake it. */
+     * IT CARRIES THE DRAWING WITH IT. A thing this field puts out is drawn by
+     * the ordinary shading law for as long as it is out, whatever `lit` above
+     * says: the promotion is what "this thing is alight" looks like, and a
+     * fixture painted bright in a room whose fixtures are out is a flame
+     * somebody forgot to blow out. So `"only_when_sector_lit": true` alone is
+     * a candelabra that goes dark WITH its room and comes back with it, and
+     * the pair `"only_when_sector_lit": true, "lit": false` is the same thing
+     * with the ordinary shading kept on it while it burns as well.
+     *
+     * What it does NOT unmake is the MAP's own mark: a thing the map itself
+     * marks fullbright is the map's statement, this field grants no promotion
+     * over it and takes none away. */
     int has_only_when_lit;
     int only_when_lit;
 };

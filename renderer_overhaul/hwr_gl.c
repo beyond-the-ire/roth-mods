@@ -2258,6 +2258,9 @@ static const char g_geometry_fragment_body[] =
     "uniform int u_point_count;\n"
     /* How softly that window's two edges fade, in world units. */
     "uniform float u_point_z_edge;\n"
+    /* And how much of its own size a light hung inside something is given, as a
+     * share of the radius its own seeding published. Nought is a point. */
+    "uniform float u_point_body;\n"
     /* The three classes the modern law must not touch, and why each one would be
      * a disaster if it did.
      *
@@ -2435,6 +2438,33 @@ static const char g_geometry_fragment_body[] =
     "  vec3 l=r>0.0 ? d/r : vec3(0.0,-1.0,0.0);\n"
     "  float ndl=dot(n,l);\n"
     "  float gain=1.0;\n"
+    /* HOW FAR INSIDE THE THING'S OWN BODY THIS SURFACE IS, which is a question
+     * about the fixture the flame hangs in and about nothing else in the room.
+     *
+     * A flame hung in a chandelier is not a point out in the room to that
+     * chandelier's own arms. They are AT it -- a few dozen units away on every
+     * side, with the flame between them -- and the light they take comes at
+     * them from all round rather than from one direction. A point law reads
+     * them as edge-on, because the emit point lies in the plane of every arm
+     * radiating out of it, and the one thing in the room that IS a light is
+     * then the only black shape in it.
+     *
+     * So inside the thing's own radius the incidence is wrapped by how deep in
+     * it the surface is: the whole way at the middle, and nothing at all at
+     * the body's own edge, where it meets the point law it came from. Outside
+     * that radius nothing happens at all -- this is a statement about a
+     * fixture and not about a room, so the room's own picture is the picture
+     * it always was, to the bit.
+     *
+     * It only ever ADDS: a surface facing the light square on takes the same
+     * one it took before, so what moves is the terminator. And the radius is
+     * nought for every light not hung inside anything and for a row set to
+     * nothing, which is the point law again, operation for operation. */
+    "  float body=u_point_z[i].z*u_point_body;\n"
+    "  if (body>0.0 && r<body) {\n"
+    "    float w=r>0.0 ? min(body/r-1.0,1.0) : 1.0;\n"
+    "    ndl=(ndl+w)/(1.0+w);\n"
+    "  }\n"
     /* A standing figure is not a wall here either: the same wrap and the same
      * dial, because what makes a figure a figure is the figure, not which
      * light is falling on it. */
@@ -6073,6 +6103,10 @@ static void hwr_bind_light_uniforms(GLuint program,
      * held inside. The window travels with each light; this is one row, so it
      * is one uniform beside the rig rather than a third component per light. */
     hwr_uniform_1f(program, "u_point_z_edge", light->point_z_edge);
+    /* And how much of its own size such a light is given, for the same reason
+     * in the same place: the radius belongs to the light and travels with it,
+     * while how much of it counts is one row for the whole picture. */
+    hwr_uniform_1f(program, "u_point_body", light->point_body);
 }
 
 /* The geometry stage's own world-to-view transform, in C, for a position that is
@@ -6160,6 +6194,12 @@ static void hwr_bind_point_lights(GLuint program,
         color_energy[i * 4u + 3u] = light->intensity;
         window[i * 4u + 0u] = light->z_lo;
         window[i * 4u + 1u] = light->z_hi;
+        /* How big the thing this one burns inside is, which rides the row the
+         * window already owns: the third component was padding the std140
+         * layout spends whatever is written in it, so an area source costs the
+         * block nothing at all. Nought for every light that is not inside
+         * anything, which is what the memset above already left here. */
+        window[i * 4u + 2u] = light->body;
         /* The world side of the same light, for the shadow lookup, which
          * runs in world space exactly as the sun's does. The tile rides the
          * fourth component; minus one is every light no map stands for. */

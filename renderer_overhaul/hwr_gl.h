@@ -434,6 +434,11 @@ struct hwr_gl_light {
      * edges, and it is the same softness for all of them because it is one
      * row. Zero is a hard edge. */
     float point_z_edge;
+    /* How much of its own size a light hung INSIDE something is given (see
+     * `body` on the light itself). One is the thing's own size; zero is a
+     * point, which is what every light was before this row and is inert to the
+     * bit, because the term it scales is then nought. */
+    float point_body;
 };
 
 /* How many lights that are NOT at the eye the world pass carries at once.
@@ -483,6 +488,29 @@ struct hwr_gl_point_light {
      * no vertex data -- it is what stops a torch lighting the room above it. */
     float z_lo;
     float z_hi;
+    /* HOW BIG THE THING IT BURNS INSIDE IS, in world units, or nought for a
+     * light that is not inside anything.
+     *
+     * A flame hung in a chandelier, a candelabrum or a brazier is not a point
+     * out in the room: the thing's own arms are AT it, a few dozen units away
+     * on every side, and from there the flame fills half the sky. A point law
+     * reads that as edge-on and lights none of it -- the emit point sits in
+     * the plane of every arm radiating from it -- so the one thing in the room
+     * that is a light hangs dark in the middle of the pool it casts.
+     *
+     * This is the radius of that BODY, which for a 3D prop is the prop's own:
+     * the far corner of the geometry the light is hung in the middle of, read
+     * off the same pack the emit point is. What reads it is one line of the
+     * falloff (point_light_term) -- inside the body the light wraps past a
+     * surface's terminator by how deep in it that surface is, and at the
+     * body's own edge it is the point law again.
+     *
+     * It is a statement about the FIXTURE: nothing outside that radius moves,
+     * so a room lit by a light hung in a prop is the room it always was.
+     * Nought for every other class, and for a prop under a row set to nothing:
+     * the term is then never entered and the light is the point it always was,
+     * to the bit. */
+    float body;
     /* What a game config SAID about this light casting shadows, which is a
      * three-state answer and not a switch: nothing at all (follow the
      * settings row -- the ordinary case, every light in an undescribed

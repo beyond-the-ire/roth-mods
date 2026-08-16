@@ -1716,6 +1716,31 @@ int hwr_lights_object_promoted(const struct hwr_world *world,
         return 0;
     if (named.off)
         return 0;
+    /* AND WHETHER THE ROOM WANTS IT BURNING AT ALL, by the same live word and
+     * through the same law the light itself is held to.
+     *
+     * A fixture that follows its room's switch is DRAWN lit only while it
+     * burns. The two halves of one statement cannot part company: a candelabra
+     * whose light goes out with the switch and which stays painted bright
+     * afterwards is a flame somebody forgot to blow out, and it is the one
+     * shape an unlit room must not contain. So the drawing asks the seeding's
+     * own question -- named rather than transcribed, one authority for the two
+     * of them -- and a room whose fixtures are out draws the thing by the
+     * ordinary shading law, which that same switch moves.
+     *
+     * An entry that says nothing about the switch is untouched: `wanted`
+     * answers true for it for ever, which is what every grant did before the
+     * field existed.
+     *
+     * It follows the WORD rather than the light's own fade. What is being
+     * asked is whether this thing is alight, which is a fact about the room
+     * and not about which lights won a place in this frame's set: a fixture
+     * out past the count's reach, or one the cap dropped, is a lit fixture
+     * still and is drawn as one. So the drawn state changes on the frame the
+     * engine's own latch flips -- the frame the room's own shading changes
+     * class on -- rather than at the far end of a fade. */
+    if (!hwr_light_wanted(world, object->sector_index, &named))
+        return 0;
     /* The entry's own word on the drawing, composed like every field: absent
      * means true -- what a grant has always done -- and false keeps the
      * ordinary shading law on the sprite while the light it gives stands.
@@ -1809,6 +1834,14 @@ static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
  * horizontal middle taken off a lopsided prop would walk its light toward a
  * wall for no reason anybody could state.
  *
+ * AND HOW BIG THE THING IS, about that same point, which is the other half of
+ * the same sentence: a flame in the middle of a chandelier has the chandelier's
+ * own arms a few dozen units away on every side, and a light that is a POINT
+ * there lies in the plane of every one of them and lights none of them (see
+ * `body` in hwr_gl.h). The size is the far corner of the prop's own geometry
+ * and it comes out of this read rather than a second one, so it cannot drift
+ * from the middle it is measured about.
+ *
  * Answers 0 for anything that is not a packed 3D prop, and then the sprite law
  * above has its say. */
 #define HWR_LIGHT_MESH_FLAG 0x8000u
@@ -1816,10 +1849,12 @@ static int hwr_light_sprite_middle(const struct hwr_lights_frame *frame,
 static int hwr_light_mesh_middle(const struct hwr_lights_frame *frame,
                                  const struct hwr_sprite_lookup *lookup,
                                  const struct hwr_object *object,
-                                 float *out_z)
+                                 float *out_z, float *out_body)
 {
     const struct hwr_meshes *meshes = frame->meshes;
     const struct hwr_mesh_resource *resource = NULL;
+    double middle;
+    double far_squared = 0.0;
     int32_t low;
     int32_t high;
     size_t v;
@@ -1852,8 +1887,30 @@ static int hwr_light_mesh_middle(const struct hwr_lights_frame *frame,
         if (at > high)
             high = at;
     }
-    *out_z = (float)((double)object->world_z +
-                     ((double)low + (double)high) * 0.5);
+    middle = ((double)low + (double)high) * 0.5;
+    *out_z = (float)((double)object->world_z + middle);
+    /* AND HOW BIG THE THING IS, about that same point: the far corner of the
+     * prop's own geometry, which is the radius of the body the flame is inside
+     * (hwr_gl.h, `body`). Taken off the pack the middle above came from and in
+     * the pack's own local coordinates, which needs no facing: a radius about
+     * a point on the axis is the same radius however the thing is turned.
+     *
+     * The FARTHEST corner rather than an average or a half-height: what the
+     * radius has to cover is the thing's own arms, since it is the arms that a
+     * point law leaves dark, and they are exactly the corners furthest from
+     * the middle. */
+    for (v = 0; v < resource->vertex_count; v++) {
+        const struct hwr_mesh_local_vertex *at =
+            &meshes->vertices[resource->first_vertex + v];
+        double dz = (double)at->vertical - middle;
+        double squared = (double)at->x * (double)at->x +
+                         (double)at->y * (double)at->y + dz * dz;
+
+        if (squared > far_squared)
+            far_squared = squared;
+    }
+    if (out_body != NULL)
+        *out_body = (float)sqrt(far_squared);
     return 1;
 }
 
@@ -2079,9 +2136,16 @@ static int hwr_light_from_object(const struct hwr_lights_frame *frame,
     out->light.world_z = (float)object->world_z;
     /* A 3D prop first, because a prop has no sprite frame for the sprite law to
      * read and the two are asking one question. Neither answering leaves the
-     * anchor, which is where every light stood before either existed. */
+     * anchor, which is where every light stood before either existed.
+     *
+     * The prop is also the one class that answers the OTHER question the emit
+     * point raises -- how big the thing the flame is inside is -- and it comes
+     * back from the same read for the same reason: a size worked out anywhere
+     * but beside the middle it is measured about could drift from it. A card
+     * leaves it at nought and is the point light it always was. */
     if (resolved &&
-        !hwr_light_mesh_middle(frame, &lookup, object, &out->light.world_z))
+        !hwr_light_mesh_middle(frame, &lookup, object, &out->light.world_z,
+                               &out->light.body))
         (void)hwr_light_sprite_middle(frame, &lookup, object,
                                       &out->light.world_z);
     (void)hwr_light_wall_clearance(world, object, &out->light.world_x,

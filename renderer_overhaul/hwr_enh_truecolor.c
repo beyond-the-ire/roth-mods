@@ -89,6 +89,7 @@
 #define HWR_POINT_HOPS_ROW "point_light_hops"
 #define HWR_POINT_Z_SLACK_ROW "point_light_z_slack"
 #define HWR_POINT_FADE_ROW "point_light_fade"
+#define HWR_POINT_BODY_ROW "point_light_body"
 #define HWR_POINT_SHADOWS_ROW "point_light_shadows"
 
 /* What the map now loaded says about the brightness it was authored at: the
@@ -483,6 +484,14 @@ static void hwr_truecolor_light(const struct hwr_settings *settings,
                                                  0.5f);
     light->point_z_edge = hwr_truecolor_row_float(HWR_POINT_Z_SLACK_ROW,
                                                  settings, 64.0f);
+    /* And how much of its own size a light hung inside something is given: one
+     * is the thing's own, nothing at all is the point every light was before
+     * the row, and the term it scales is nought for every light that is not
+     * inside anything whatever this says. */
+    light->point_body = hwr_truecolor_row_float(HWR_POINT_BODY_ROW, settings,
+                                                1.0f);
+    if (!(light->point_body > 0.0f))
+        light->point_body = 0.0f;
     /* A reach of nothing would divide the falloff by zero; the row's own
      * minimum is well clear of it and this is what holds a value that arrived
      * some other way. */
