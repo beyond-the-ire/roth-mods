@@ -391,6 +391,61 @@ static inline float hwr_sunm_bias_slope(int soft, int taps,
     return 0.5f / (float)resolution;
 }
 
+/* ================== THE WALL-CLASS CASTER'S TEXEL ROW ====================
+ *
+ * A wall-class caster -- a wall band, a portal band, a door leaf -- samples
+ * its row from the same coordinate the eye's wall driver walks, and it has
+ * to reach the SAME texel: a hole the eye draws is a hole the light passes,
+ * and a hole anywhere else is the shadow of a picture nobody is looking at.
+ *
+ * The engine's horizontal flip is one instruction of that driver --
+ * `ax = (~ax) + width` on the sixteen-bit row accumulator, which is
+ * (height-1) - row wrapped to sixteen bits -- taken when the face's own
+ * mapping flag says so, exclusive-or the resolved texture's own toggle. The
+ * eye's fragment program states exactly that, on the coordinate BEFORE the
+ * wrap to the picture's height, and both halves matter: a picture whose
+ * height does not divide 65536 lands on a different row if the wrap comes
+ * first.
+ *
+ * `u` is the caster's interpolated row coordinate, already in the eye's own
+ * post-halving texel units (the emitter did the halving where it built the
+ * vertex), so what is left here is the flip, the sixteen-bit wrap and the
+ * picture's own wrap, in the eye's order. It is taken at double width
+ * because the offline twin walks its rays in double; the program's own
+ * interpolation is the GPU's and lands on the same texel.
+ *
+ * The caster fragment program mirrors these lines and the offline twin
+ * compiles them; neither states the law anywhere else. */
+static inline int hwr_sunm_caster_row(double u, int height, int flip)
+{
+    int base;
+
+    if (height <= 0)
+        return 0;
+    base = (int)floor(u);
+    if (flip)
+        base = ((height - 1) - base) & 0xffff;
+    base %= height;
+    if (base < 0)
+        base += height;
+    return base;
+}
+
+/* The face's authored horizontal-flip bit in the map's texture-mapping flag
+ * byte -- a byte fact about the map format, named here because both sides of
+ * the law below read it. */
+#define HWR_SUNM_TEX_FLIP 0x02u
+
+/* The eye's own flip condition for a wall-class surface, in the one place
+ * the caster emitter and the gates both read it: the face's authored
+ * mapping flip bit against the flip the grouped-texture resolution ended up
+ * carrying. The eye's material emitter states the same inequality over the
+ * same two facts. */
+static inline int hwr_sunm_wall_flip(uint8_t mapping_flags, int texture_flip)
+{
+    return ((mapping_flags & HWR_SUNM_TEX_FLIP) != 0) != (texture_flip != 0);
+}
+
 /* The texel side of one decoded 3D-prop face, exactly as the eye emitter
  * reads the same DAS fields (the four coordinate laws and the flip), so a
  * tree's leaf holes are the same holes in its shadow that they are in its

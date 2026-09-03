@@ -3496,7 +3496,16 @@ static const char g_sun_fragment_shader[] =
     "  int w=int(v_dims.x), h=int(v_dims.y);\n"
     "  uint texel=255u;\n"
     "  if ((v_flags & 7u)!=0u && w>0 && h>0) {\n"
-    "    int iy=int(floor(v_uv.x)) % h; if (iy<0) iy+=h;\n"
+    /* The wall driver's horizontal flip (hwr_sunm_caster_row states the law
+     * and the offline twin compiles it): the engine reverses the row with a
+     * sixteen-bit register instruction BEFORE the wrap to the picture's
+     * height, and the eye's own wall branch does exactly that, so past the
+     * first tile the order is not the same texel as flipping a wrapped row.
+     * The flip bit stands clear of the three class bits the fetch above is
+     * gated on -- it decides WHICH texel is read, never whether one is. */
+    "    int iy=int(floor(v_uv.x));\n"
+    "    if ((v_flags & 8u)!=0u) iy=((h-1)-iy) & 65535;\n"
+    "    iy=iy % h; if (iy<0) iy+=h;\n"
     "    int ix=int(floor(v_uv.y)) % w; if (ix<0) ix+=w;\n"
     "    texel=texelFetch(u_texels,int(v_offset)+iy*w+ix).r;\n"
     "  }\n"

@@ -247,8 +247,15 @@ unsigned long hwr_sun_static_dims(void)
     unsigned long count = 0;
     size_t i;
 
+    /* The class bits alone decide this, by MASK rather than by equality: the
+     * flag byte also carries texel-sampling bits (the horizontal flip), and a
+     * dim is a dim whatever they say. An equality test here would quietly
+     * stop counting the moment anything else moved into the byte. */
     for (i = 0; i < g_static_count; i++) {
-        if (g_static[i].flags == (uint8_t)HWR_GL_SUN_TRANSLUCENT &&
+        if ((g_static[i].flags & (uint8_t)(HWR_GL_SUN_MASKED |
+                                           HWR_GL_SUN_CARD |
+                                           HWR_GL_SUN_TRANSLUCENT)) ==
+                (uint8_t)HWR_GL_SUN_TRANSLUCENT &&
             g_static[i].width == 0)
             count++;
     }
@@ -461,6 +468,7 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
     uint16_t width = 0;
     uint16_t height = 0;
     uint8_t flags = 0;
+    int flip = 0;
     size_t i;
 
     if (cutout == 4) {
@@ -484,6 +492,34 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
         flags = cutout == 3
               ? (uint8_t)(HWR_GL_SUN_TRANSLUCENT | HWR_GL_SUN_MASKED)
               : (uint8_t)HWR_GL_SUN_MASKED;
+        /* AND THE EYE'S OWN HORIZONTAL FLIP, so the caster reads the texel
+         * the eye reads. Without it a masked face casts a MIRRORED pattern
+         * of its own holes, and an arch authored with one of its two sides
+         * flipped casts two disagreeing copies at once.
+         *
+         * Where the flip goes depends on which coordinate law the face is
+         * on, exactly as the eye's fragment program splits them:
+         *
+         *  - a wall band's row is a TILING ACCUMULATOR, and the engine's
+         *    wall driver flips it with a sixteen-bit register instruction
+         *    (`ax = (~ax) + width`) BEFORE the wrap to the picture's height.
+         *    Past the first tile that ordering is not the same texel as
+         *    flipping a wrapped row, so the law has to travel to the
+         *    fragment: the vertex carries the bit and the program states it.
+         *
+         *  - a door leaf's row is AUTHORED DIRECTLY, 0..1 across the leaf,
+         *    and the eye samples it wrapped-then-flipped; that is exactly
+         *    what a reversed coordinate gives, so it is baked here -- the
+         *    same way the decoded 3D-prop faces beside it bake theirs
+         *    (hwr_sunm_mesh_uv). Nothing has to reach the fragment.
+         *
+         * A flat is on neither law: this slice carries no world-plane texel
+         * coordinate for one at all, so there is no row here to reverse. */
+        flip = (surface->flags & HWR_SURFACE_FLAT) == 0 &&
+               hwr_sunm_wall_flip(surface->mapping_flags,
+                                  scene->textures[id].flip_toggle);
+        if (flip && surface->kind != HWR_SURFACE_DOOR)
+            flags |= (uint8_t)HWR_GL_SUN_HFLIP;
     }
     out = hwr_sun_grow(&g_static, &g_static_count, &g_static_capacity,
                        surface->vertex_count);
@@ -527,9 +563,14 @@ static int hwr_sun_emit_surface(const struct hwr_scene *scene,
         if (flags != 0 && cutout != 4) {
             if (surface->kind == HWR_SURFACE_DOOR) {
                 /* Door leaves carry direct 0..1 coordinates; the eye emit
-                 * scales them by the texture just under its edge. */
+                 * scales them by the texture just under its edge. The flip
+                 * is baked into the row here (see above): a reversed
+                 * coordinate IS wrapped-then-flipped, which is how the eye
+                 * samples this law. */
                 u = source->wall_s * ((float)height - 1.0f / 64.0f);
                 v = source->wall_top * ((float)width - 1.0f / 64.0f);
+                if (flip)
+                    u = (float)height - u;
             } else if ((surface->flags & HWR_SURFACE_FLAT) == 0) {
                 float top = source->wall_top;
                 int fit = (surface->mapping_flags &

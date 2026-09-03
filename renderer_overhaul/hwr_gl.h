@@ -608,7 +608,17 @@ enum hwr_gl_sun_vertex_flags {
      * beam whole, exactly as a masked caster's paint does. Carried WITHOUT
      * a texture (width 0), it is the palette-colour solid-blend part: the
      * whole footprint filters by the fitted weight and owns no depth. */
-    HWR_GL_SUN_TRANSLUCENT = 1u << 2
+    HWR_GL_SUN_TRANSLUCENT = 1u << 2,
+    /* The wall driver's horizontal flip, carried from the eye's own
+     * condition -- the face's authored flip bit against the resolved
+     * texture's own -- so a caster reads the SAME texel the eye reads and
+     * a masked face's holes fall where its picture's holes fall. Deliberately
+     * outside the low three bits, which are the classes the fetch is gated
+     * on: a flip decides WHICH texel is read, never whether one is.
+     *
+     * A texel-sampling bit only. The three class bits above are what the
+     * two passes branch on, and none of them may be reached by this. */
+    HWR_GL_SUN_HFLIP = 1u << 3
 };
 
 /* The directional key light and the light-space depth map that gates it,
