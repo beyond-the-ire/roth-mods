@@ -88,6 +88,17 @@ int hwr_composite_source_to_engine(const struct roth_api_v1 *api,
                                    uint32_t source_x, uint32_t source_y,
                                    uint32_t *engine_x, uint32_t *engine_y);
 
+/* Where a rectangle of the engine framebuffer lies on the submitted image, in
+ * that image's pixels. The part of the rectangle outside the frame's viewport
+ * is left out first: only there does the image show through the engine layer.
+ * Returns zero when nothing of it is left. */
+int hwr_composite_engine_rect_to_source(const struct roth_api_v1 *api,
+                                        const struct roth_world_frame_v1 *frame,
+                                        int32_t x, int32_t y,
+                                        uint32_t w, uint32_t h,
+                                        int32_t *source_x, int32_t *source_y,
+                                        uint32_t *source_w, uint32_t *source_h);
+
 /* Build the palette the world image is presented through, from the engine's
  * live palette plus whatever palette-level effects are in force, and publish it
  * as the reference every consumer of the submitted pixels shares. Passing a

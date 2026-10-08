@@ -914,6 +914,30 @@ the matching wide projection, and engine-only menus retain their original coordi
 Authentic rendering is what the mod produces with every enhancement off, so there is no separate
 rendering mode to select.
 
+## Working with other mods
+
+While this mod draws the world, the original renderer paints no world pixels, and the 8-bit frame
+other mods draw their overlays on only stands in for the picture: a pixel left exactly as the
+engine published it shows the full-color world, and a pixel a mod changed shows as that 8-bit
+value. Opaque overlays (text, bars, panels) are unaffected. Two things stop working, and the mod
+publishes an interface so other mods can ask for them instead:
+
+- **Decorating one object as it is drawn.** A mod sends, every frame, the objects it wants drawn
+  differently: a size step, a tint, a glow with a halo, a sweeping highlight. They are drawn over
+  the finished world, hidden by whatever hides the sprite.
+- **Darkening the world behind a translucent panel.** A mod names rectangles of the screen (or
+  the whole world) and the renderer darkens its own picture there, including while the game is
+  held under a menu.
+
+The interface is found through the SDK's plugin-interface registry (SDK 0.8) under the name
+`ire.roth.renderer_overhaul.ext`. Its contract, with every record and rule, is
+[`renderer_overhaul_ext.h`](renderer_overhaul_ext.h): copy that one header into your mod. A mod
+that finds no such interface is running without this renderer and draws as it always did.
+
+Limits of this first version: looks are not drawn in mirrors, an object's sun and point-light
+shadows keep its original size, and looks are left off while the engine shows its desaturated
+pause picture.
+
 ## Enhancements
 
 The Enhancements section of the settings screen holds the settings that change how the world looks

@@ -113,6 +113,15 @@ struct hwr_billboards {
      * closure means the closure walk missed a reachable id (the sprite is
      * skipped, never drawn) -- the atlas-miss logger surfaces it. */
     size_t stat_atlas_miss;
+    /* The primary view's decorated sprites (renderer_overhaul_ext.h), one
+     * record per sprite another mod sent a look for this frame. Rebuilt by
+     * each primary emit and handed to the GL layer with the view. fx_unit is
+     * how many target pixels one pixel of a 320x240 screen covers, which is
+     * the unit a look states its halo in; the caller sets it before the emit. */
+    struct hwr_gl_fx_quad *fx;
+    size_t fx_count;
+    size_t fx_capacity;
+    float fx_unit;
     char error[192];
 };
 

@@ -1,4 +1,5 @@
 #include "hwr_billboards.h"
+#include "hwr_ext.h"
 
 #include "hwr_lights.h"
 #include "hwr_sprite_span.h"
@@ -206,6 +207,7 @@ void hwr_billboards_clear(struct hwr_billboards *bb)
     free(bb->flat);
     free(bb->translucent);
     free(bb->runs);
+    free(bb->fx);
     memset(bb, 0, sizeof *bb);
 }
 
@@ -988,6 +990,94 @@ static int hwr_bb_emit_quad(struct hwr_gl_vertex **dst, size_t *cnt, size_t *cap
     return written;
 }
 
+/* Records one decorated sprite for the pass that draws object looks: the quad
+ * it was emitted as, and the look turned into what that pass draws with. A
+ * sprite cut into more portal windows than the record carries is recorded
+ * uncut. Silently drops the record when the list cannot grow. */
+static void hwr_bb_push_fx(struct hwr_billboards *bb,
+                           const struct hwr_ext_object_look_v1 *look,
+                           int16_t xl, int16_t yl, int16_t xr, int16_t yr,
+                           int16_t z_top, int16_t z_bottom, uint32_t offset,
+                           uint16_t tw, uint16_t th, int flip, int32_t depth,
+                           const struct hwr_bb_clip *clip,
+                           int has_floor, int16_t floor_z)
+{
+    enum { HWR_BB_FX_MAX = 128 };
+    struct hwr_gl_fx_quad *quad;
+    float unit = bb->fx_unit > 0.0f ? bb->fx_unit : 1.0f;
+
+    if (bb->fx_count >= (size_t)HWR_BB_FX_MAX)
+        return;
+    if (bb->fx_count == bb->fx_capacity) {
+        size_t next = bb->fx_capacity != 0 ? bb->fx_capacity * 2u : 16u;
+        struct hwr_gl_fx_quad *grown = (struct hwr_gl_fx_quad *)realloc(
+            bb->fx, next * sizeof *grown);
+
+        if (grown == NULL)
+            return;
+        bb->fx = grown;
+        bb->fx_capacity = next;
+    }
+    quad = &bb->fx[bb->fx_count];
+    memset(quad, 0, sizeof *quad);
+    quad->xl = xl; quad->yl = yl; quad->xr = xr; quad->yr = yr;
+    quad->z_top = z_top;
+    quad->z_bottom = z_bottom;
+    quad->texture_offset = offset;
+    quad->texture_width = tw;
+    quad->texture_height = th;
+    quad->hflip = (uint8_t)(flip != 0);
+    quad->has_floor = (uint8_t)(has_floor != 0);
+    quad->floor_z = floor_z;
+    quad->depth = (float)depth;
+    if (look->tint_strength != 0) {
+        float r = (float)((look->tint_rgb >> 16) & 0xffu);
+        float g = (float)((look->tint_rgb >> 8) & 0xffu);
+        float b = (float)(look->tint_rgb & 0xffu);
+        float top = r > g ? r : g;
+
+        if (b > top)
+            top = b;
+        if (top > 0.0f) {
+            unsigned strength = look->tint_strength > 100u
+                              ? 100u : look->tint_strength;
+
+            quad->tint[0] = r / top;
+            quad->tint[1] = g / top;
+            quad->tint[2] = b / top;
+            quad->tint[3] = (float)strength / 100.0f;
+        }
+    }
+    if (look->glow_level != 0) {
+        unsigned limit = look->bloom != 0 ? 255u : 48u;
+        unsigned size = look->glow_size > limit ? limit : look->glow_size;
+
+        quad->glow[0] = (float)((look->glow_rgb >> 16) & 0xffu) / 255.0f;
+        quad->glow[1] = (float)((look->glow_rgb >> 8) & 0xffu) / 255.0f;
+        quad->glow[2] = (float)(look->glow_rgb & 0xffu) / 255.0f;
+        quad->glow[3] = (float)look->glow_level / 255.0f;
+        quad->halo_px = (float)size * unit;
+        quad->bloom = (uint8_t)(look->bloom != 0);
+    }
+    /* The sweep's own shape is the software one's: a seven-pixel stripe every
+     * two hundred and seventy, in pixels of a 320x240 screen. */
+    quad->shine_phase = look->shine != 0
+                      ? (float)look->shine_phase / 65536.0f : -1.0f;
+    quad->shine_gap_px = 270.0f * unit;
+    quad->shine_band_px = 7.0f * unit;
+    if (clip != NULL && clip->active && clip->count > 0 &&
+        clip->count <= HWR_GL_FX_CLIP_MAX) {
+        int c;
+
+        for (c = 0; c < clip->count; c++) {
+            quad->clip_lo[c] = clip->lo[c];
+            quad->clip_hi[c] = clip->hi[c];
+        }
+        quad->clip_count = clip->count;
+    }
+    bb->fx_count++;
+}
+
 /* Appends the ground-shadow oval for one object to the pending translucent set.
  * The engine emits it (renderer.c:8068-8098, the +9 bit0 "mirror double") as a
  * type-1 billboard at the object's XY on the sector floor, textured with the
@@ -1102,6 +1192,10 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
 
     if (bb == NULL)
         return 0;
+    /* The decorated-sprite list is the primary view's: a mirror's emit
+     * leaves it standing. */
+    if (camera == NULL || !camera->reflected)
+        bb->fx_count = 0;
     bb->opaque_count = 0;
     bb->flat_count = 0;
     bb->translucent_count = 0;
@@ -1166,6 +1260,7 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         int16_t xl, yl, xr, yr, origin_x, origin_y;
         int translucent, do_trace, cl, is_flat;
         struct hwr_bb_clip clip;
+        const struct hwr_ext_object_look_v1 *look = NULL;
 
         bb->stat_enumerated++;
         if (!camera->reflected &&
@@ -1354,6 +1449,17 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
         if (tw == 0 || th == 0)
             continue;
 
+        /* WHAT ANOTHER MOD SAID ABOUT THIS OBJECT (renderer_overhaul_ext.h).
+         * A size step is taken on the block modifier itself, before either
+         * half of the sizing law reads it, so the sprite is exactly the one
+         * the engine would draw from a frame authored at that scale. Only a
+         * record of the map's own object lists can be named: a particle and
+         * the flying pickup have no record to name. */
+        if (o->source == HWR_OBJECT_MAP && hwr_ext_have_looks())
+            look = hwr_ext_look_for(o->appearance_ptr);
+        if (look != NULL && look->size_step != 0)
+            fa = hwr_ext_scaled_flags(fa, look->size_step);
+
         /* Shade seed compose (renderer.c:6180-6182): the +8 seed, biased by the
          * owner sector's light when both are nonzero, else passed through. The
          * composed value stands in as the billboard's effective light (a neutral
@@ -1476,6 +1582,20 @@ int hwr_billboards_emit(struct hwr_billboards *bb,
                  o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
                  o->sector_index < world->sector_count)
             obj_floor_id = HWR_BB_WALL_TAG | (uint32_t)o->sector_index;
+
+        if (look != NULL && !camera->reflected &&
+            (look->tint_strength != 0 || look->glow_level != 0 ||
+             look->shine != 0)) {
+            int floored = !is_flat &&
+                o->sector_index != (uint16_t)HWR_OBJECT_NO_SECTOR &&
+                o->sector_index < world->sector_count;
+
+            hwr_bb_push_fx(bb, look, xl, yl, xr, yr,
+                           hwr_bb_clamp_i16(z_top), hwr_bb_clamp_i16(z_bottom),
+                           offset, tw, th, lookup.flip, depth, &clip, floored,
+                           floored ? (int16_t)world->sectors[o->sector_index].floor_z
+                                   : (int16_t)0);
+        }
 
         if (bb_log || (trace >= 2 && throttle))
             fprintf(stderr,

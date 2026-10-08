@@ -5929,6 +5929,14 @@ static int hwr_scene_emit_view(struct hwr_scene *scene,
                         api) != 0)
         return hwr_scene_fail(scene, "%s",
                               hwr_meshes_error(&scene->object_meshes));
+    /* The unit a look states its halo in: one pixel of a 320x240 screen, in
+     * pixels of this target. The view's own height is what the target's rows
+     * are a scaling of. */
+    scene->billboards.fx_unit =
+        camera->source_height != 0
+            ? (float)height / (float)camera->source_height *
+              (camera->source_width > 400u ? 2.0f : 1.0f)
+            : 1.0f;
     hwr_billboards_emit(&scene->billboards, objects, world, camera,
                         scene->visible, scene->visible_count, scene->pvs_valid,
                         spans, span_count, api);
@@ -6230,6 +6238,10 @@ const uint32_t *hwr_scene_render(struct hwr_scene *scene,
     views[view_count].camera = camera;
     view_count++;
 
+    /* The looks other mods sent for this frame, with the camera they were
+     * emitted under. Set every frame, so a frame with none clears the last. */
+    hwr_gl_set_fx_quads(scene->billboards.fx, scene->billboards.fx_count,
+                        &camera);
     hwr_build_palette(world, palette, base_palette, &published);
     hwr_gl_set_stale_mask(scene->stale_mask_seen);
     /* The lights that are not at the eye, found afresh for this frame and handed

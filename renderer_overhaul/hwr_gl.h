@@ -973,4 +973,57 @@ int hwr_gl_read_scene_indices(uint8_t *out, uint32_t width, uint32_t height);
  * environment default on the next frame. */
 void hwr_gl_set_debug_vis(int mode);
 
+/* ---- what another mod asked for, drawn over the resolved image ---- */
+
+/* How many of a sprite's own portal windows its look is cut to. A sprite cut
+ * into more than this is drawn uncut. */
+#define HWR_GL_FX_CLIP_MAX 4
+
+/* One decorated sprite of the primary view: the quad the world pass drew it as,
+ * and what to do to the pixels it covers. */
+struct hwr_gl_fx_quad {
+    int16_t xl, yl, xr, yr;
+    int16_t z_top, z_bottom;
+    uint32_t texture_offset;
+    uint16_t texture_width;
+    uint16_t texture_height;
+    uint8_t hflip;
+    /* Set where the sprite is drawn over its own sector's floor, with that
+     * floor's height. */
+    uint8_t has_floor;
+    /* Set where the halo is a bloom: smooth, measured from the sprite's box,
+     * and drawn over nearer geometry. */
+    uint8_t bloom;
+    int16_t floor_z;
+    /* View depth of the sprite, which sizes the halo's margin. */
+    float depth;
+    /* rgb is the hue with its brightest channel at one; a is the strength. */
+    float tint[4];
+    /* rgb is the glow colour; a is how bright it is now. */
+    float glow[4];
+    /* Halo reach in target pixels; nought is no halo. */
+    float halo_px;
+    /* Where the sweep is in its cycle, 0..1; negative is no sweep. */
+    float shine_phase;
+    float shine_gap_px;
+    float shine_band_px;
+    int clip_count;
+    float clip_lo[HWR_GL_FX_CLIP_MAX];
+    float clip_hi[HWR_GL_FX_CLIP_MAX];
+};
+
+/* A rectangle of the target to darken; strength 0..1 is the light taken away. */
+struct hwr_gl_dim {
+    int32_t x, y;
+    uint32_t w, h;
+    float strength;
+};
+
+/* Both lists stand until they are set again, so a held frame that is resolved
+ * a second time carries what it carried the first. The camera is the primary
+ * view's. */
+void hwr_gl_set_fx_quads(const struct hwr_gl_fx_quad *quads, size_t count,
+                         const struct hwr_gl_camera *camera);
+void hwr_gl_set_dims(const struct hwr_gl_dim *dims, size_t count);
+
 #endif

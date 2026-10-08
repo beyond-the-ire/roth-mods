@@ -583,6 +583,60 @@ static int hwr_engine_to_source(const struct hwr_canvas_mapping *mapping,
     return 1;
 }
 
+int hwr_composite_engine_rect_to_source(const struct roth_api_v1 *api,
+                                        const struct roth_world_frame_v1 *frame,
+                                        int32_t x, int32_t y,
+                                        uint32_t w, uint32_t h,
+                                        int32_t *source_x, int32_t *source_y,
+                                        uint32_t *source_w, uint32_t *source_h)
+{
+    struct hwr_canvas_mapping mapping;
+    int64_t x0 = x, y0 = y;
+    int64_t x1 = (int64_t)x + (int64_t)w, y1 = (int64_t)y + (int64_t)h;
+    double left, top, right, bottom;
+    int64_t sx0, sy0, sx1, sy1;
+
+    if (source_x == NULL || source_y == NULL || source_w == NULL ||
+        source_h == NULL || frame == NULL || frame->vw == 0 ||
+        frame->vh == 0 || !hwr_canvas_mapping_read(api, frame, &mapping))
+        return 0;
+    if (x0 < (int64_t)frame->vx) x0 = frame->vx;
+    if (y0 < (int64_t)frame->vy) y0 = frame->vy;
+    if (x1 > (int64_t)frame->vx + (int64_t)frame->vw)
+        x1 = (int64_t)frame->vx + (int64_t)frame->vw;
+    if (y1 > (int64_t)frame->vy + (int64_t)frame->vh)
+        y1 = (int64_t)frame->vy + (int64_t)frame->vh;
+    if (x1 <= x0 || y1 <= y0)
+        return 0;
+    if (frame->composite_mode ==
+        ROTH_COMPOSITE_ENGINE_CENTERED_OVER_CANVAS) {
+        left = mapping.x + (double)x0 * mapping.w / mapping.screen_w;
+        right = mapping.x + (double)x1 * mapping.w / mapping.screen_w;
+        top = mapping.y + (double)y0 * mapping.h / mapping.screen_h;
+        bottom = mapping.y + (double)y1 * mapping.h / mapping.screen_h;
+    } else {
+        left = (double)(x0 - frame->vx) * frame->w / frame->vw;
+        right = (double)(x1 - frame->vx) * frame->w / frame->vw;
+        top = (double)(y0 - frame->vy) * frame->h / frame->vh;
+        bottom = (double)(y1 - frame->vy) * frame->h / frame->vh;
+    }
+    sx0 = (int64_t)(left + 0.5);
+    sy0 = (int64_t)(top + 0.5);
+    sx1 = (int64_t)(right + 0.5);
+    sy1 = (int64_t)(bottom + 0.5);
+    if (sx0 < 0) sx0 = 0;
+    if (sy0 < 0) sy0 = 0;
+    if (sx1 > (int64_t)frame->w) sx1 = (int64_t)frame->w;
+    if (sy1 > (int64_t)frame->h) sy1 = (int64_t)frame->h;
+    if (sx1 <= sx0 || sy1 <= sy0)
+        return 0;
+    *source_x = (int32_t)sx0;
+    *source_y = (int32_t)sy0;
+    *source_w = (uint32_t)(sx1 - sx0);
+    *source_h = (uint32_t)(sy1 - sy0);
+    return 1;
+}
+
 int hwr_composite_source_to_engine(const struct roth_api_v1 *api,
                                    const struct roth_world_frame_v1 *frame,
                                    uint32_t source_x, uint32_t source_y,

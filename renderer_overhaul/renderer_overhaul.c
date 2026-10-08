@@ -27,6 +27,7 @@
 #include "hwr_pshadow.h"
 #include "hwr_overlay.h"
 #include "hwr_sysinfo.h"
+#include "hwr_ext.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -90,6 +91,9 @@ static struct hwr_render_settings g_render_settings = { 1, 0, 0 };
 static struct hwr_settings g_window_settings;
 static uint32_t g_window_pending;
 static uint32_t g_wrap_serial;
+/* The dim rectangles the image on screen was resolved under, as the
+ * signature hwr_sync_ext_dims answers. */
+static uint32_t g_dims_applied;
 static uint32_t g_watchdog_serial;
 static uint32_t g_watchdog_stall_count;
 static uint32_t g_poll_serial;
@@ -623,6 +627,7 @@ static void hwr_withdraw_if_owned(const struct roth_api_v1 *api)
     result = api->present->withdraw_world_frame(g_channel_api);
     if (result == ROTH_OK || result == ROTH_ERR_NOT_OWNER)
         g_channel_owned = 0;
+    hwr_ext_set_world_state(0, 0, 0, 0, 0);
 }
 
 /* The original renderer is on screen and stays there until something proves it
@@ -666,9 +671,14 @@ static int hwr_submit_frame(const struct roth_api_v1 *api,
             g_channel_owned = 0;
             g_last_frame_valid = 0;
         }
+        hwr_ext_set_world_state(0, 0, 0, 0, 0);
         return 0;
     }
     g_channel_owned = 1;
+    /* What other mods are told is on screen (renderer_overhaul_ext.h): the
+     * world shows through the viewport this frame carries. The one caller
+     * that hands the whole viewport to the engine layer takes it back. */
+    hwr_ext_set_world_state(1, frame->vx, frame->vy, frame->vw, frame->vh);
     return 1;
 }
 
@@ -747,7 +757,67 @@ static int hwr_submit_engine_passthrough(const struct roth_api_v1 *api,
         hwr_composite_mode_for(frame.w, frame.h, &viewport);
     if (!hwr_composite_engine_shadow(&g_composite, api, &frame))
         return 0;
-    return hwr_submit_frame(api, &frame);
+    if (!hwr_submit_frame(api, &frame))
+        return 0;
+    /* Every pixel inside the viewport is the engine's own here. */
+    hwr_ext_set_world_state(0, 0, 0, 0, 0);
+    return 1;
+}
+
+/* THE DIM RECTANGLES OTHER MODS ASKED FOR (renderer_overhaul_ext.h), turned
+ * into rectangles of the image about to be resolved and handed to the GL layer.
+ *
+ * They are stated in the engine framebuffer's pixels and the image is the
+ * canvas, so they go through the same mapping the composite uses to lay one
+ * over the other. Returns a signature of what was handed over: a held image
+ * was resolved under one set, and a different signature is what says it has
+ * to be resolved again. Nought is "no dims", so a game with no such mod
+ * compares nought against nought for ever. */
+static uint32_t hwr_sync_ext_dims(const struct roth_api_v1 *api,
+                                  const struct roth_world_frame_v1 *frame)
+{
+    struct hwr_ext_dim_v1 asked[HWR_EXT_DIM_SLOTS * 4u];
+    struct hwr_gl_dim dims[HWR_EXT_DIM_SLOTS * 4u];
+    size_t asked_count = hwr_ext_dims(asked, sizeof asked / sizeof asked[0]);
+    size_t count = 0;
+    uint32_t signature = 0;
+    size_t i;
+
+    for (i = 0; i < asked_count; i++) {
+        struct hwr_gl_dim *dim = &dims[count];
+
+        if (asked[i].whole_world) {
+            dim->x = 0;
+            dim->y = 0;
+            dim->w = frame->w;
+            dim->h = frame->h;
+        } else if (!hwr_composite_engine_rect_to_source(
+                       api, frame, asked[i].x, asked[i].y, asked[i].w,
+                       asked[i].h, &dim->x, &dim->y, &dim->w, &dim->h)) {
+            continue;
+        }
+        dim->strength = (float)asked[i].strength / 255.0f;
+        /* FNV-1a over the numbers that decide the picture. */
+        {
+            const uint32_t words[5] = {
+                (uint32_t)dim->x, (uint32_t)dim->y, dim->w, dim->h,
+                asked[i].strength
+            };
+            unsigned k;
+
+            if (signature == 0)
+                signature = 2166136261u;
+            for (k = 0; k < 5u; k++) {
+                signature ^= words[k];
+                signature *= 16777619u;
+            }
+        }
+        count++;
+    }
+    if (count != 0 && signature == 0)
+        signature = 1u;
+    hwr_gl_set_dims(dims, count);
+    return signature;
 }
 
 /* Palette-level effects are live engine state and the engine drives them
@@ -763,13 +833,18 @@ static void hwr_refresh_held_palette(const struct roth_api_v1 *api)
     const uint32_t *pixels;
     const uint8_t *lut = NULL;
     int32_t level;
+    uint32_t dims;
 
     if (!g_last_frame_valid || !g_ownership.present_valid ||
         g_gdv_palette_effect_active || g_composite.effect_active != 0)
         return;
     level = hwr_ownership_damage_level(api);
+    /* What another mod wants darkened is part of the same resolve, so a
+     * change in it is the same kind of falling behind. */
+    dims = hwr_sync_ext_dims(api, &g_last_frame);
     if (level == g_ownership.present_damage &&
-        g_ownership.grayscale_held == g_ownership.present_grayscale)
+        g_ownership.grayscale_held == g_ownership.present_grayscale &&
+        dims == g_dims_applied)
         return;
     if (g_ownership.grayscale_held) {
         lut = hwr_ownership_grayscale_lut(api);
@@ -805,6 +880,7 @@ static void hwr_refresh_held_palette(const struct roth_api_v1 *api)
     g_last_frame.pixels = pixels;
     g_ownership.present_damage = level;
     g_ownership.present_grayscale = g_ownership.grayscale_held;
+    g_dims_applied = dims;
 }
 
 /* The world pass publishes its baseline before the engine draws the chrome for
@@ -1132,6 +1208,9 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
     g_suppress_active = hardware_ready;
     roth_next_render_world_view_pass(chain, eax_record);
     g_suppress_active = 0;
+    /* The looks other mods sent for this frame. A mod riding the engine's
+     * walk has just sent them, and nothing below reads them before here. */
+    hwr_ext_latch_looks();
     hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_ENGINE_WALK);
 
     if (!hwr_read_viewport(api, &viewport)) {
@@ -1289,6 +1368,22 @@ static void hwr_render_world_view_pass_impl(struct roth_chain *chain,
         if (g_scene.valid)
             hwr_scene_sun_frame(&g_scene, &g_world, &g_objects, api);
         hwr_frame_perf_mark(&frame_perf, HWR_FRAME_PERF_SUN);
+        /* And the dims, mapped through the frame this render is about to be
+         * submitted as. */
+        {
+            struct roth_world_frame_v1 shape;
+
+            memset(&shape, 0, sizeof shape);
+            shape.w = render_width;
+            shape.h = render_height;
+            shape.vx = viewport.x;
+            shape.vy = viewport.y;
+            shape.vw = viewport.width;
+            shape.vh = viewport.height;
+            shape.composite_mode = hwr_composite_mode_for(
+                render_width, render_height, &viewport);
+            g_dims_applied = hwr_sync_ext_dims(api, &shape);
+        }
         pixels = g_scene.valid
                ? hwr_scene_render(&g_scene, &g_world, &g_objects, api,
                                   render_width, render_height,
@@ -2044,6 +2139,15 @@ static void ROTH_CDECL hwr_on_load(const struct roth_api_v1 *api)
     hwr_config_open(g_plugin_dir);
     hwr_look_load(g_plugin_dir);
     hwr_overlay_init();
+    /* What other mods can ask of the renderer (renderer_overhaul_ext.h).
+     * Published whether or not hardware rendering ends up in use: the table
+     * answers "not live" for as long as it is not, which is the answer a
+     * mod needs to keep drawing for the original renderer. */
+    if (api->interfaces != NULL &&
+        api->interfaces->publish(api, HWR_EXT_NAME, HWR_EXT_VERSION,
+                                 hwr_ext_table()) != ROTH_OK)
+        fprintf(stderr, "[renderer_overhaul] the mod interface could not be"
+                        " published; other mods will not find it\n");
 }
 
 /* The keystroke seam, in the tick. Everything it can do is flip a flag and note

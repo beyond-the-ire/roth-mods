@@ -259,6 +259,14 @@ static GLuint g_index_copy_texture;
  * after opaque geometry, for the translucent pass. */
 static GLuint g_stale_copy_texture;
 static GLuint g_depth_buffer;
+/* Whether the resolve target carries the world's depth buffer too. A look
+ * drawn over the resolved image has to be hidden by whatever stands in front
+ * of its sprite, so without it none is drawn. */
+static int g_fx_depth_attached;
+/* Whether the image being resolved is the engine's desaturated one. A look
+ * is colour, and colour drawn over a picture the engine has just taken the
+ * colour out of would be the one thing on the screen still wearing it. */
+static int g_fx_grayscale;
 static GLuint g_texture_buffer;
 static GLuint g_texture_buffer_texture;
 static GLuint g_colormap_texture;
@@ -4725,6 +4733,19 @@ static int hwr_create_framebuffer(uint32_t width, uint32_t height)
         hwr_destroy_framebuffer();
         return 0;
     }
+    /* The resolve target shares the world's depth, read-only: nothing drawn
+     * there writes it, and the one pass that tests against it is the pass
+     * that draws object looks. A driver that will not complete the target
+     * with it attached keeps the target it always had. */
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_fbo);
+    g_gl.framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                  GL_RENDERBUFFER, g_depth_buffer);
+    g_fx_depth_attached =
+        g_gl.check_framebuffer_status(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    if (!g_fx_depth_attached)
+        g_gl.framebuffer_renderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                      GL_RENDERBUFFER, 0);
+    g_gl.bind_framebuffer(GL_FRAMEBUFFER, g_index_fbo);
     g_gl.gen_textures(1, &g_index_copy_texture);
     g_gl.bind_texture(GL_TEXTURE_2D, g_index_copy_texture);
     g_gl.tex_parameter_i(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -7439,6 +7460,471 @@ static void hwr_truecolor_snapshot_color(uint32_t width, uint32_t height)
 }
 
 /* The frame's final resolve into the RGBA target the readback reads. */
+/* ---- object looks and world dims: a pass of its own over the resolved image ----
+ *
+ * What another mod asked for (renderer_overhaul_ext.h) is drawn here, after the
+ * world has been resolved to the colours that will be read back and before
+ * they are. Keeping it out of the world pass is deliberate: the world programs
+ * and their vertex format carry nothing of it, a frame nobody decorates issues
+ * no call below the first test, and the picture underneath is the picture the
+ * renderer drew.
+ *
+ * A decorated sprite is drawn again as one quad of its own, grown by the halo's
+ * reach, against the primary view's own depth -- so whatever hides the sprite
+ * hides its look. Two blends carry every effect: one multiplies what is there
+ * (the tint, the body's brightening, and making room for what is added), one
+ * adds (the glow's colour, the halo, the sweep). Neither touches alpha.
+ *
+ * The lists are kept from the frame they were set for, because a held frame is
+ * resolved again without being drawn again and has to come out the same. */
+enum { HWR_GL_FX_QUAD_MAX = 128, HWR_GL_FX_DIM_MAX = 32 };
+
+struct hwr_gl_fx_vertex {
+    float x, y, z;
+    float s, t;
+};
+
+static struct hwr_gl_fx_quad g_fx_quads[HWR_GL_FX_QUAD_MAX];
+static size_t g_fx_quad_count;
+static struct hwr_gl_camera g_fx_camera;
+static struct hwr_gl_dim g_fx_dims[HWR_GL_FX_DIM_MAX];
+static size_t g_fx_dim_count;
+static GLuint g_fx_program;
+static GLuint g_fx_dim_program;
+static GLuint g_fx_vao;
+static GLuint g_fx_vbo;
+static int g_fx_failed;
+
+static const char g_fx_vertex_shader[] =
+    "#version 330 core\n"
+    "layout(location=0) in vec3 a_pos;\n"
+    "layout(location=1) in vec2 a_st;\n"
+    "uniform ivec2 u_view_offset;\n"
+    "uniform int u_eye_z;\n"
+    "uniform int u_x_flip;\n"
+    "uniform vec2 u_basis;\n"
+    "uniform vec2 u_focal;\n"
+    "uniform vec2 u_center;\n"
+    "uniform vec2 u_viewport;\n"
+    "out vec2 v_st;\n"
+    "out float v_depth;\n"
+    "out float v_z;\n"
+    "int wrap16(int v) { int w=v & 65535; return w >= 32768 ? w-65536 : w; }\n"
+    /* The world pass's own projection, on a position that may sit between two
+     * world units: the sixteen-bit wrap runs on the whole part and the
+     * remainder is added afterwards, exactly as it is there. */
+    "void main() {\n"
+    "  float fx=floor(a_pos.x), fy=floor(a_pos.y);\n"
+    "  float wx=float(wrap16(int(fx)+u_view_offset.x))+(a_pos.x-fx);\n"
+    "  float wy=float(wrap16(int(fy)+u_view_offset.y))+(a_pos.y-fy);\n"
+    "  float s=u_basis.x, c=u_basis.y;\n"
+    "  float vx=s*wx+c*wy;\n"
+    "  if (u_x_flip != 0) vx=-vx;\n"
+    "  float depth=s*wy-c*wx;\n"
+    "  float zr=float(u_eye_z)-a_pos.z;\n"
+    "  float clip_x=(2.0*u_focal.x/u_viewport.x)*vx+"
+    "(2.0*u_center.x/u_viewport.x-1.0)*depth;\n"
+    "  float clip_y=(2.0*u_focal.y/u_viewport.y)*zr+"
+    "(2.0*u_center.y/u_viewport.y-1.0)*depth;\n"
+    "  const float n=16.0, f=20000.0;\n"
+    "  float clip_z=((f+n)/(f-n))*depth-(2.0*f*n/(f-n));\n"
+    "  gl_Position=vec4(clip_x,clip_y,clip_z,depth);\n"
+    "  v_st=a_st; v_depth=depth; v_z=a_pos.z;\n"
+    "}\n";
+
+static const char g_fx_fragment_shader[] =
+    "#version 330 core\n"
+    "uniform usamplerBuffer u_texels;\n"
+    "uniform int u_offset;\n"
+    /* x = the count down the sprite, y = the count across it: the store is
+     * column-major, as the world pass reads it. */
+    "uniform ivec2 u_dims;\n"
+    "uniform int u_hflip;\n"
+    "uniform int u_pass;\n"
+    "uniform vec4 u_tint;\n"
+    "uniform vec4 u_glow;\n"
+    "uniform float u_halo_px;\n"
+    "uniform int u_bloom;\n"
+    "uniform float u_shine;\n"
+    "uniform vec2 u_shine_shape;\n"
+    "uniform int u_floor_active;\n"
+    "uniform float u_floor_z;\n"
+    "uniform float u_eye_zf;\n"
+    "uniform int u_clip_count;\n"
+    "uniform vec2 u_clip[4];\n"
+    "in vec2 v_st;\n"
+    "in float v_depth;\n"
+    "in float v_z;\n"
+    "layout(location=0) out vec4 out_color;\n"
+    "bool solid(ivec2 p) {\n"
+    "  if (p.x<0 || p.y<0 || p.x>=u_dims.y || p.y>=u_dims.x) return false;\n"
+    "  int across=u_hflip!=0 ? (u_dims.y-1)-p.x : p.x;\n"
+    "  return texelFetch(u_texels,u_offset+across*u_dims.x+p.y).r!=0u;\n"
+    "}\n"
+    "float window_depth(float d) {\n"
+    "  const float n=16.0, f=20000.0;\n"
+    "  return 0.5*((f+n)/(f-n)-(2.0*f*n/(f-n))/d)+0.5;\n"
+    "}\n"
+    "void main() {\n"
+    "  vec2 tex=v_st*0.5;\n"
+    "  vec2 gx=dFdx(tex), gy=dFdy(tex);\n"
+    "  bool inside=solid(ivec2(floor(tex)));\n"
+    /* A bloom's light is not the sprite: it spills past whatever cut or hid
+     * the sprite itself. */
+    "  bool spill=u_bloom!=0 && !inside;\n"
+    /* The sprite's own portal windows, as the world pass cut it. */
+    "  if (u_clip_count>0 && !spill) {\n"
+    "    bool keep=false;\n"
+    "    for (int i=0;i<u_clip_count;i++)\n"
+    "      if (gl_FragCoord.x>=u_clip[i].x && gl_FragCoord.x<u_clip[i].y)"
+    " keep=true;\n"
+    "    if (!keep) discard;\n"
+    "  }\n"
+    "  float closeness=0.0;\n"
+    "  if (spill) {\n"
+    "    if (u_halo_px<=0.0 || u_glow.a<=0.0) discard;\n"
+    /* How far, in pixels, to the sprite's box: the offset in texels to the
+     * nearest point of the box, taken back through the texel grid's own
+     * slope across the screen. No search, so a bloom the size of the screen
+     * costs a fragment no more than a small one. */
+    "    vec2 box=vec2(float(u_dims.y),float(u_dims.x));\n"
+    "    vec2 off=tex-clamp(tex,vec2(0.0),box);\n"
+    "    float det=gx.x*gy.y-gy.x*gx.y;\n"
+    "    if (abs(det)<1.0e-12) discard;\n"
+    "    float dist=length(vec2(gy.y*off.x-gy.x*off.y,gx.x*off.y-gx.y*off.x)/det);\n"
+    "    if (dist>u_halo_px) discard;\n"
+    "    closeness=1.0-dist/u_halo_px;\n"
+    "  } else if (!inside) {\n"
+    "    if (u_halo_px<=0.0 || u_glow.a<=0.0) discard;\n"
+    /* How far, in pixels, to the nearest painted texel: rings of sixteen
+     * directions, stepped through the sprite's own texel grid. A wider halo
+     * takes more rings, so the gaps between them stay narrower than the
+     * sprite they are looking for. */
+    "    float best=u_halo_px*2.0;\n"
+    "    int rings=int(clamp(ceil(u_halo_px/6.0),3.0,10.0));\n"
+    "    for (int k=0;k<16;k++) {\n"
+    "      float angle=0.39269908*float(k);\n"
+    "      vec2 dir=vec2(cos(angle),sin(angle));\n"
+    "      for (int ring=1;ring<=rings;ring++) {\n"
+    "        float r=u_halo_px*float(ring)/float(rings);\n"
+    "        if (r<best && solid(ivec2(floor(tex+(gx*dir.x+gy*dir.y)*r))))"
+    " best=r;\n"
+    "      }\n"
+    "    }\n"
+    "    if (best>u_halo_px) discard;\n"
+    "    closeness=clamp(1.5-1.5*best/u_halo_px,0.0,1.0);\n"
+    "  }\n"
+    /* A sprite's feet may stand below its own floor and are drawn over it; the
+     * depth there is the floor's. Take the floor's depth along this ray for
+     * that part, so the floor does not hide the look and anything nearer than
+     * the floor still does. The small pull toward the eye absorbs the
+     * difference between this program's depth and the world pass's. */
+    "  float d=v_depth;\n"
+    "  if (u_floor_active!=0 && v_z<u_floor_z && u_eye_zf>u_floor_z)\n"
+    "    d=v_depth*(u_eye_zf-u_floor_z)/(u_eye_zf-v_z);\n"
+    "  gl_FragDepth=spill ? 0.0 : window_depth(max(d*0.998-0.25,16.5));\n"
+    "  float glow_in=0.16*u_glow.a;\n"
+    "  float stripe=0.0;\n"
+    "  if (inside && u_shine>=0.0 && u_shine_shape.x>0.0) {\n"
+    "    float along=mod(gl_FragCoord.x+gl_FragCoord.y-u_shine,u_shine_shape.x);\n"
+    "    if (along<u_shine_shape.y) stripe=0.6;\n"
+    "  }\n"
+    "  float halo=spill ? u_glow.a*0.95*closeness*sqrt(closeness)\n"
+    "                   : u_glow.a*(0.25+0.45*closeness);\n"
+    "  if (u_pass==0) {\n"
+    /* Multiply, through a blend that doubles: half is one. */
+    "    vec3 factor;\n"
+    "    if (inside) {\n"
+    "      factor=mix(vec3(1.0),u_tint.rgb*1.3,u_tint.a)*(1.0+0.45*u_glow.a);\n"
+    "      factor*=(1.0-glow_in)*(1.0-stripe);\n"
+    "    } else {\n"
+    "      factor=vec3(1.0-halo);\n"
+    "    }\n"
+    "    out_color=vec4(0.5*min(factor,vec3(2.0)),0.5);\n"
+    "  } else {\n"
+    "    vec3 add;\n"
+    "    if (inside) add=u_glow.rgb*glow_in*(1.0-stripe)+vec3(stripe);\n"
+    "    else add=min(u_glow.rgb*1.25,vec3(1.0))*halo;\n"
+    "    out_color=vec4(add,0.0);\n"
+    "  }\n"
+    "}\n";
+
+/* The dim: one solid colour through a multiply, so alpha stays what it was. */
+static const char g_fx_dim_fragment_shader[] =
+    "#version 330 core\n"
+    "uniform float u_keep;\n"
+    "layout(location=0) out vec4 out_color;\n"
+    "void main() { out_color=vec4(u_keep,u_keep,u_keep,1.0); }\n";
+
+void hwr_gl_set_fx_quads(const struct hwr_gl_fx_quad *quads, size_t count,
+                         const struct hwr_gl_camera *camera)
+{
+    if (quads == NULL || camera == NULL)
+        count = 0;
+    if (count > HWR_GL_FX_QUAD_MAX)
+        count = HWR_GL_FX_QUAD_MAX;
+    if (count != 0) {
+        memcpy(g_fx_quads, quads, count * sizeof *quads);
+        g_fx_camera = *camera;
+    }
+    g_fx_quad_count = count;
+}
+
+void hwr_gl_set_dims(const struct hwr_gl_dim *dims, size_t count)
+{
+    if (dims == NULL)
+        count = 0;
+    if (count > HWR_GL_FX_DIM_MAX)
+        count = HWR_GL_FX_DIM_MAX;
+    if (count != 0)
+        memcpy(g_fx_dims, dims, count * sizeof *dims);
+    g_fx_dim_count = count;
+}
+
+static void hwr_fx_destroy_objects(void)
+{
+    if (g_fx_program != 0)
+        g_gl.delete_program(g_fx_program);
+    if (g_fx_dim_program != 0)
+        g_gl.delete_program(g_fx_dim_program);
+    if (g_fx_vao != 0)
+        g_gl.delete_vertex_arrays(1, &g_fx_vao);
+    if (g_fx_vbo != 0)
+        g_gl.delete_buffers(1, &g_fx_vbo);
+    g_fx_program = 0;
+    g_fx_dim_program = 0;
+    g_fx_vao = 0;
+    g_fx_vbo = 0;
+}
+
+static int hwr_fx_ensure(void)
+{
+    const GLsizei stride = (GLsizei)sizeof(struct hwr_gl_fx_vertex);
+
+    if (g_fx_failed)
+        return 0;
+    if (g_fx_program != 0 && g_fx_dim_program != 0 && g_fx_vao != 0)
+        return 1;
+    hwr_fx_destroy_objects();
+    g_fx_program = hwr_link_program(g_fx_vertex_shader, g_fx_fragment_shader);
+    g_fx_dim_program = hwr_link_program(g_resolve_vertex_shader,
+                                        g_fx_dim_fragment_shader);
+    if (g_fx_program == 0 || g_fx_dim_program == 0) {
+        fprintf(stderr, "[renderer_overhaul] object looks and world dims are"
+                        " unavailable: %s\n", g_error);
+        hwr_fx_destroy_objects();
+        g_fx_failed = 1;
+        return 0;
+    }
+    g_gl.gen_vertex_arrays(1, &g_fx_vao);
+    g_gl.gen_buffers(1, &g_fx_vbo);
+    g_gl.bind_vertex_array(g_fx_vao);
+    g_gl.bind_buffer(GL_ARRAY_BUFFER, g_fx_vbo);
+    g_gl.enable_vertex_attrib_array(0);
+    g_gl.vertex_attrib_pointer(0, 3, GL_FLOAT, GL_FALSE, stride,
+                               (const void *)0);
+    g_gl.enable_vertex_attrib_array(1);
+    g_gl.vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, stride,
+                               (const void *)offsetof(struct hwr_gl_fx_vertex,
+                                                      s));
+    g_gl.bind_vertex_array(0);
+    return 1;
+}
+
+/* One quad's six vertices, grown on every side by what its halo reaches.
+ * Returns zero for a quad with no extent to draw. */
+static int hwr_fx_build_quad(const struct hwr_gl_fx_quad *quad,
+                             const struct hwr_gl_camera *camera,
+                             struct hwr_gl_fx_vertex out[6])
+{
+    /* The corners are modular map coordinates: the span between them is taken
+     * in the sixteen bits the world is authored in. */
+    double dx = (double)(int16_t)((uint16_t)quad->xr - (uint16_t)quad->xl);
+    double dy = (double)(int16_t)((uint16_t)quad->yr - (uint16_t)quad->yl);
+    double length = sqrt(dx * dx + dy * dy);
+    double tall = (double)quad->z_top - (double)quad->z_bottom;
+    double focal = camera->focal_x < camera->focal_y ? camera->focal_x
+                                                     : camera->focal_y;
+    double margin = 0.0;
+    double ux, uy, s_per, t_per;
+    double lx, ly, rx, ry, top, bottom, s0, s1, t0, t1;
+    struct hwr_gl_fx_vertex tl, tr, bl, br;
+
+    if (!(length >= 1.0) || !(tall >= 1.0) || quad->texture_width == 0 ||
+        quad->texture_height == 0 || !(focal > 0.0))
+        return 0;
+    if (quad->halo_px > 0.0f && quad->glow[3] > 0.0f)
+        margin = ((double)quad->halo_px + 1.5) *
+                 (quad->depth > 16.0f ? (double)quad->depth : 16.0) / focal;
+    ux = dx / length;
+    uy = dy / length;
+    s_per = 2.0 * (double)quad->texture_height / length;
+    t_per = 2.0 * (double)quad->texture_width / tall;
+    lx = (double)quad->xl - ux * margin;
+    ly = (double)quad->yl - uy * margin;
+    rx = (double)quad->xl + dx + ux * margin;
+    ry = (double)quad->yl + dy + uy * margin;
+    top = (double)quad->z_top + margin;
+    bottom = (double)quad->z_bottom - margin;
+    s0 = -margin * s_per;
+    s1 = 2.0 * (double)quad->texture_height + margin * s_per;
+    t0 = -margin * t_per;
+    t1 = 2.0 * (double)quad->texture_width + margin * t_per;
+    tl.x = (float)lx; tl.y = (float)ly; tl.z = (float)top;
+    tl.s = (float)s0; tl.t = (float)t0;
+    tr.x = (float)rx; tr.y = (float)ry; tr.z = (float)top;
+    tr.s = (float)s1; tr.t = (float)t0;
+    bl.x = (float)lx; bl.y = (float)ly; bl.z = (float)bottom;
+    bl.s = (float)s0; bl.t = (float)t1;
+    br.x = (float)rx; br.y = (float)ry; br.z = (float)bottom;
+    br.s = (float)s1; br.t = (float)t1;
+    out[0] = tl; out[1] = tr; out[2] = br;
+    out[3] = tl; out[4] = br; out[5] = bl;
+    return 1;
+}
+
+static void hwr_fx_draw_quads(uint32_t width, uint32_t height)
+{
+    static struct hwr_gl_fx_vertex vertices[HWR_GL_FX_QUAD_MAX * 6];
+    static uint8_t drawn[HWR_GL_FX_QUAD_MAX];
+    const struct hwr_gl_camera *camera = &g_fx_camera;
+    GLuint program = g_fx_program;
+    size_t i;
+
+    for (i = 0; i < g_fx_quad_count; i++)
+        drawn[i] = (uint8_t)hwr_fx_build_quad(&g_fx_quads[i], camera,
+                                              &vertices[i * 6]);
+    g_gl.bind_vertex_array(g_fx_vao);
+    g_gl.bind_buffer(GL_ARRAY_BUFFER, g_fx_vbo);
+    g_gl.buffer_data(GL_ARRAY_BUFFER,
+                     (GLsizeiptr)(g_fx_quad_count * 6 * sizeof vertices[0]),
+                     vertices, GL_STREAM_DRAW);
+    g_gl.use_program(program);
+    g_gl.active_texture(GL_TEXTURE0);
+    g_gl.bind_texture(GL_TEXTURE_BUFFER, g_texture_buffer_texture);
+    hwr_set_sampler(program, "u_texels", 0);
+    hwr_uniform_2i(program, "u_view_offset",
+                   camera->view_offset_x, camera->view_offset_y);
+    hwr_uniform_1i(program, "u_eye_z", camera->eye_z);
+    hwr_uniform_1f(program, "u_eye_zf", (GLfloat)camera->eye_z);
+    hwr_uniform_1i(program, "u_x_flip", camera->x_flip != 0);
+    hwr_uniform_2f(program, "u_basis",
+                   (GLfloat)camera->yaw_sin / 16384.0f,
+                   (GLfloat)camera->yaw_cos / 16384.0f);
+    hwr_uniform_2f(program, "u_focal",
+                   (GLfloat)camera->focal_x, (GLfloat)camera->focal_y);
+    hwr_uniform_2f(program, "u_center",
+                   (GLfloat)camera->center_x, (GLfloat)camera->horizon);
+    hwr_uniform_2f(program, "u_viewport", (GLfloat)width, (GLfloat)height);
+    g_gl.enable(GL_DEPTH_TEST);
+    g_gl.depth_func(GL_LEQUAL);
+    g_gl.depth_mask(GL_FALSE);
+    g_gl.enable(GL_BLEND);
+    for (i = 0; i < g_fx_quad_count; i++) {
+        const struct hwr_gl_fx_quad *quad = &g_fx_quads[i];
+        GLint clip_location;
+        int clips = quad->clip_count;
+
+        if (!drawn[i])
+            continue;
+        if (clips < 0 || clips > HWR_GL_FX_CLIP_MAX)
+            clips = 0;
+        hwr_uniform_1i(program, "u_offset", (GLint)quad->texture_offset);
+        hwr_uniform_2i(program, "u_dims", quad->texture_width,
+                       quad->texture_height);
+        hwr_uniform_1i(program, "u_hflip", quad->hflip != 0);
+        {
+            GLint tint = g_gl.get_uniform_location(program, "u_tint");
+            GLint glow = g_gl.get_uniform_location(program, "u_glow");
+
+            if (tint >= 0)
+                g_gl.uniform_4fv(tint, 1, quad->tint);
+            if (glow >= 0)
+                g_gl.uniform_4fv(glow, 1, quad->glow);
+        }
+        hwr_uniform_1f(program, "u_halo_px", quad->halo_px);
+        hwr_uniform_1i(program, "u_bloom", quad->bloom != 0);
+        hwr_uniform_1f(program, "u_shine",
+                       quad->shine_phase >= 0.0f
+                           ? quad->shine_phase * quad->shine_gap_px : -1.0f);
+        hwr_uniform_2f(program, "u_shine_shape", quad->shine_gap_px,
+                       quad->shine_band_px);
+        hwr_uniform_1i(program, "u_floor_active", quad->has_floor != 0);
+        hwr_uniform_1f(program, "u_floor_z", (GLfloat)quad->floor_z);
+        hwr_uniform_1i(program, "u_clip_count", clips);
+        clip_location = g_gl.get_uniform_location(program, "u_clip");
+        if (clip_location >= 0 && clips > 0) {
+            GLfloat pairs[HWR_GL_FX_CLIP_MAX * 2];
+            int c;
+
+            for (c = 0; c < clips; c++) {
+                pairs[c * 2] = quad->clip_lo[c];
+                pairs[c * 2 + 1] = quad->clip_hi[c];
+            }
+            g_gl.uniform_2fv(clip_location, clips, pairs);
+        }
+        g_gl.blend_func(GL_DST_COLOR, GL_SRC_COLOR);
+        hwr_uniform_1i(program, "u_pass", 0);
+        g_gl.draw_arrays(GL_TRIANGLES, (GLint)(i * 6), 6);
+        g_gl.blend_func(GL_ONE, GL_ONE);
+        hwr_uniform_1i(program, "u_pass", 1);
+        g_gl.draw_arrays(GL_TRIANGLES, (GLint)(i * 6), 6);
+    }
+    g_gl.disable(GL_BLEND);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.depth_func(GL_LESS);
+    g_gl.depth_mask(GL_TRUE);
+}
+
+static void hwr_fx_draw_dims(uint32_t width, uint32_t height)
+{
+    size_t i;
+
+    g_gl.use_program(g_fx_dim_program);
+    g_gl.bind_vertex_array(g_resolve_vao);
+    g_gl.disable(GL_DEPTH_TEST);
+    g_gl.enable(GL_BLEND);
+    g_gl.blend_func(GL_ZERO, GL_SRC_COLOR);
+    g_gl.enable(GL_SCISSOR_TEST);
+    for (i = 0; i < g_fx_dim_count; i++) {
+        const struct hwr_gl_dim *dim = &g_fx_dims[i];
+        int64_t x0 = dim->x, y0 = dim->y;
+        int64_t x1 = x0 + (int64_t)dim->w, y1 = y0 + (int64_t)dim->h;
+        float keep = 1.0f - dim->strength;
+
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > (int64_t)width) x1 = (int64_t)width;
+        if (y1 > (int64_t)height) y1 = (int64_t)height;
+        if (x1 <= x0 || y1 <= y0 || !(keep < 1.0f))
+            continue;
+        if (keep < 0.0f)
+            keep = 0.0f;
+        hwr_uniform_1f(g_fx_dim_program, "u_keep", keep);
+        /* The image is drawn top row first, so its rows are the target's own. */
+        g_gl.scissor((GLint)x0, (GLint)y0, (GLsizei)(x1 - x0),
+                     (GLsizei)(y1 - y0));
+        g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    }
+    g_gl.disable(GL_SCISSOR_TEST);
+    g_gl.disable(GL_BLEND);
+}
+
+/* Runs with the resolve target bound and the resolved image in it. Leaves the
+ * state the resolve pass left: no depth test, no blend, no scissor. */
+static void hwr_fx_pass(uint32_t width, uint32_t height)
+{
+    if (g_fx_quad_count == 0 && g_fx_dim_count == 0)
+        return;
+    if (g_debug_vis != 0 || !hwr_fx_ensure())
+        return;
+    if (g_fx_quad_count != 0 && g_fx_depth_attached && !g_fx_grayscale)
+        hwr_fx_draw_quads(width, height);
+    if (g_fx_dim_count != 0)
+        hwr_fx_draw_dims(width, height);
+    g_gl.active_texture(GL_TEXTURE0);
+}
+
 static void hwr_scene_resolve_pass(uint32_t width, uint32_t height)
 {
     g_gl.disable(GL_SCISSOR_TEST);
@@ -7768,6 +8254,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
     }
     compare_active = g_truecolor_active && hwr_truecolor_compare_enabled();
     hwr_truecolor_set_effects(palette);
+    g_fx_grayscale = palette->grayscale != 0;
 
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.active_texture(GL_TEXTURE1);
@@ -7905,6 +8392,7 @@ const uint32_t *hwr_gl_scene_render(const struct hwr_gl_scene_view *views,
         perf_views = hwr_perf_now_ns();
 
     hwr_scene_resolve_pass(width, height);
+    hwr_fx_pass(width, height);
     if (perf_enabled)
         perf_resolve = hwr_perf_now_ns();
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
@@ -7992,6 +8480,7 @@ const uint32_t *hwr_gl_scene_resolve(const struct hwr_gl_palette *palette,
     /* Nothing has drawn into the standing target since the render that produced
      * the image, so resolving it again yields exactly what that render would
      * have produced with these effects in force. */
+    g_fx_grayscale = palette->grayscale != 0;
     g_gl.pixel_store_i(GL_UNPACK_ALIGNMENT, 1);
     g_gl.active_texture(GL_TEXTURE1);
     g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
@@ -8035,6 +8524,7 @@ const uint32_t *hwr_gl_scene_resolve(const struct hwr_gl_palette *palette,
         g_gl.bind_texture(GL_TEXTURE_2D, g_palette_texture);
     }
     g_gl.draw_arrays(GL_TRIANGLES, 0, 3);
+    hwr_fx_pass(width, height);
     g_gl.read_pixels(0, 0, (GLsizei)width, (GLsizei)height,
                      GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, g_pixels);
     return g_pixels;
@@ -8092,6 +8582,7 @@ void hwr_gl_shutdown(void)
                 g_truecolor_break ? " (negative self-test)" : "");
     if (g_initialized && hwr_platform_make_current()) {
         hwr_destroy_scene_objects();
+        hwr_fx_destroy_objects();
         hwr_sun_destroy_objects();
         hwr_pshadow_destroy_objects();
         hwr_destroy_programs();
